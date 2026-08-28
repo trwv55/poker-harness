@@ -1,0 +1,96 @@
+<svg width="680" height="1300" viewBox="0 0 680 1300" xmlns="http://www.w3.org/2000/svg">
+<rect x="0" y="0" width="680" height="1300" fill="#FFFFFF"/>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#888780" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+
+<rect x="120" y="30" width="160" height="40" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="200" y="55" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#444441">Скрин (1 рука)</text>
+<rect x="300" y="30" width="180" height="40" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="390" y="55" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#444441">HH (весь турнир)</text>
+
+<line x1="200" y1="70" x2="200" y2="110" stroke="#888780" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="390" y1="70" x2="390" y2="110" stroke="#888780" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+<rect x="80" y="112" width="440" height="96" rx="12" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+<text x="300" y="139" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#3C3489">1 · Парсеры</text>
+<rect x="104" y="150" width="180" height="44" rx="8" fill="#CECBF6" stroke="#534AB7" stroke-width="0.5"/>
+<text x="194" y="171" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#26215C">VisionAdapter</text>
+<text x="194" y="187" text-anchor="middle" font-family="DejaVu Sans" font-size="12" fill="#3C3489">LLM · гипотеза</text>
+<rect x="316" y="150" width="180" height="44" rx="8" fill="#CECBF6" stroke="#534AB7" stroke-width="0.5"/>
+<text x="406" y="171" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#26215C">HHParser</text>
+<text x="406" y="187" text-anchor="middle" font-family="DejaVu Sans" font-size="12" fill="#3C3489">код · факты</text>
+
+<line x1="300" y1="208" x2="300" y2="242" stroke="#888780" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="230" y="244" width="140" height="36" rx="18" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="300" y="267" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#444441">RawHand</text>
+<line x1="300" y1="280" x2="300" y2="314" stroke="#888780" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+<rect x="120" y="316" width="360" height="64" rx="12" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text x="300" y="343" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#085041">2 · HandNormalizer (адаптер)</text>
+<text x="300" y="365" text-anchor="middle" font-family="DejaVu Sans" font-size="12" fill="#0F6E56">RawHand → канон · один на все входы</text>
+
+<line x1="300" y1="380" x2="300" y2="414" stroke="#888780" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="212" y="416" width="176" height="36" rx="18" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="300" y="439" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#444441">CanonicalHand</text>
+<line x1="300" y1="452" x2="300" y2="486" stroke="#888780" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+<rect x="80" y="488" width="440" height="100" rx="12" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+<text x="300" y="515" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#712B13">3 · Движок руки</text>
+<rect x="104" y="526" width="190" height="44" rx="8" fill="#F5C4B3" stroke="#993C1D" stroke-width="0.5"/>
+<text x="199" y="547" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#4A1B0C">Replay engine</text>
+<text x="199" y="563" text-anchor="middle" font-family="DejaVu Sans" font-size="12" fill="#712B13">правила NLHE</text>
+<rect x="306" y="526" width="190" height="44" rx="8" fill="#F5C4B3" stroke="#993C1D" stroke-width="0.5"/>
+<text x="401" y="547" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#4A1B0C">Validation</text>
+<text x="401" y="563" text-anchor="middle" font-family="DejaVu Sans" font-size="12" fill="#712B13">pass · escalate</text>
+<rect x="540" y="510" width="120" height="56" rx="8" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5"/>
+<text x="600" y="535" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#633806">Эскалация</text>
+<text x="600" y="553" text-anchor="middle" font-family="DejaVu Sans" font-size="12" fill="#854F0B">не править</text>
+<line x1="520" y1="538" x2="536" y2="538" stroke="#888780" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+<line x1="300" y1="588" x2="300" y2="622" stroke="#888780" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="216" y="624" width="168" height="36" rx="18" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="300" y="647" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#444441">EnrichedHand</text>
+<line x1="300" y1="660" x2="300" y2="694" stroke="#888780" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+<rect x="60" y="696" width="480" height="180" rx="12" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+<text x="300" y="723" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#0C447C">4 · Аналитическое ядро</text>
+<rect x="84" y="736" width="200" height="52" rx="8" fill="#B5D4F4" stroke="#185FA5" stroke-width="0.5"/>
+<text x="184" y="759" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#042C53">Разбор руки</text>
+<text x="184" y="777" text-anchor="middle" font-family="DejaVu Sans" font-size="12" fill="#0C447C">точки решения</text>
+<rect x="316" y="736" width="200" height="52" rx="8" fill="#B5D4F4" stroke="#185FA5" stroke-width="0.5"/>
+<text x="416" y="759" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#042C53">Префлоп-скан</text>
+<text x="416" y="777" text-anchor="middle" font-family="DejaVu Sans" font-size="12" fill="#0C447C">весь турнир · код</text>
+<rect x="84" y="800" width="200" height="52" rx="8" fill="#B5D4F4" stroke="#185FA5" stroke-width="0.5"/>
+<text x="184" y="823" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#042C53">Зоны доверия</text>
+<text x="184" y="841" text-anchor="middle" font-family="DejaVu Sans" font-size="12" fill="#0C447C">строго · предполагая</text>
+<rect x="316" y="800" width="200" height="52" rx="8" fill="#B5D4F4" stroke="#185FA5" stroke-width="0.5"/>
+<text x="416" y="823" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#042C53">Оценщик ошибки</text>
+<text x="416" y="841" text-anchor="middle" font-family="DejaVu Sans" font-size="12" fill="#0C447C">EV · ранжирование</text>
+
+<line x1="300" y1="876" x2="300" y2="910" stroke="#888780" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+<rect x="80" y="912" width="440" height="100" rx="12" fill="#FBEAF0" stroke="#993556" stroke-width="0.5"/>
+<text x="300" y="939" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#72243E">5 · Изложение</text>
+<rect x="104" y="950" width="190" height="44" rx="8" fill="#F4C0D1" stroke="#993556" stroke-width="0.5"/>
+<text x="199" y="971" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#4B1528">Текст вердикта</text>
+<text x="199" y="987" text-anchor="middle" font-family="DejaVu Sans" font-size="12" fill="#72243E">LLM · излагает</text>
+<rect x="306" y="950" width="190" height="44" rx="8" fill="#F4C0D1" stroke="#993556" stroke-width="0.5"/>
+<text x="401" y="971" text-anchor="middle" font-family="DejaVu Sans" font-size="13" font-weight="500" fill="#4B1528">Рендер диапазонов</text>
+<text x="401" y="987" text-anchor="middle" font-family="DejaVu Sans" font-size="12" fill="#72243E">код · SVG→PNG</text>
+
+<line x1="300" y1="1012" x2="300" y2="1046" stroke="#888780" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="190" y="1048" width="220" height="40" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5"/>
+<text x="300" y="1073" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#444441">Игроку в ТГ</text>
+
+<rect x="60" y="1128" width="280" height="88" rx="12" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text x="200" y="1155" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#085041">6 · Память (БД)</text>
+<text x="200" y="1177" text-anchor="middle" font-family="DejaVu Sans" font-size="12" fill="#0F6E56">руки · заметки (vision) · сессии</text>
+<text x="200" y="1195" text-anchor="middle" font-family="DejaVu Sans" font-size="12" fill="#0F6E56">eval-датасет · подтверждения</text>
+
+<rect x="360" y="1128" width="280" height="88" rx="12" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/>
+<text x="500" y="1155" text-anchor="middle" font-family="DejaVu Sans" font-size="14" font-weight="500" fill="#27500A">7 · Платформа</text>
+<text x="500" y="1177" text-anchor="middle" font-family="DejaVu Sans" font-size="12" fill="#3B6D11">ТГ + сессии · роутер входа</text>
+<text x="500" y="1195" text-anchor="middle" font-family="DejaVu Sans" font-size="12" fill="#3B6D11">llm() · трейс · прогон evals</text>
+
+<text x="300" y="1256" text-anchor="middle" font-family="DejaVu Sans" font-size="12" fill="#5F5E5A">Память и платформа — сквозные: обслуживают все пять станций конвейера</text>
+<text x="300" y="1278" text-anchor="middle" font-family="DejaVu Sans" font-size="12" fill="#5F5E5A">LLM только в двух местах: VisionAdapter и текст вердикта</text>
+</svg>
