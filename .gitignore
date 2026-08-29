@@ -1,10 +1,24 @@
+# macOS
 .DS_Store
-.env
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.TemporaryItems
+.AppleDouble
+.LSOverride
+Icon
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 .venv/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+*.egg-info/
 
-# скриншоты столов: содержат ники и ставки, в репозиторий не едут
+# секреты и локальные данные
+.env
 .claude/screens/
