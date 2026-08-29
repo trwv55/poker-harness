@@ -34,6 +34,16 @@ uv run pytest -q -ra
 uv run ruff check . && uv run pyright
 ```
 
+### Публикация
+
+Репозиторий открыт до выхода продукта. Что в него не попадает и почему — в
+[docs/publishing-policy.md](docs/publishing-policy.md); правило проверяется хуком
+`pre-push`, который включается на клоне один раз:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ### Фикстуры
 
 Регрессионная сетка гоняется на реальных hand history — это приватные данные игрока,
