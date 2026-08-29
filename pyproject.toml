@@ -23,6 +23,12 @@ packages = ["src/harness"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Вывод тестов держим чистым, иначе наши собственные предупреждения утонут в чужих.
+# Всё, кроме известного шума eval7 (он зовёт устаревшие функции pyparsing), — ошибка.
+filterwarnings = [
+    "error",
+    "ignore::pyparsing.warnings.PyparsingDeprecationWarning",
+]
 
 [tool.ruff]
 line-length = 100
