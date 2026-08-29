@@ -41,7 +41,7 @@ _MAX_COLLISION_ATTEMPTS = 10_000
 _ComboSource = tuple[list[tuple[str, str]], list[float]]  # (комбо, кумулятивные веса)
 
 
-def _combos_for_class(cls: str) -> list[tuple[str, str]]:
+def combos_of_class(cls: str) -> list[tuple[str, str]]:
     """Все конкретные комбо карт для класса ("AKs" -> 4 комбо и т. п.), без учёта мёртвых карт."""
     if len(cls) == 2:
         rank = cls[0]
@@ -67,7 +67,7 @@ def _expand_range(rng: Range, dead: set[str]) -> _ComboSource:
         weight = rng.weight(cls)
         if weight <= 0.0:
             continue
-        for c1, c2 in _combos_for_class(cls):
+        for c1, c2 in combos_of_class(cls):
             if c1 in dead or c2 in dead:
                 continue
             combos.append((c1, c2))
