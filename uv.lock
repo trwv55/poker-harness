@@ -21,6 +21,35 @@ wheels = [
 ]
 
 [[package]]
+name = "eval7"
+version = "0.1.11"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "future" },
+    { name = "pyparsing" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/39/d4/ad41232fcfeae157ab4f5d1f47c238c10e91ad9022a81a3897fb0808f9e9/eval7-0.1.11-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:fc4d9ae8cae8420966770277b3708f92f727346756a3291eb7b41eee898c318b", size = 234618, upload-time = "2026-07-29T01:04:51.134Z" },
+    { url = "https://files.pythonhosted.org/packages/98/6a/12506d4efe3471d0cc7e7daede08bfa42b9fd7f6789455a2d0f1721fdb56/eval7-0.1.11-cp312-cp312-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:7d6f63e4ae6262774b1ddbbb20b430264c3d326c95059bb2f3af17369ce9e839", size = 716487, upload-time = "2026-07-29T01:04:52.425Z" },
+    { url = "https://files.pythonhosted.org/packages/81/b7/0e1c9e92511e7cabbd477b6944e88d5306d302714f1de8b92b4408446cac/eval7-0.1.11-cp312-cp312-win32.whl", hash = "sha256:ad775ce0297d0185eea752680fba5d1655d93b36a4700eda8a5bd1f05a09a57a", size = 99719, upload-time = "2026-07-29T01:04:53.729Z" },
+    { url = "https://files.pythonhosted.org/packages/11/f2/1bea3d588054f331c46d9a51386a5ffda815ebb06f1f74849fb51013aa20/eval7-0.1.11-cp312-cp312-win_amd64.whl", hash = "sha256:74a19fc72e5938c2a43959fd9c0cdb1fcfda9f0f1acfc8c5aeefe25550d212c0", size = 109775, upload-time = "2026-07-29T01:04:54.977Z" },
+    { url = "https://files.pythonhosted.org/packages/3e/27/88bd3acb5932134ee01e25a4959198d6e869cd179ef16442c7f1eaa15e77/eval7-0.1.11-cp313-cp313-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:64ccb07b6ad560e2f7c70a337b63f44e2fd790be11083617b4516bb7ee71dc3e", size = 686015, upload-time = "2026-07-29T01:04:56.416Z" },
+    { url = "https://files.pythonhosted.org/packages/a3/b1/ccea508d7f47f3d73a104850de3ba60a8e45c6b8e0f3aafee2daed8f66a8/eval7-0.1.11-cp314-cp314-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:1a28209536e72f76f305ee10cd4fa6200f40ba30717f9d449514631c4832d35f", size = 679918, upload-time = "2026-07-29T01:04:57.724Z" },
+    { url = "https://files.pythonhosted.org/packages/5b/32/101674bcd3578803549f9423a0703404bf15246936f0ea8edbce536abac5/eval7-0.1.11-cp314-cp314t-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:8da39428fbeca345af2eb90c26b27f25619bf0777697963818d40a1628dec7b4", size = 841536, upload-time = "2026-07-29T01:04:59.327Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/95/0464ae5ff73784002eb4895b98cbaac3b0428ec2c178ed6ff6f0c193fc4a/eval7-0.1.11-cp315-cp315-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:450bc15c62122fa396582b190ab454e45ba3c9a9ed270482dccb6829121c2e88", size = 684460, upload-time = "2026-07-29T01:05:00.538Z" },
+    { url = "https://files.pythonhosted.org/packages/e9/e4/b39d3ef74fc9585356caf555a7f0bc98dcca7560be207f3f7b3497583a07/eval7-0.1.11-cp315-cp315t-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:0d6009f6f8677226c14b05eaf16ea36ef42c248b60f984b92da3b4483d66ea65", size = 826137, upload-time = "2026-07-29T01:05:01.816Z" },
+]
+
+[[package]]
+name = "future"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a7/b2/4140c69c6a66432916b26158687e821ba631a4c9273c474343badf84d3ba/future-1.0.0.tar.gz", hash = "sha256:bd2968309307861edae1458a4f8a4f3598c03be43b97521076aebf5d94c07b05", size = 1228490, upload-time = "2024-02-21T11:52:38.461Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/da/71/ae30dadffc90b9006d77af76b393cb9dfbfc9629f339fc1574a1c52e6806/future-1.0.0-py3-none-any.whl", hash = "sha256:929292d34f5872e70396626ef385ec22355a1fae8ad29e1a734c3e43f9fbc216", size = 491326, upload-time = "2024-02-21T11:52:35.956Z" },
+]
+
+[[package]]
 name = "iniconfig"
 version = "2.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -61,6 +90,7 @@ name = "poker-harness"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "eval7" },
     { name = "pokerkit" },
     { name = "pydantic" },
 ]
@@ -75,6 +105,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "eval7", specifier = ">=0.1.11" },
     { name = "pokerkit", specifier = "==0.7.5" },
     { name = "pydantic", specifier = ">=2.7" },
 ]
@@ -193,6 +224,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/49/2e/ced460408999b33da6b31b0021b0f37d329e202d4169aeb164493778f25b/pygments-2.21.0.tar.gz", hash = "sha256:610ca751c9bc2492b38eb9a38a7fbc93edbbb2d7182edaf34e66ae493dee5c8c", size = 5005329, upload-time = "2026-08-17T08:02:48.824Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/71/46/17f022dd3e953bf20a04a028a21ec746d942f8d2af30fa0f124fa0e6a684/pygments-2.21.0-py3-none-any.whl", hash = "sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9", size = 1250147, upload-time = "2026-08-17T08:02:44.912Z" },
+]
+
+[[package]]
+name = "pyparsing"
+version = "3.3.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f3/91/9c6ee907786a473bf81c5f53cf703ba0957b23ab84c264080fb5a450416f/pyparsing-3.3.2.tar.gz", hash = "sha256:c777f4d763f140633dcb6d8a3eda953bf7a214dc4eff598413c070bcdc117cbc", size = 6851574, upload-time = "2026-01-21T03:57:59.36Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/10/bd/c038d7cc38edc1aa5bf91ab8068b63d4308c66c4c8bb3cbba7dfbc049f9c/pyparsing-3.3.2-py3-none-any.whl", hash = "sha256:850ba148bd908d7e2411587e247a1e4f0327839c40e2e5e6d05a007ecc69911d", size = 122781, upload-time = "2026-01-21T03:57:55.912Z" },
 ]
 
 [[package]]

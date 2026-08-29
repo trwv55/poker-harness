@@ -3,6 +3,7 @@ name = "poker-harness"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    "eval7>=0.1.11",
     # Точный пин, а не диапазон: реплей опирается на внутреннее состояние
     # PokerKit (`State.statuses`), и патч-релиз может увести его из-под нас.
     "pokerkit==0.7.5",
