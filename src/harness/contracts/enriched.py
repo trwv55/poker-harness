@@ -55,6 +55,10 @@ class EngineReport(BaseModel):
     stacks_end: dict[str, int]
     decision_points: list[DecisionPoint]
     illegal_actions: list[str] = []
+    # Игроки, которым источник записал пас при нулевом стеке (олл-ин с
+    # вынужденной ставки): движок исполняет такой пас, хотя правила NLHE
+    # оставляют игрока в руке. Список делает эту поправку видимой в трассе.
+    forfeits: list[str] = []
 
 
 class EnrichedHand(BaseModel):

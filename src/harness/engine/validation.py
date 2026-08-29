@@ -82,12 +82,14 @@ def validate(hand: CanonicalHand, report: EngineReport) -> Verdict:
         reasons.append("duplicate cards")
         fields.append(_FIELD_CARDS)
 
+    # Реплей играет руку до рейка: PokerKit раздаёт банк целиком, ничего не
+    # удерживая. Поэтому фишки обязаны сойтись ровно, без слагаемого за рейк —
+    # добавить его значило бы отклонять любую руку с ненулевым рейком. Сам рейк
+    # ловится сверкой `final_pot` с `Total pot`: рум пишет обе суммы до удержания.
     start = sum(p.stack for p in hand.players)
-    rake = hand.summary.rake if hand.summary is not None else 0
-    if sum(report.stacks_end.values()) + rake != start:
+    if sum(report.stacks_end.values()) != start:
         reasons.append(
-            f"chip conservation violated: start={start} "
-            f"end={sum(report.stacks_end.values())} rake={rake}"
+            f"chip conservation violated: start={start} end={sum(report.stacks_end.values())}"
         )
         fields.append(_FIELD_STACKS)
 

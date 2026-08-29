@@ -162,16 +162,27 @@ def _decision_point(
 ) -> DecisionPoint:
     """Снимок состояния перед решением игрока.
 
-    `eff_stack` — фишки за спиной: минимум из стека решающего и наибольшего стека
-    живого оппонента (больше в этой руке в игру всё равно не войдёт). `live_total`
-    и `live_behind` — вход правила зоны доверия: сколько игроков ещё в руке и
-    сколько из них ходят после решающего в текущем круге.
+    `pot_before` — банк, за который решающий реально играет: вклад каждого игрока
+    учитывается не полностью, а до потолка «сколько решающий вообще способен
+    поставить» (уже поставленное плюс стек). Ставку сверх этого потолка выиграть
+    нельзя — она вернётся поставившему, и складывать её в банк значило бы
+    завысить шансы банка. На тестовой руке это даёт 14532, а `pot_before + to_call`
+    — 14673, ровно тот мейн-пот, который записал рум.
+
+    `eff_stack` — минимум из остатка стека решающего и наибольшего остатка среди
+    живых оппонентов: больше этого в руке выиграть или проиграть нельзя.
+    `live_total` и `live_behind` — вход правила зоны доверия: сколько игроков ещё
+    в руке и сколько из них ходят после решающего в текущем круге.
     """
     actor = seating.index(action.label)
     street_index = state.street_index
     assert street_index is not None
     street = _STREET_BY_INDEX[street_index]
-    pot_before = state.total_pot_amount
+    # -payoffs[i] — всё, что игрок вложил в руку к этому моменту: собранное в
+    # банк плюс невыровненные ставки круга (анте и блайнды тоже).
+    committed = [-state.payoffs[i] for i in state.player_indices]
+    ceiling = committed[actor] + state.stacks[actor]
+    pot_before = sum(min(amount, ceiling) for amount in committed)
     opponents = [
         state.stacks[i] for i in state.player_indices if i != actor and state.statuses[i]
     ]
@@ -219,6 +230,7 @@ class _Replay:
         self.pot_by_street: dict[Street, int] = {}
         self.side_pots: list[SidePot] = []
         self.final_pot: int | None = None
+        self.forfeits: list[str] = []
         self._street_index = self.state.street_index
         self._uncalled = 0
 
@@ -235,7 +247,9 @@ class _Replay:
     def _step(self) -> bool:
         """Один шаг реплея. `False` — дальше идти нельзя, причина уже записана."""
         state = self.state
-        if state.can_collect_bets():
+        if self._is_forfeit(self.pending[0] if self.pending else None):
+            self._forfeit(self.pending.popleft().label)
+        elif state.can_collect_bets():
             self._collect_bets()
         elif state.can_burn_card():
             state.burn_card(self.supply.draw())
@@ -253,6 +267,48 @@ class _Replay:
             self.illegal.append("реплей встал: состояние не предлагает следующей операции")
             return False
         return True
+
+    def _is_forfeit(self, action: CanonicalAction | None) -> bool:
+        """Пас от игрока, у которого не осталось фишек за спиной.
+
+        Так GG записывает игрока, ушедшего в олл-ин вынужденной ставкой (обычно
+        он сидит аут или отвалился по связи): рум считает его вышедшим из руки,
+        а его фишки — мёртвыми деньгами в банке. Правила NLHE так не умеют —
+        олл-ин игрок остаётся в руке и претендует на мейн-пот, — и PokerKit хода
+        у него не спросит. Провенанс `hand_history` — это факт: отказ проиграть
+        записанное румом действие дал бы ложный `reject` на настоящей руке
+        игрока. Условие держим узким: только явный `folds` и только при нулевом
+        остатке стека.
+        """
+        if action is None or action.kind != ActionKind.FOLD:
+            return False
+        if action.label not in self.seating:
+            return False
+        index = self.seating.index(action.label)
+        if not self.state.statuses[index] or self.state.stacks[index]:
+            return False
+        # Последнего оставшегося не выводим: пас всех до одного — не форфейт,
+        # а битые данные, и разбираться с ними должен обычный путь.
+        return sum(self.state.statuses) > 1
+
+    def _forfeit(self, label: str) -> None:
+        """Исполнить записанный румом пас: игрок выходит из руки, вклад остаётся.
+
+        `State.fold` для этого не годится: она требует, чтобы игрок был на ходу,
+        и прямо утверждает `assert self.stacks[player_index]` — по правилам
+        человек без фишек пасовать не может. Снимаем ровно тот флаг, который
+        снимает сама PokerKit при пасе (`statuses`): игрок перестаёт быть
+        участником банка (`State.pots` раздаёт поты только живым), а всё, что он
+        успел вложить, остаётся в банке мёртвыми деньгами — как и у рума.
+
+        Пробовал сделать это сбросом карт на шоудауне (`show_or_muck_hole_cards`
+        со статусом `False`) — не работает: при олл-ин-ранауте PokerKit вскрывает
+        карты ДО добора борда, и сброс оставляет за столом одного живого игрока,
+        после чего `_begin_betting` следующей улицы падает на
+        `assert len(effective_stacks) > 1` внутри `get_effective_stack`.
+        """
+        self.forfeits.append(label)
+        self.state.statuses[self.seating.index(label)] = False
 
     def _note_unplayed(self) -> None:
         """Рука кончилась, а действия источника остались — это расхождение, не мелочь.
@@ -412,6 +468,7 @@ class _Replay:
             },
             decision_points=self.points,
             illegal_actions=self.illegal,
+            forfeits=self.forfeits,
         )
 
 

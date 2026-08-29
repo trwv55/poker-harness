@@ -16,7 +16,8 @@ from harness.contracts import (
 )
 from harness.engine import enrich
 from harness.normalizer import normalize
-from harness.parsers.hh_parser import parse_hand
+from harness.parsers.hh_parser import parse_file, parse_hand
+from tests.conftest import FIXTURE_DAILY
 from tests.test_hh_parser import SAMPLE
 
 
@@ -117,3 +118,40 @@ def test_heads_up_button_posts_small_blind():
     dp = next(d for d in en.report.decision_points if d.label == "Hero")
     assert dp.position == "BTN" and dp.to_call == 3000
     assert (dp.live_total, dp.live_behind) == (2, 1)
+
+
+def test_decision_point_pot_is_only_what_hero_can_win():
+    """`pot_before` — банк, за который герой играет, а не всё, что лежит на столе.
+
+    Виллан поставил 69 000 при стеке героя 3891: 63 000 из них ему вернутся, и
+    выиграть их герой не может — складывать их в банк значило бы завысить шансы
+    банка. `pot_before + to_call` даёт 14 673, ровно тот мейн-пот, который рум
+    записал строкой `5553a2cd collected 14,673`.
+    """
+    en = enrich(normalize(parse_hand(SAMPLE, source_ref="x")))
+    dp = next(d for d in en.report.decision_points if d.label == "Hero")
+    assert dp.pot_before == 14532
+    assert dp.pot_before + dp.to_call == 14673
+
+
+def test_forfeit_of_blind_all_in_is_honoured():
+    """Реальная рука: рум пишет `folds` игроку, ушедшему в олл-ин блайндом.
+
+    `e0fb14f7` со стеком 236 платит анте 100 и малый блайнд 136 — фишек за спиной
+    не остаётся. По правилам NLHE он остаётся в руке и претендует на мейн-пот, но
+    рум считает его вышедшим, а его 136 — мёртвыми деньгами, и отдаёт весь банк
+    4136 победителю. Провенанс `hand_history` — это факт, движок его исполняет и
+    отмечает поправку в `forfeits`.
+    """
+    raw = next(
+        r
+        for r in parse_file(FIXTURE_DAILY.read_text(encoding="utf-8"), source_ref="daily")
+        if r.hand_no == "TM6315415787"
+    )
+    en = enrich(normalize(raw))
+    assert en.verdict.status == "pass"
+    assert en.report.forfeits == ["e0fb14f7"]  # поправка видна в трассе
+    assert en.report.illegal_actions == []
+    assert en.report.final_pot == 4136  # Total pot рума, вместе с мёртвыми 136
+    assert en.report.stacks_end["e0fb14f7"] == 0  # назад не вернулось ничего
+    assert en.report.stacks_end["ce115272"] == 38_247  # победитель забрал весь банк
