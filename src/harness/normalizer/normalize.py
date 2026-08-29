@@ -86,15 +86,22 @@ def _canonical_actions(raw: RawHand) -> list[CanonicalAction]:
 
 
 def _update_committed(committed: dict[tuple[Street, str], int], action: RawAction) -> int:
-    """Обновить накопленный коммит по `(street, label)` действием и вернуть новое значение."""
+    """Обновить накопленный коммит по `(street, label)` действием и вернуть новое значение.
+
+    Если источник не дал нужного поля (у `raise` нет `to_amount`, у `call`/`bet` нет
+    `amount` — схема это допускает, и vision-вход задачи 22 даст именно такое усечение),
+    аккумулятор остаётся на последнем известном значении: нормалайзер не придумывает
+    сумму. Получившаяся несходимость — сигнал для движка и валидатора (задача 6),
+    которые эскалируют её игроку; падать здесь нельзя — краш обходит машину эскалаций,
+    ради которой на vision-пути всё и затевалось.
+    """
     key = (action.street, action.label)
-    if action.kind == ActionKind.RAISE:
-        assert action.to_amount is not None
+    if action.kind == ActionKind.RAISE and action.to_amount is not None:
         committed[key] = action.to_amount
-    elif action.kind in (ActionKind.CALL, ActionKind.BET):
-        assert action.amount is not None
+    elif action.kind in (ActionKind.CALL, ActionKind.BET) and action.amount is not None:
         committed[key] = committed.get(key, 0) + action.amount
-    # FOLD/CHECK не меняют коммит — читаем уже накопленное (0, если ещё не ставил)
+    # FOLD/CHECK, либо raise/call/bet с отсутствующим полем — коммит не меняем,
+    # читаем уже накопленное (0, если ещё не ставил).
     return committed.get(key, 0)
 
 
