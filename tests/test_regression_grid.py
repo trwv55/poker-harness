@@ -2,13 +2,11 @@ import pytest
 
 from tests.conftest import FIXTURE_DAILY, FIXTURE_PKO
 
-pytestmark = pytest.mark.xfail(reason="конвейер ещё не реализован", strict=False)  # снимается в задаче 7
 
 def _pipeline(path):
-    from harness.parsers.hh_parser import parse_file  # type: ignore[import-not-found]
-
-    from harness.engine import enrich  # type: ignore[import-not-found]
-    from harness.normalizer import normalize  # type: ignore[import-not-found]
+    from harness.engine import enrich
+    from harness.normalizer import normalize
+    from harness.parsers.hh_parser import parse_file
     raws = parse_file(path.read_text(encoding="utf-8"), source_ref=path.name)
     return raws, [enrich(normalize(r)) for r in raws]
 
