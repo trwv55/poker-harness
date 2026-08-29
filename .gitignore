@@ -5,3 +5,6 @@ __pycache__/
 .venv/
 .pytest_cache/
 .ruff_cache/
+
+# скриншоты столов: содержат ники и ставки, в репозиторий не едут
+.claude/screens/
