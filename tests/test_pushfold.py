@@ -316,6 +316,34 @@ def test_bracket_wide_is_about_top_40_percent():
     assert all(w == 1.0 for w in wide.weights.values())
 
 
+@pytest.mark.slow
+def test_bracket_wide_is_derived_from_equity_against_a_random_hand():
+    # Состав широкого конца вилки не выбирается руками: классы упорядочены по
+    # эквити против случайной руки (это и есть метрика пуш-фолда — руки идут на
+    # вскрытие), и берётся столько верхних, чтобы доля комбо была ближе всего к 40%.
+    # Тест воспроизводит вывод независимо от реализации и требует совпадения состава.
+    from harness.analysis.tools.equity import combos_of_class
+
+    live = _live_combo_share()
+    classes = all_classes()
+    strength = {
+        h: sum(live[(h, c)] * class_equity(h, c) for c in classes) for h in classes
+    }
+    ordered = sorted(classes, key=lambda c: (-strength[c], c))
+
+    target = 0.40 * 1326
+    cumulative, best_prefix, best_gap = 0, 0, target
+    for position, cls in enumerate(ordered, start=1):
+        cumulative += len(combos_of_class(cls))
+        if abs(cumulative - target) < best_gap:
+            best_gap, best_prefix = abs(cumulative - target), position
+    expected = set(ordered[:best_prefix])
+
+    assert set(BRACKET_WIDE(10.0).weights) == expected
+    # и порядок действительно осмысленный: премиум наверху, мусор внизу
+    assert ordered[0] == "AA"
+    assert ordered[-1] == "32o"
+
 
 def test_bracket_wide_contains_tight_at_every_depth():
     for depth in (3.0, 8.0, 12.0, 20.0):

@@ -44,6 +44,7 @@ from harness.analysis.tools.equity import combos_of_class, equity_vs_ranges
 from harness.contracts import Range, all_classes
 
 _DECK_SIZE = 52
+_TOTAL_COMBOS = 1326  # C(52,2) — все стартовые комбо
 
 # Больше 7 игроков позади за столом 9-max не бывает (герой + 7 = 8 мест до баттона),
 # а 2^n веток растёт вдвое на каждого: кап делает стоимость расчёта предсказуемой.
@@ -239,61 +240,6 @@ def fold_equity_ok(callers: list[CallerModel]) -> bool:
     prob_all_fold = prod(1.0 - c.call_range.fraction_of_hands() for c in callers)
     return prob_all_fold > _MIN_FOLD_PROB
 
-
-
-# --- Bracket-модели колл-диапазона (вход bracket-теста зоны, задача 12) ---------
-#
-# Это не оценка «как коллируют на самом деле», а два намеренно грубых конца
-# вилки: если вердикт одинаков и против премиум-онли, и против top-40%, он не
-# зависит от угаданного диапазона. Обе модели не зависят от глубины: глубина
-# принимается аргументом, потому что вызывающая сторона ею оперирует и потому
-# что уточнение по глубине — вопрос данных, а не кода, и не должно менять места
-# вызова. Сузить вилку без данных значило бы выдумать число.
-
-_TIGHT_CLASSES: tuple[str, ...] = ("AA", "KK", "QQ", "JJ", "AKs", "AKo")
-
-# Top-40% по комбо: 534 из 1326 (40.3%). Состав — стандартная форма широкого
-# диапазона (пары, тузы, бродвеи, одномастные коннекторы), а не вычисленный
-# порядок сил рук: это верхний конец вилки, и его задача — быть заведомо шире
-# правдоподобного, а не точным.
-_WIDE_CLASSES: tuple[str, ...] = (
-    # пары 22+ (13 классов, 78 комбо)
-    "AA", "KK", "QQ", "JJ", "TT", "99", "88", "77", "66", "55", "44", "33", "22",
-    # тузы одномастные A2s+ (12 классов, 48 комбо)
-    "AKs", "AQs", "AJs", "ATs", "A9s", "A8s", "A7s", "A6s", "A5s", "A4s", "A3s", "A2s",
-    # тузы разномастные A5o+ (9 классов, 108 комбо)
-    "AKo", "AQo", "AJo", "ATo", "A9o", "A8o", "A7o", "A6o", "A5o",
-    # короли одномастные K2s+ (11 классов, 44 комбо)
-    "KQs", "KJs", "KTs", "K9s", "K8s", "K7s", "K6s", "K5s", "K4s", "K3s", "K2s",
-    # короли разномастные K7o+ (6 классов, 72 комбо)
-    "KQo", "KJo", "KTo", "K9o", "K8o", "K7o",
-    # дамы одномастные Q4s+ (8 классов, 32 комбо)
-    "QJs", "QTs", "Q9s", "Q8s", "Q7s", "Q6s", "Q5s", "Q4s",
-    # дамы разномастные Q9o+ (3 класса, 36 комбо)
-    "QJo", "QTo", "Q9o",
-    # валеты одномастные J6s+ (5 классов, 20 комбо)
-    "JTs", "J9s", "J8s", "J7s", "J6s",
-    # валеты разномастные J9o+ (2 класса, 24 комбо)
-    "JTo", "J9o",
-    # десятки одномастные T6s+ (4 класса, 16 комбо) и T9o (12 комбо)
-    "T9s", "T8s", "T7s", "T6s", "T9o",
-    # одномастные коннекторы и однозазорники ниже (8 классов * 4 = 32 комбо) и 98o (12)
-    "98s", "97s", "96s", "98o", "87s", "86s", "76s", "75s", "65s",
-)
-
-
-def _bracket_tight(depth_bb: float) -> Range:
-    """Узкий конец вилки: только премиум (JJ+, AK) на любой глубине."""
-    return Range(weights=dict.fromkeys(_TIGHT_CLASSES, 1.0))
-
-
-def _bracket_wide(depth_bb: float) -> Range:
-    """Широкий конец вилки: top-40% по комбо на любой глубине."""
-    return Range(weights=dict.fromkeys(_WIDE_CLASSES, 1.0))
-
-
-BRACKET_TIGHT: Callable[[float], Range] = _bracket_tight
-BRACKET_WIDE: Callable[[float], Range] = _bracket_wide
 
 
 # --- Таблица эквити 169x169 и хедз-ап равновесие --------------------------------
@@ -593,3 +539,81 @@ def nash_hu(eff_bb: float, *, cache_dir: Path | None = None) -> tuple[Range, Ran
     solution = _solve_nash_hu(eff_bb)
     _write_nash_cache(path, eff_bb, solution)
     return Range(weights=solution[0]), Range(weights=solution[1])
+
+
+# --- Bracket-модели колл-диапазона (вход bracket-теста зоны, задача 12) ---------
+#
+# Это не оценка «как коллируют на самом деле», а два намеренно грубых конца
+# вилки: если вердикт одинаков и против премиум-онли, и против top-40%, он не
+# зависит от угаданного диапазона. Обе модели не зависят от глубины: глубина
+# принимается аргументом, потому что вызывающая сторона ею оперирует и потому
+# что уточнение по глубине — вопрос данных, а не кода, и не должно менять места
+# вызова. Сузить вилку без данных значило бы выдумать число.
+#
+# Именно эти два диапазона решают, помечен вердикт как «строго» или как
+# «предполагая», поэтому ни одно число в них не выбирается на глаз.
+
+_TIGHT_CLASSES: tuple[str, ...] = ("AA", "KK", "QQ", "JJ", "AKs", "AKo")
+
+_WIDE_TARGET_FRACTION = 0.40
+
+
+@cache
+def equity_vs_random_hand(hero_cls: str) -> float:
+    """Эквити класса против случайной руки — из таблицы, с учётом блокеров.
+
+    Усреднение по классам оппонента идёт не по 1326 комбо, а по условному
+    распределению после снятия карт героя: держа AA, герой сам делает AA у
+    оппонента вшестеро реже.
+    """
+    index = _class_index()
+    if hero_cls not in index:
+        raise ValueError(f"неизвестный класс руки: {hero_cls!r}")
+    conditional = _conditional_class_probs()[index[hero_cls]]
+    row = _eq169()[1][index[hero_cls]]
+    return sum(p * eq for p, eq in zip(conditional, row, strict=True))
+
+
+@cache
+def classes_by_strength() -> tuple[str, ...]:
+    """169 классов по убыванию эквити против случайной руки.
+
+    Для пуш-фолда это правильная метрика силы, а не суррогат: руки идут на
+    вскрытие без улиц, и разыгрываемость (ради которой обычно двигают вверх
+    одномастные коннекторы) в оценку шова не входит. Имя класса — вторичный
+    ключ сортировки, чтобы порядок был воспроизводим при совпадении эквити.
+    """
+    return tuple(sorted(all_classes(), key=lambda cls: (-equity_vs_random_hand(cls), cls)))
+
+
+@cache
+def _wide_classes() -> tuple[str, ...]:
+    """Верхние классы по силе, набирающие долю комбо, ближайшую к 40%.
+
+    Граница берётся по КОМБО, а не по числу классов (offsuit-класс весит 12
+    комбо, suited — 4), и выбирается тот префикс, который ближе к цели: 40% —
+    заявленная ширина, и она должна быть проверяемой, а не приблизительной.
+    """
+    target = _WIDE_TARGET_FRACTION * _TOTAL_COMBOS
+    ordered = classes_by_strength()
+    cumulative = 0
+    best_prefix, best_gap = 0, target
+    for position, cls in enumerate(ordered, start=1):
+        cumulative += len(combos_of_class(cls))
+        if abs(cumulative - target) < best_gap:
+            best_gap, best_prefix = abs(cumulative - target), position
+    return ordered[:best_prefix]
+
+
+def _bracket_tight(depth_bb: float) -> Range:
+    """Узкий конец вилки: только премиум (JJ+, AK) на любой глубине."""
+    return Range(weights=dict.fromkeys(_TIGHT_CLASSES, 1.0))
+
+
+def _bracket_wide(depth_bb: float) -> Range:
+    """Широкий конец вилки: top-40% по эквити против случайной руки, на любой глубине."""
+    return Range(weights=dict.fromkeys(_wide_classes(), 1.0))
+
+
+BRACKET_TIGHT: Callable[[float], Range] = _bracket_tight
+BRACKET_WIDE: Callable[[float], Range] = _bracket_wide
