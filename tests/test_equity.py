@@ -1,5 +1,5 @@
 from harness.analysis.tools.equity import equity_hand_vs_hand, equity_vs_range
-from harness.contracts import Range
+from harness.contracts import Range, all_classes
 
 
 def test_anchor_aks_vs_qq():
@@ -24,11 +24,27 @@ def test_equity_deterministic_with_seed():
     assert equity_vs_range(("Th", "Td"), r) == equity_vs_range(("Th", "Td"), r)
 
 
-def test_multiway_equity_below_headsup():
+def test_multiway_equity_drops_against_independent_ranges():
+    # контроль: со случайными руками блокеры размыты, и доля банка падает,
+    # как и ожидается от лишнего оппонента. Проверено перебором: 0.8005 -> 0.6498
     from harness.analysis.tools.equity import equity_vs_ranges
 
-    r = Range(weights={"AKo": 1.0, "AKs": 1.0})
-    hu = equity_vs_ranges(("Qs", "Qh"), [r])
-    three = equity_vs_ranges(("Qs", "Qh"), [r, r])
-    assert hu > three  # против двух AK доля банка меньше, чем против одного
-    assert 0.35 < three < 0.55  # QQ против двух AK — примерно паритет
+    any_two = Range(weights={c: 1.0 for c in all_classes()})
+    one = equity_vs_ranges(("Qs", "Qh"), [any_two])
+    two = equity_vs_ranges(("Qs", "Qh"), [any_two, any_two])
+    assert two < one - 0.05
+
+
+def test_multiway_blockers_can_raise_equity():
+    # НЕ опечатка: против ДВУХ оппонентов с одинаковым узким AK доля QQ ВЫШЕ,
+    # чем против одного. Два AK съедают тузов и королей друг друга: вероятность
+    # борда без туза и короля растёт с 0.4968 до 0.6206. Проверено точным
+    # перебором всех бордов: 0.5412 против одного -> 0.5765 против двух.
+    # Тест несёт двойную нагрузку: наивная реализация, сэмплирующая оппонентов
+    # независимо и не снимающая их карты из колоды, этот эффект не воспроизведёт.
+    from harness.analysis.tools.equity import equity_vs_ranges
+
+    ak = Range(weights={"AKo": 1.0, "AKs": 1.0})
+    one = equity_vs_ranges(("Qs", "Qh"), [ak])
+    two = equity_vs_ranges(("Qs", "Qh"), [ak, ak])
+    assert two > one + 0.03  # эффект крупный, это не шум выборки
