@@ -1,3 +1,5 @@
+import random
+
 import pytest
 
 from harness.analysis.tools.pushfold import (
@@ -5,11 +7,13 @@ from harness.analysis.tools.pushfold import (
     BRACKET_WIDE,
     CallerModel,
     call_shove_ev_bb,
+    class_equity,
     default_call_prob,
     fold_equity_ok,
+    nash_hu,
     shove_ev_bb,
 )
-from harness.contracts import Range, class_of
+from harness.contracts import Range, all_classes, class_of
 
 
 def test_shove_ev_headsup_computed():
@@ -211,8 +215,6 @@ def test_fold_equity_ok_true_for_real_ranges():
 
 
 def test_fold_equity_ok_false_when_someone_calls_any_two():
-    from harness.contracts import all_classes
-
     any_two = CallerModel(
         call_range=Range(weights=dict.fromkeys(all_classes(), 1.0)), behind_bb=10.0
     )
@@ -253,3 +255,207 @@ def test_shove_ev_monotone_in_equity_and_in_call_prob():
         "72o", equity_fn=lambda *a, **k: 0.2, call_prob_fn=lambda *a: 0.1, **kwargs
     )
     assert rare > low
+
+
+# --- Таблица эквити 169x169 и HU-равновесие -----------------------------------
+
+
+def _live_combo_share() -> dict[tuple[str, str], float]:
+    """P(у оппонента класс c | у игрока класс h) — независимый перебор комбо.
+
+    Пересчитывает блокеры в лоб, не пользуясь ничем из pushfold: если реализация
+    ошибётся в снятии карт, тесты, опирающиеся на этот словарь, разойдутся с ней.
+    """
+    from harness.analysis.tools.equity import combos_of_class
+
+    classes = all_classes()
+    combos = {cls: combos_of_class(cls) for cls in classes}
+    return {
+        (h, c): sum(
+            1 for a in combos[h] for b in combos[c] if a[0] not in b and a[1] not in b
+        )
+        / len(combos[h])
+        / 1225
+        for h in classes
+        for c in classes
+    }
+
+
+
+def test_class_equity_is_symmetric_with_half_on_diagonal():
+    # Эквити — доля банка в хедз-апе, поэтому eq(a,b) + eq(b,a) = 1 тождественно,
+    # а класс против самого себя даёт ровно 0.5 по симметрии мастей.
+    classes = all_classes()
+    assert len(classes) == 169
+    for a in classes:
+        assert class_equity(a, a) == 0.5
+    for a in classes[::17]:
+        for b in classes:
+            assert abs(class_equity(a, b) + class_equity(b, a) - 1.0) < 1e-9
+
+
+def test_class_equity_matches_known_anchors():
+    # Те же якоря, что уже проверены на равном движке эквити (tests/test_equity.py):
+    # они ловят перепутанные оси таблицы и сдвиг индексов.
+    assert abs(class_equity("AA", "KK") - 0.815) < 0.02
+    assert abs(class_equity("AKs", "QQ") - 0.46) < 0.015
+    assert class_equity("AA", "72o") > 0.85
+    assert class_equity("72o", "AA") < 0.15
+
+
+def test_class_equity_aces_beat_everything():
+    for other in all_classes():
+        if other == "AA":
+            continue
+        assert class_equity("AA", other) > 0.65, other
+
+
+def test_class_equity_rejects_unknown_class():
+    with pytest.raises(ValueError, match="класс"):
+        class_equity("AA", "AAs")
+
+
+@pytest.mark.slow
+def test_class_equity_matches_independent_recomputation():
+    # Обязательная сверка закоммиченных данных: таблица считалась один раз скриптом,
+    # и больше её никто не пересчитает. Здесь несколько клеток пересчитываются
+    # НЕЗАВИСИМЫМ путём — через equity_vs_range, другим сидом и другим числом
+    # итераций. Совпадение в пределах допуска означает, что данные не подогнаны
+    # и оси не перепутаны.
+    from harness.analysis.tools.equity import equity_vs_range
+    from harness.analysis.tools.pushfold import representative_combo
+
+    rng = random.Random(20260830)
+    classes = all_classes()
+    cells = [(rng.choice(classes), rng.choice(classes)) for _ in range(6)]
+    for hero_cls, villain_cls in cells:
+        hero = representative_combo(hero_cls)
+        villain_range = Range(weights={villain_cls: 1.0})
+        want = equity_vs_range(hero, villain_range, iterations=30_000, seed=987_654_321)
+        got = class_equity(hero_cls, villain_cls)
+        assert abs(got - want) < 0.02, (hero_cls, villain_cls, got, want)
+
+
+@pytest.mark.slow
+def test_nash_hu_anchors_10bb(tmp_path):
+    push, call = nash_hu(10.0, cache_dir=tmp_path)
+    assert push.weight("AA") == 1.0 and call.weight("AA") == 1.0  # AA всегда
+    assert push.weight("22") > 0.9  # мелкие пары пушатся на 10bb
+    assert push.weight("32o") < 0.1  # мусор — фолд на 10bb
+    assert call.weight("32o") < 0.05  # и тем более не колл
+
+
+@pytest.mark.slow
+def test_nash_monotone_by_depth(tmp_path):
+    p5, c5 = nash_hu(5.0, cache_dir=tmp_path)
+    p10, c10 = nash_hu(10.0, cache_dir=tmp_path)
+    p15, c15 = nash_hu(15.0, cache_dir=tmp_path)
+    assert p5.fraction_of_hands() >= p10.fraction_of_hands()  # мельче — шире
+    assert p10.fraction_of_hands() >= p15.fraction_of_hands()
+    assert c5.fraction_of_hands() >= c10.fraction_of_hands() >= c15.fraction_of_hands()
+
+
+@pytest.mark.slow
+def test_nash_push_is_wider_than_call():
+    # SB рискует стеком, чтобы забрать 1bb блайндов, поэтому пушит заметно шире,
+    # чем BB коллирует: у BB нет фолд-эквити, только вскрытие.
+    push, call = nash_hu(10.0)
+    assert push.fraction_of_hands() > call.fraction_of_hands() + 0.1
+
+
+@pytest.mark.slow
+def test_nash_at_2bb_matches_closed_form_threshold():
+    # На 2bb равновесие раскрывается в лоб, и это независимая от fictitious play
+    # проверка ВСЕХ 169 классов сразу, а не якорь на пару рук.
+    # BB: доплатить 1 в банк 4 -> нужно 25% эквити; худшая рука против ~90%
+    # диапазона держит около 32%, поэтому BB коллирует любые две карты.
+    # SB против 100% колла: шов даёт 2*2*eq - 2, фолд -0.5 => пуш ровно при
+    # eq > 0.375 против случайной руки.
+    push, call = nash_hu(2.0)
+    assert call.fraction_of_hands() == 1.0
+
+    classes = all_classes()
+    live = _live_combo_share()
+    borderline = 0
+    for hero in classes:
+        eq_vs_random = sum(live[(hero, c)] * class_equity(hero, c) for c in classes)
+        if abs(eq_vs_random - 0.375) < 0.005:
+            borderline += 1  # в полосе шума таблицы (SE ~0.15%) знак не определён
+            continue
+        expected = 1.0 if eq_vs_random > 0.375 else 0.0
+        assert abs(push.weight(hero) - expected) < 0.05, (hero, eq_vs_random, push.weight(hero))
+    assert borderline <= 5  # полоса неопределённости должна быть узкой
+
+
+def test_nash_cached_deterministic(tmp_path):
+    a, _ = nash_hu(8.0, cache_dir=tmp_path)
+    b, _ = nash_hu(8.0, cache_dir=tmp_path)
+    assert a == b
+
+
+def test_nash_cache_is_speedup_not_source_of_truth(tmp_path):
+    # Кэш обязан совпадать с расчётом с нуля: тест проходит и на пустом кэше.
+    fresh_a = nash_hu(6.0, cache_dir=tmp_path / "a")
+    assert (tmp_path / "a" / "nash_hu_6.00.json").exists()
+    fresh_b = nash_hu(6.0, cache_dir=tmp_path / "b")  # другой пустой каталог
+    cached = nash_hu(6.0, cache_dir=tmp_path / "a")  # тот же, но уже с файлом
+    assert fresh_a == fresh_b == cached
+
+
+def test_nash_rejects_impossible_depth(tmp_path):
+    with pytest.raises(ValueError, match="эффективный стек"):
+        nash_hu(0.5, cache_dir=tmp_path)
+
+
+@pytest.mark.slow
+def test_nash_is_mutual_best_response():
+    # Оракул равновесия по определению, а не по якорям: пересобираем игру с нуля
+    # (включая условное распределение руки оппонента по блокерам — прямым перебором
+    # комбо) и проверяем, что ни SB, ни BB не выигрывают от отклонения. Такой тест
+    # ловит и перепутанные знаки в EV, и ошибку в блокерной матрице, и недосходимость.
+    from harness.analysis.tools.equity import combos_of_class
+
+    eff = 10.0
+    push, call = nash_hu(eff)
+    classes = all_classes()
+    live = _live_combo_share()
+    prior = {cls: len(combos_of_class(cls)) / 1326 for cls in classes}
+
+    # SB: EV шова против средней стратегии колла BB; альтернатива — фолд за -0.5.
+    shove_ev = {
+        h: sum(
+            live[(h, c)]
+            * (
+                call.weight(c) * (2.0 * class_equity(h, c) - 1.0) * eff
+                + (1.0 - call.weight(c)) * 1.0
+            )
+            for c in classes
+        )
+        for h in classes
+    }
+    sb_gain = sum(
+        prior[h]
+        * (
+            max(shove_ev[h], -0.5)
+            - (push.weight(h) * shove_ev[h] + (1.0 - push.weight(h)) * -0.5)
+        )
+        for h in classes
+    )
+
+    # BB: разница "колл минус фолд" против средней стратегии шова SB.
+    call_minus_fold = {
+        b: sum(
+            live[(b, h)] * push.weight(h) * (2.0 * class_equity(b, h) * eff - eff + 1.0)
+            for h in classes
+        )
+        for b in classes
+    }
+    bb_gain = sum(
+        prior[b] * (max(call_minus_fold[b], 0.0) - call.weight(b) * call_minus_fold[b])
+        for b in classes
+    )
+
+    # Порог равен критерию остановки fictitious play (_FP_EXPLOITABILITY_BB = 1e-3
+    # на двоих) — тест проверяет, что заявленная сходимость действительно достигнута,
+    # и меряет это независимо пересобранной игрой.
+    assert 0.0 <= sb_gain + bb_gain < 1e-3, (sb_gain, bb_gain)

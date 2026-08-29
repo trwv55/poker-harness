@@ -24,13 +24,17 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import cache
 from itertools import combinations
 from math import comb, prod
+from operator import mul
+from pathlib import Path
 
 from harness.analysis.tools.equity import combos_of_class, equity_vs_ranges
-from harness.contracts import Range
+from harness.contracts import Range, all_classes
 
 _DECK_SIZE = 52
 
@@ -257,3 +261,302 @@ def _bracket_wide(depth_bb: float) -> Range:
 
 BRACKET_TIGHT: Callable[[float], Range] = _bracket_tight
 BRACKET_WIDE: Callable[[float], Range] = _bracket_wide
+
+
+# --- Таблица эквити 169x169 и хедз-ап равновесие --------------------------------
+
+_DATA_DIR = Path(__file__).parent / "data"
+_EQ169_PATH = _DATA_DIR / "eq169.json"
+
+# Хедз-ап пуш-фолд: SB ставит 0.5, BB ставит 1.0, SB ходит первым — шов на весь
+# эффективный стек или фолд; BB отвечает коллом или фолдом. Все EV — в bb
+# относительно начала раздачи (до постов): фолд SB = -0.5, проход шова = +1.0,
+# вскрытие на eff_bb с каждого = 2*equity*eff_bb - eff_bb.
+_SB_BLIND = 0.5
+_BB_BLIND = 1.0
+
+# Fictitious play: чередование лучших ответов на СРЕДНЮЮ стратегию оппонента с
+# усреднением по итерациям (для зеро-сум игры это сходится).
+#
+# Критерий остановки — эксплуатируемость, то есть сумма того, что каждый игрок
+# выигрывает, отклонившись от средней стратегии против средней стратегии
+# соперника. Это определение ε-равновесия, и оно считается внутри цикла даром:
+# лучший ответ и так перебирает EV всех альтернатив.
+#
+# Изменения значения игры |ΔEV| как критерия НЕ хватает, и это измерено, а не
+# предположено: при 1/t-усреднении значение меняется на O(1/t) само по себе, так
+# что порог |ΔEV| < 0.001bb достигается уже на 3-19-й итерации, когда
+# эксплуатируемость ещё 0.01-0.04bb, а диапазоны гуляют на 5-7% комбо. Порог по
+# |ΔEV| оставлен как дополнительное (более слабое) условие, но решает первое.
+#
+# 1e-3 bb на двоих — с большим запасом ниже шкалы, на которой решения различимы
+# (пуш и фолд расходятся на десятые доли bb). Замер: этот порог достигается на
+# ~20 итерациях при 2bb, ~210 при 5bb, ~400 при 10bb, ~600 при 15bb; дальнейшие
+# итерации двигают ширину диапазонов уже меньше чем на 0.001 доли комбо.
+_FP_EXPLOITABILITY_BB = 1e-3
+_FP_VALUE_TOLERANCE_BB = 1e-3
+_FP_MAX_ITERATIONS = 20_000
+
+# Минимум шагов усреднения — не запас "на всякий случай", а граница на вес
+# произвольного стартового убеждения: первый лучший ответ считается против
+# равномерного 0.5 и входит в среднее с весом 1/N. На мелких стеках игра почти
+# тривиальна, и порог по эксплуатируемости достигается за 10 шагов — тогда в диапазоне
+# остаются мусорные веса по 0.1 у рук, которые пушатся только против этого
+# стартового убеждения. При 200 шагах остаток ограничен 0.005.
+_FP_MIN_AVERAGING_STEPS = 200
+
+_MIN_EFF_BB = 1.0
+_MAX_EFF_BB = 100.0
+
+# Веса равновесных диапазонов округляются перед сохранением, чтобы значение из
+# кэша совпадало с пересчитанным бит в бит, а файл оставался читаемым.
+_WEIGHT_PRECISION = 6
+
+
+@cache
+def _eq169() -> tuple[tuple[str, ...], tuple[tuple[float, ...], ...]]:
+    """Таблица эквити класс-против-класса, сгенерированная `scripts/build_eq169.py`."""
+    if not _EQ169_PATH.exists():
+        raise FileNotFoundError(
+            f"нет таблицы эквити {_EQ169_PATH} — она генерируется один раз командой "
+            f"`uv run python scripts/build_eq169.py` и коммитится как данные"
+        )
+    payload = json.loads(_EQ169_PATH.read_text(encoding="utf-8"))
+    classes = tuple(payload["classes"])
+    matrix = tuple(tuple(float(x) for x in row) for row in payload["equity"])
+    expected = tuple(all_classes())
+    if classes != expected:
+        raise ValueError("порядок классов в eq169.json разошёлся с all_classes()")
+    if len(matrix) != len(classes) or any(len(row) != len(classes) for row in matrix):
+        raise ValueError(f"таблица эквити должна быть {len(classes)}x{len(classes)}")
+    return classes, matrix
+
+
+@cache
+def _class_index() -> dict[str, int]:
+    return {cls: i for i, cls in enumerate(_eq169()[0])}
+
+
+def class_equity(hero_cls: str, villain_cls: str) -> float:
+    """Префлоп-эквити класса против класса в хедз-апе — из предвычисленной таблицы.
+
+    Значения получены Монте-Карло в `scripts/build_eq169.py` и лежат в репозитории
+    как данные: считать их на лету нельзя (14 365 пар — минуты), а fictitious play
+    зовёт эту функцию десятки миллионов раз.
+    """
+    index = _class_index()
+    if hero_cls not in index or villain_cls not in index:
+        unknown = hero_cls if hero_cls not in index else villain_cls
+        raise ValueError(f"неизвестный класс руки: {unknown!r}")
+    return _eq169()[1][index[hero_cls]][index[villain_cls]]
+
+
+@cache
+def _live_combo_counts() -> tuple[tuple[float, ...], ...]:
+    """N[h][c] — сколько комбо класса c в среднем живы, когда у игрока рука класса h.
+
+    Это учёт блокеров на уровне классов, и он не факультативен: держа AA, игрок
+    оставляет оппоненту одно комбо AA из шести. Сумма N[h] по всем c равна ровно
+    C(50,2) = 1225 — столько рук может быть у оппонента после снятия двух карт
+    героя; это же и проверка корректности подсчёта.
+    """
+    classes = all_classes()
+    combos = {cls: combos_of_class(cls) for cls in classes}
+    per_card: list[dict[str, int]] = []
+    as_set: list[set[frozenset[str]]] = []
+    for cls in classes:
+        counts: dict[str, int] = {}
+        for c1, c2 in combos[cls]:
+            counts[c1] = counts.get(c1, 0) + 1
+            counts[c2] = counts.get(c2, 0) + 1
+        per_card.append(counts)
+        as_set.append({frozenset(combo) for combo in combos[cls]})
+
+    matrix: list[tuple[float, ...]] = []
+    for hero_cls in classes:
+        hero_combos = combos[hero_cls]
+        row: list[float] = []
+        for j, villain_cls in enumerate(classes):
+            total = 0
+            for card1, card2 in hero_combos:
+                blocked = per_card[j].get(card1, 0) + per_card[j].get(card2, 0)
+                if frozenset((card1, card2)) in as_set[j]:
+                    blocked -= 1  # комбо, состоящее ровно из карт героя, вычтено дважды
+                total += len(combos[villain_cls]) - blocked
+            row.append(total / len(hero_combos))
+        if abs(sum(row) - comb(_DECK_SIZE - 2, 2)) > 1e-9:
+            raise ValueError(f"живых комбо у оппонента против {hero_cls} не 1225: {sum(row)}")
+        matrix.append(tuple(row))
+    return tuple(matrix)
+
+
+@cache
+def _conditional_class_probs() -> tuple[tuple[float, ...], ...]:
+    """P(у оппонента класс c | у игрока класс h) с учётом снятых карт."""
+    total = float(comb(_DECK_SIZE - 2, 2))
+    return tuple(tuple(n / total for n in row) for row in _live_combo_counts())
+
+
+@cache
+def _class_priors() -> tuple[float, ...]:
+    """Безусловная вероятность класса руки: комбо класса от 1326."""
+    return tuple(
+        Range(weights={cls: 1.0}).fraction_of_hands() for cls in all_classes()
+    )
+
+
+def _solve_nash_hu(eff_bb: float) -> tuple[dict[str, float], dict[str, float], int, float]:
+    """Fictitious play для хедз-ап пуш-фолда.
+
+    Возвращает (диапазон шова, диапазон колла, число шагов усреднения, EV SB в bb).
+    """
+    classes = all_classes()
+    _, equity = _eq169()
+    conditional = _conditional_class_probs()
+    priors = _class_priors()
+    size = len(classes)
+
+    # EV шова для SB с рукой h против средней стратегии BB:
+    #   EV(h) = Σ_c P(c|h) * [ call_w(c) * (2*eq(h,c)-1)*eff + (1-call_w(c)) * (+1) ]
+    #         = 1 + Σ_c push_term[h][c] * call_w(c),   т.к. Σ_c P(c|h) = 1.
+    push_term = [
+        tuple(
+            conditional[h][c] * ((2.0 * equity[h][c] - 1.0) * eff_bb - _BB_BLIND)
+            for c in range(size)
+        )
+        for h in range(size)
+    ]
+    # Разница "колл минус фолд" для BB с рукой b против шова руки h:
+    #   2*eq(b,h)*eff - eff + 1 (фолд стоит BB его блайнда).
+    call_term = [
+        tuple(
+            conditional[b][h] * (2.0 * equity[b][h] * eff_bb - eff_bb + _BB_BLIND)
+            for h in range(size)
+        )
+        for b in range(size)
+    ]
+
+    avg_push = [0.5] * size  # стартовое убеждение, в среднее не входит: на шаге 1
+    avg_call = [0.5] * size  # оно целиком заменяется первым лучшим ответом
+    averaging_steps = 0
+    previous_value = None
+    value = 0.0
+
+    for step in range(1, _FP_MAX_ITERATIONS + 1):
+        shove_ev = [_BB_BLIND + sum(map(mul, push_term[h], avg_call)) for h in range(size)]
+        call_minus_fold = [sum(map(mul, call_term[b], avg_push)) for b in range(size)]
+
+        value = sum(
+            priors[h] * (avg_push[h] * shove_ev[h] + (1.0 - avg_push[h]) * -_SB_BLIND)
+            for h in range(size)
+        )
+        # Эксплуатируемость текущей пары средних стратегий: сколько даёт отклонение.
+        gain_sb = sum(
+            priors[h]
+            * (
+                max(shove_ev[h], -_SB_BLIND)
+                - (avg_push[h] * shove_ev[h] + (1.0 - avg_push[h]) * -_SB_BLIND)
+            )
+            for h in range(size)
+        )
+        gain_bb = sum(
+            priors[b] * (max(call_minus_fold[b], 0.0) - avg_call[b] * call_minus_fold[b])
+            for b in range(size)
+        )
+        converged = (
+            averaging_steps >= _FP_MIN_AVERAGING_STEPS
+            and gain_sb + gain_bb <= _FP_EXPLOITABILITY_BB
+            and previous_value is not None
+            and abs(value - previous_value) < _FP_VALUE_TOLERANCE_BB
+        )
+        if converged:
+            break
+        previous_value = value
+
+        br_push = [1.0 if ev > -_SB_BLIND else 0.0 for ev in shove_ev]
+        br_call = [1.0 if diff > 0.0 else 0.0 for diff in call_minus_fold]
+        averaging_steps += 1
+        if averaging_steps == 1:
+            avg_push, avg_call = br_push, br_call
+        else:
+            rate = 1.0 / averaging_steps
+            avg_push = [w + (br - w) * rate for w, br in zip(avg_push, br_push, strict=True)]
+            avg_call = [w + (br - w) * rate for w, br in zip(avg_call, br_call, strict=True)]
+
+    push = {
+        cls: round(w, _WEIGHT_PRECISION)
+        for cls, w in zip(classes, avg_push, strict=True)
+        if round(w, _WEIGHT_PRECISION) > 0.0
+    }
+    call = {
+        cls: round(w, _WEIGHT_PRECISION)
+        for cls, w in zip(classes, avg_call, strict=True)
+        if round(w, _WEIGHT_PRECISION) > 0.0
+    }
+    return push, call, averaging_steps, value
+
+
+def _read_nash_cache(path: Path) -> tuple[Range, Range] | None:
+    """Кэш — ускорение, а не источник истины: любая порча файла ведёт к пересчёту."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return Range(weights=payload["push"]), Range(weights=payload["call"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _write_nash_cache(
+    path: Path, eff_bb: float, solution: tuple[dict[str, float], dict[str, float], int, float]
+) -> None:
+    push, call, iterations, value = solution
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "eff_bb": eff_bb,
+                    "fp_iterations": iterations,
+                    "sb_ev_bb": round(value, 6),
+                    "push": push,
+                    "call": call,
+                },
+                ensure_ascii=False,
+                indent=1,
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass  # каталог пакета может быть только для чтения — считаем без кэша
+
+
+def nash_hu(eff_bb: float, *, cache_dir: Path | None = None) -> tuple[Range, Range]:
+    """Равновесие хедз-ап пуш-фолда на глубине `eff_bb`: (диапазон шова SB, колла BB).
+
+    Игра: SB ставит 0.5, BB ставит 1.0, SB шовит на весь эффективный стек или
+    фолдит, BB коллирует или фолдит. Решается fictitious play по предвычисленной
+    таблице эквити (`class_equity`) — Монте-Карло внутри итераций не запускается,
+    иначе сходимости не дождаться. Блокеры учтены: распределение руки оппонента
+    условно по руке игрока.
+
+    Результат кэшируется в `cache_dir` (по умолчанию — `data/` рядом с модулем).
+    Кэш только ускоряет: при пустом или испорченном кэше считается заново и даёт
+    тот же ответ — fictitious play здесь полностью детерминирован.
+    """
+    if not _MIN_EFF_BB < eff_bb <= _MAX_EFF_BB:
+        raise ValueError(
+            f"эффективный стек должен лежать в ({_MIN_EFF_BB}, {_MAX_EFF_BB}] bb: "
+            f"на {eff_bb} bb шов SB не покрывает даже блайнд BB либо стек слишком глубок "
+            f"для пуш-фолда"
+        )
+
+    directory = Path(cache_dir) if cache_dir is not None else _DATA_DIR
+    path = directory / f"nash_hu_{eff_bb:.2f}.json"
+
+    cached = _read_nash_cache(path)
+    if cached is not None:
+        return cached
+
+    solution = _solve_nash_hu(eff_bb)
+    _write_nash_cache(path, eff_bb, solution)
+    return Range(weights=solution[0]), Range(weights=solution[1])
