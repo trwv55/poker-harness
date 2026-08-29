@@ -2,7 +2,10 @@
 name = "poker-harness"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["pydantic>=2.7"]
+dependencies = [
+    "pokerkit>=0.7,<0.8",
+    "pydantic>=2.7",
+]
 
 [dependency-groups]
 dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6", "pyright>=1.1.380"]

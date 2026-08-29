@@ -61,6 +61,7 @@ name = "poker-harness"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "pokerkit" },
     { name = "pydantic" },
 ]
 
@@ -73,7 +74,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pydantic", specifier = ">=2.7" }]
+requires-dist = [
+    { name = "pokerkit", specifier = ">=0.7,<0.8" },
+    { name = "pydantic", specifier = ">=2.7" },
+]
 
 [package.metadata.requires-dev]
 dev = [
@@ -81,6 +85,15 @@ dev = [
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "ruff", specifier = ">=0.6" },
+]
+
+[[package]]
+name = "pokerkit"
+version = "0.7.5"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c0/a8/8a40e4d0fcf92b178e2c2cb6a959ed4ef8e23e9f11e011e0389e15f794f8/pokerkit-0.7.5.tar.gz", hash = "sha256:7eed51e55821295d9ccaf83dbdc61f6905b8a6f4829da115513ea148e86e8102", size = 109723, upload-time = "2026-08-22T07:14:53.448Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3f/15/e2c2c1acf4a2e17fc9c300564befe758cc0a97067a7e841cff579681c316/pokerkit-0.7.5-py3-none-any.whl", hash = "sha256:3e1a0b2a8a9785369c86e2c1392dd2204ee536fbcbe77a779c875bd545eb63e8", size = 113874, upload-time = "2026-08-22T07:14:52.187Z" },
 ]
 
 [[package]]
