@@ -35,6 +35,7 @@ import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import cache
+from hashlib import sha256
 from itertools import combinations
 from math import comb, prod
 from operator import mul
@@ -53,6 +54,11 @@ _MAX_CALLERS = 7
 # Ветки с вероятностью ниже этого порога отбрасываются: их вклад в EV меньше
 # 1e-4 * (максимальный по модулю вклад ветки ~ десятки bb), то есть заведомо ниже
 # точности самих колл-диапазонов, а каждая ветка стоит одного вызова Монте-Карло.
+# Отброшенная масса НЕ перенормируется: сумма вероятностей учтённых веток может не
+# дотягивать до единицы, и результат смещён на величину порядка отброшенной массы
+# (не более 2^n * 1e-4, то есть <= 1.3% при семи игроках позади и много меньше на
+# практике). Перенормировка размазала бы эту массу по оставшимся веткам, что не
+# честнее: она приписала бы редким исходам вес, которого у них нет.
 _MIN_BRANCH_PROB = 1e-4
 
 # Порог фолд-эквити: проверяется не «мало ли фолдов», а «возможны ли они вообще».
@@ -257,32 +263,58 @@ _BB_BLIND = 1.0
 # Fictitious play: чередование лучших ответов на СРЕДНЮЮ стратегию оппонента с
 # усреднением по итерациям (для зеро-сум игры это сходится).
 #
-# Критерий остановки — эксплуатируемость, то есть сумма того, что каждый игрок
-# выигрывает, отклонившись от средней стратегии против средней стратегии
-# соперника. Это определение ε-равновесия, и оно считается внутри цикла даром:
-# лучший ответ и так перебирает EV всех альтернатив.
+# Критериев остановки два, и они меряют разное.
 #
-# Изменения значения игры |ΔEV| как критерия НЕ хватает, и это измерено, а не
-# предположено: при 1/t-усреднении значение меняется на O(1/t) само по себе, так
-# что порог |ΔEV| < 0.001bb достигается уже на 3-19-й итерации, когда
-# эксплуатируемость ещё 0.01-0.04bb, а диапазоны гуляют на 5-7% комбо. Порог по
-# |ΔEV| оставлен как дополнительное (более слабое) условие, но решает первое.
+# 1. Агрегатная эксплуатируемость — сумма выигрышей обоих игроков от отклонения,
+#    взвешенная априорной вероятностью класса. Это определение ε-равновесия и
+#    правильная мера сходимости игры в целом. Считается внутри цикла даром: шаг
+#    лучшего ответа и так перебирает EV альтернатив.
 #
-# 1e-3 bb на двоих — с большим запасом ниже шкалы, на которой решения различимы
-# (пуш и фолд расходятся на десятые доли bb). Замер: этот порог достигается на
-# ~20 итерациях при 2bb, ~210 при 5bb, ~400 при 10bb, ~600 при 15bb; дальнейшие
-# итерации двигают ширину диапазонов уже меньше чем на 0.001 доли комбо.
+#    Изменения значения игры |ΔEV| для этой роли НЕ хватает, и это измерено, а не
+#    предположено: при 1/t-усреднении значение меняется на O(1/t) само по себе, так
+#    что порог |ΔEV| < 0.001bb достигается уже на 3-19-й итерации, когда
+#    эксплуатируемость ещё 0.01-0.04bb, а диапазоны гуляют на 5-7% комбо. Порог по
+#    |ΔEV| оставлен как дополнительное (более слабое) условие.
+#
+# 2. Пер-хендовый регрет — МАКСИМУМ по классам, без взвешивания априорной
+#    вероятностью. Он нужен потому, что агрегат сам по себе ничего не обещает
+#    отдельному классу: при априорной вероятности ~0.009 класс может проигрывать
+#    ~0.1bb и добавить к сумме всего ~1e-3. А читают этот модуль поклассно.
+#
+#    Что именно гарантирует порог 0.01bb. Регрет класса = (вес, стоящий на худшем
+#    действии) * (отрыв действий). Отсюда: класс, вернувшийся с весом w на худшем
+#    действии, имеет отрыв не больше 0.01/w. Значит вес 0.4 возможен только при
+#    отрыве <= 0.025bb, то есть при настоящем безразличии, а рука с отрывом 0.1bb
+#    обязана вернуться с весом не хуже 0.9 или не лучше 0.1. Остаток усреднения
+#    больше не может выглядеть как смешанная стратегия на явно плюсовой руке.
+#
+#    Замер стоимости: порог 0.01bb достигается на 110 / 249 / 297 итерациях при
+#    5 / 10 / 15bb — РАНЬШЕ, чем срабатывает агрегатный (204 / 398 / 559), поэтому
+#    условие бесплатно и на практике не связывает. Фактически достигаемый регрет
+#    на точке остановки: 0.0026 / 0.0063 / 0.0070bb. Ужесточение до 0.001bb стоило
+#    бы ~1050 / 2700 / 2900 итераций (единицы секунд на глубину) и ширины
+#    равновесий не двигает — если понадобится, менять здесь одну константу.
+#
+# 1e-3 bb агрегатной эксплуатируемости — с запасом ниже шкалы, на которой решения
+# различимы. Про пер-хендовую границу так сказать было НЕЛЬЗЯ, и прежний
+# комментарий, утверждавший это про обе, был неверен: десятые доли bb — это как раз
+# та шкала. Достигнутая граница отдаётся наружу (`nash_hu_regret_bb`), чтобы
+# вызывающая сторона могла отказаться от строгого вердикта.
 _FP_EXPLOITABILITY_BB = 1e-3
+_FP_MAX_HAND_REGRET_BB = 1e-2
 _FP_VALUE_TOLERANCE_BB = 1e-3
 _FP_MAX_ITERATIONS = 20_000
 
 # Минимум шагов усреднения — не запас "на всякий случай", а граница на вес
 # произвольного стартового убеждения: первый лучший ответ считается против
 # равномерного 0.5 и входит в среднее с весом 1/N. На мелких стеках игра почти
-# тривиальна, и порог по эксплуатируемости достигается за 10 шагов — тогда в диапазоне
-# остаются мусорные веса по 0.1 у рук, которые пушатся только против этого
-# стартового убеждения. При 200 шагах остаток ограничен 0.005.
+# тривиальна, и порог по эксплуатируемости достигается за 10 шагов — тогда в
+# диапазоне остаются мусорные веса по 0.1 у рук, которые пушатся только против
+# этого стартового убеждения. При 200 шагах остаток ограничен 0.005.
 _FP_MIN_AVERAGING_STEPS = 200
+
+# Версия формата кэша равновесий: меняется, когда меняется смысл записанного.
+_NASH_CACHE_VERSION = 1
 
 _MIN_EFF_BB = 1.0
 _MAX_EFF_BB = 100.0
@@ -384,10 +416,15 @@ def _class_priors() -> tuple[float, ...]:
     )
 
 
-def _solve_nash_hu(eff_bb: float) -> tuple[dict[str, float], dict[str, float], int, float]:
+def _solve_nash_hu(eff_bb: float) -> tuple[dict[str, float], dict[str, float], int, float, float]:
     """Fictitious play для хедз-ап пуш-фолда.
 
-    Возвращает (диапазон шова, диапазон колла, число шагов усреднения, EV SB в bb).
+    Возвращает (диапазон шова, диапазон колла, число шагов усреднения, EV SB в bb,
+    достигнутый максимальный пер-хендовый регрет в bb).
+
+    Не сошлось за `_FP_MAX_ITERATIONS` — это `RuntimeError`, а не «последнее
+    среднее молча». Правдоподобный результат вместо отказа здесь опаснее падения:
+    вызывающая сторона примет его за равновесие.
     """
     classes = all_classes()
     _, equity = _eq169()
@@ -420,8 +457,11 @@ def _solve_nash_hu(eff_bb: float) -> tuple[dict[str, float], dict[str, float], i
     averaging_steps = 0
     previous_value = None
     value = 0.0
+    hand_regret = 0.0
+    gain_sb = gain_bb = float("inf")
+    converged = False
 
-    for step in range(1, _FP_MAX_ITERATIONS + 1):
+    for _step in range(1, _FP_MAX_ITERATIONS + 1):
         shove_ev = [_BB_BLIND + sum(map(mul, push_term[h], avg_call)) for h in range(size)]
         call_minus_fold = [sum(map(mul, call_term[b], avg_push)) for b in range(size)]
 
@@ -429,26 +469,30 @@ def _solve_nash_hu(eff_bb: float) -> tuple[dict[str, float], dict[str, float], i
             priors[h] * (avg_push[h] * shove_ev[h] + (1.0 - avg_push[h]) * -_SB_BLIND)
             for h in range(size)
         )
-        # Эксплуатируемость текущей пары средних стратегий: сколько даёт отклонение.
-        gain_sb = sum(
-            priors[h]
-            * (
-                max(shove_ev[h], -_SB_BLIND)
-                - (avg_push[h] * shove_ev[h] + (1.0 - avg_push[h]) * -_SB_BLIND)
-            )
+        # Регрет класса: сколько даёт переход на лучшее чистое действие ИМЕННО этой
+        # рукой. Агрегат взвешивает их априорной вероятностью, пер-хендовая граница
+        # берёт максимум — редкий класс не должен прятаться за своей редкостью.
+        regret_sb = [
+            max(shove_ev[h], -_SB_BLIND)
+            - (avg_push[h] * shove_ev[h] + (1.0 - avg_push[h]) * -_SB_BLIND)
             for h in range(size)
-        )
-        gain_bb = sum(
-            priors[b] * (max(call_minus_fold[b], 0.0) - avg_call[b] * call_minus_fold[b])
+        ]
+        regret_bb = [
+            max(call_minus_fold[b], 0.0) - avg_call[b] * call_minus_fold[b]
             for b in range(size)
-        )
-        converged = (
+        ]
+        gain_sb = sum(priors[h] * regret_sb[h] for h in range(size))
+        gain_bb = sum(priors[b] * regret_bb[b] for b in range(size))
+        hand_regret = max(max(regret_sb), max(regret_bb))
+
+        if (
             averaging_steps >= _FP_MIN_AVERAGING_STEPS
             and gain_sb + gain_bb <= _FP_EXPLOITABILITY_BB
+            and hand_regret <= _FP_MAX_HAND_REGRET_BB
             and previous_value is not None
             and abs(value - previous_value) < _FP_VALUE_TOLERANCE_BB
-        )
-        if converged:
+        ):
+            converged = True
             break
         previous_value = value
 
@@ -462,6 +506,13 @@ def _solve_nash_hu(eff_bb: float) -> tuple[dict[str, float], dict[str, float], i
             avg_push = [w + (br - w) * rate for w, br in zip(avg_push, br_push, strict=True)]
             avg_call = [w + (br - w) * rate for w, br in zip(avg_call, br_call, strict=True)]
 
+    if not converged:
+        raise RuntimeError(
+            f"fictitious play не сошёлся на {eff_bb} bb за {_FP_MAX_ITERATIONS} итераций "
+            f"(эксплуатируемость {gain_sb + gain_bb:.6f}, пер-хендовый регрет "
+            f"{hand_regret:.6f}) — возвращать последнее среднее как равновесие нельзя"
+        )
+
     push = {
         cls: round(w, _WEIGHT_PRECISION)
         for cls, w in zip(classes, avg_push, strict=True)
@@ -472,30 +523,65 @@ def _solve_nash_hu(eff_bb: float) -> tuple[dict[str, float], dict[str, float], i
         for cls, w in zip(classes, avg_call, strict=True)
         if round(w, _WEIGHT_PRECISION) > 0.0
     }
-    return push, call, averaging_steps, value
+    return push, call, averaging_steps, value, hand_regret
 
 
-def _read_nash_cache(path: Path) -> tuple[Range, Range] | None:
-    """Кэш — ускорение, а не источник истины: любая порча файла ведёт к пересчёту."""
+@cache
+def _nash_fingerprint() -> str:
+    """Отпечаток входных данных равновесия: таблица эквити и пороги сходимости.
+
+    Без него локальный кэш переживает и перегенерацию `eq169.json`, и смену
+    порогов, и молча отдаёт равновесие, посчитанное при других входах. Имя файла
+    от этого не защищает: в нём только глубина.
+    """
+    digest = sha256(_EQ169_PATH.read_bytes()).hexdigest()[:16]
+    return (
+        f"v{_NASH_CACHE_VERSION}"
+        f"-eq{digest}"
+        f"-x{_FP_EXPLOITABILITY_BB:g}"
+        f"-r{_FP_MAX_HAND_REGRET_BB:g}"
+        f"-d{_FP_VALUE_TOLERANCE_BB:g}"
+        f"-m{_FP_MIN_AVERAGING_STEPS}"
+    )
+
+
+def _read_nash_cache(path: Path, eff_bb: float) -> tuple[Range, Range, float] | None:
+    """Кэш — ускорение, а не источник истины: любое несовпадение ведёт к пересчёту.
+
+    Проверяется и отпечаток входов, и записанная внутрь глубина: имя файла
+    округляет `eff_bb` до сотых, поэтому само по себе оно ничего не гарантирует.
+    """
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        return Range(weights=payload["push"]), Range(weights=payload["call"])
+        if payload.get("fingerprint") != _nash_fingerprint():
+            return None
+        if abs(float(payload["eff_bb"]) - eff_bb) > 1e-9:
+            return None
+        return (
+            Range(weights=payload["push"]),
+            Range(weights=payload["call"]),
+            float(payload["hand_regret_bb"]),
+        )
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
 
 def _write_nash_cache(
-    path: Path, eff_bb: float, solution: tuple[dict[str, float], dict[str, float], int, float]
+    path: Path,
+    eff_bb: float,
+    solution: tuple[dict[str, float], dict[str, float], int, float, float],
 ) -> None:
-    push, call, iterations, value = solution
+    push, call, iterations, value, hand_regret = solution
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             json.dumps(
                 {
+                    "fingerprint": _nash_fingerprint(),
                     "eff_bb": eff_bb,
                     "fp_iterations": iterations,
                     "sb_ev_bb": round(value, 6),
+                    "hand_regret_bb": hand_regret,
                     "push": push,
                     "call": call,
                 },
@@ -509,19 +595,7 @@ def _write_nash_cache(
         pass  # каталог пакета может быть только для чтения — считаем без кэша
 
 
-def nash_hu(eff_bb: float, *, cache_dir: Path | None = None) -> tuple[Range, Range]:
-    """Равновесие хедз-ап пуш-фолда на глубине `eff_bb`: (диапазон шова SB, колла BB).
-
-    Игра: SB ставит 0.5, BB ставит 1.0, SB шовит на весь эффективный стек или
-    фолдит, BB коллирует или фолдит. Решается fictitious play по предвычисленной
-    таблице эквити (`class_equity`) — Монте-Карло внутри итераций не запускается,
-    иначе сходимости не дождаться. Блокеры учтены: распределение руки оппонента
-    условно по руке игрока.
-
-    Результат кэшируется в `cache_dir` (по умолчанию — `data/` рядом с модулем).
-    Кэш только ускоряет: при пустом или испорченном кэше считается заново и даёт
-    тот же ответ — fictitious play здесь полностью детерминирован.
-    """
+def _nash_solution(eff_bb: float, cache_dir: Path | None) -> tuple[Range, Range, float]:
     if not _MIN_EFF_BB < eff_bb <= _MAX_EFF_BB:
         raise ValueError(
             f"эффективный стек должен лежать в ({_MIN_EFF_BB}, {_MAX_EFF_BB}] bb: "
@@ -532,13 +606,45 @@ def nash_hu(eff_bb: float, *, cache_dir: Path | None = None) -> tuple[Range, Ran
     directory = Path(cache_dir) if cache_dir is not None else _DATA_DIR
     path = directory / f"nash_hu_{eff_bb:.2f}.json"
 
-    cached = _read_nash_cache(path)
+    cached = _read_nash_cache(path, eff_bb)
     if cached is not None:
         return cached
 
     solution = _solve_nash_hu(eff_bb)
     _write_nash_cache(path, eff_bb, solution)
-    return Range(weights=solution[0]), Range(weights=solution[1])
+    return Range(weights=solution[0]), Range(weights=solution[1]), solution[4]
+
+
+def nash_hu(eff_bb: float, *, cache_dir: Path | None = None) -> tuple[Range, Range]:
+    """Равновесие хедз-ап пуш-фолда на глубине `eff_bb`: (диапазон шова SB, колла BB).
+
+    Игра: SB ставит 0.5, BB ставит 1.0, SB шовит на весь эффективный стек или
+    фолдит, BB коллирует или фолдит. Решается fictitious play по предвычисленной
+    таблице эквити (`class_equity`) — Монте-Карло внутри итераций не запускается,
+    иначе сходимости не дождаться. Блокеры учтены: распределение руки оппонента
+    условно по руке игрока.
+
+    Веса в возвращённых диапазонах читаются поклассно, поэтому у них есть
+    пер-хендовая гарантия, а не только средняя по игре: для каждого класса
+    отклонение от его лучшего чистого действия стоит не больше
+    `_FP_MAX_HAND_REGRET_BB`. Достигнутое значение отдаёт `nash_hu_regret_bb`.
+
+    Результат кэшируется в `cache_dir` (по умолчанию — `data/` рядом с модулем).
+    Кэш только ускоряет: при пустом, испорченном или посчитанном на других входах
+    кэше считается заново и даёт тот же ответ — fictitious play детерминирован.
+    """
+    push, call, _ = _nash_solution(eff_bb, cache_dir)
+    return push, call
+
+
+def nash_hu_regret_bb(eff_bb: float, *, cache_dir: Path | None = None) -> float:
+    """Достигнутый максимальный пер-хендовый регрет равновесия на этой глубине, в bb.
+
+    Верхняя граница на то, сколько теряет класс, сыгранный по возвращённому весу
+    вместо своего лучшего чистого действия. Вызывающая сторона может по ней
+    решить, имеет ли право ставить строгий вердикт на пограничную руку.
+    """
+    return _nash_solution(eff_bb, cache_dir)[2]
 
 
 # --- Bracket-модели колл-диапазона (вход bracket-теста зоны, задача 12) ---------

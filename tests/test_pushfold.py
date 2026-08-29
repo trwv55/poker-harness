@@ -1,3 +1,4 @@
+import json
 import random
 
 import pytest
@@ -12,6 +13,7 @@ from harness.analysis.tools.pushfold import (
     equity_vs_range_classes,
     fold_equity_ok,
     nash_hu,
+    nash_hu_regret_bb,
     shove_ev_bb,
 )
 from harness.contracts import Range, all_classes, class_of
@@ -561,6 +563,120 @@ def test_nash_cache_is_speedup_not_source_of_truth(tmp_path):
     fresh_b = nash_hu(6.0, cache_dir=tmp_path / "b")  # другой пустой каталог
     cached = nash_hu(6.0, cache_dir=tmp_path / "a")  # тот же, но уже с файлом
     assert fresh_a == fresh_b == cached
+
+
+@pytest.mark.slow
+def test_nash_guarantees_per_hand_regret_not_just_aggregate():
+    # Агрегатная эксплуатируемость взвешена априорной вероятностью класса, поэтому
+    # редкий класс может быть плох сам по себе и почти не сдвинуть сумму. Продукт
+    # же читает этот модуль ПОКЛАССНО, поэтому гарантия нужна на класс, а не на
+    # среднее. Тест пересобирает игру независимо и берёт МАКСИМУМ по классам.
+    from harness.analysis.tools.equity import combos_of_class
+
+    live = _live_combo_share()
+    classes = all_classes()
+    for eff in (5.0, 10.0, 15.0):
+        push, call = nash_hu(eff)
+        shove_ev = {
+            h: sum(
+                live[(h, c)]
+                * (
+                    call.weight(c) * (2.0 * class_equity(h, c) - 1.0) * eff
+                    + (1.0 - call.weight(c)) * 1.0
+                )
+                for c in classes
+            )
+            for h in classes
+        }
+        worst_sb = max(
+            max(shove_ev[h], -0.5) - (push.weight(h) * shove_ev[h] + (1 - push.weight(h)) * -0.5)
+            for h in classes
+        )
+        diff = {
+            b: sum(
+                live[(b, h)] * push.weight(h) * (2.0 * class_equity(b, h) * eff - eff + 1.0)
+                for h in classes
+            )
+            for b in classes
+        }
+        worst_bb = max(max(diff[b], 0.0) - call.weight(b) * diff[b] for b in classes)
+        assert max(worst_sb, worst_bb) <= 0.01, (eff, worst_sb, worst_bb)
+        assert combos_of_class("AA")  # диапазоны непусты, тест не вырожден
+
+
+@pytest.mark.slow
+def test_nash_fractional_weight_implies_near_indifference():
+    # Прямая проверка свойства, ради которого нужна пер-хендовая граница: если
+    # класс вернулся с ДРОБНЫМ весом, он обязан быть почти безразличен, а не быть
+    # остатком усреднения на явно плюсовой руке. Арифметика: регрет = (вес на
+    # худшем действии) * отрыв, поэтому регрет <= 0.01 и вес >= 0.1 дают отрыв
+    # <= 0.1bb. Задача 12 не должна принимать "пушит 40% времени" за безразличие,
+    # когда на деле это чистый пуш.
+    live = _live_combo_share()
+    classes = all_classes()
+    eff = 10.0
+    push, call = nash_hu(eff)
+
+    for h in classes:
+        weight = push.weight(h)
+        if not 0.1 <= weight <= 0.9:
+            continue
+        shove_ev = sum(
+            live[(h, c)]
+            * (
+                call.weight(c) * (2.0 * class_equity(h, c) - 1.0) * eff
+                + (1.0 - call.weight(c)) * 1.0
+            )
+            for c in classes
+        )
+        assert abs(shove_ev - (-0.5)) <= 0.1, (h, weight, shove_ev)
+
+
+@pytest.mark.slow
+def test_nash_exposes_achieved_per_hand_regret():
+    # Задача 12 должна уметь отказаться от «строго», поэтому достигнутая граница —
+    # часть выдачи, а не внутренняя деталь.
+    bound = nash_hu_regret_bb(10.0)
+    assert 0.0 < bound <= 0.01
+
+
+def test_nash_raises_instead_of_returning_unconverged(monkeypatch, tmp_path):
+    # Молчаливый возврат последнего среднего при исчерпании лимита — ровно тот
+    # отказ («вернуть правдоподобное вместо падения»), который в этом проекте
+    # ловится снова и снова.
+    from harness.analysis.tools import pushfold
+
+    monkeypatch.setattr(pushfold, "_FP_MAX_ITERATIONS", 5)
+    with pytest.raises(RuntimeError, match="не сошёлся"):
+        nash_hu(10.0, cache_dir=tmp_path)
+
+
+def test_nash_cache_recomputes_on_foreign_fingerprint(tmp_path):
+    # Кэш переживает перегенерацию таблицы эквити и смену порогов, поэтому без
+    # отпечатка он тихо отдаёт равновесие, посчитанное на других входных данных.
+    push, _ = nash_hu(9.0, cache_dir=tmp_path)
+    path = tmp_path / "nash_hu_9.00.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["fingerprint"] = "чужой-отпечаток"
+    payload["push"] = {"AA": 1.0}  # заведомо неверное равновесие
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    again, _ = nash_hu(9.0, cache_dir=tmp_path)
+    assert again == push
+    assert json.loads(path.read_text(encoding="utf-8"))["fingerprint"] != "чужой-отпечаток"
+
+
+def test_nash_cache_recomputes_when_stored_depth_disagrees(tmp_path):
+    # Имя файла округляет глубину до сотых, поэтому одного имени мало: сверяется
+    # ещё и записанный внутрь eff_bb.
+    push, _ = nash_hu(9.0, cache_dir=tmp_path)
+    path = tmp_path / "nash_hu_9.00.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["eff_bb"] = 20.0
+    payload["push"] = {"AA": 1.0}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert nash_hu(9.0, cache_dir=tmp_path)[0] == push
 
 
 def test_nash_rejects_impossible_depth(tmp_path):
