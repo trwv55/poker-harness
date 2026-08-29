@@ -317,9 +317,10 @@ def test_169_classes():
 def test_range_validates():
     r = Range(weights={"AA": 1.0, "AKs": 0.5})
     assert r.weight("AA") == 1.0 and r.weight("72o") == 0.0
-    import pytest
-    with pytest.raises(Exception): Range(weights={"XX": 1.0})
-    with pytest.raises(Exception): Range(weights={"AA": 1.5})
+    with pytest.raises(ValidationError):      # pytest.raises(Exception) прошёл бы и на сломанном коде
+        Range(weights={"XX": 1.0})            # класса нет среди 169
+    with pytest.raises(ValidationError):
+        Range(weights={"AA": 1.5})            # вес вне [0, 1]
 
 def test_fraction_of_hands():
     assert abs(Range(weights={c: 1.0 for c in all_classes()}).fraction_of_hands() - 1.0) < 1e-9
