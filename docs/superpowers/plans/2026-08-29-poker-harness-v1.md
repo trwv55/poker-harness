@@ -694,7 +694,7 @@ def validate(hand, report) -> Verdict:
 **Files:**
 - Modify: `tests/test_regression_grid.py` (снять `pytestmark = xfail`), `src/harness/parsers/hh_parser.py`, `src/harness/engine/*` (по находкам)
 
-- [ ] **Step 1:** удалить строку `pytestmark = pytest.mark.xfail(...)`.
+- [ ] **Step 1:** удалить строку `pytestmark = pytest.mark.xfail(...)`; заодно снять с импортов конвейера временные подавления типов (`# type: ignore[import-not-found]`), поставленные в задаче 3, — модули к этому моменту существуют, а забытое подавление глушило бы настоящие ошибки импорта.
 - [ ] **Step 2:** `uv run pytest tests/test_regression_grid.py -q -x` — гонять и чинить до зелени. Ожидаемые находки: не покрытые паттерны PKO-файла (уйдут из `unknown_lines`), сплит-поты/нечётные фишки, ранние уходы игроков. Валидатор и движок не ослаблять под тест — чинить парсинг/реплей; если строка формата легитимно не влияет на разбор, парсер распознаёт её явно (не через unknown_lines).
 - [ ] **Step 3:** полный прогон `uv run pytest -q && uv run ruff check . && uv run pyright` — всё зелёное.
 - [ ] **Step 4: Commit** — `feat: регрессионная сетка зелёная на 318 реальных руках GG`
