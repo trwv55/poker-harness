@@ -516,6 +516,7 @@ RE_BOARD = re.compile(r"^Board \[(?P<b>[^\]]+)\]$")
 
 **Interfaces:**
 - Produces: `normalize(raw: RawHand) -> CanonicalHand`; `POSITIONS_BY_COUNT: dict[int, list[str]]` — позиции в порядке мест от SB.
+- Словарь `bounty_source` закреплён: в v1 единственное значение `"vision"` (точные суммы со скрина). Из HH баунти не восстановимы, поэтому значения «из HH» не существует; задача 12 читает это поле при выборе зоны, поэтому строка — контракт, а не свободный текст.
 
 - [ ] **Step 1: тесты**
 
@@ -536,11 +537,11 @@ def test_positions_and_bb():
 
 def test_committed_after_unified():
     h = normalize(parse_hand(SAMPLE, source_ref="x"))
-    acts = {(a.label, a.kind): a for a in h.actions}
-    assert acts[("5553a2cd", "raise")].committed_after == 69000
-    # Hero: SB 3000 + call 141 = 3144? нет: блайнд 3000 + доплата 141 = 3141
-    assert acts[("Hero", "call")].committed_after == 3141
-    assert acts[("Hero", "call")].is_all_in
+    acts = {(a.label, a.kind): a for a in h.actions}   # ключ типизирован ActionKind —
+    assert acts[("5553a2cd", ActionKind.RAISE)].committed_after == 69000   # строковый литерал
+    # Hero: блайнд 3000 + доплата 141 = 3141 (источник пишет доплату, канон — итог)
+    assert acts[("Hero", ActionKind.CALL)].committed_after == 3141
+    assert acts[("Hero", ActionKind.CALL)].is_all_in
 
 def test_heads_up_button_is_sb():
     # синтетика: 2 игрока, кнопка = SB
@@ -569,7 +570,7 @@ POSITIONS_BY_COUNT = {
 }
 ```
 
-Порядок мест: занятые места по кругу начиная со следующего после кнопки (для HU — с кнопки). `committed_after` — аккумулятор по (label, street): блайнды входят в префлоп-коммит; `call N`/`bets N` — прибавка; `raises X to Y` — установка в Y; анте в коммит улицы НЕ входит (он в банке отдельно). Identity: `Hero` → hero; из `vision.nicknames` → nick; иначе anon. `hand_index` проставляет вызывающий (parse_file порядковый номер после сортировки — добавить проставление в `parse_file` или тут оставить None; выбрано: None, проставляет воркер при сохранении).
+Порядок мест: занятые места по кругу начиная со следующего после кнопки (для HU — с кнопки). `committed_after` — аккумулятор по (label, street): блайнды входят в префлоп-коммит; `call N`/`bets N` — прибавка; `raises X to Y` — установка в Y; анте в коммит улицы НЕ входит (он в банке отдельно). **Неполное действие не роняет нормалайзер:** если у рейза нет `to_amount`, а у колла/бета — `amount` (схема это допускает, и vision-вход задачи 22 такое даст), аккумулятор остаётся на последнем известном значении. Число не выдумывается; получившаяся несходимость — сигнал для движка и валидатора (задача 6), которые эскалируют её игроку. Падать здесь нельзя: краш обходит машину эскалаций, ради которой вся ветка и существует. Identity: `Hero` → hero; из `vision.nicknames` → nick; иначе anon. `hand_index` проставляет вызывающий (parse_file порядковый номер после сортировки — добавить проставление в `parse_file` или тут оставить None; выбрано: None, проставляет воркер при сохранении).
 
 - [ ] **Step 4: зелёные + pyright.**
 - [ ] **Step 5: Commit** — `feat: нормалайзер (позиции, bb, унификация коммитов, identity)`
