@@ -660,7 +660,11 @@ state = NoLimitTexasHoldem.create_state(
 )
 ```
 
-Карты: `state.deal_hole(...)` по `dealt` (неизвестные — из остатка колоды детерминированно, они не влияют на банк); действия по улицам: fold → `state.fold()`, check/call → `state.check_or_call()`, bet/raise → `state.complete_bet_or_raise_to(committed_after)`; доски — `state.deal_board(...)`. Перед каждым действием Hero-игрока снять `DecisionPoint` (to_call = `state.checking_or_calling_amount`, pot_before = `state.total_pot_amount`, eff_stack = min(стек героя, макс. стек живого оппонента), spr = eff/pot на постфлопе, `live_total` = не сфолдившие на этот момент, `live_behind` = из них те, чей ход после Hero в текущем круге). Несовпадение ожидаемого актёра/нелегальное действие → записать в `illegal_actions`, прервать реплей. `pot_by_street` фиксировать на границах улиц; `final_pot` = `state.total_pot_amount` до раздачи выигрышей; `stacks_end` = `state.stacks` после.
+Карты: `state.deal_hole(...)` по `dealt` (неизвестные — из остатка колоды детерминированно, они не влияют на банк); действия по улицам: fold → `state.fold()`, check/call → `state.check_or_call()`, bet/raise → `state.complete_bet_or_raise_to(committed_after)`; доски — `state.deal_board(...)`. Перед каждым действием Hero-игрока снять `DecisionPoint`: to_call = `state.checking_or_calling_amount`; eff_stack = min(остаток героя, макс. остаток среди живых оппонентов); spr = eff/pot на постфлопе; `live_total` = не сфолдившие на этот момент; `live_behind` = из них те, чей ход после Hero в текущем круге.
+
+**`pot_before` — оспариваемый банк, а не `total_pot_amount`.** Считается как Σ по игрокам от min(вложено игроком к этому моменту, максимальный вклад героя), где максимум героя = уже вложенное им + остаток стека. Причина: часть ставки, превышающая стек героя, ему недоступна — её вернут ставившему; включив её, мы завысили бы пот-оддсы, и задача 12 признала бы плохие коллы хорошими. Тихий баг ровно того класса, ради которого в архитектуре заведена observability. Формула сверена с записью рума на `SAMPLE`: `pot_before == 14532` в точке решения Hero, а `pot_before + to_call == 14673` — ровно мейн-пот из строки `5553a2cd collected 14,673`. Несовпадение ожидаемого актёра/нелегальное действие → записать в `illegal_actions`, прервать реплей. `pot_by_street` фиксировать на границах улиц; `final_pot` = `state.total_pot_amount` до раздачи выигрышей; `stacks_end` = `state.stacks` после.
+
+**Форфейт олл-инного игрока (рум-специфика GG).** GG пишет `folds` игроку с нулевым остатком за спиной — он в олл-ине с форсированной ставки (обычно сидит-аут или отключён), и рум считает его деньги мёртвыми. По чистым правилам NLHE такой игрок жив и претендует на мейн-пот, поэтому реплей без поправки расходится с румом (2 руки из 318). Реплей обязан отыграть записанный источником фолд: игрок теряет вложенное, деньги остаются в банке. Условие узкое — только явный `folds` при нулевом остатке; сработавший форфейт пишется в `EngineReport.forfeits: list[str] = []` (новое опциональное поле), чтобы поправка была видна в трейсе, а не меняла арифметику молча.
 
 - [ ] **Step 4: реализация `validate`** — политика (движок не судит — спека §3 арх.):
 
@@ -673,8 +677,10 @@ def validate(hand, report) -> Verdict:
         fields += ["stacks", "actions"]
     if _has_duplicate_cards(hand): reasons.append("duplicate cards"); fields.append("cards")
     start = sum(p.stack for p in hand.players)
-    if sum(report.stacks_end.values()) + (hand.summary.rake if hand.summary else 0) != start:
-        reasons.append("chip conservation violated")
+    if sum(report.stacks_end.values()) != start:   # реплей работает в до-рейковом пространстве:
+        reasons.append("chip conservation violated")  # рейк не моделируется, прибавлять его нельзя,
+    # иначе раздача с rake > 0 ложно отклонится. Рейк ловится сверкой final_pot с summary.total_pot,
+    # которую рум тоже пишет до вычета.
     if not reasons: return Verdict(status="pass")
     if hand.provenance == Provenance.SCREENSHOT:
         return Verdict(status="escalate", fields=sorted(set(fields)),
