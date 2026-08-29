@@ -869,10 +869,39 @@ def test_sums_to_total():
     eq = icm_equities([7000, 2000, 1000], [0.5, 0.3, 0.2])
     assert abs(sum(eq) - 1.0) < 1e-9
     assert eq[0] > eq[1] > eq[2]
+    # значения посчитаны независимым перебором всех порядков финиша
+    for got, want in zip(eq, [0.435278, 0.308889, 0.255833]):
+        assert abs(got - want) < 1e-5
 
-def test_chip_lead_worth_less_than_linear():
+def test_chip_lead_worth_far_less_than_chip_share():
+    # суть ICM одним числом: 90% фишек стоят 47.9% призовых, а не 90%
     eq = icm_equities([9000, 500, 500], [0.5, 0.3, 0.2])
-    assert eq[0] < 0.5 * (9000 / 10000) / 0.5   # нелинейность ICM: фишки дорожают убывающе
+    assert abs(eq[0] - 0.479474) < 1e-5
+    assert abs(eq[1] - 0.260263) < 1e-5 and abs(eq[2] - 0.260263) < 1e-5
+    assert eq[0] < 0.9 - 0.4          # доля фишек 0.9, доля призовых заметно ниже
+
+def test_matches_independent_brute_force():
+    # Оракул: прямой перебор всех порядков финиша — другой алгоритм, тот же ответ.
+    # Рекурсия Малмута-Харвилла должна совпадать с ним до 1e-9 на малых n.
+    from itertools import permutations
+
+    def oracle(stacks, payouts):
+        n, S = len(stacks), sum(stacks)
+        eq = [0.0] * n
+        for order in permutations(range(n)):
+            p, rem = 1.0, S
+            for who in order:
+                p *= stacks[who] / rem
+                rem -= stacks[who]
+            for place, who in enumerate(order):
+                if place < len(payouts):
+                    eq[who] += p * payouts[place]
+        return eq
+
+    for stacks in ([5000, 3000, 2000], [12000, 800, 600, 400], [1, 1, 98]):
+        pay = [0.5, 0.3, 0.2]
+        for got, want in zip(icm_equities(stacks, pay), oracle(stacks, pay)):
+            assert abs(got - want) < 1e-9, (stacks, got, want)
 ```
 
 - [ ] **Step 2: падают.** Step 3: реализация — рекурсия Малмута-Харвилла: P(place k) через произведения stack/оставшаяся масса, мемоизация по frozenset индексов; сложность допустима до 9 игроков × 3–4 платных места (v1: ограничить `len(payouts) <= 4`, иначе ValueError с текстом — для MTT-спотов передавать хвост призовой структуры релевантного стола).
