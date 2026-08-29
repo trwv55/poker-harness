@@ -1,6 +1,6 @@
 import pytest
 
-from tests.conftest import FIXTURE_DAILY, FIXTURE_PKO
+from tests.conftest import FIXTURE_DAILY, FIXTURE_PKO, requires_fixtures
 
 
 def _pipeline(path):
@@ -10,6 +10,7 @@ def _pipeline(path):
     raws = parse_file(path.read_text(encoding="utf-8"), source_ref=path.name)
     return raws, [enrich(normalize(r)) for r in raws]
 
+@requires_fixtures
 @pytest.mark.parametrize("path,expected_hands", [(FIXTURE_DAILY, 146), (FIXTURE_PKO, 172)])
 def test_grid(path, expected_hands):
     raws, enriched = _pipeline(path)

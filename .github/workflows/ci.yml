@@ -9,4 +9,5 @@ jobs:
       - run: uv sync
       - run: uv run ruff check .
       - run: uv run pyright
-      - run: uv run pytest -q
+      # -ra: пропуски тестов, зависящих от приватных фикстур, должны быть видны
+      - run: uv run pytest -q -ra

@@ -1,6 +1,6 @@
 from harness.contracts import ActionKind, PostKind, Street
 from harness.parsers.hh_parser import parse_file, parse_hand
-from tests.conftest import FIXTURE_DAILY
+from tests.conftest import FIXTURE_DAILY, requires_fixtures
 
 SAMPLE = """Poker Hand #TM6316081388: Tournament #306148954, Daily Classic $4 Hold'em No Limit - Level23(3,000/6,000(750)) - 2026/08/20 22:22:36
 Table '8' 8-max Seat #3 is the button
@@ -76,6 +76,7 @@ def test_parse_sample_hand():
     assert h.showdowns[0].cards == ["Js", "Ah"]
     assert h.unknown_lines == []
 
+@requires_fixtures
 def test_parse_file_sorted_and_counted():
     raws = parse_file(FIXTURE_DAILY.read_text(encoding="utf-8"), source_ref="daily")
     assert len(raws) == 146

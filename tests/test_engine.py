@@ -17,7 +17,7 @@ from harness.contracts import (
 from harness.engine import enrich
 from harness.normalizer import normalize
 from harness.parsers.hh_parser import parse_file, parse_hand
-from tests.conftest import FIXTURE_DAILY
+from tests.conftest import FIXTURE_DAILY, requires_fixtures
 from tests.test_hh_parser import SAMPLE
 
 
@@ -134,6 +134,7 @@ def test_decision_point_pot_is_only_what_hero_can_win():
     assert dp.pot_before + dp.to_call == 14673
 
 
+@requires_fixtures
 def test_forfeit_of_blind_all_in_is_honoured():
     """Реальная рука: рум пишет `folds` игроку, ушедшему в олл-ин блайндом.
 
