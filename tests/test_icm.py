@@ -1,3 +1,5 @@
+import pytest
+
 from harness.analysis.tools.icm import icm_equities
 
 
@@ -47,3 +49,30 @@ def test_matches_independent_brute_force():
         pay = [0.5, 0.3, 0.2]
         for got, want in zip(icm_equities(stacks, pay), oracle(stacks, pay)):
             assert abs(got - want) < 1e-9, (stacks, got, want)
+
+
+def test_too_many_paid_places_raises():
+    # len(payouts) <= 4 — жёсткий предел брифа (Step 3): для MTT передают
+    # хвост релевантной призовой структуры, а не всю сетку на сотни мест.
+    with pytest.raises(ValueError, match="4 платных мест"):
+        icm_equities([100] * 5, [0.2, 0.2, 0.2, 0.2, 0.2])
+
+def test_empty_stacks_raises():
+    with pytest.raises(ValueError, match="пустым"):
+        icm_equities([], [0.5, 0.3, 0.2])
+
+def test_zero_total_stack_raises():
+    with pytest.raises(ValueError, match="положительными"):
+        icm_equities([0, 0, 0], [0.5, 0.3, 0.2])
+
+def test_zero_stack_player_among_positive_raises():
+    # Не только некорректно по смыслу (выбывший игрок), но и математически:
+    # если бы это прошло, распределение мест на подмножестве из одних нулевых
+    # стеков после того, как игрок с фишками уже занял более высокое место,
+    # упёрлось бы в 0/0 внутри first_place_probs.
+    with pytest.raises(ValueError, match="положительными"):
+        icm_equities([100, 0], [0.6, 0.4])
+
+def test_more_paid_places_than_players_raises():
+    with pytest.raises(ValueError, match="больше числа игроков"):
+        icm_equities([100, 200], [0.5, 0.3, 0.2])
