@@ -242,6 +242,8 @@ class DecisionPoint(BaseModel):
     index: int; street: Street; label: str; position: str
     to_call: int; pot_before: int; eff_stack: int; eff_stack_bb: float
     spr: float | None = None; action: CanonicalAction
+    live_total: int = 0    # игроков ещё в руке на момент решения, включая Hero
+    live_behind: int = 0   # из них ещё не действовавших после Hero — вход правила зоны
 class ValidationStatus(StrEnum): PASS = "pass"; ESCALATE = "escalate"; REJECT = "reject"
 class Verdict(BaseModel):
     status: ValidationStatus
@@ -608,6 +610,7 @@ def test_decision_point_for_hero():
     assert dp.street == "preflop"
     assert dp.to_call == 141                                  # доплата при стеке 141 за анте+SB
     assert dp.action.kind == "call" and dp.action.is_all_in
+    assert (dp.live_total, dp.live_behind) == (3, 1)          # рейзер, Hero, BB; после Hero — BB
 
 def test_validation_rejects_chip_mismatch():
     h = normalize(parse_hand(SAMPLE, source_ref="x"))
@@ -654,7 +657,7 @@ state = NoLimitTexasHoldem.create_state(
 )
 ```
 
-Карты: `state.deal_hole(...)` по `dealt` (неизвестные — из остатка колоды детерминированно, они не влияют на банк); действия по улицам: fold → `state.fold()`, check/call → `state.check_or_call()`, bet/raise → `state.complete_bet_or_raise_to(committed_after)`; доски — `state.deal_board(...)`. Перед каждым действием Hero-игрока снять `DecisionPoint` (to_call = `state.checking_or_calling_amount`, pot_before = `state.total_pot_amount`, eff_stack = min(стек героя, макс. стек живого оппонента), spr = eff/pot на постфлопе). Несовпадение ожидаемого актёра/нелегальное действие → записать в `illegal_actions`, прервать реплей. `pot_by_street` фиксировать на границах улиц; `final_pot` = `state.total_pot_amount` до раздачи выигрышей; `stacks_end` = `state.stacks` после.
+Карты: `state.deal_hole(...)` по `dealt` (неизвестные — из остатка колоды детерминированно, они не влияют на банк); действия по улицам: fold → `state.fold()`, check/call → `state.check_or_call()`, bet/raise → `state.complete_bet_or_raise_to(committed_after)`; доски — `state.deal_board(...)`. Перед каждым действием Hero-игрока снять `DecisionPoint` (to_call = `state.checking_or_calling_amount`, pot_before = `state.total_pot_amount`, eff_stack = min(стек героя, макс. стек живого оппонента), spr = eff/pot на постфлопе, `live_total` = не сфолдившие на этот момент, `live_behind` = из них те, чей ход после Hero в текущем круге). Несовпадение ожидаемого актёра/нелегальное действие → записать в `illegal_actions`, прервать реплей. `pot_by_street` фиксировать на границах улиц; `final_pot` = `state.total_pot_amount` до раздачи выигрышей; `stacks_end` = `state.stacks` после.
 
 - [ ] **Step 4: реализация `validate`** — политика (движок не судит — спека §3 арх.):
 
@@ -717,7 +720,7 @@ def validate(hand, report) -> Verdict:
 - Test: `tests/test_equity.py`, `tests/test_pot_odds.py`
 
 **Interfaces:**
-- Produces: `equity_vs_range(hero: tuple[str, str], rng: Range, board: list[str] = [], *, iterations: int = 200_000, seed: int = 42) -> float`; `equity_hand_vs_hand(h1, h2, board=[]) -> float`; `required_equity(to_call: int, pot_before: int) -> float`.
+- Produces: `equity_vs_range(hero: tuple[str, str], rng: Range, board: list[str] = [], *, iterations: int = 200_000, seed: int = 42) -> float`; `equity_vs_ranges(hero: tuple[str, str], ranges: Sequence[Range], board: list[str] = [], *, iterations: int = 100_000, seed: int = 42) -> float` — доля банка героя при вскрытии против нескольких диапазонов сразу (ничьи делятся поровну; карточные коллизии между сэмплами оппонентов отбрасываются) — нужна мультивей-шову задачи 11; `equity_hand_vs_hand(h1, h2, board=[]) -> float`; `required_equity(to_call: int, pot_before: int) -> float`.
 - Зависимость: `uv add eval7`. **Contingency:** если у eval7 нет колеса под Python 3.12 и сборка из исходников не взлетает за ~час — реализовать `equity.py` на PokerKit-эвалуаторе с собственным MC-сэмплером (интерфейс тот же, тесты те же, скорость проверить: ≥50k итераций/с достаточно), решение зафиксировать строкой в спеке §3.
 
 - [ ] **Step 1: тесты (якоря из EVALS.md, этаж 1)**
@@ -744,6 +747,14 @@ def test_equity_vs_range_monotone():
 def test_equity_deterministic_with_seed():
     r = Range(weights={"AKo": 1.0, "AKs": 1.0})
     assert equity_vs_range(("Th", "Td"), r) == equity_vs_range(("Th", "Td"), r)
+
+def test_multiway_equity_below_headsup():
+    from harness.analysis.tools.equity import equity_vs_ranges
+    r = Range(weights={"AKo": 1.0, "AKs": 1.0})
+    hu = equity_vs_ranges(("Qs", "Qh"), [r])
+    three = equity_vs_ranges(("Qs", "Qh"), [r, r])
+    assert hu > three            # против двух AK доля банка меньше, чем против одного
+    assert 0.35 < three < 0.55   # QQ против двух AK — примерно паритет
 
 def test_required_equity():
     assert abs(required_equity(50, 100) - 50 / 150) < 1e-9   # пот 100 (ставка внутри), колл 50
@@ -803,8 +814,9 @@ def test_chip_lead_worth_less_than_linear():
 
 **Interfaces:**
 - Produces:
-  - `shove_ev_bb(hero_cls: str, hero_bb: float, pot_dead_bb: float, callers: list[CallerModel], *, equity_fn=equity_vs_range, call_prob_fn=None) -> float` — EV шова в bb относительно фолда (базлайн фолда = 0); `call_prob_fn(caller, hero_cls) -> float`, по умолчанию — доля комбо диапазона с поправкой на блокеры;
-  - `CallerModel(call_range: Range, stack_bb: float)`;
+  - `shove_ev_bb(hero_cls: str, hero_behind_bb: float, pot_dead_bb: float, callers: list[CallerModel], *, equity_fn=equity_vs_ranges, call_prob_fn=None) -> float` — EV шова в bb **относительно фолда** (фолд = 0; уже поставленное в банк — sunk, в базлайне потеряно). `hero_behind_bb` — стек за спиной после постов, `pot_dead_bb` — весь банк на момент решения. `call_prob_fn(caller, hero_cls) -> float`, по умолчанию — доля комбо колл-диапазона с поправкой на блокеры карт героя;
+  - `CallerModel(call_range: Range, behind_bb: float)` — `behind_bb` — стек коллера за спиной;
+  - `BRACKET_TIGHT`, `BRACKET_WIDE: Callable[[float], Range]` — узкая («только премиум»: AA-JJ, AK) и широкая (top-40%) модели колл-диапазона по глубине; вход bracket-теста зоны (задача 12);
   - `call_shove_ev_bb(hero_cls, hero_bb, shover_range: Range, pot_bb, to_call_bb, *, equity_fn=...) -> float`;
   - `nash_hu(eff_bb: float) -> tuple[Range, Range]` — (SB push, BB call), кэш в data/;
   - `fold_equity_ok(callers: list[CallerModel]) -> bool` — fold-equity check (все фолдят с вероятностью < 1 → шов не «бесплатный»); обязателен перед вердиктом о шове (спека, арх. §4).
@@ -816,14 +828,23 @@ def test_chip_lead_worth_less_than_linear():
 from harness.analysis.tools.pushfold import CallerModel, nash_hu, shove_ev_bb
 from harness.contracts import Range
 
-def test_shove_ev_hand_computed():
-    # HU, эфф. 10bb, SB шов; колл 40% времени, эквити при колле 0.40. Расчёт руками:
-    # фолд сейчас: конечный стек 9.5bb. Шов: fold(0.6) -> 11.0; call(0.4) -> 20*0.4=8.0
-    # EV(final) = 0.6*11 + 0.4*8 = 9.8 -> относительно фолда +0.3bb
-    caller = CallerModel(call_range=Range(weights={"AA": 1.0}), stack_bb=10.0)
-    ev = shove_ev_bb("32o", 10.0, pot_dead_bb=1.5, callers=[caller],
+def test_shove_ev_headsup_computed():
+    # Hero SB: стек 10bb, поставил 0.5 -> за спиной 9.5; BB за спиной 9.0; в банке 1.5
+    # фолд-ветка (0.6): +1.5bb (весь банк, включая свои 0.5 — они в базлайне уже потеряны)
+    # колл-ветка (0.4): банк 1.5+9.5+9.0=20 -> 0.4*20 - 9.5 = -1.5bb
+    # EV = 0.6*1.5 + 0.4*(-1.5) = +0.3bb
+    caller = CallerModel(call_range=Range(weights={"AA": 1.0}), behind_bb=9.0)
+    ev = shove_ev_bb("32o", hero_behind_bb=9.5, pot_dead_bb=1.5, callers=[caller],
                      equity_fn=lambda *a, **k: 0.40, call_prob_fn=lambda *a: 0.4)
     assert abs(ev - 0.3) < 1e-9
+
+def test_shove_ev_multiway_enumerates_subsets():
+    # два игрока позади, каждый коллит с p=0.5; эквити героя при любом колле = 0
+    # оба фолдят (0.25): +2.0bb; любая колл-ветка (0.75): -9.0bb (весь стек за спиной)
+    c = CallerModel(call_range=Range(weights={"AA": 1.0}), behind_bb=9.0)
+    ev = shove_ev_bb("32o", hero_behind_bb=9.0, pot_dead_bb=2.0, callers=[c, c],
+                     equity_fn=lambda *a, **k: 0.0, call_prob_fn=lambda *a: 0.5)
+    assert abs(ev - (0.25 * 2.0 + 0.75 * -9.0)) < 1e-9   # перебор 4 веток, не попарно
 
 def test_nash_hu_anchors_10bb():
     push, call = nash_hu(10.0)
@@ -842,7 +863,7 @@ def test_nash_cached_deterministic(tmp_path):
 ```
 
 - [ ] **Step 2: падают.** Step 3: реализация:
-  - `shove_ev_bb`: конечный стек при фолде = hero_bb − уже вложенное (dead включает блайнды/анте); при шове: Π фолдов → банк герою; иначе первый коллер (v1: EV против каждого коллера попарно, худший случай для мультивея — задокументировать в docstring как приближение, точный мультивей — вне v1); эквити через `equity_fn(hero_cls → представитель комбо, call_range, [])`. `call_prob_fn` по умолчанию = `call_range.fraction_of_hands()` с поправкой на блокеры карт героя (карточное исключение через раскрытие комбо).
+  - `shove_ev_bb`: **перебор подмножеств коллеров** (не попарное приближение). Для n игроков позади перебираются все 2^n веток «кто коллит» (n ≤ 7 → ≤128 веток; ветки с вероятностью < 1e-4 отбрасываются). Вероятность ветки = Π p_call(коллеры) × Π (1 − p_call)(фолдеры). Ветка «все сфолдили» → +`pot_dead_bb`. Ветка с набором S: банк = `pot_dead_bb` + `hero_behind_bb` + Σ min(behind_i, hero_behind_bb) для i ∈ S, эквити = `equity_fn(hero_cls, [call_range_i for i in S])`, вклад ветки = эквити × банк − `hero_behind_bb`; при коллере короче героя остаток его стека в контест не входит (сайд-пот герою недоступен — учитывается через min). `call_prob_fn` по умолчанию = доля комбо `call_range` после исключения карт героя. **Арифметика точная при заданных диапазонах; приближение — только сами колл-диапазоны, и оно помечается зоной (задача 12).**
   - `nash_hu(eff_bb)`: fictitious play на матрице 169×169 — предвычислить эквити всех пар классов (симметричная таблица 169×169, MC 50k/пара с сидом, генерится один раз в `data/eq169.npy`, ~30 сек, коммитится); итерации: лучшая чистая стратегия против средней смешанной оппонента, усреднение, 200–500 итераций до сходимости |ΔEV| < 0.001bb; результат в `data/nash_hu_{eff_bb}.json`.
   - `fold_equity_ok`: False если суммарная вероятность колла ≈ 1 (все диапазоны колла покрывают всё) — тогда «шов ради фолдов» не аргумент.
 - [ ] **Step 4: зелёные** (nash-тесты помечены `@pytest.mark.slow`, в CI входят). Step 5: Commit — `feat: пуш-фолд EV + HU-Нэш fictitious play + fold-equity check`
@@ -859,6 +880,8 @@ def test_nash_cached_deterministic(tmp_path):
 - Consumes: `EnrichedHand`, инструменты задач 9–11.
 - Produces: `analyze_hand(en: EnrichedHand) -> AnalysisResult` — v1: только префлоп-точки Hero, зона strict; `classify(dp: DecisionPoint, en: EnrichedHand) -> SpotKind`; `rank_points(points: list[PointVerdict]) -> list[int]` (индексы по убыванию потери).
 - Политика v1 (из спеки §5.5, арх. «дисциплина»): судим против диапазона на момент решения, не против вскрытия; порог пуш-фолд парадигмы: eff_stack_bb ≤ 15 и (спот не открыт рейзом не-олином).
+- Produces: `zone_for(best_tight: str, best_wide: str, *, live_total: int) -> tuple[Zone, str]` — правило зоны спеки §5.5: при `live_total == 2` (HU) зона `strict` («равновесие»); при 3+ живых — `strict`, если `best_tight == best_wide` (bracket стабилен, вывод от диапазонов не зависит), иначе `assuming` («модель диапазонов»).
+- **Область `nash_hu` (замечание ревью):** равновесие HU применяется **только** при `live_total == 2` — настоящий HU-стол или SB-vs-BB после фолдов. При 3+ живых `nash_hu` не выдаётся за равновесие: его колл-сторона используется как *модель* колл-диапазона каждого игрока позади (по его глубине), и точка помечается зоной по `zone_for`.
 
 - [ ] **Step 1: тесты**
 
@@ -875,7 +898,10 @@ def test_fixture_hand_correct_call_not_flagged():
     hero_points = [p for p in res.points if p.spot == "pushfold_facing_shove"]
     assert len(hero_points) == 1
     p = hero_points[0]
-    assert p.zone == "strict" and p.ev_diff_bb >= -0.05      # не ошибка
+    # strict здесь не по улице, а по правилу зоны: колл 141 в банк 20k верен против любого
+    # диапазона -> bracket стабилен, допущение не несёт нагрузки
+    assert p.zone == "strict" and p.assumption is None
+    assert p.ev_diff_bb >= -0.05                             # не ошибка
     assert p.best_action == "call" and p.action_taken == "call"
 
 def test_synthetic_bad_open_shove_flagged():
@@ -886,6 +912,27 @@ def test_synthetic_bad_open_shove_flagged():
     assert p.spot == "pushfold_unopened" and p.ev_diff_bb < -0.3
     assert p.best_action == "fold" and p.action_taken == "shove"
     assert res.ranked[0] == 0 and res.total_ev_loss_bb <= p.ev_diff_bb
+
+def test_zone_rule_direct():
+    from harness.analysis.preflop import zone_for
+    assert zone_for("shove", "shove", live_total=2)[0] == "strict"    # HU: равновесие
+    assert zone_for("shove", "shove", live_total=5)[0] == "strict"    # bracket стабилен
+    z, why = zone_for("shove", "fold", live_total=5)
+    assert z == "assuming" and why                                    # вердикт зависит от модели
+
+def test_multiway_shove_zone_invariant():
+    en = _make_multiway_shove_hand(hero_cards=("Ac", "Ts"), eff_bb=12.0, players_behind=3)
+    for p in analyze_hand(en).points:
+        assert (p.assumption is not None) == (p.zone == "assuming")   # допущение показано всегда
+        if p.zone == "assuming":
+            assert "мультивей" in p.assumption.note or "модел" in p.assumption.note
+
+def test_range_independent_call_is_strict():
+    # колл шова с AA верен против любого диапазона -> bracket стабилен -> strict
+    en = _make_facing_shove_hand(hero_cards=("Ah", "Ad"), eff_bb=12.0, shover_bb=12.0)
+    p = analyze_hand(en).points[0]
+    assert p.best_action == "call" and p.zone == "strict"
+    assert p.assumption is None
 
 def test_no_llm_and_no_result_bias():
     # вскрытые карты соперника не влияют на вердикт: пересунем вскрытие — вердикт тот же
@@ -898,8 +945,10 @@ def test_no_llm_and_no_result_bias():
 
 - [ ] **Step 2: падают.** Step 3: реализация:
   - `classify`: pushfold_unopened — никто не вложился добровольно до Hero и eff ≤ 15bb; pushfold_facing_shove — перед Hero олин и eff ≤ 15bb (либо колл = олин Hero); прочее префлоп — preflop_other (v1: вердикт «не размечен», ev_diff 0, в отчёт не ранжируется); постфлоп — postflop (v1: пропускается, зона придёт ступенью 2 порядка разработки).
-  - pushfold_unopened: сравнение с `nash_hu` (HU) / EV-расчётом против модельных коллеров (мультивей: колл-диапазоны из `nash_hu` колл-стороны по эфф. стеку каждого — приближение, документируется в `PointVerdict.detail["method"]`); ev_diff = EV(сделанного) − EV(лучшего из {push, fold}).
-  - pushfold_facing_shove: `call_shove_ev_bb` против диапазона шова (Нэш push-сторона по глубине шовера); best = call если EV>0 иначе fold; ev_diff аналогично.
+  - pushfold_unopened, `live_total == 2`: `nash_hu(eff_bb)` — равновесие, зона `strict`, `tools=["nash_hu"]`.
+  - pushfold_unopened, `live_total >= 3`: `shove_ev_bb` с моделью коллеров (колл-сторона `nash_hu` по глубине каждого игрока позади) → `best_action`; затем bracket-тест: тот же расчёт с `BRACKET_TIGHT` и `BRACKET_WIDE`; зона и причина — из `zone_for(best_tight, best_wide, live_total=...)`. При `assuming` заполняется `Assumption(range=<модель среднего коллера>, source="model:nash_hu_call", note="колл-диапазоны игроков позади смоделированы: мультивей-равновесия в v1 нет")`. В `detail`: `{"method": "subset_enumeration", "bracket": "stable"|"unstable", "branches": N}`.
+  - pushfold_facing_shove: `call_shove_ev_bb` против диапазона шовера (push-сторона `nash_hu` по его глубине при `live_total == 2` — зона `strict`; иначе как модель + bracket-тест по узкой/широкой моделям шова). best = call при EV > 0, иначе fold.
+  - `assumption` заполняется **тогда и только тогда**, когда зона `assuming` — инвариант проверяется тестом.
   - `rank_points`: сортировка по ev_diff возрастанию (самая дорогая потеря первой); `total_ev_loss_bb` = сумма отрицательных.
 - [ ] **Step 4: зелёные.** Step 5: Commit — `feat: префлоп-анализ пуш-фолд зоны строго + оценщик/ранжирование ошибок`
 
@@ -912,7 +961,7 @@ def test_no_llm_and_no_result_bias():
 - Test: `tests/test_scan.py`
 
 **Interfaces:**
-- Produces: `scan_tournament(enriched: list[EnrichedHand]) -> ScanSummary`; `ScanSummary(BaseModel): hands_total: int; hands_with_decision: int; items: list[ScanItem]; total_loss_bb: float`; `ScanItem(BaseModel): hand_no: str; hand_index: int | None; hero_class: str; spot: SpotKind; action_taken: str; best_action: str; ev_diff_bb: float` — items отсортированы по цене, только расхождения (ev_diff < −0.1bb). Формулировка «расхождение», не «ошибка» — честность из архитектуры.
+- Produces: `scan_tournament(enriched: list[EnrichedHand]) -> ScanSummary`; `ScanSummary(BaseModel): hands_total: int; hands_with_decision: int; items: list[ScanItem]; total_loss_bb: float`; `ScanItem(BaseModel): hand_no: str; hand_index: int | None; hero_class: str; spot: SpotKind; action_taken: str; best_action: str; ev_diff_bb: float; zone: Zone` — items отсортированы по цене, только расхождения (ev_diff < −0.1bb); `zone` переносится из `PointVerdict` и показывается в сводке (мультивей-шовы в сводке не выдаются за точный расчёт). Формулировка «расхождение», не «ошибка» — честность из архитектуры.
 
 - [ ] **Step 1: тесты**
 
@@ -1102,7 +1151,7 @@ async def test_retry_on_schema_error_then_fail(db_factory):
 - Produces (чистые функции, ни ТГ-API, ни БД — по «правилу единого голоса» §4):
   - `Msg(BaseModel): text: str; buttons: list[list[Btn]] = []` · `Btn(BaseModel): text: str; callback_data: str`
   - `progress_text(station: Literal["parse","validate","analyze","explain"]) -> str` — «Читаю стол… / Проверяю руку… / Считаю эквити… / Формулирую…»
-  - `scan_summary_msg(s: ScanSummary, quota_left: int, quota_total: int) -> Msg` — топ расхождений с ценой в bb, под каждым `Btn("разобрать", f"deep:{hand_no}")`; формулировки «расхождение», не «ошибка»
+  - `scan_summary_msg(s: ScanSummary, quota_left: int, quota_total: int) -> Msg` — топ расхождений с ценой в bb, под каждым `Btn("разобрать", f"deep:{hand_no}")`; формулировки «расхождение», не «ошибка»; строки с `zone == "assuming"` несут пометку «по модели диапазонов» (тест: пометка есть у assuming-строк и отсутствует у strict)
   - `deep_dive_msg(res: AnalysisResult, elapsed_s: int, zone: Zone, quota_left: int, quota_total: int) -> Msg` — точки решения числами (до задачи 21 — без LLM-текста) + статус-строка `⏱ {N}с · зона: {строго|предполагая} · разборов {осталось}/{всего} за 24 ч` + кнопки `Диапазоны | Подробнее | Не согласен`
   - `escalation_msg(field: str, question: str, options: list[str]) -> Msg` — варианты + `Btn("ввести вручную", ...)`
   - `failed_msg(reason_public: str) -> Msg`, `quota_exceeded_msg(hours_to_free: int) -> Msg`
