@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Защита от публикации того, что публиковать нельзя.
+#
+# Репозиторий открыт до запуска продукта. Закрытие репозитория НЕ ретроактивно:
+# форки, архивы и клоны остаются. Поэтому решение принимается на каждом пуше,
+# а не по дате — всё, что уехало, считается опубликованным навсегда.
+#
+# Обоснование списка — docs/publishing-policy.md
+# Обойти осознанно: git push --no-verify
+
+set -uo pipefail
+
+ZERO=0000000000000000000000000000000000000000
+BLOCKED=0
+say() { printf '%s\n' "$*" >&2; }
+
+# Пути, которых не должно быть в публичной истории.
+FORBIDDEN_PATHS='^(evals/vision/|evals/e2e/|\.claude/screens/|fixtures/hh/.+\.txt$|\.env$|src/harness/parsers/prompts/)'
+
+# Файлы, которым разрешено содержать образец реальной руки (осознанное решение владельца).
+# .githooks/ и политика содержат сам шаблон поиска — иначе хук блокировал бы себя.
+HAND_ALLOWLIST='^(tests/test_hh_parser\.py|src/harness/parsers/hh_parser\.py|docs/superpowers/(plans|specs)/|\.githooks/|docs/publishing-policy\.md$)'
+
+# Секреты: ключи провайдеров, токен бота, токен GitHub.
+SECRET_RE='(sk-ant-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{36}|xoxb-[A-Za-z0-9-]{20,}|\b[0-9]{8,10}:[A-Za-z0-9_-]{35}\b)'
+
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    [ "$local_sha" = "$ZERO" ] && continue          # удаление ветки — проверять нечего
+
+    if [ "$remote_sha" = "$ZERO" ]; then
+        files=$(git ls-tree -r --name-only "$local_sha")   # новая ветка: всё дерево ново для remote
+    else
+        files=$(git diff --name-only "$remote_sha" "$local_sha")
+    fi
+    [ -z "$files" ] && continue
+
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        git cat-file -e "$local_sha:$f" 2>/dev/null || continue   # файл удалён — не проверяем
+
+        if printf '%s' "$f" | grep -Eq "$FORBIDDEN_PATHS"; then
+            say "ЗАПРЕЩЁННЫЙ ПУТЬ: $f"
+            BLOCKED=1
+            continue
+        fi
+
+        content=$(git cat-file -p "$local_sha:$f" 2>/dev/null) || continue
+
+        if printf '%s' "$content" | grep -Eq "$SECRET_RE"; then
+            say "ПОХОЖЕ НА СЕКРЕТ: $f"
+            BLOCKED=1
+        fi
+
+        if ! printf '%s' "$f" | grep -Eq "$HAND_ALLOWLIST"; then
+            if printf '%s' "$content" | grep -q 'Poker Hand #'; then
+                say "РЕАЛЬНАЯ РУКА ВНЕ СПИСКА ИСКЛЮЧЕНИЙ: $f"
+                BLOCKED=1
+            fi
+        fi
+    done <<< "$files"
+done
+
+if [ "$BLOCKED" -ne 0 ]; then
+    say ""
+    say "Пуш остановлен: см. docs/publishing-policy.md"
+    say "Если публикация осознанна — git push --no-verify"
+    exit 1
+fi
+
+exit 0
