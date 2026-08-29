@@ -271,14 +271,20 @@ class _Replay:
     def _is_forfeit(self, action: CanonicalAction | None) -> bool:
         """Пас от игрока, у которого не осталось фишек за спиной.
 
-        Так GG записывает игрока, ушедшего в олл-ин вынужденной ставкой (обычно
-        он сидит аут или отвалился по связи): рум считает его вышедшим из руки,
-        а его фишки — мёртвыми деньгами в банке. Правила NLHE так не умеют —
+        Так GG записывает игрока, ушедшего в олл-ин **вынужденной** ставкой
+        (обычно он сидит аут или отвалился по связи): рум считает его вышедшим из
+        руки, а его фишки — мёртвыми деньгами в банке. Правила NLHE так не умеют —
         олл-ин игрок остаётся в руке и претендует на мейн-пот, — и PokerKit хода
         у него не спросит. Провенанс `hand_history` — это факт: отказ проиграть
         записанное румом действие дал бы ложный `reject` на настоящей руке
-        игрока. Условие держим узким: только явный `folds` и только при нулевом
-        остатке стека.
+        игрока.
+
+        Условие держим предельно узким, потому что цена ошибки — молча уехавший
+        не туда банк. Мало того, что это явный `folds` при нулевом остатке
+        стека: игрок должен был обнулиться **на анте с блайндом**, а не
+        добровольной ставкой. Иначе лишняя строка `folds` после чьего-нибудь
+        олл-ин-рейза (ровно то, что даёт сбой распознавания или баг парсера)
+        вывела бы из руки живого игрока и отдала бы его банк сопернику.
         """
         if action is None or action.kind != ActionKind.FOLD:
             return False
@@ -287,9 +293,19 @@ class _Replay:
         index = self.seating.index(action.label)
         if not self.state.statuses[index] or self.state.stacks[index]:
             return False
+        if not self._all_in_from_forced_bet(action.label):
+            return False
         # Последнего оставшегося не выводим: пас всех до одного — не форфейт,
         # а битые данные, и разбираться с ними должен обычный путь.
         return sum(self.state.statuses) > 1
+
+    def _all_in_from_forced_bet(self, label: str) -> bool:
+        """Игроку хватило стека ровно на анте с блайндом — добровольно он не ставил."""
+        index = self.seating.index(label)
+        posted = self.state.get_effective_ante(index) + self.state.get_effective_blind_or_straddle(
+            index
+        )
+        return self.state.starting_stacks[index] <= posted
 
     def _forfeit(self, label: str) -> None:
         """Исполнить записанный румом пас: игрок выходит из руки, вклад остаётся.
@@ -329,13 +345,7 @@ class _Replay:
         ходить не может, а его блайнд остаётся живым в банке. Это расхождение
         рума с правилами, а не битый парсер — диагностике стоит сказать прямо.
         """
-        if label not in self.seating:
-            return ""
-        index = self.seating.index(label)
-        posted = self.state.get_effective_ante(index) + self.state.get_effective_blind_or_straddle(
-            index
-        )
-        if self.state.starting_stacks[index] > posted:
+        if label not in self.seating or not self._all_in_from_forced_bet(label):
             return ""
         return " (игрок ушёл в олл-ин ещё на анте с блайндом и ходить не может)"
 

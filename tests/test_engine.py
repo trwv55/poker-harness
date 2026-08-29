@@ -155,3 +155,82 @@ def test_forfeit_of_blind_all_in_is_honoured():
     assert en.report.final_pot == 4136  # Total pot рума, вместе с мёртвыми 136
     assert en.report.stacks_end["e0fb14f7"] == 0  # назад не вернулось ничего
     assert en.report.stacks_end["ce115272"] == 38_247  # победитель забрал весь банк
+
+
+def test_validation_rejects_misdirected_pot():
+    """Банк правильного размера, уехавший не тому игроку.
+
+    Ни одна из остальных проверок такого не ловит: реплей легален, `final_pot`
+    сходится с `Total pot`, карты не дублируются, фишки сохраняются. Ловит только
+    сверка стеков с выплатами, записанными самим румом.
+    """
+    h = normalize(parse_hand(SAMPLE, source_ref="x"))
+    bad = h.model_copy(deep=True)
+    for entry in bad.collected:
+        entry.label = "Hero"  # банк записан проигравшему
+    en = enrich(bad)
+    assert en.report.illegal_actions == []  # реплей прошёл без единой претензии
+    assert en.report.final_pot == 20391  # и банк ровно тот же
+    assert en.verdict.status == "reject"
+    assert any("payout" in r for r in en.verdict.reasons)
+
+
+def test_voluntary_all_in_fold_is_not_forfeited():
+    """Лишний `folds` после ДОБРОВОЛЬНОГО олл-ина форфейтом не считается.
+
+    Такую строку даёт сбой распознавания или баг парсера. Если принять её за
+    форфейт, из руки вылетит живой игрок, а его банк молча уедет сопернику —
+    ровно та подмена денег, ради которой правило и держится узким.
+    """
+    raw = RawHand(
+        provenance=Provenance.HAND_HISTORY,
+        source_ref="x",
+        hand_no="P1",
+        tournament_id="1",
+        tournament_name="T",
+        level=1,
+        sb=1000,
+        bb=2000,
+        ante=0,
+        timestamp=datetime(2026, 8, 20, 1, 2, 3),  # noqa: DTZ001
+        table_name="1",
+        max_seats=3,
+        button_seat=3,
+        seats=[
+            SeatInfo(seat=1, label="A", stack=20_000),
+            SeatInfo(seat=2, label="Hero", stack=40_000),
+            SeatInfo(seat=3, label="C", stack=40_000),
+        ],
+        posts=[
+            Post(label="A", kind=PostKind.SMALL_BLIND, amount=1000),
+            Post(label="Hero", kind=PostKind.BIG_BLIND, amount=2000),
+        ],
+        actions=[
+            RawAction(street=Street.PREFLOP, label="C", kind=ActionKind.FOLD, raw_line="C: folds"),
+            RawAction(
+                street=Street.PREFLOP,
+                label="A",
+                kind=ActionKind.RAISE,
+                amount=19_000,
+                to_amount=20_000,
+                is_all_in=True,  # олл-ин добровольный, а не с блайнда
+                raw_line="A: raises 19,000 to 20,000 and is all-in",
+            ),
+            RawAction(
+                street=Street.PREFLOP,
+                label="Hero",
+                kind=ActionKind.CALL,
+                amount=18_000,
+                raw_line="Hero: calls 18,000",
+            ),
+            RawAction(street=Street.PREFLOP, label="A", kind=ActionKind.FOLD, raw_line="A: folds"),
+        ],
+        boards={Street.FLOP: ["2c", "7d", "9h"], Street.TURN: ["Jc"], Street.RIVER: ["4s"]},
+        dealt={"A": ["Ac", "Ad"], "Hero": ["Kc", "Kd"]},
+        collected=[Collected(label="A", amount=40_000)],
+        summary=SummaryInfo(total_pot=40_000, rake=0, jackpot=0, bingo=0, fortune=0, tax=0),
+    )
+    en = enrich(normalize(raw))
+    assert en.report.forfeits == []  # живого игрока из руки не вывели
+    assert en.verdict.status == "reject"  # лишняя строка названа, а не проглочена
+    assert any("A: folds" in r for r in en.verdict.reasons)
