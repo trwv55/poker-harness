@@ -9,6 +9,7 @@ from harness.analysis.tools.pushfold import (
     call_shove_ev_bb,
     class_equity,
     default_call_prob,
+    equity_vs_range_classes,
     fold_equity_ok,
     nash_hu,
     shove_ev_bb,
@@ -316,19 +317,21 @@ def test_bracket_wide_is_about_top_40_percent():
     assert all(w == 1.0 for w in wide.weights.values())
 
 
-@pytest.mark.slow
-def test_bracket_wide_is_derived_from_equity_against_a_random_hand():
-    # Состав широкого конца вилки не выбирается руками: классы упорядочены по
-    # эквити против случайной руки (это и есть метрика пуш-фолда — руки идут на
-    # вскрытие), и берётся столько верхних, чтобы доля комбо была ближе всего к 40%.
-    # Тест воспроизводит вывод независимо от реализации и требует совпадения состава.
+def _wide_expected_at(depth: float) -> set[str]:
+    """Независимый пересчёт состава широкой вилки: порядок по эквити ПРОТИВ ШОВА."""
     from harness.analysis.tools.equity import combos_of_class
 
+    push, _ = nash_hu(depth)
     live = _live_combo_share()
     classes = all_classes()
-    strength = {
-        h: sum(live[(h, c)] * class_equity(h, c) for c in classes) for h in classes
-    }
+
+    strength: dict[str, float] = {}
+    for hero in classes:
+        weighted = sum(
+            live[(hero, h)] * push.weight(h) * class_equity(hero, h) for h in classes
+        )
+        mass = sum(live[(hero, h)] * push.weight(h) for h in classes)
+        strength[hero] = weighted / mass
     ordered = sorted(classes, key=lambda c: (-strength[c], c))
 
     target = 0.40 * 1326
@@ -337,12 +340,61 @@ def test_bracket_wide_is_derived_from_equity_against_a_random_hand():
         cumulative += len(combos_of_class(cls))
         if abs(cumulative - target) < best_gap:
             best_gap, best_prefix = abs(cumulative - target), position
-    expected = set(ordered[:best_prefix])
+    return set(ordered[:best_prefix])
 
-    assert set(BRACKET_WIDE(10.0).weights) == expected
-    # и порядок действительно осмысленный: премиум наверху, мусор внизу
-    assert ordered[0] == "AA"
-    assert ordered[-1] == "32o"
+
+@pytest.mark.slow
+def test_bracket_wide_is_ranked_by_equity_against_the_shoving_range():
+    # Состав широкого конца вилки не выбирается руками И не ранжируется против
+    # случайной руки: коллер отвечает на ШОВ, поэтому руки упорядочены по эквити
+    # против равновесного диапазона шова на той же глубине. Тест воспроизводит
+    # вывод независимо и требует совпадения состава.
+    for depth in (5.0, 10.0):
+        assert set(BRACKET_WIDE(depth).weights) == _wide_expected_at(depth), depth
+
+
+@pytest.mark.slow
+def test_small_pair_is_in_the_wide_bracket_at_every_depth():
+    # Существенное последствие смены критерия: при ранжировании против СЛУЧАЙНОЙ
+    # руки двойка вылетала из вилки (0.5036 при границе 0.5231), хотя любой
+    # лузовый оппонент коллирует шов с 22. Против диапазона шова она проходит
+    # на всех глубинах — вилка снова ограничивает поведение оппонента сверху.
+    for depth in (5.0, 10.0, 15.0, 20.0):
+        assert "22" in BRACKET_WIDE(depth).weights, depth
+
+
+@pytest.mark.slow
+def test_small_pair_vs_weak_ace_ordering_flips_with_the_width_of_the_shove():
+    # Порядок «22 против A2o» не абсолютный, он зависит от ШИРИНЫ диапазона шова,
+    # и это проверяется на обоих концах, чтобы фиксировать механизм, а не якорь.
+    # Против узкого шова (25bb, 36% комбо) впереди пара: узкий шов — это в основном
+    # старшие карты и пары, слабый туз там доминирован. Против широкого (10bb,
+    # 58% комбо) впереди туз: в широком диапазоне много несвязанного мусора, против
+    # которого туз-хай выигрывает, а двойка остаётся позади любой старшей пары.
+    narrow, _ = nash_hu(25.0)
+    wide, _ = nash_hu(10.0)
+    assert narrow.fraction_of_hands() < 0.40 < wide.fraction_of_hands()
+
+    assert equity_vs_range_classes("22", narrow) > equity_vs_range_classes("A2o", narrow)
+    assert equity_vs_range_classes("22", wide) < equity_vs_range_classes("A2o", wide)
+
+
+@pytest.mark.slow
+def test_bracket_wide_leaves_suited_connectors_out():
+    # Не регресс, а свойство: колл шова — это вскрытие, а разыгрываемость, ради
+    # которой одномастные коннекторы держат, там не существует. Они вне вилки и
+    # по старому критерию, и по новому.
+    wide = BRACKET_WIDE(10.0).weights
+    for cls in ("65s", "76s", "87s"):
+        assert cls not in wide, cls
+
+
+@pytest.mark.slow
+def test_bracket_wide_moves_with_depth():
+    # Диапазон шова на 5bb заметно шире, чем на 15bb, поэтому и порядок сил
+    # против него другой: состав вилки обязан зависеть от глубины, иначе аргумент
+    # "ранжируем против шова" не работает.
+    assert set(BRACKET_WIDE(5.0).weights) != set(BRACKET_WIDE(15.0).weights)
 
 
 def test_bracket_wide_contains_tight_at_every_depth():
