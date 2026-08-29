@@ -10,16 +10,23 @@
 Арифметика внутри ветки точная; приближение здесь ровно одно — сами колл-диапазоны
 (их задаёт вызывающая сторона, и она же помечает вывод зоной доверия).
 
-Ограничение модели, которое стоит знать. Стеки сравниваются в координатах «за
-спиной» (`hero_behind_bb` против `behind_bb` коллера), а посты каждого игрока
-по отдельности в API не передаются — известна только их сумма `pot_dead_bb`.
-Поэтому формула банка `pot_dead + hero_behind + Σ min(behind_i, hero_behind)`
-верна, когда суммарный вклад коллера не меньше суммарного вклада героя (обычный
-случай: коллер покрывает героя либо стеки равны — тогда меньший `behind` коллера
-компенсирован его большим постом, как у BB против SB). Если же коллер реально
-короче героя по общему вкладу, непокрытый остаток шова герою должен был бы
-вернуться, а модель считает его проигранным — оценка получается консервативной
-(заниженной). Точный учёт требует знать посты по игрокам, то есть менять контракт.
+Стеки сравниваются по СУММАРНОМУ вкладу игрока (`posted + behind`), а не по
+остатку за спиной. Это не педантизм: шов не может быть заколлирован на сумму
+больше, чем есть у коллера, и непокрытый остаток герою возвращается. Модель,
+сравнивавшая только остатки за спиной, систематически занижала EV шова против
+короткого коллера (на примере «герой 10, коллер 4, мёртвых 1.5, эквити 0.5» —
+-2.25bb вместо верных +0.75bb). Смещение было односторонним и удерживало от
+правильных шовов, то есть порождало правдоподобно неверный вердикт — ровно тот
+отказ, ради предотвращения которого этот продукт и существует. Поэтому посты
+входят в контракт: `CallerModel.posted_bb` и `hero_posted_bb`.
+
+Что в модели осталось приближением. При нескольких коллерах разной глубины
+настоящая раздача образует основной банк и сайд-поты, у которых РАЗНЫЕ составы
+вскрытия (в сайд-поте короткого коллера уже нет). Здесь весь контест считается
+одним банком с эквити против всех заколлировавших сразу. Эквити против большего
+числа оппонентов ниже, поэтому сайд-пот недооценивается — остаточное смещение
+того же знака, но на порядок меньше снятого: оно возникает только когда коллеры
+разной глубины и оба заколлировали.
 """
 
 from __future__ import annotations
@@ -56,10 +63,17 @@ _MIN_FOLD_PROB = 1e-6
 
 @dataclass(frozen=True)
 class CallerModel:
-    """Игрок позади: его модель колл-диапазона и стек за спиной (после постов)."""
+    """Игрок позади: модель колл-диапазона, стек за спиной и уже поставленное им.
+
+    `behind_bb` — то, чем он ещё может заплатить; `posted_bb` — его блайнд/анте,
+    уже лежащие в банке. Сумма этих двух и есть его вклад, которым меряется, на
+    сколько он способен заколлировать шов. Ноль по умолчанию означает «весь банк
+    состоит из чужих денег» — это осмысленный расклад, а не заглушка.
+    """
 
     call_range: Range
     behind_bb: float
+    posted_bb: float = 0.0
 
 
 def representative_combo(hero_cls: str) -> tuple[str, str]:
@@ -110,18 +124,28 @@ def shove_ev_bb(
     pot_dead_bb: float,
     callers: list[CallerModel],
     *,
+    hero_posted_bb: float = 0.0,
     equity_fn: Callable[..., float] = equity_vs_ranges,
     call_prob_fn: Callable[..., float] | None = None,
 ) -> float:
     """EV шова в bb относительно фолда (фолд = 0).
 
-    `hero_behind_bb` — стек героя за спиной (после постов), `pot_dead_bb` — весь
-    банк на момент решения, включая собственные посты героя.
+    `hero_behind_bb` — стек героя за спиной (после постов), `hero_posted_bb` — его
+    собственные блайнд и анте, `pot_dead_bb` — весь банк на момент решения, включая
+    посты всех, кто ещё в раздаче.
 
-    Ветка «все сфолдили» даёт `+pot_dead_bb`. Ветка, где заколлировало множество S,
-    даёт `equity * банк − hero_behind_bb`, где банк =
-    `pot_dead_bb + hero_behind_bb + Σ_{i∈S} min(behind_i, hero_behind_bb)`
-    (коллер короче героя вносит только свой стек — остаток шова в контест не идёт).
+    Ветка «все сфолдили» даёт `+pot_dead_bb` (герой забирает банк целиком, свои
+    посты в базлайне уже списаны). Ветка, где заколлировало множество S:
+
+    - вклад игрока = `posted + behind`; матчится не больше, чем есть у соперника,
+      поэтому герой рискует `at_risk = min(вклад героя, max вклад среди S)`,
+      а каждый коллер вносит `min(вклад_i, at_risk)`;
+    - непокрытый остаток шова возвращается герою, поэтому цена ветки — не весь
+      стек за спиной, а `at_risk − hero_posted_bb`;
+    - деньги игроков, которых в этой ветке нет (уже сбросивших до решения и
+      сбросивших в этой ветке коллеров), остаются в банке:
+      `pot_dead_bb − hero_posted_bb − Σ_{i∈S} posted_i`;
+    - вклад ветки = `equity * банк − (at_risk − hero_posted_bb)`.
     """
     if hero_behind_bb <= 0.0:
         raise ValueError(
@@ -136,6 +160,14 @@ def shove_ev_bb(
         )
     if any(c.behind_bb <= 0.0 for c in callers):
         raise ValueError("стек коллера за спиной должен быть положительным")
+    if hero_posted_bb < 0.0 or any(c.posted_bb < 0.0 for c in callers):
+        raise ValueError("уже поставленное не может быть отрицательным")
+    posted_total = hero_posted_bb + sum(c.posted_bb for c in callers)
+    if posted_total > pot_dead_bb + 1e-9:
+        raise ValueError(
+            f"сумма постов ({posted_total}) больше банка ({pot_dead_bb}): банк на момент "
+            f"решения обязан включать посты всех, кто ещё в раздаче"
+        )
 
     prob_fn = call_prob_fn or default_call_prob
     probs = [prob_fn(caller, hero_cls) for caller in callers]
@@ -143,6 +175,7 @@ def shove_ev_bb(
         raise ValueError(f"вероятность колла должна лежать в [0,1], получено {probs}")
 
     hero_combo = representative_combo(hero_cls)
+    hero_total = hero_posted_bb + hero_behind_bb
     indices = range(len(callers))
 
     ev = 0.0
@@ -155,13 +188,12 @@ def shove_ev_bb(
             if not called:
                 ev += branch_prob * pot_dead_bb
                 continue
-            contested = (
-                pot_dead_bb
-                + hero_behind_bb
-                + sum(min(callers[i].behind_bb, hero_behind_bb) for i in called)
-            )
+            totals = [callers[i].posted_bb + callers[i].behind_bb for i in called]
+            at_risk = min(hero_total, max(totals))
+            others = pot_dead_bb - hero_posted_bb - sum(callers[i].posted_bb for i in called)
+            contested = others + at_risk + sum(min(total, at_risk) for total in totals)
             equity = equity_fn(hero_combo, [callers[i].call_range for i in called])
-            ev += branch_prob * (equity * contested - hero_behind_bb)
+            ev += branch_prob * (equity * contested - (at_risk - hero_posted_bb))
     return ev
 
 
@@ -206,6 +238,7 @@ def fold_equity_ok(callers: list[CallerModel]) -> bool:
     """
     prob_all_fold = prod(1.0 - c.call_range.fraction_of_hands() for c in callers)
     return prob_all_fold > _MIN_FOLD_PROB
+
 
 
 # --- Bracket-модели колл-диапазона (вход bracket-теста зоны, задача 12) ---------

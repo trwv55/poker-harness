@@ -17,10 +17,31 @@ from harness.contracts import Range, all_classes, class_of
 
 
 def test_shove_ev_headsup_computed():
-    # Hero SB: стек 10bb, поставил 0.5 -> за спиной 9.5; BB за спиной 9.0; в банке 1.5
+    # Hero SB: стек 10bb, поставил 0.5 -> за спиной 9.5; BB: стек 10bb, поставил 1.0,
+    # за спиной 9.0; в банке 1.5 — это ровно два поста, чужих денег в банке нет.
     # фолд-ветка (0.6): +1.5bb (весь банк, включая свои 0.5 — они в базлайне уже потеряны)
-    # колл-ветка (0.4): банк 1.5+9.5+9.0=20 -> 0.4*20 - 9.5 = -1.5bb
+    # колл-ветка (0.4): вклады равны (10.0 и 10.0), непокрытого остатка нет,
+    #   банк 0 + 10 + 10 = 20 -> 0.4*20 - (10 - 0.5) = -1.5bb
     # EV = 0.6*1.5 + 0.4*(-1.5) = +0.3bb
+    caller = CallerModel(call_range=Range(weights={"AA": 1.0}), behind_bb=9.0, posted_bb=1.0)
+    ev = shove_ev_bb(
+        "32o",
+        hero_behind_bb=9.5,
+        pot_dead_bb=1.5,
+        callers=[caller],
+        hero_posted_bb=0.5,
+        equity_fn=lambda *a, **k: 0.40,
+        call_prob_fn=lambda *a: 0.4,
+    )
+    assert abs(ev - 0.3) < 1e-9
+
+
+def test_shove_ev_same_spot_without_posts_is_a_different_and_correct_number():
+    # Тот же расклад, но посты не заданы (по умолчанию 0): тогда 1.5 в банке —
+    # это чужие мёртвые деньги, вклад героя 9.5 против 9.0 коллера, и непокрытые
+    # 0.5 герою возвращаются. Банк 1.5 + 9 + 9 = 19.5, вклад 0.4*19.5 - 9 = -1.2.
+    # EV = 0.6*1.5 + 0.4*(-1.2) = +0.42. Это не расхождение с якорем выше, а
+    # другая раздача: без постов модель обязана вернуть непокрытый остаток.
     caller = CallerModel(call_range=Range(weights={"AA": 1.0}), behind_bb=9.0)
     ev = shove_ev_bb(
         "32o",
@@ -30,7 +51,7 @@ def test_shove_ev_headsup_computed():
         equity_fn=lambda *a, **k: 0.40,
         call_prob_fn=lambda *a: 0.4,
     )
-    assert abs(ev - 0.3) < 1e-9
+    assert abs(ev - 0.42) < 1e-9
 
 
 def test_shove_ev_multiway_enumerates_subsets():
@@ -62,20 +83,78 @@ def test_shove_ev_everyone_folds_wins_whole_dead_pot():
     assert abs(ev - 2.25) < 1e-9
 
 
-def test_shove_ev_caller_shorter_than_hero_contributes_only_his_stack():
-    # Коллер за спиной держит 4bb против 9bb героя: в контест входит min(4, 9) = 4,
-    # остаток его стека в банк не идёт. Банк = 1.5 + 9 + 4 = 14.5.
-    # p_call = 1 -> ветка одна: 0.5 * 14.5 - 9 = -1.75
+def test_shove_ev_short_caller_returns_hero_uncalled_remainder():
+    # Регрессия на систематическое смещение, найденное ревью. Герой шовит 10bb,
+    # единственный коллер может поставить только 4bb, чужих мёртвых денег 1.5.
+    # Непокрытые 6bb шова герою ВОЗВРАЩАЮТСЯ: в контесте 1.5 + 4 + 4 = 9.5,
+    # риск 4. Вклад = 0.5 * 9.5 - 4 = +0.75bb.
+    # Прежняя формула (банк = pot_dead + hero_behind + min(behind_i, hero_behind))
+    # давала -2.25bb — она считала непокрытый остаток проигранным.
     short = CallerModel(call_range=Range(weights={"AA": 1.0}), behind_bb=4.0)
     ev = shove_ev_bb(
         "KK",
-        hero_behind_bb=9.0,
+        hero_behind_bb=10.0,
         pot_dead_bb=1.5,
         callers=[short],
         equity_fn=lambda *a, **k: 0.5,
         call_prob_fn=lambda *a: 1.0,
     )
-    assert abs(ev - (0.5 * 14.5 - 9.0)) < 1e-9
+    assert abs(ev - 0.75) < 1e-9
+
+
+def test_shove_ev_short_caller_with_posts_accounts_them_in_totals():
+    # Тот же по форме спот, но 1.5 в банке — это посты самих игроков, а не чужие
+    # деньги: герой 0.5 + 10 = 10.5 вклада, коллер 1.0 + 3 = 4.0. Матчится 4.0,
+    # чужих денег в банке нет: контест 0 + 4 + 4 = 8, риск сверх поста 4 - 0.5.
+    # Вклад = 0.5 * 8 - 3.5 = +0.5bb — не +0.75: посты меняют, кто сколько внёс.
+    short = CallerModel(call_range=Range(weights={"AA": 1.0}), behind_bb=3.0, posted_bb=1.0)
+    ev = shove_ev_bb(
+        "KK",
+        hero_behind_bb=10.0,
+        pot_dead_bb=1.5,
+        callers=[short],
+        hero_posted_bb=0.5,
+        equity_fn=lambda *a, **k: 0.5,
+        call_prob_fn=lambda *a: 1.0,
+    )
+    assert abs(ev - 0.5) < 1e-9
+
+
+def test_shove_ev_at_risk_is_the_largest_caller_not_every_caller():
+    # Позади короткий A (1.0 + 3.0 = 4.0) и покрывающий B (0 + 10.0), герой 0.5 + 9.5.
+    # Сколько герой рискует, определяет САМЫЙ БОЛЬШОЙ вклад среди заколлировавших,
+    # а каждый коллер вносит не больше своего вклада:
+    #   ()     -> +1.5
+    #   {A}    -> чужих 0, риск 4,  банк 4 + 4 = 8       -> 0.5*8 - 3.5  = +0.5
+    #   {B}    -> чужих 1.0 (пост A остаётся в банке), риск 10,
+    #             банк 1 + 10 + 10 = 21                   -> 0.5*21 - 9.5 = +1.0
+    #   {A, B} -> чужих 0, риск 10, банк 10 + 4 + 10 = 24 -> 0.5*24 - 9.5 = +2.5
+    short = CallerModel(call_range=Range(weights={"AA": 1.0}), behind_bb=3.0, posted_bb=1.0)
+    covering = CallerModel(call_range=Range(weights={"KK": 1.0}), behind_bb=10.0)
+    ev = shove_ev_bb(
+        "QQ",
+        hero_behind_bb=9.5,
+        pot_dead_bb=1.5,
+        callers=[short, covering],
+        hero_posted_bb=0.5,
+        equity_fn=lambda *a, **k: 0.5,
+        call_prob_fn=lambda *a: 0.5,
+    )
+    assert abs(ev - 0.25 * (1.5 + 0.5 + 1.0 + 2.5)) < 1e-9
+
+
+def test_shove_ev_rejects_posts_exceeding_the_pot():
+    # Посты не могут быть больше банка: иначе "чужие деньги" в ветке уходят в минус,
+    # и банк тихо занижается. Это ошибка вызывающей стороны, а не повод считать.
+    caller = CallerModel(call_range=Range(weights={"AA": 1.0}), behind_bb=9.0, posted_bb=1.0)
+    with pytest.raises(ValueError, match="постов"):
+        shove_ev_bb(
+            "AA",
+            hero_behind_bb=9.5,
+            pot_dead_bb=1.0,
+            callers=[caller],
+            hero_posted_bb=0.5,
+        )
 
 
 def test_shove_ev_passes_only_calling_ranges_to_equity_fn():
@@ -161,8 +240,9 @@ def test_shove_ev_default_call_prob_is_used_when_not_injected():
         callers=[caller],
         equity_fn=lambda *a, **k: 0.10,
     )
+    # без постов: банк 1.5 + 9.0 + 9.0 = 19.5, риск = min(9.5, 9.0) = 9.0
     p = 6 / 1225
-    want = (1 - p) * 1.5 + p * (0.10 * 20.0 - 9.5)
+    want = (1 - p) * 1.5 + p * (0.10 * 19.5 - 9.0)
     assert abs(ev - want) < 1e-12
 
 
@@ -234,6 +314,7 @@ def test_bracket_wide_is_about_top_40_percent():
     wide = BRACKET_WIDE(10.0)
     assert abs(wide.fraction_of_hands() - 0.40) < 0.01
     assert all(w == 1.0 for w in wide.weights.values())
+
 
 
 def test_bracket_wide_contains_tight_at_every_depth():
