@@ -73,7 +73,7 @@
 
 ```
 poker-harness/
-  src/
+  src/harness/
     contracts/      # RawHand, CanonicalHand, EnrichedHand, Range, AnalysisResult
     parsers/        # vision_adapter.py (LLM), hh_parser.py (код)
     normalizer/     # RawHand -> CanonicalHand
@@ -91,6 +91,9 @@ poker-harness/
   scripts/          # spike_vision.py (выкидной, §13) и пр. разовые
   docs/superpowers/specs/
 ```
+
+Корневой пакет `harness`: пакет верхнего уровня `platform` затенял бы stdlib-модуль
+`platform`.
 
 **Правило зависимостей.** Конвейерные пакеты (`contracts`, `parsers`, `normalizer`,
 `engine`, `analysis`, `explanation`) не импортируют ни Телеграм, ни БД — все данные им
