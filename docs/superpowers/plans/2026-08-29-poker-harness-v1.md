@@ -369,6 +369,7 @@ def test_grid(path, expected_hands):
     for en in enriched:
         # каждая рука проходит валидатор без эскалаций (HH = факт)
         assert en.verdict.status == "pass", (en.hand.hand_no, en.verdict)
+        assert en.hand.summary is not None          # сужение для pyright (tests в include)
         # банк, пересчитанный движком, сходится с SUMMARY (rake в фикстурах = 0)
         assert en.report.final_pot == en.hand.summary.total_pot, en.hand.hand_no
         assert en.hand.summary.rake == 0
@@ -376,7 +377,7 @@ def test_grid(path, expected_hands):
         assert all(v >= 0 for v in en.report.stacks_end.values())
         start = sum(p.stack for p in en.hand.players)
         end = sum(en.report.stacks_end.values())
-        assert start == end + 0  # rake 0: фишки не исчезают
+        assert start == end      # rake 0: фишки не исчезают
 ```
 
 - [ ] **Step 2: убедиться, что xfail** — `uv run pytest tests/test_regression_grid.py -q` → 2 xfailed.
