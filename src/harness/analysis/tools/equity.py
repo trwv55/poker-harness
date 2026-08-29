@@ -30,6 +30,14 @@ _DEFAULT_ITERATIONS_HEADS_UP = 200_000
 _DEFAULT_ITERATIONS_MULTIWAY = 100_000
 _DEFAULT_SEED = 42
 
+# Кап на число попыток раздать оппонентам непересекающиеся руки на одной итерации MC.
+# Без кепа `while True` может не завершиться никогда, если пространство комбо у оппонентов
+# исчерпано настолько, что коллизия гарантирована на каждой попытке (например, у обоих
+# оппонентов после раздачи в диапазоне остаётся ровно одно и то же комбо). 10 000 — с большим
+# запасом: даже при 5% шансе успеха на попытку случайный отказ практически невозможен, а
+# по-настоящему исчерпанное пространство падает за сотые доли секунды.
+_MAX_COLLISION_ATTEMPTS = 10_000
+
 _ComboSource = tuple[list[tuple[str, str]], list[float]]  # (комбо, кумулятивные веса)
 
 
@@ -92,7 +100,8 @@ def _mc_equity(
 
     На каждой итерации сэмплируется по одному комбо на каждый источник (при
     коллизии карт между оппонентами — вся выборка итерации отбрасывается и
-    берётся заново), дораздаётся борд до 5 карт, вскрытие сравнивается через
+    берётся заново, не более `_MAX_COLLISION_ATTEMPTS` раз — иначе `ValueError`,
+    а не зависание), дораздаётся борд до 5 карт, вскрытие сравнивается через
     `eval7.evaluate`. Ничья между несколькими игроками делится поровну.
     """
     if len(board) > 5:
@@ -106,7 +115,7 @@ def _mc_equity(
 
     wins = 0.0
     for _ in range(iterations):
-        while True:
+        for _attempt in range(_MAX_COLLISION_ATTEMPTS):
             used = set(dead)
             opponent_hands: list[tuple[str, str]] = []
             collided = False
@@ -119,6 +128,13 @@ def _mc_equity(
                 opponent_hands.append(combo)
             if not collided:
                 break
+        else:
+            raise ValueError(
+                f"не удалось раздать оппонентам непересекающиеся руки за "
+                f"{_MAX_COLLISION_ATTEMPTS} попыток — диапазоны оппонентов не допускают "
+                f"коллизионно-свободной раздачи (слишком мало живых комбо относительно "
+                f"числа оппонентов)"
+            )
 
         remaining = [c for c in _FULL_DECK if c not in used]
         extra_board = [eval7.Card(c) for c in rand.sample(remaining, n_to_deal)]

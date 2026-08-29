@@ -1,3 +1,7 @@
+import threading
+
+import pytest
+
 from harness.analysis.tools.equity import equity_hand_vs_hand, equity_vs_range
 from harness.contracts import Range, all_classes
 
@@ -48,3 +52,40 @@ def test_multiway_blockers_can_raise_equity():
     one = equity_vs_ranges(("Qs", "Qh"), [ak])
     two = equity_vs_ranges(("Qs", "Qh"), [ak, ak])
     assert two > one + 0.03  # эффект крупный, это не шум выборки
+
+
+def test_multiway_collision_exhaustion_raises_instead_of_hanging():
+    # У обоих оппонентов после исключения дохлых карт остаётся ровно одно и то же
+    # комбо (Ac Kc) — каждая попытка раздачи гарантированно коллизирует. Раньше
+    # `while True:` в _mc_equity не имел кепа и висел вечно; воспроизведено ревьюером
+    # с 8-секундным watchdog. Гоняем в отдельном потоке с join(timeout=...): если
+    # регрессия вернёт бесконечный цикл, тест упадёт по таймауту, а не подвесит сьют.
+    from harness.analysis.tools.equity import equity_vs_ranges
+
+    r = Range(weights={"AKs": 1.0})
+    outcome: list[BaseException | None] = [None]
+
+    def run() -> None:
+        try:
+            equity_vs_ranges(("Qs", "Qh"), [r, r], board=["As", "Ah", "Ad"], iterations=1)
+        except BaseException as exc:  # noqa: BLE001 — ловим что угодно, чтобы не молчать
+            outcome[0] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout=8.0)
+    assert not thread.is_alive(), "equity_vs_ranges завис вместо того, чтобы поднять ValueError"
+    assert isinstance(outcome[0], ValueError)
+
+
+def test_equity_vs_range_empty_range_raises():
+    with pytest.raises(ValueError):
+        equity_vs_range(("Qs", "Qh"), Range())
+
+
+def test_equity_vs_range_fully_blocked_range_raises():
+    # диапазон — только AKs (4 комбо, по одному на масть); если у героя и на борде
+    # заняты все 4 туза, ни один комбо не выживает — диапазон заблокирован целиком.
+    r = Range(weights={"AKs": 1.0})
+    with pytest.raises(ValueError):
+        equity_vs_range(("As", "Ah"), r, board=["Ad", "Ac", "2c"])
