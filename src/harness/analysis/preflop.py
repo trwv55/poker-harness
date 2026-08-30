@@ -740,6 +740,132 @@ def _taken_ev(taken: str, active: str, ev: float) -> float:
     return ev if taken == active else 0.0
 
 
+# Порог дешёвого префильтра (задача 13, SCALING.md §3): доля веса шова в
+# равновесном чарте на САМОЙ КОРОТКОЙ глубине среди живых позади героя — той,
+# что даёт равновесию САМЫЙ ШИРОКИЙ шов (короче эффективный стек — шире шов,
+# см. замер в комментарии к `_DEPTH_STEP_BB`: 72o/32o/83o на 10.25bb с тремя
+# позади дают ПОЛОЖИТЕЛЬНУЮ EV шова именно за счёт фолд-эквити более узкого
+# поля). Если даже на этой, самой щедрой к шову глубине чарт не даёт классу
+# героя веса больше десятой доли, дальше можно не считать: полный перебор
+# подмножеств с сеткой ширин колл-диапазона (`_unopened_verdict`) способен
+# только СУЗИТЬ обоснование шова относительно этой оценки — больше живых
+# позади означает больше шансов быть отвеченным, а не меньше, — и развернуть
+# вердикт в сторону шова он не может. Порог найден не подбором: 0.1 — это то
+# же число, которым отсекается сама сводка скана (задача 13, `< -0.1bb`), и
+# смысл тот же: цена ошибки ниже него всё равно не попала бы в список.
+_PREFILTER_PUSH_WEIGHT_MAX = 0.1
+
+
+def cheap_fold_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | None:
+    """Дешёвый вердикт «фолд верен» для тривиального неоткрытого фолда — рычаг скана.
+
+    Не альтернатива `verdict_for`, а обгон перед ним. Большинство рук турнирного
+    файла — «сфолдил в неоткрытый банк, отдал блайнды» (SCALING.md §3), и для
+    них дорогая часть расчёта (`shove_ev_bb`: перебор 2^n подмножеств коллеров
+    на КАЖДОЙ из точек сетки ширин, с Монте-Карло на мультивее) ничего не меняет
+    в выводе — чарт уже уверенно говорит «фолд». Эта функция закрывает именно
+    такую точку одним попаданием в закешированный равновесный push-чарт
+    (`_push_model`, тот же самый, которым уже пользуется `_unopened_verdict`),
+    без единого вызова эквити-инструментов.
+
+    Возвращает `None`, если условия не выполняются или чарт не даёт уверенного
+    «фолд» (весом >= 0.9) — тогда точку обязан посчитать `verdict_for` целиком:
+    отказ здесь не констатирует ошибку, а лишь снимает с себя право её судить
+    дёшево. Это гарантирует отсутствие ложных «расхождения нет» на настоящих
+    промахах: см. `_PREFILTER_PUSH_WEIGHT_MAX`.
+
+    Зона проставляется тем же правилом, что и в `zone_for` для хедз-апа: точный
+    расчёт (`strict`, без допущения) — только для SB против BB один на один,
+    где колл-диапазон не угадан, а взят из равновесия. На мультивее полного
+    перебора здесь нет, а значит нет и bracket-теста, который мог бы подтвердить
+    устойчивость к ширине диапазона колла — зона обязана быть `assuming` с
+    показанным допущением (контракт `PointVerdict._assumption_matches_zone`),
+    как и для любого другого мультивей-вывода в этом модуле.
+    """
+    if dp.street is not Street.PREFLOP or dp.action.kind is not ActionKind.FOLD:
+        return None
+    state = table_state(dp, en)
+    if spot_for(dp, state) is not SpotKind.PUSHFOLD_UNOPENED:
+        return None
+
+    hero_cls = _hero_class(en.hand)
+    if hero_cls is None:
+        return None
+    behind_all = state.behind_hero
+    behind = [s for s in behind_all if s.behind > 0]
+    if len(behind) != len(behind_all):
+        # Живой олл-ин позади (короткий блайнд ушёл в олл-ин постом) — вне
+        # модели шова, как и в `_unopened_verdict` (там это `all_in_behind`,
+        # принудительно ведущее к `assuming`). Дешёвый лукап такую точку не
+        # обязан разбирать — она уходит на полный расчёт, который знает, что
+        # с ней делать.
+        return None
+    if not behind or state.hero.behind <= 0:
+        return None
+    if len(behind) > _MAX_MODELLED_CALLERS:
+        # Перебор подмножеств в `_unopened_verdict` на таком числе коллеров сам
+        # не считается (2^n веток) и возвращает точку БЕЗ вердикта — дешёвый
+        # лукап не имеет права быть увереннее полного расчёта там, где тот
+        # прямо отказывается судить.
+        return None
+
+    bb = en.hand.bb
+    hero_eff = state.hero.stack_after_ante
+    depths = [min(hero_eff, seat.stack_after_ante) / bb for seat in behind]
+    dead_bb = _table_dead_bb(state)
+    shortest_depth = min(depths)
+    push_range = _push_model(shortest_depth, dead_bb)
+    push_weight = push_range.weight(hero_cls)
+    if push_weight > _PREFILTER_PUSH_WEIGHT_MAX:
+        return None
+
+    equilibrium_depth = None
+    if dp.live_total == 2 and len(behind) == 1 and behind[0].position == "BB":
+        equilibrium_depth = _equilibrium_depth(min(hero_eff, behind[0].stack_after_ante) / bb)
+
+    if equilibrium_depth is not None:
+        zone = Zone.STRICT
+        why = "хедз-ап SB против BB: колл-диапазон взят из равновесия пуш-фолда"
+        assumption = None
+    else:
+        zone = Zone.ASSUMING
+        why = (
+            f"дешёвый префильтр: вес шова в равновесном чарте {push_weight:.3f} <= "
+            f"{_PREFILTER_PUSH_WEIGHT_MAX} на самой короткой глубине среди живых "
+            f"позади — полная сетка ширин колл-диапазона не проверялась"
+        )
+        assumption = Assumption(
+            range=push_range,
+            source="model:nash_hu_push_prefilter",
+            note=(
+                "дешёвый префильтр смотрит равновесный push-чарт на самой короткой "
+                "глубине среди живых позади вместо полного перебора подмножеств "
+                "коллеров и сетки ширин их диапазона"
+            ),
+        )
+
+    detail: dict[str, object] = {
+        "method": "prefilter_chart_lookup",
+        "hero_class": hero_cls,
+        "push_weight": round(push_weight, 6),
+        "lookup_depth_bb": round(shortest_depth, 2),
+        "dead_extra_bb": round(dead_bb, 4),
+        "zone_reason": why,
+    }
+    return PointVerdict(
+        dp_index=dp.index,
+        street=dp.street,
+        spot=SpotKind.PUSHFOLD_UNOPENED,
+        zone=zone,
+        action_taken="fold",
+        best_action="fold",
+        ev_diff_bb=0.0,
+        assumption=assumption,
+        tools=["nash_hu"],
+        detail=detail,
+    )
+
+
 def verdict_for(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict:
     """Вердикт по одной точке решения героя.
 

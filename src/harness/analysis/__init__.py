@@ -13,11 +13,12 @@ from __future__ import annotations
 
 from harness.analysis.classifier import classify
 from harness.analysis.error_cost import rank_points, total_ev_loss_bb
-from harness.analysis.preflop import verdict_for, zone_for
+from harness.analysis.preflop import cheap_fold_verdict, verdict_for, zone_for
 from harness.contracts import AnalysisResult, EnrichedHand
 
 __all__ = [
     "analyze_hand",
+    "cheap_fold_verdict",
     "classify",
     "rank_points",
     "total_ev_loss_bb",
