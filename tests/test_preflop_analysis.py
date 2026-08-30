@@ -221,19 +221,15 @@ def test_fixture_hand_correct_call_not_flagged():
     hero_points = [p for p in res.points if p.spot == "pushfold_facing_shove"]
     assert len(hero_points) == 1
     p = hero_points[0]
+    # strict здесь не по улице, а по правилу зоны: колл 141 в банк 14532 верен
+    # против любого диапазона (порог эквити 0.96%) и при любом поведении живого
+    # BB за героем — вилка устойчива по обеим осям, допущение нагрузки не несёт.
+    assert p.zone == "strict" and p.assumption is None
     assert p.ev_diff_bb >= -0.05
     assert p.best_action == "call" and p.action_taken == "call"
-    # Вилка вердикт подтверждает с обоих концов: колл 141 в банк 14532 верен против
-    # любого диапазона (порог эквити 0.96%).
     assert p.detail["bracket"] == "stable"
     assert p.detail["required_equity"] < 0.01
-    # Зона при этом `assuming`, и не из-за диапазона: за героем остался живой BB,
-    # а `call_shove_ev_bb` считает вскрытие один на один. Его возможный колл в
-    # модель не входит, эквити героя завышено — заявлять точность нельзя.
-    # (Бриф ожидал здесь `strict`; правило «живые за героем -> assuming» принято
-    # координатором позже и этот случай перекрывает.)
-    assert p.detail["live_others"] == 1
-    assert p.zone == "assuming" and p.assumption is not None
+    assert p.detail["live_others"] == 1  # игрок позади есть, но вердикт не двигает
 
 
 def test_synthetic_bad_open_shove_flagged():
@@ -703,18 +699,13 @@ def test_ante_can_flip_the_verdict_from_mistake_to_correct():
 # --- Живые игроки за героем при колле шова --------------------------------------
 
 
-def test_facing_shove_with_live_players_behind_is_assuming():
-    """`call_shove_ev_bb` считает вскрытие один на один — живые за героем не учтены.
+def test_live_players_behind_do_not_force_assuming_when_verdict_is_unmoved():
+    """Живые за героем сами по себе точность не отменяют — отменяет их влияние.
 
-    Смещение направлено в сторону колла, поэтому заявлять точность нельзя, как бы
-    ни повела себя вилка диапазонов.
+    AA против шова верны и один на один, и когда малый блайнд тоже заколлирует.
+    Вторая ось вилки это проверяет, а не постулирует: категорическое «живые
+    позади -> assuming» недо-заявляло бы там, где заявлять есть что.
     """
-    en = _make_facing_shove_hand(hero_cards=("Ah", "Ad"), eff_bb=12.0, shover_bb=12.0)
-    alone = analyze_hand(en).points[0]
-    assert alone.detail["live_others"] == 0
-    assert alone.zone == "strict" and alone.detail["bracket"] == "stable"
-
-    # тот же спот, но большой блайнд ещё не сказал своего слова (герой в малом)
     stacks = {**dict.fromkeys(_SIX_MAX_SEATS, 96), "SB": 24, "UTG": 24}
     labels, seats, posts = _six_max(stacks, "SB")
     actions = [_shove(labels["UTG"], 24)]
@@ -724,7 +715,44 @@ def test_facing_shove_with_live_players_behind_is_assuming():
     raw = _raw(
         seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["Ah", "Ad"]}
     )
-    with_behind = analyze_hand(enrich(normalize(raw))).points[0]
-    assert with_behind.detail["live_others"] == 1
-    assert with_behind.detail["bracket"] == "stable"  # вилка вердикт подтверждает
-    assert with_behind.zone == "assuming" and with_behind.assumption is not None
+    p = analyze_hand(enrich(normalize(raw))).points[0]
+    assert p.detail["live_others"] == 1
+    assert p.detail["bracket"] == "stable"
+    assert p.zone == "strict" and p.assumption is None
+
+
+def test_players_behind_axis_is_computed_and_can_disagree():
+    """Вторая ось считается и умеет расходиться с первой.
+
+    A2o против шова 12bb: один на один колл плюсовой (+0.72bb), а если малый
+    блайнд тоже войдёт — минусовой (−2.00bb). Ось помечена `unstable`, зона
+    `assuming`.
+
+    Изолированного случая, где вторая ось двигает вердикт, а первая нет, найти
+    не удалось (перебор по глубинам шовера 5–20bb, стекам героя, анте и 21 классу
+    рук — ноль попаданий): узкий конец `BRACKET_TIGHT` настолько тесен, что везде
+    срабатывает раньше. Поэтому саму развилку проверяет модульный тест на
+    `zone_for`, а здесь — что ось действительно считается по руке.
+    """
+    stacks = {**dict.fromkeys(_SIX_MAX_SEATS, 96), "SB": 24, "UTG": 24}
+    labels, seats, posts = _six_max(stacks, "SB")
+    actions = [_shove(labels["UTG"], 24)]
+    actions += [_fold(labels[pos]) for pos in ("HJ", "CO", "BTN")]
+    actions.append(_call("Hero", 23, all_in=True))
+    actions.append(_fold(labels["BB"]))
+    raw = _raw(
+        seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["Ah", "2c"]}
+    )
+    p = analyze_hand(enrich(normalize(raw))).points[0]
+    assert p.detail["ev_call_bb"] > 0.0 > p.detail["ev_call_all_behind_bb"]
+    assert p.detail["behind_axis"] == "unstable"
+    assert p.zone == "assuming" and p.assumption is not None
+    assert "позади" in p.assumption.note
+
+
+def test_zone_for_takes_the_players_behind_axis():
+    assert zone_for("call", "call", live_total=4, best_model="call", best_behind=("call",))[0] == (
+        "strict"
+    )
+    z, why = zone_for("call", "call", live_total=4, best_model="call", best_behind=("fold",))
+    assert z == "assuming" and "позади" in why

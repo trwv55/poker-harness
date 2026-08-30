@@ -51,7 +51,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from harness.analysis.classifier import (
     SeatSnapshot,
@@ -237,6 +237,7 @@ def zone_for(
     live_total: int,
     equilibrium: bool = True,
     best_model: str | None = None,
+    best_behind: Sequence[str] = (),
 ) -> tuple[Zone, str]:
     """Зона доверия точки и причина, по которой она такая (спека §5.5).
 
@@ -248,9 +249,20 @@ def zone_for(
     `nash_hu` — там мёртвый малый блайнд и другой шовер. Такая точка судится
     вилкой, как мультивей.
 
-    При трёх и более живых зона `strict` выдаётся только тогда, когда вердикт от
-    модели диапазонов не зависит: **все три** расчёта — узкий конец вилки, широкий
-    конец и сама модель — дают один ответ.
+    При трёх и более живых зона `strict` выдаётся только тогда, когда вердикт не
+    зависит ни от чего немоделированного. Проверяется это вилкой по ДВУМ осям, и
+    `strict` требует одного ответа на всех её концах:
+
+    * ось диапазона — узкий конец, широкий конец и сама модель (`best_model`);
+    * ось игроков позади (`best_behind`) — расчёт в предположении, что живые за
+      героем тоже входят в банк, против расчёта, где не входит никто.
+
+    Вторая ось нужна там, где эти игроки в саму модель не входят: `call_shove_ev_bb`
+    считает вскрытие один на один. Категорическое «живые позади — значит assuming»
+    было бы проще, но оно недо-заявляет: на руке `SAMPLE` герою нужно 0.96% эквити
+    при 54% против любых двух карт, и никакое поведение игрока позади этот колл
+    неверным не сделает. Зона обязана говорить, что обосновано, а не страховаться
+    от всего, чего не умеет посчитать.
 
     Требование про `best_model` появилось не из соображений строгости, а по факту
     с реальных рук. Вилка `BRACKET_TIGHT`/`BRACKET_WIDE` собрана как модель
@@ -265,13 +277,23 @@ def zone_for(
     """
     if live_total == 2 and equilibrium:
         return Zone.STRICT, "хедз-ап SB против BB: колл-диапазон взят из равновесия пуш-фолда"
-    verdicts = {best_tight, best_wide} | ({best_model} if best_model is not None else set())
-    if len(verdicts) == 1:
+    by_range = {best_tight, best_wide} | ({best_model} if best_model is not None else set())
+    by_behind = set(best_behind)
+    if len(by_range | by_behind) == 1:
         stable = (
             f"вердикт «{best_tight}» не меняется ни против узкой, ни против широкой "
-            f"модели диапазона — допущение на него не влияет"
+            f"модели диапазона"
+            + (", ни если живые за героем тоже войдут в банк" if by_behind else "")
+            + " — допущение на него не влияет"
         )
         return Zone.STRICT, stable
+    if len(by_range) == 1 and by_behind - by_range:
+        moved = ", ".join(sorted(by_behind - by_range))
+        by_behind_reason = (
+            f"вердикт «{best_tight}» держится на том, что живые позади не войдут в "
+            f"банк: если войдут, лучше «{moved}»"
+        )
+        return Zone.ASSUMING, by_behind_reason
     if best_model is not None and best_model not in (best_tight, best_wide):
         unsupported = (
             f"вердикт «{best_model}» держится на модели диапазона: вилка его не "
@@ -395,6 +417,18 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
         equilibrium=equilibrium_depth is not None,
         best_model=best,
     )
+    # Та же вторая ось, что и при колле шова, но здесь она в основном уже внутри
+    # модели: перебор подмножеств интегрирует поведение игроков позади с их
+    # вероятностями, а вилка диапазонов сдвигает эти вероятности от «почти никто
+    # не коллирует» (узкий конец) до «коллирует каждый третий» (широкий). Поэтому
+    # отдельного конца добавлять нечего — кроме случая, когда живой игрок позади
+    # в модель не попал вовсе. Тогда ось немоделирована, и `strict` заявлять не о
+    # чем, как и при колле шова.
+    if all_in_behind:
+        zone, why = Zone.ASSUMING, (
+            f"позади героя {all_in_behind} живых уже в олл-ине: модель шова их не "
+            f"перебирает, и их влияние на вердикт не проверено"
+        )
     taken = "shove" if state.hero_all_in_after else "fold"
     folds_possible = fold_equity_ok(callers(model_ranges))
 
@@ -466,6 +500,44 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
     ev_tight = ev(BRACKET_TIGHT(shover_depth_bb))
     ev_wide = ev(BRACKET_WIDE(shover_depth_bb))
 
+    # Вторая ось вилки: живые за героем. `call_shove_ev_bb` считает вскрытие один
+    # на один, поэтому их возможный вход в банк — величина, которой в модели нет
+    # вовсе. Считаем противоположный конец: все они коллируют. Эквити героя тогда
+    # делится на всех (хуже для него), но и банк растёт на их деньги (лучше), —
+    # обе поправки берутся вместе, иначе конец вилки был бы искусственно мрачным.
+    # Арифметика та же самая, из замороженного инструмента: подменяется только
+    # набор диапазонов на вскрытии и размер банка.
+    behind = [
+        seat
+        for seat in state.seats
+        if seat.live and seat.label not in (state.hero.label, shover.label)
+    ]
+    behind_unmodelled = len(behind) > _MAX_MODELLED_CALLERS
+    best_behind: list[str] = []
+    ev_behind: float | None = None
+    if behind and not behind_unmodelled:
+        behind_ranges = [
+            _call_model(min(seat.stack_after_ante, state.hero.stack_after_ante) / bb, dead_bb)
+            for seat in behind
+        ]
+        pot_with_behind_bb = (state.pot_before + _extra_from_behind(state, behind)) / bb
+
+        def ev_all(rng: Range) -> float:
+            return call_shove_ev_bb(
+                hero_cls,
+                hero_bb,
+                rng,
+                pot_with_behind_bb,
+                to_call_bb,
+                equity_fn=_equity_with_behind(behind_ranges),
+            )
+
+        ev_behind = ev_all(model_range)
+        best_behind = [
+            _best_of("call", ev_all(rng))
+            for rng in (model_range, BRACKET_TIGHT(shover_depth_bb), BRACKET_WIDE(shover_depth_bb))
+        ]
+
     equilibrium_depth = None
     if (
         dp.live_total == 2
@@ -479,32 +551,32 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
 
     best_tight, best_wide = _best_of("call", ev_tight), _best_of("call", ev_wide)
     best = _best_of("call", ev_model)
+    # Две оси разводятся в `detail` намеренно: они отвечают на разные вопросы —
+    # «зависит ли вывод от угаданного диапазона» и «зависит ли он от того, войдут
+    # ли живые позади». Слепить их в один флаг значило бы лишить изложение
+    # возможности назвать причину.
     bracket_call = "stable" if {best_tight, best_wide, best} == {best} else "unstable"
+    # «Ось сдвинула вердикт» — значит расчёт с вошедшими в банк игроками позади
+    # даёт не то, что выдала модель. Сравнивать надо именно с вердиктом модели, а
+    # не с объединением концов вилки: иначе ось молчала бы всякий раз, когда
+    # диапазонная вилка и так неустойчива, то есть ровно там, где смотреть на неё
+    # интереснее всего.
+    behind_moved = bool(set(best_behind) - {best})
+    behind_axis = None if not best_behind else ("unstable" if behind_moved else "stable")
     zone, why = zone_for(
         best_tight,
         best_wide,
         live_total=dp.live_total,
         equilibrium=equilibrium_depth is not None,
         best_model=best,
+        best_behind=best_behind,
     )
-    taken = "call" if dp.action.kind is ActionKind.CALL else "fold"
-
-    # Живые игроки, которые ещё могут ответить на шов после героя, в модель не
-    # входят: `call_shove_ev_bb` считает вскрытие один на один. Если кто-то из
-    # них тоже заколлирует, эквити героя окажется ниже посчитанной — смещение
-    # направлено в сторону колла. Правильно моделировать их — отдельная работа;
-    # честный ответ до неё — перестать заявлять точность, как бы ни повела себя
-    # вилка. Недо-заявить безопасно, пере-заявить — тот единственный отказ,
-    # ради которого правило зоны и существует.
-    live_others = sum(
-        1 for s in state.seats if s.live and s.label not in (state.hero.label, shover.label)
-    )
-    if live_others:
-        zone = Zone.ASSUMING
-        why = (
-            f"за героем ещё {live_others} живых: модель считает вскрытие один на один, "
-            f"их возможный колл в неё не входит — эквити героя завышено"
+    if behind_unmodelled:
+        zone, why = Zone.ASSUMING, (
+            f"живых за героем {len(behind)} — больше, чем модель вскрытия способна "
+            f"перебрать, их влияние на вердикт не проверено"
         )
+    taken = "call" if dp.action.kind is ActionKind.CALL else "fold"
 
     detail: dict[str, object] = {
         "method": "call_ev",
@@ -518,7 +590,9 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         "dead_extra_bb": round(dead_bb, 4),
         # Считаются все живые, кроме героя и шовера: уже походивший опенер тоже
         # может ответить на шов, поэтому «ещё не действовавших» было бы занижением.
-        "live_others": live_others,
+        "live_others": len(behind),
+        "behind_axis": behind_axis,
+        "ev_call_all_behind_bb": None if ev_behind is None else round(ev_behind, 4),
         "zone_reason": why,
     }
     return PointVerdict(
@@ -535,9 +609,9 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
                 source="model:nash_hu_push",
                 note=_ASSUMPTION_SHOVER
                 + (
-                    f"; кроме того, живых за героем {live_others} — их возможный колл "
-                    f"модель вскрытия не учитывает"
-                    if live_others
+                    f"; вдобавок вердикт двигают {len(behind)} живых позади — "
+                    f"если они тоже войдут в банк, лучше сыграть иначе"
+                    if behind_moved
                     else ""
                 ),
             )
@@ -547,6 +621,36 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         tools=["nash_hu", "call_shove_ev_bb", "required_equity"],
         detail=detail,
     )
+
+
+def _extra_from_behind(state: TableState, behind: Sequence[SeatSnapshot]) -> int:
+    """Сколько фишек добавят в банк героя живые позади, если тоже заколлируют.
+
+    Каждый доколлирует до уровня ставки, но не больше своего стека; из этого
+    герой способен выиграть лишь то, что покрыто его собственным вкладом, —
+    потолок тот же, по которому движок считает `pot_before`.
+    """
+    ceiling = state.hero.stack
+    level = max(seat.street_committed for seat in state.seats)
+    total = 0
+    for seat in behind:
+        final = min(seat.stack, seat.ante + level)
+        total += max(min(final, ceiling) - min(seat.contributed, ceiling), 0)
+    return total
+
+
+def _equity_with_behind(behind_ranges: Sequence[Range]) -> Callable[..., float]:
+    """Эквити героя на вскрытии, куда добавлены диапазоны живых позади.
+
+    Подменяет только эквити: сама арифметика банка остаётся в `call_shove_ev_bb`,
+    иначе формулу денег пришлось бы написать второй раз — ровно тот дубль, на
+    котором этот проект уже ловил расхождение.
+    """
+
+    def fn(hero: _HeroCombo, ranges: Sequence[Range]) -> float:
+        return _model_equity(hero, [*ranges, *behind_ranges])
+
+    return fn
 
 
 def _best_of(active: str, ev: float) -> str:
