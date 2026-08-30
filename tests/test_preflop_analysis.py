@@ -804,20 +804,28 @@ def test_k5o_interior_reversal_is_assuming():
     assert "внутри" in p.detail["zone_reason"]
 
 
-def test_narrow_end_of_the_polled_interval_can_object():
-    """Узкий конец интервала — не «только премиум»: он обязан уметь возражать.
+def test_premium_tight_end_never_objects_and_that_is_honest():
+    """Против премиум-границы шов плюсовой чем угодно — и это факт об игре.
 
-    При 3% колла фолд-эквити делает плюсовым шов чем угодно, поэтому вердикт
-    «надо было пасовать» не мог стать `strict` структурно. Узкий конец теперь
-    начинается с ширины, на которой возражение возможно.
+    72o на 10.25bb против поля, коллирующего только JJ+/AK, даёт +1.76bb: когда
+    оппоненты почти никогда не коллируют, фолд-эквити огромно. Отсюда вердикт
+    «пас был верен» и правда зависит от того, что коллируют достаточно часто, и
+    `assuming` — честный для него ярлык, а не дефект вилки.
+
+    Поднять узкий конец до 20% значило бы не убрать допущение, а создать его —
+    «никто никогда не коллирует теснее 20%». Правдоподобная нижняя граница
+    колл-поведения будет измерена популяционными частотами (ступень 3); до тех
+    пор широкий интервал консервативнее.
     """
-    from harness.analysis.preflop import _SHOVE_CALL_WIDTHS
+    from harness.analysis.preflop import _PREMIUM_KEY
 
-    assert min(_SHOVE_CALL_WIDTHS) >= 0.15
-    assert max(_SHOVE_CALL_WIDTHS) == 1.0  # фолд-эквити исчезает полностью
-    en = _ante_table_shove(5, hero_cards=("Kc", "5d"), behind=3, depth_bb=10.25, seats_count=8)
-    widths = analyze_hand(en).points[0].detail["ev_shove_by_width_bb"]
-    assert widths[str(min(_SHOVE_CALL_WIDTHS))] < 0.0  # возразил
+    en = _ante_table_shove(5, hero_cards=("7c", "2d"), behind=3, depth_bb=10.25, seats_count=8)
+    p = analyze_hand(en).points[0]
+    widths = p.detail["ev_shove_by_width_bb"]
+    assert widths[_PREMIUM_KEY] > 1.0  # мусорный шов против премиум-поля прибылен
+    assert min(widths.values()) < 0.0  # но не против поля, которое коллирует
+    assert p.best_action == "fold"
+    assert p.zone == "assuming" and p.assumption is not None
 
 
 # --- Цена не должна опираться на то, что вторая ось уже опровергла ---------------
