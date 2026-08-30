@@ -41,6 +41,7 @@ class SeatSnapshot:
     label: str
     position: str
     stack: int  # стартовый стек — потолок всего, что игрок способен вложить в руку
+    ante: int  # уплаченное анте — мёртвые деньги, входящие в решаемую игру
     contributed: int  # вложено в руку к этому моменту: анте + блайнд + добровольное
     street_committed: int  # из этого — поставлено на текущей улице
     live: bool  # ещё в руке
@@ -50,6 +51,15 @@ class SeatSnapshot:
     def behind(self) -> int:
         """Остаток стека за спиной."""
         return self.stack - self.contributed
+
+    @property
+    def stack_after_ante(self) -> int:
+        """Стек за вычетом анте — глубина игры, которую решает `nash_hu`.
+
+        Равновесие берёт анте отдельным слагаемым мёртвых денег, поэтому глубину
+        ему надо давать уже без него: иначе анте посчитается дважды.
+        """
+        return self.stack - self.ante
 
 
 @dataclass(frozen=True)
@@ -159,6 +169,7 @@ def table_state(dp: DecisionPoint, en: EnrichedHand) -> TableState:
             label=p.label,
             position=p.position,
             stack=p.stack,
+            ante=ante[p.label],
             contributed=ante[p.label] + committed[p.label],
             street_committed=committed[p.label],
             live=live[p.label],

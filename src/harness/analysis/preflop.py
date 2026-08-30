@@ -8,6 +8,14 @@
 структуры, а считать поправку не из чего — инструмент `icm_equities` ждёт
 источника выплат.
 
+**Анте стола входит в решаемую игру.** Продукт заявлен для MTT с анте, и брать
+равновесие игры без анте значило бы судить не ту раздачу: на фикстуре семь анте
+по 0.125bb дают 0.875bb мёртвых денег сверх 1.5bb блайндов, и равновесие без них
+на 10bb теснее на 12.4 п.п. комбо по пушу и на 13.8 п.п. по коллу. Теснее — значит
+верные шовы помечались бы ошибкой, а для тренажёра ложное обвинение хуже
+пропущенной ошибки: оно учит пасовать там, где надо входить. Поэтому `nash_hu`
+получает `dead_extra_bb` (сумма анте стола), а глубину — уже за вычетом анте.
+
 **Правило зоны.** Точный расчёт есть только там, где колл-диапазон не угадан:
 хедз-ап SB против BB решается равновесием `nash_hu`. При трёх и более живых
 мультивей-равновесия у нас нет, колл-диапазоны игроков позади моделируются, и
@@ -18,6 +26,12 @@
 (почему требуется третье совпадение — в докстринге `zone_for`). Ошибка, которую
 правило предотвращает, ровно одна и односторонняя: объявить устойчивым вывод,
 который на деле держится на догадке, значит переоценить собственную уверенность.
+
+**Живые игроки за героем при колле шова.** `call_shove_ev_bb` считает вскрытие
+один на один. Если за героем остались живые, их возможный колл в модель не
+входит, и эквити героя завышено — смещение направлено в сторону колла. Правильно
+моделировать их — отдельная работа; до неё зона такой точки принудительно
+`assuming`, как бы ни повела себя вилка диапазонов.
 
 **Границы применимости, за которыми вердикта нет.** Модель описывает ровно две
 формы: «шов или пас в неоткрытый банк» и «колл или пас против ОДНОГО открытого
@@ -52,6 +66,7 @@ from harness.analysis.tools.pot_odds import required_equity
 from harness.analysis.tools.pushfold import (
     BRACKET_TIGHT,
     BRACKET_WIDE,
+    MAX_DEAD_EXTRA_BB,
     CallerModel,
     call_shove_ev_bb,
     equity_vs_range_classes,
@@ -101,6 +116,12 @@ _MAX_MODEL_DEPTH_BB = 25.0
 # (2^n веток). Спот с большим числом живых позади остаётся без вердикта — цена,
 # посчитанная по урезанному составу оппонентов, была бы правдоподобно неверной.
 _MAX_MODELLED_CALLERS = 7
+
+# Шаг сетки мёртвых денег (сумма анте стола в bb). Нужен ровно затем же, зачем
+# сетка глубин: без него каждый уровень блайндов заводил бы своё равновесие. Шаг
+# 0.05bb — меньше половины типичного анте одного игрока (0.125-0.15bb), то есть
+# заведомо мельче зернистости самой структуры.
+_DEAD_STEP_BB = 0.05
 
 # Итераций Монте-Карло на ветку с двумя и более коллерами. Хедз-ап-ветки идут по
 # предвычисленной таблице эквити и Монте-Карло не трогают вовсе, поэтому платим
@@ -165,14 +186,39 @@ def _equilibrium_depth(depth_bb: float) -> float | None:
     return key
 
 
-def _call_model(depth_bb: float) -> Range:
+def _dead_key(dead_bb: float) -> float:
+    """Мёртвые деньги, округлённые до сетки и зажатые окном `nash_hu`.
+
+    Верхний зажим — деградация вместо падения. Гвард в `nash_hu` стоит против
+    перепутанных единиц (фишки вместо bb); здесь величина считается из настоящих
+    анте и bb, перепутать нечего, поэтому структура с невероятным анте должна
+    дать самое широкое равновесие из посчитанных, а не уронить разбор турнира.
+    На фикстурах максимум — 1.2bb при потолке 5.
+    """
+    clamped = min(max(dead_bb, 0.0), MAX_DEAD_EXTRA_BB)
+    return round(clamped / _DEAD_STEP_BB) * _DEAD_STEP_BB
+
+
+def _table_dead_bb(state: TableState) -> float:
+    """Сумма анте всего стола в bb — мёртвые деньги решаемого равновесия.
+
+    Считаются анте ВСЕХ мест, а не только живых: анте спасовавших остаётся в
+    банке и разыгрывается наравне с блайндами. Именно эта величина и была
+    потеряна в игре без анте — на фикстуре она даёт 0.875bb против 1.5bb
+    блайндов, и равновесие без неё оказывается на 12-14 п.п. комбо теснее того,
+    в которое играет пользователь.
+    """
+    return _dead_key(sum(seat.ante for seat in state.seats) / state.bb)
+
+
+def _call_model(depth_bb: float, dead_bb: float) -> Range:
     """Модель колл-диапазона игрока такой глубины — колл-сторона равновесия."""
-    return nash_hu(_depth_key(depth_bb))[1]
+    return nash_hu(_depth_key(depth_bb), dead_extra_bb=dead_bb)[1]
 
 
-def _push_model(depth_bb: float) -> Range:
+def _push_model(depth_bb: float, dead_bb: float) -> Range:
     """Модель диапазона шова игрока такой глубины — пуш-сторона равновесия."""
-    return nash_hu(_depth_key(depth_bb))[0]
+    return nash_hu(_depth_key(depth_bb), dead_extra_bb=dead_bb)[0]
 
 
 def _average_range(ranges: Sequence[Range]) -> Range:
@@ -302,7 +348,11 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
     hero_behind_bb = state.hero.behind / bb
     hero_posted_bb = state.hero.contributed / bb
     pot_dead_bb = state.pot_before / bb
-    depths = [min(ceiling, seat.stack) / bb for seat in behind]
+    dead_bb = _table_dead_bb(state)
+    # Глубина равновесия — стек ПОСЛЕ анте: само анте входит в игру отдельным
+    # слагаемым мёртвых денег, и складывать его в стек значило бы посчитать дважды.
+    hero_eff = state.hero.stack_after_ante
+    depths = [min(hero_eff, seat.stack_after_ante) / bb for seat in behind]
 
     def callers(ranges: Sequence[Range]) -> list[CallerModel]:
         return [
@@ -324,14 +374,16 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
             equity_fn=_model_equity,
         )
 
-    model_ranges = [_call_model(depth) for depth in depths]
+    model_ranges = [_call_model(depth, dead_bb) for depth in depths]
     ev_model = ev(model_ranges)
     ev_tight = ev([BRACKET_TIGHT(depth) for depth in depths])
     ev_wide = ev([BRACKET_WIDE(depth) for depth in depths])
 
     equilibrium_depth = None
     if dp.live_total == 2 and len(behind) == 1 and behind[0].position == "BB":
-        equilibrium_depth = _equilibrium_depth(min(ceiling, behind[0].stack) / bb)
+        equilibrium_depth = _equilibrium_depth(
+            min(hero_eff, behind[0].stack_after_ante) / bb
+        )
 
     best_tight, best_wide = _best_of("shove", ev_tight), _best_of("shove", ev_wide)
     best = _best_of("shove", ev_model)
@@ -356,7 +408,7 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
         "ev_shove_wide_bb": round(ev_wide, 4),
         "hero_class": hero_cls,
         "depths_bb": [round(_depth_key(depth), 2) for depth in depths],
-        "dead_beyond_blinds_bb": round(_dead_beyond_blinds(state) / bb, 4),
+        "dead_extra_bb": round(dead_bb, 4),
         "zone_reason": why,
     }
     if all_in_behind:
@@ -397,8 +449,9 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
     if state.to_call <= 0 or state.hero.behind <= 0:
         return _unjudged(dp, spot, "доплаты нет либо у героя не осталось фишек")
 
-    rivals = [seat.stack for seat in state.seats if seat.label != shover.label]
-    shover_depth_bb = min(shover.stack, max(rivals)) / bb
+    dead_bb = _table_dead_bb(state)
+    rivals = [seat.stack_after_ante for seat in state.seats if seat.label != shover.label]
+    shover_depth_bb = min(shover.stack_after_ante, max(rivals)) / bb
     pot_bb = state.pot_before / bb
     to_call_bb = state.to_call / bb
     hero_bb = state.hero.behind / bb
@@ -408,7 +461,7 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
             hero_cls, hero_bb, rng, pot_bb, to_call_bb, equity_fn=_model_equity
         )
 
-    model_range = _push_model(shover_depth_bb)
+    model_range = _push_model(shover_depth_bb, dead_bb)
     ev_model = ev(model_range)
     ev_tight = ev(BRACKET_TIGHT(shover_depth_bb))
     ev_wide = ev(BRACKET_WIDE(shover_depth_bb))
@@ -420,7 +473,9 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         and shover.position in ("SB", "BTN")
         and state.voluntary_actors == (shover.label,)
     ):
-        equilibrium_depth = _equilibrium_depth(min(state.hero.stack, shover.stack) / bb)
+        equilibrium_depth = _equilibrium_depth(
+            min(state.hero.stack_after_ante, shover.stack_after_ante) / bb
+        )
 
     best_tight, best_wide = _best_of("call", ev_tight), _best_of("call", ev_wide)
     best = _best_of("call", ev_model)
@@ -434,6 +489,23 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
     )
     taken = "call" if dp.action.kind is ActionKind.CALL else "fold"
 
+    # Живые игроки, которые ещё могут ответить на шов после героя, в модель не
+    # входят: `call_shove_ev_bb` считает вскрытие один на один. Если кто-то из
+    # них тоже заколлирует, эквити героя окажется ниже посчитанной — смещение
+    # направлено в сторону колла. Правильно моделировать их — отдельная работа;
+    # честный ответ до неё — перестать заявлять точность, как бы ни повела себя
+    # вилка. Недо-заявить безопасно, пере-заявить — тот единственный отказ,
+    # ради которого правило зоны и существует.
+    live_others = sum(
+        1 for s in state.seats if s.live and s.label not in (state.hero.label, shover.label)
+    )
+    if live_others:
+        zone = Zone.ASSUMING
+        why = (
+            f"за героем ещё {live_others} живых: модель считает вскрытие один на один, "
+            f"их возможный колл в неё не входит — эквити героя завышено"
+        )
+
     detail: dict[str, object] = {
         "method": "call_ev",
         "bracket": bracket_call,
@@ -443,14 +515,10 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         "hero_class": hero_cls,
         "required_equity": round(required_equity(state.to_call, state.pot_before), 6),
         "shover_depth_bb": round(_depth_key(shover_depth_bb), 2),
-        # Модель считает вскрытие один на один с шовером. Прочие живые игроки в
-        # неё не входят, и если кто-то из них тоже заколлирует, эквити героя
-        # окажется ниже посчитанной — смещение в сторону колла. Считаются все
-        # живые, кроме героя и шовера: уже походивший опенер тоже может ответить
-        # на шов, поэтому «ещё не действовавших» здесь было бы занижением.
-        "live_others": sum(
-            1 for s in state.seats if s.live and s.label not in (state.hero.label, shover.label)
-        ),
+        "dead_extra_bb": round(dead_bb, 4),
+        # Считаются все живые, кроме героя и шовера: уже походивший опенер тоже
+        # может ответить на шов, поэтому «ещё не действовавших» было бы занижением.
+        "live_others": live_others,
         "zone_reason": why,
     }
     return PointVerdict(
@@ -462,7 +530,17 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         best_action=best,
         ev_diff_bb=round(_taken_ev(taken, "call", ev_model) - max(ev_model, 0.0), 6),
         assumption=(
-            Assumption(range=model_range, source="model:nash_hu_push", note=_ASSUMPTION_SHOVER)
+            Assumption(
+                range=model_range,
+                source="model:nash_hu_push",
+                note=_ASSUMPTION_SHOVER
+                + (
+                    f"; кроме того, живых за героем {live_others} — их возможный колл "
+                    f"модель вскрытия не учитывает"
+                    if live_others
+                    else ""
+                ),
+            )
             if zone is Zone.ASSUMING
             else None
         ),
@@ -478,24 +556,6 @@ def _best_of(active: str, ev: float) -> str:
 
 def _taken_ev(taken: str, active: str, ev: float) -> float:
     return ev if taken == active else 0.0
-
-
-def _dead_beyond_blinds(state: TableState) -> int:
-    """Мёртвые деньги сверх двух блайндов — анте и вклады уже спасовавших.
-
-    Равновесие `nash_hu` решает игру без анте. В турнире с анте банк больше, и
-    равновесный колл чуть шире посчитанного. Величина мёртвых денег выносится в
-    `detail`, чтобы остаточное приближение было видно, а не подразумевалось.
-    """
-    heads_up = len(state.seats) == 2
-    blinds = sum(
-        seat.street_committed
-        for seat in state.seats
-        if seat.position == "BB"
-        or seat.position == "SB"
-        or (heads_up and seat.position == "BTN")
-    )
-    return max(state.pot_before - blinds, 0)
 
 
 def verdict_for(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict:

@@ -42,6 +42,8 @@ def _raw(
     actions: list[RawAction],
     dealt: dict[str, list[str]],
     ante: int = 0,
+    sb: int = _SB,
+    bb: int = _BB,
     boards: dict[Street, list[str]] | None = None,
     showdowns: list | None = None,
 ) -> RawHand:
@@ -58,8 +60,8 @@ def _raw(
         tournament_id="T1",
         tournament_name="synthetic",
         level=1,
-        sb=_SB,
-        bb=_BB,
+        sb=sb,
+        bb=bb,
         ante=ante,
         timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
         table_name="syn",
@@ -219,11 +221,19 @@ def test_fixture_hand_correct_call_not_flagged():
     hero_points = [p for p in res.points if p.spot == "pushfold_facing_shove"]
     assert len(hero_points) == 1
     p = hero_points[0]
-    # strict здесь не по улице, а по правилу зоны: колл 141 в банк 14532 верен против
-    # любого диапазона -> bracket стабилен, допущение не несёт нагрузки
-    assert p.zone == "strict" and p.assumption is None
     assert p.ev_diff_bb >= -0.05
     assert p.best_action == "call" and p.action_taken == "call"
+    # Вилка вердикт подтверждает с обоих концов: колл 141 в банк 14532 верен против
+    # любого диапазона (порог эквити 0.96%).
+    assert p.detail["bracket"] == "stable"
+    assert p.detail["required_equity"] < 0.01
+    # Зона при этом `assuming`, и не из-за диапазона: за героем остался живой BB,
+    # а `call_shove_ev_bb` считает вскрытие один на один. Его возможный колл в
+    # модель не входит, эквити героя завышено — заявлять точность нельзя.
+    # (Бриф ожидал здесь `strict`; правило «живые за героем -> assuming» принято
+    # координатором позже и этот случай перекрывает.)
+    assert p.detail["live_others"] == 1
+    assert p.zone == "assuming" and p.assumption is not None
 
 
 def test_synthetic_bad_open_shove_flagged():
@@ -616,3 +626,105 @@ def test_two_all_ins_before_hero_are_not_priced():
     )
     p = analyze_hand(enrich(normalize(raw))).points[0]
     assert p.spot == "preflop_other" and p.best_action == ""
+
+
+# --- Анте стола входит в равновесие ---------------------------------------------
+
+
+def _ante_table_shove(ante_chips: int, hero_cards: tuple[str, str] = ("Kc", "9d")):
+    """6-max, все пасуют до Hero на CO, Hero шовит 10bb. Блайнды 20/40."""
+    bb_chips, sb_chips = 40, 20
+    stack = 10 * bb_chips
+    labels = {pos: ("Hero" if pos == "CO" else pos) for pos in _SIX_MAX_SEATS}
+    seats = [
+        SeatInfo(seat=i + 1, label=labels[pos], stack=stack)
+        for i, pos in enumerate(_SIX_MAX_SEATS)
+    ]
+    posts = [Post(label=s.label, kind=PostKind.ANTE, amount=ante_chips) for s in seats if ante_chips]
+    posts += [
+        Post(label=labels["SB"], kind=PostKind.SMALL_BLIND, amount=sb_chips),
+        Post(label=labels["BB"], kind=PostKind.BIG_BLIND, amount=bb_chips),
+    ]
+    actions = [_fold(labels["UTG"]), _fold(labels["HJ"])]
+    actions.append(
+        RawAction(
+            street=Street.PREFLOP,
+            label="Hero",
+            kind=ActionKind.RAISE,
+            amount=stack,
+            to_amount=stack,
+            is_all_in=True,
+            raw_line=f"Hero: raises {stack} to {stack} and is all-in",
+        )
+    )
+    actions += [_fold(labels[pos]) for pos in ("BTN", "SB", "BB")]
+    raw = _raw(
+        seats=seats,
+        button_seat=6,
+        posts=posts,
+        actions=actions,
+        dealt={"Hero": list(hero_cards)},
+        ante=ante_chips,
+        sb=sb_chips,
+        bb=bb_chips,
+    )
+    return enrich(normalize(raw))
+
+
+def test_equilibrium_uses_table_ante_not_the_ante_free_game():
+    """Анте стола входит в решаемую игру, а не выбрасывается.
+
+    Продукт заявлен для MTT с анте. Равновесие без анте ТЕСНЕЕ разыгрываемого
+    (на 10bb пуш 58.3% против 70.7%), поэтому по нему верные шовы помечались бы
+    ошибкой — для тренажёра ложное обвинение хуже пропущенной ошибки.
+    """
+    dry = analyze_hand(_ante_table_shove(0)).points[0]
+    ante = analyze_hand(_ante_table_shove(5)).points[0]  # 5/40 = 0.125bb с игрока
+    assert dry.detail["dead_extra_bb"] == 0.0
+    assert ante.detail["dead_extra_bb"] == pytest.approx(6 * 0.125, abs=0.03)
+    # больше мёртвых денег в банке -> шов прибыльнее, и это не округление
+    assert ante.detail["ev_shove_bb"] > dry.detail["ev_shove_bb"] + 0.3
+
+
+def test_ante_can_flip_the_verdict_from_mistake_to_correct():
+    """Ровно тот отказ, ради которого правилась игра: верный шов помечался ошибкой.
+
+    K9o, шов 10bb с CO при трёх игроках позади. Без анте модель насчитывает
+    -0.29bb («вы ошиблись»), с анте стола — +0.52bb («сыграно верно»). Ложное
+    обвинение учит пасовать там, где надо входить, и рушит доверие при первой же
+    сверке с солвером.
+    """
+    dry = analyze_hand(_ante_table_shove(0, hero_cards=("Kc", "9d"))).points[0]
+    ante = analyze_hand(_ante_table_shove(5, hero_cards=("Kc", "9d"))).points[0]
+    assert dry.best_action == "fold" and dry.ev_diff_bb < -0.2
+    assert ante.best_action == "shove" and ante.ev_diff_bb == 0.0
+
+
+# --- Живые игроки за героем при колле шова --------------------------------------
+
+
+def test_facing_shove_with_live_players_behind_is_assuming():
+    """`call_shove_ev_bb` считает вскрытие один на один — живые за героем не учтены.
+
+    Смещение направлено в сторону колла, поэтому заявлять точность нельзя, как бы
+    ни повела себя вилка диапазонов.
+    """
+    en = _make_facing_shove_hand(hero_cards=("Ah", "Ad"), eff_bb=12.0, shover_bb=12.0)
+    alone = analyze_hand(en).points[0]
+    assert alone.detail["live_others"] == 0
+    assert alone.zone == "strict" and alone.detail["bracket"] == "stable"
+
+    # тот же спот, но большой блайнд ещё не сказал своего слова (герой в малом)
+    stacks = {**dict.fromkeys(_SIX_MAX_SEATS, 96), "SB": 24, "UTG": 24}
+    labels, seats, posts = _six_max(stacks, "SB")
+    actions = [_shove(labels["UTG"], 24)]
+    actions += [_fold(labels[pos]) for pos in ("HJ", "CO", "BTN")]
+    actions.append(_call("Hero", 23, all_in=True))
+    actions.append(_fold(labels["BB"]))
+    raw = _raw(
+        seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["Ah", "Ad"]}
+    )
+    with_behind = analyze_hand(enrich(normalize(raw))).points[0]
+    assert with_behind.detail["live_others"] == 1
+    assert with_behind.detail["bracket"] == "stable"  # вилка вердикт подтверждает
+    assert with_behind.zone == "assuming" and with_behind.assumption is not None

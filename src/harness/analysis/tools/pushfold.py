@@ -254,11 +254,35 @@ _DATA_DIR = Path(__file__).parent / "data"
 _EQ169_PATH = _DATA_DIR / "eq169.json"
 
 # Хедз-ап пуш-фолд: SB ставит 0.5, BB ставит 1.0, SB ходит первым — шов на весь
-# эффективный стек или фолд; BB отвечает коллом или фолдом. Все EV — в bb
-# относительно начала раздачи (до постов): фолд SB = -0.5, проход шова = +1.0,
-# вскрытие на eff_bb с каждого = 2*equity*eff_bb - eff_bb.
+# эффективный стек или фолд; BB отвечает коллом или фолдом.
+#
+# `dead_extra_bb` — мёртвые деньги сверх двух блайндов, то есть СУММА АНТЕ всего
+# стола. Без этого параметра решалась не та игра, в которую играет пользователь:
+# продукт заявлен для MTT с анте, а в фикстуре анте 0.125bb с семи игроков даёт
+# 2.375bb мёртвых денег против 1.5bb, которые предполагает игра без анте — на
+# 58% больше. Больше мёртвых денег — шире и пуш, и колл, поэтому равновесие без
+# анте ТЕСНЕЕ реально разыгрываемого, и продукт помечал бы верные шовы ошибкой.
+# Для тренажёра ложное обвинение хуже пропущенной ошибки: оно учит пасовать там,
+# где надо входить.
+#
+# Соглашение о величинах (важно, иначе анте посчитается дважды). `eff_bb` — это
+# эффективный стек ПОСЛЕ уплаты анте, то есть всё, что игрок может поставить
+# сверх своего анте. Тогда:
+#   * банк, который SB забирает при пасе BB   = 0.5 + 1.0 + dead;
+#   * банк вскрытия                            = 2*eff_bb + dead
+#     (свои анте обоих участников уже сидят внутри `dead`, а их ставки — внутри
+#     eff_bb, так что каждое слагаемое учтено ровно один раз);
+#   * риск SB относительно паса                = eff_bb - 0.5.
+# Все EV — в bb относительно состояния «анте уплачено, блайнды не поставлены»:
+# фолд SB = -0.5, проход шова = +1.0 + dead. Анте — константа в обеих ветках и
+# на равновесную стратегию не влияет.
 _SB_BLIND = 0.5
 _BB_BLIND = 1.0
+
+# Потолок мёртвых денег: 5bb сверх блайндов — это заведомо за пределами любой
+# турнирной структуры (при анте 0.15bb с девяти игроков выходит 1.35bb). Гвард
+# ловит перепутанные единицы (фишки вместо bb), а не защищает от структуры.
+MAX_DEAD_EXTRA_BB = 5.0
 
 # Fictitious play: чередование лучших ответов на СРЕДНЮЮ стратегию оппонента с
 # усреднением по итерациям (для зеро-сум игры это сходится).
@@ -419,8 +443,10 @@ def _class_priors() -> tuple[float, ...]:
     )
 
 
-def _solve_nash_hu(eff_bb: float) -> tuple[dict[str, float], dict[str, float], int, float, float]:
-    """Fictitious play для хедз-ап пуш-фолда.
+def _solve_nash_hu(
+    eff_bb: float, dead_extra_bb: float
+) -> tuple[dict[str, float], dict[str, float], int, float, float]:
+    """Fictitious play для хедз-ап пуш-фолда с мёртвыми деньгами `dead_extra_bb`.
 
     Возвращает (диапазон шова, диапазон колла, число шагов усреднения, EV SB в bb,
     достигнутый максимальный пер-хендовый регрет в bb).
@@ -435,21 +461,26 @@ def _solve_nash_hu(eff_bb: float) -> tuple[dict[str, float], dict[str, float], i
     priors = _class_priors()
     size = len(classes)
 
+    # Проход шова: SB забирает блайнд BB и все мёртвые деньги.
+    through = _BB_BLIND + dead_extra_bb
+    # Банк вскрытия: по eff_bb с каждого плюс мёртвые деньги.
+    showdown_pot = 2.0 * eff_bb + dead_extra_bb
+
     # EV шова для SB с рукой h против средней стратегии BB:
-    #   EV(h) = Σ_c P(c|h) * [ call_w(c) * (2*eq(h,c)-1)*eff + (1-call_w(c)) * (+1) ]
-    #         = 1 + Σ_c push_term[h][c] * call_w(c),   т.к. Σ_c P(c|h) = 1.
+    #   EV(h) = Σ_c P(c|h) * [ call_w(c)*(eq*банк - eff) + (1-call_w(c))*through ]
+    #         = through + Σ_c push_term[h][c] * call_w(c),   т.к. Σ_c P(c|h) = 1.
     push_term = [
         tuple(
-            conditional[h][c] * ((2.0 * equity[h][c] - 1.0) * eff_bb - _BB_BLIND)
+            conditional[h][c] * (equity[h][c] * showdown_pot - eff_bb - through)
             for c in range(size)
         )
         for h in range(size)
     ]
     # Разница "колл минус фолд" для BB с рукой b против шова руки h:
-    #   2*eq(b,h)*eff - eff + 1 (фолд стоит BB его блайнда).
+    #   eq*банк - eff + 1 (фолд стоит BB его блайнда).
     call_term = [
         tuple(
-            conditional[b][h] * (2.0 * equity[b][h] * eff_bb - eff_bb + _BB_BLIND)
+            conditional[b][h] * (equity[b][h] * showdown_pot - eff_bb + _BB_BLIND)
             for h in range(size)
         )
         for b in range(size)
@@ -465,7 +496,7 @@ def _solve_nash_hu(eff_bb: float) -> tuple[dict[str, float], dict[str, float], i
     converged = False
 
     for _step in range(1, _FP_MAX_ITERATIONS + 1):
-        shove_ev = [_BB_BLIND + sum(map(mul, push_term[h], avg_call)) for h in range(size)]
+        shove_ev = [through + sum(map(mul, push_term[h], avg_call)) for h in range(size)]
         call_minus_fold = [sum(map(mul, call_term[b], avg_push)) for b in range(size)]
 
         value = sum(
@@ -511,7 +542,8 @@ def _solve_nash_hu(eff_bb: float) -> tuple[dict[str, float], dict[str, float], i
 
     if not converged:
         raise RuntimeError(
-            f"fictitious play не сошёлся на {eff_bb} bb за {_FP_MAX_ITERATIONS} итераций "
+            f"fictitious play не сошёлся на {eff_bb} bb (мёртвых {dead_extra_bb} bb) "
+            f"за {_FP_MAX_ITERATIONS} итераций "
             f"(эксплуатируемость {gain_sb + gain_bb:.6f}, пер-хендовый регрет "
             f"{hand_regret:.6f}) — возвращать последнее среднее как равновесие нельзя"
         )
@@ -530,12 +562,17 @@ def _solve_nash_hu(eff_bb: float) -> tuple[dict[str, float], dict[str, float], i
 
 
 @cache
-def _nash_fingerprint() -> str:
-    """Отпечаток входных данных равновесия: таблица эквити и пороги сходимости.
+def _nash_fingerprint(dead_extra_bb: float) -> str:
+    """Отпечаток входных данных равновесия: таблица эквити, пороги, мёртвые деньги.
 
     Без него локальный кэш переживает и перегенерацию `eq169.json`, и смену
     порогов, и молча отдаёт равновесие, посчитанное при других входах. Имя файла
-    от этого не защищает: в нём только глубина.
+    от этого не защищает: в нём только глубина и мёртвые деньги.
+
+    Мёртвые деньги входят в отпечаток наравне с порогами, и это не
+    перестраховка: равновесие при другом анте — это равновесие ДРУГОЙ игры.
+    Файлы, записанные до появления параметра, отпечатку не соответствуют и будут
+    пересчитаны, а не прочитаны.
     """
     digest = sha256(_EQ169_PATH.read_bytes()).hexdigest()[:16]
     return (
@@ -545,20 +582,24 @@ def _nash_fingerprint() -> str:
         f"-r{_FP_MAX_HAND_REGRET_BB:g}"
         f"-d{_FP_VALUE_TOLERANCE_BB:g}"
         f"-m{_FP_MIN_AVERAGING_STEPS}"
+        f"-D{dead_extra_bb:g}"
     )
 
 
-def _read_nash_cache(path: Path, eff_bb: float) -> tuple[Range, Range, float] | None:
+def _read_nash_cache(path: Path, eff_bb: float, dead_extra_bb: float) -> tuple[Range, Range, float] | None:
     """Кэш — ускорение, а не источник истины: любое несовпадение ведёт к пересчёту.
 
-    Проверяется и отпечаток входов, и записанная внутрь глубина: имя файла
-    округляет `eff_bb` до сотых, поэтому само по себе оно ничего не гарантирует.
+    Проверяется и отпечаток входов, и записанные внутрь глубина с мёртвыми
+    деньгами: имя файла округляет обе величины до сотых, поэтому само по себе
+    оно ничего не гарантирует.
     """
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("fingerprint") != _nash_fingerprint():
+        if payload.get("fingerprint") != _nash_fingerprint(dead_extra_bb):
             return None
         if abs(float(payload["eff_bb"]) - eff_bb) > 1e-9:
+            return None
+        if abs(float(payload.get("dead_extra_bb", 0.0)) - dead_extra_bb) > 1e-9:
             return None
         return (
             Range(weights=payload["push"]),
@@ -572,6 +613,7 @@ def _read_nash_cache(path: Path, eff_bb: float) -> tuple[Range, Range, float] | 
 def _write_nash_cache(
     path: Path,
     eff_bb: float,
+    dead_extra_bb: float,
     solution: tuple[dict[str, float], dict[str, float], int, float, float],
 ) -> None:
     push, call, iterations, value, hand_regret = solution
@@ -580,8 +622,9 @@ def _write_nash_cache(
         path.write_text(
             json.dumps(
                 {
-                    "fingerprint": _nash_fingerprint(),
+                    "fingerprint": _nash_fingerprint(dead_extra_bb),
                     "eff_bb": eff_bb,
+                    "dead_extra_bb": dead_extra_bb,
                     "fp_iterations": iterations,
                     "sb_ev_bb": round(value, 6),
                     "hand_regret_bb": hand_regret,
@@ -598,28 +641,42 @@ def _write_nash_cache(
         pass  # каталог пакета может быть только для чтения — считаем без кэша
 
 
-def _nash_solution(eff_bb: float, cache_dir: Path | None) -> tuple[Range, Range, float]:
+def _nash_solution(
+    eff_bb: float, dead_extra_bb: float, cache_dir: Path | None
+) -> tuple[Range, Range, float]:
     if not _MIN_EFF_BB < eff_bb <= _MAX_EFF_BB:
         raise ValueError(
             f"эффективный стек должен лежать в ({_MIN_EFF_BB}, {_MAX_EFF_BB}] bb: "
             f"на {eff_bb} bb шов SB не покрывает даже блайнд BB либо стек слишком глубок "
             f"для пуш-фолда"
         )
+    if not 0.0 <= dead_extra_bb <= MAX_DEAD_EXTRA_BB:
+        raise ValueError(
+            f"мёртвые деньги сверх блайндов должны лежать в [0, {MAX_DEAD_EXTRA_BB}] bb, "
+            f"получено {dead_extra_bb} — похоже на фишки вместо bb"
+        )
 
     directory = Path(cache_dir) if cache_dir is not None else _DATA_DIR
-    path = directory / f"nash_hu_{eff_bb:.2f}.json"
+    path = directory / f"nash_hu_{eff_bb:.2f}_d{dead_extra_bb:.2f}.json"
 
-    cached = _read_nash_cache(path, eff_bb)
+    cached = _read_nash_cache(path, eff_bb, dead_extra_bb)
     if cached is not None:
         return cached
 
-    solution = _solve_nash_hu(eff_bb)
-    _write_nash_cache(path, eff_bb, solution)
+    solution = _solve_nash_hu(eff_bb, dead_extra_bb)
+    _write_nash_cache(path, eff_bb, dead_extra_bb, solution)
     return Range(weights=solution[0]), Range(weights=solution[1]), solution[4]
 
 
-def nash_hu(eff_bb: float, *, cache_dir: Path | None = None) -> tuple[Range, Range]:
+def nash_hu(
+    eff_bb: float, *, dead_extra_bb: float = 0.0, cache_dir: Path | None = None
+) -> tuple[Range, Range]:
     """Равновесие хедз-ап пуш-фолда на глубине `eff_bb`: (диапазон шова SB, колла BB).
+
+    `eff_bb` — эффективный стек ПОСЛЕ уплаты анте; `dead_extra_bb` — мёртвые
+    деньги сверх двух блайндов, то есть сумма анте всего стола (ноль для игры без
+    анте). Разделение обязательно: иначе анте либо теряется, либо считается
+    дважды — подробности в комментарии к `_SB_BLIND`.
 
     Игра: SB ставит 0.5, BB ставит 1.0, SB шовит на весь эффективный стек или
     фолдит, BB коллирует или фолдит. Решается fictitious play по предвычисленной
@@ -636,18 +693,20 @@ def nash_hu(eff_bb: float, *, cache_dir: Path | None = None) -> tuple[Range, Ran
     Кэш только ускоряет: при пустом, испорченном или посчитанном на других входах
     кэше считается заново и даёт тот же ответ — fictitious play детерминирован.
     """
-    push, call, _ = _nash_solution(eff_bb, cache_dir)
+    push, call, _ = _nash_solution(eff_bb, dead_extra_bb, cache_dir)
     return push, call
 
 
-def nash_hu_regret_bb(eff_bb: float, *, cache_dir: Path | None = None) -> float:
+def nash_hu_regret_bb(
+    eff_bb: float, *, dead_extra_bb: float = 0.0, cache_dir: Path | None = None
+) -> float:
     """Достигнутый максимальный пер-хендовый регрет равновесия на этой глубине, в bb.
 
     Верхняя граница на то, сколько теряет класс, сыгранный по возвращённому весу
     вместо своего лучшего чистого действия. Вызывающая сторона может по ней
     решить, имеет ли право ставить строгий вердикт на пограничную руку.
     """
-    return _nash_solution(eff_bb, cache_dir)[2]
+    return _nash_solution(eff_bb, dead_extra_bb, cache_dir)[2]
 
 
 # --- Bracket-модели колл-диапазона (вход bracket-теста зоны, задача 12) ---------

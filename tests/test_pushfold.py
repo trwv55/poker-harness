@@ -559,7 +559,7 @@ def test_nash_cached_deterministic(tmp_path):
 def test_nash_cache_is_speedup_not_source_of_truth(tmp_path):
     # Кэш обязан совпадать с расчётом с нуля: тест проходит и на пустом кэше.
     fresh_a = nash_hu(6.0, cache_dir=tmp_path / "a")
-    assert (tmp_path / "a" / "nash_hu_6.00.json").exists()
+    assert (tmp_path / "a" / "nash_hu_6.00_d0.00.json").exists()
     fresh_b = nash_hu(6.0, cache_dir=tmp_path / "b")  # другой пустой каталог
     cached = nash_hu(6.0, cache_dir=tmp_path / "a")  # тот же, но уже с файлом
     assert fresh_a == fresh_b == cached
@@ -655,7 +655,7 @@ def test_nash_cache_recomputes_on_foreign_fingerprint(tmp_path):
     # Кэш переживает перегенерацию таблицы эквити и смену порогов, поэтому без
     # отпечатка он тихо отдаёт равновесие, посчитанное на других входных данных.
     push, _ = nash_hu(9.0, cache_dir=tmp_path)
-    path = tmp_path / "nash_hu_9.00.json"
+    path = tmp_path / "nash_hu_9.00_d0.00.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["fingerprint"] = "чужой-отпечаток"
     payload["push"] = {"AA": 1.0}  # заведомо неверное равновесие
@@ -670,7 +670,7 @@ def test_nash_cache_recomputes_when_stored_depth_disagrees(tmp_path):
     # Имя файла округляет глубину до сотых, поэтому одного имени мало: сверяется
     # ещё и записанный внутрь eff_bb.
     push, _ = nash_hu(9.0, cache_dir=tmp_path)
-    path = tmp_path / "nash_hu_9.00.json"
+    path = tmp_path / "nash_hu_9.00_d0.00.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["eff_bb"] = 20.0
     payload["push"] = {"AA": 1.0}
@@ -736,3 +736,41 @@ def test_nash_is_mutual_best_response():
     # на двоих) — тест проверяет, что заявленная сходимость действительно достигнута,
     # и меряет это независимо пересобранной игрой.
     assert 0.0 <= sb_gain + bb_gain < 1e-3, (sb_gain, bb_gain)
+
+
+# --- Мёртвые деньги: равновесие турнира с анте -----------------------------------
+
+
+@pytest.mark.slow
+def test_nash_hu_widens_with_dead_money(tmp_path):
+    """Анте расширяет и пуш, и колл: банк больше, входить выгоднее.
+
+    Игра без анте — не та, в которую играет пользователь. Восемь игроков с анте
+    0.125bb кладут в банк 1.0bb сверх блайндов, и равновесие без них ТЕСНЕЕ
+    реального. Продукт, судящий по нему, помечал бы верные шовы ошибкой.
+    """
+    dry_push, dry_call = nash_hu(10.0, cache_dir=tmp_path)
+    ante_push, ante_call = nash_hu(10.0, dead_extra_bb=0.875, cache_dir=tmp_path)
+    assert ante_push.fraction_of_hands() > dry_push.fraction_of_hands()
+    assert ante_call.fraction_of_hands() > dry_call.fraction_of_hands()
+
+
+def test_nash_cache_never_reuses_a_different_ante(tmp_path):
+    """Равновесие при другом анте — равновесие ДРУГОЙ игры, и кэш обязан это видеть."""
+    dry = nash_hu(6.0, cache_dir=tmp_path)[0]
+    ante = nash_hu(6.0, dead_extra_bb=1.0, cache_dir=tmp_path)[0]
+    assert (tmp_path / "nash_hu_6.00_d0.00.json").exists()
+    assert (tmp_path / "nash_hu_6.00_d1.00.json").exists()
+    assert ante.fraction_of_hands() != dry.fraction_of_hands()
+    # отпечаток различает игры даже при подменённом имени файла
+    payload = json.loads((tmp_path / "nash_hu_6.00_d1.00.json").read_text(encoding="utf-8"))
+    (tmp_path / "nash_hu_6.00_d0.00.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    assert nash_hu(6.0, cache_dir=tmp_path)[0].fraction_of_hands() == dry.fraction_of_hands()
+
+
+def test_nash_hu_rejects_dead_money_in_chips(tmp_path):
+    """Мёртвые деньги в фишках вместо bb — ошибка вызова, а не тихо другая игра."""
+    with pytest.raises(ValueError, match="фишки вместо bb"):
+        nash_hu(10.0, dead_extra_bb=750.0, cache_dir=tmp_path)
