@@ -15,6 +15,7 @@ from harness.analysis.error_cost import rank_points, total_ev_loss_bb
 from harness.analysis.preflop import zone_for
 from harness.contracts import (
     ActionKind,
+    Assumption,
     Post,
     PostKind,
     Provenance,
@@ -278,6 +279,7 @@ def test_no_llm_and_no_result_bias():
     assert en1.hand.showdowns, "рука без вскрытия сделала бы этот тест пустым"
     en2 = en1.model_copy(deep=True)
     en2.hand.showdowns = []
+    en2.hand.dealt = {"Hero": en1.hand.dealt["Hero"]}  # карты соперника убраны и отсюда
     assert analyze_hand(en1).points[0].ev_diff_bb == analyze_hand(en2).points[0].ev_diff_bb
 
 
@@ -427,7 +429,8 @@ def test_marginal_multiway_shove_is_assuming_with_shown_range():
     en = _make_multiway_shove_hand(hero_cards=("Qc", "9d"), eff_bb=10.0, players_behind=2)
     p = analyze_hand(en).points[0]
     assert p.zone == "assuming" and p.detail["bracket"] == "unstable"
-    assert p.detail["ev_shove_tight_bb"] > 0.0 > p.detail["ev_shove_wide_bb"]
+    values = list(p.detail["ev_shove_by_width_bb"].values())
+    assert min(values) < 0.0 < max(values)  # на разных ширинах вердикт разный
     assert p.best_action == "fold" and p.action_taken == "shove" and p.ev_diff_bb < 0.0
     assert p.assumption is not None
     assert p.assumption.source == "model:nash_hu_call"
@@ -444,8 +447,8 @@ def test_two_live_without_equilibrium_shape_is_judged_by_bracket():
     dp = en.report.decision_points[0]
     assert dp.live_total == 2
     p = analyze_hand(en).points[0]
-    # причина зоны — устойчивость вилки, а не равновесие
-    assert "узкой" in p.detail["zone_reason"] and "широкой" in p.detail["zone_reason"]
+    # причина зоны — устойчивость вилки по ширинам, а не равновесие
+    assert "ширине" in p.detail["zone_reason"]
     assert "равновеси" not in p.detail["zone_reason"]
 
 
@@ -501,21 +504,20 @@ def test_depth_grid_does_not_move_ev_past_reporting_threshold():
 # --- Вилка обязана накрывать саму модель ----------------------------------------
 
 
-def test_zone_is_assuming_when_model_disagrees_with_both_bracket_ends():
-    """Вердикт, который не подтверждает ни один конец вилки, `strict` быть не может.
+def test_zone_is_assuming_when_model_disagrees_with_the_whole_interval():
+    """Вердикт, которого не подтверждает ни одна ширина вилки, `strict` быть не может.
 
-    Найдено прогоном по реальной фикстуре: модель шова (пуш-сторона равновесия на
-    13.5bb — около 50% комбо) ШИРЕ широкого конца вилки (top-40%), поэтому вилка
-    её не накрывает. Обе её точки говорили «фолд», модель — «колл», и точка
-    объявлялась `strict` по совпадению концов вилки между собой. Ровно та
-    переоценка уверенности, ради предотвращения которой правило зоны и заведено.
+    Найдено прогоном по реальной фикстуре: вилка была собрана как модель
+    КОЛЛ-диапазона (top-40% на широком конце), а против шова моделью служит
+    пуш-сторона равновесия — с анте это около 70% комбо, то есть за краем вилки.
+    Концы совпадали между собой, противореча самому выданному вердикту.
+
+    Сетка ширин теперь доходит до 100% и модель заведомо накрывает, поэтому такой
+    случай на реальных руках больше не возникает — но правило остаётся как
+    защита: сетку могут однажды сузить.
     """
-    en = _make_facing_shove_hand(hero_cards=("Jd", "Th"), eff_bb=9.0, shover_bb=13.5)
-    p = analyze_hand(en).points[0]
-    assert p.detail["ev_call_bb"] > 0.0  # модель: коллировать
-    assert p.detail["ev_call_tight_bb"] < 0.0 and p.detail["ev_call_wide_bb"] < 0.0
-    assert p.best_action == "call"
-    assert p.zone == "assuming" and p.assumption is not None
+    z, why = zone_for("fold", "fold", live_total=5, best_model="call", best_interior=("fold",))
+    assert z == "assuming" and "модели" in why
 
 
 def test_zone_for_requires_model_to_agree_with_bracket():
@@ -627,36 +629,54 @@ def test_two_all_ins_before_hero_are_not_priced():
 # --- Анте стола входит в равновесие ---------------------------------------------
 
 
-def _ante_table_shove(ante_chips: int, hero_cards: tuple[str, str] = ("Kc", "9d")):
-    """6-max, все пасуют до Hero на CO, Hero шовит 10bb. Блайнды 20/40."""
+_POSITIONS_8 = ("SB", "BB", "UTG", "UTG+1", "LJ", "HJ", "CO", "BTN")
+
+
+def _ante_table_shove(
+    ante_chips: int,
+    hero_cards: tuple[str, str] = ("Kc", "9d"),
+    *,
+    behind: int = 3,
+    depth_bb: float = 10.0,
+    seats_count: int = 6,
+):
+    """Стол с анте, все пасуют до Hero, Hero шовит. Блайнды 20/40.
+
+    `behind` — сколько живых остаётся позади героя, `depth_bb` — эффективный стек
+    ПОСЛЕ анте (та же величина, что уходит в равновесие).
+    """
     bb_chips, sb_chips = 40, 20
-    stack = 10 * bb_chips
-    labels = {pos: ("Hero" if pos == "CO" else pos) for pos in _SIX_MAX_SEATS}
+    stack = round(depth_bb * bb_chips) + ante_chips
+    order = _SIX_MAX_SEATS if seats_count == 6 else _POSITIONS_8
+    act_order = list(order[2:]) + ["SB", "BB"]  # порядок хода на префлопе
+    hero_index = len(act_order) - behind - 1
+    hero_position = act_order[hero_index]
+    labels = {pos: ("Hero" if pos == hero_position else pos) for pos in order}
     seats = [
-        SeatInfo(seat=i + 1, label=labels[pos], stack=stack)
-        for i, pos in enumerate(_SIX_MAX_SEATS)
+        SeatInfo(seat=i + 1, label=labels[pos], stack=stack) for i, pos in enumerate(order)
     ]
     posts = [Post(label=s.label, kind=PostKind.ANTE, amount=ante_chips) for s in seats if ante_chips]
     posts += [
         Post(label=labels["SB"], kind=PostKind.SMALL_BLIND, amount=sb_chips),
         Post(label=labels["BB"], kind=PostKind.BIG_BLIND, amount=bb_chips),
     ]
-    actions = [_fold(labels["UTG"]), _fold(labels["HJ"])]
+    already = {"SB": sb_chips, "BB": bb_chips}.get(hero_position, 0)
+    actions = [_fold(labels[pos]) for pos in act_order[:hero_index]]
     actions.append(
         RawAction(
             street=Street.PREFLOP,
             label="Hero",
             kind=ActionKind.RAISE,
-            amount=stack,
+            amount=stack - already,
             to_amount=stack,
             is_all_in=True,
-            raw_line=f"Hero: raises {stack} to {stack} and is all-in",
+            raw_line=f"Hero: raises {stack - already} to {stack} and is all-in",
         )
     )
-    actions += [_fold(labels[pos]) for pos in ("BTN", "SB", "BB")]
+    actions += [_fold(labels[pos]) for pos in act_order[hero_index + 1 :]]
     raw = _raw(
         seats=seats,
-        button_seat=6,
+        button_seat=len(order),
         posts=posts,
         actions=actions,
         dealt={"Hero": list(hero_cards)},
@@ -756,3 +776,99 @@ def test_zone_for_takes_the_players_behind_axis():
     )
     z, why = zone_for("call", "call", live_total=4, best_model="call", best_behind=("fold",))
     assert z == "assuming" and "позади" in why
+
+
+# --- Вилка опрашивает интервал, а не два его конца -------------------------------
+
+
+def test_k5o_interior_reversal_is_assuming():
+    """Контрпример координатора: вердикт переворачивается ВНУТРИ интервала.
+
+    K5o, шов 10.25bb, анте стола 8 x 0.125bb, двое позади. На обоих концах
+    опрашиваемого интервала шов плюсовой (+0.50bb против 20% колла, +0.64bb
+    против 100%), а внутри — минусовой на 35%, 50% и 65%. Опрос двух концов
+    объявил бы вердикт устойчивым на интервале, внутри которого он дважды меняет
+    знак: `strict` стоял бы на выводе, который сам себя опровергает.
+    """
+    en = _ante_table_shove(5, hero_cards=("Kc", "5d"), behind=2, depth_bb=10.25, seats_count=8)
+    p = analyze_hand(en).points[0]
+    widths = p.detail["ev_shove_by_width_bb"]
+    values = list(widths.values())
+
+    # то, что увидел бы опрос концов: оба говорят «шов»
+    assert values[0] > 0.0 and values[-1] > 0.0
+    # то, что видит опрос интервала: внутри вердикт обратный
+    assert min(values[1:-1]) < 0.0
+    assert p.detail["dead_extra_bb"] == pytest.approx(1.0, abs=0.03)
+    assert p.zone == "assuming" and p.assumption is not None
+    assert "внутри" in p.detail["zone_reason"]
+
+
+def test_narrow_end_of_the_polled_interval_can_object():
+    """Узкий конец интервала — не «только премиум»: он обязан уметь возражать.
+
+    При 3% колла фолд-эквити делает плюсовым шов чем угодно, поэтому вердикт
+    «надо было пасовать» не мог стать `strict` структурно. Узкий конец теперь
+    начинается с ширины, на которой возражение возможно.
+    """
+    from harness.analysis.preflop import _SHOVE_CALL_WIDTHS
+
+    assert min(_SHOVE_CALL_WIDTHS) >= 0.15
+    assert max(_SHOVE_CALL_WIDTHS) == 1.0  # фолд-эквити исчезает полностью
+    en = _ante_table_shove(5, hero_cards=("Kc", "5d"), behind=3, depth_bb=10.25, seats_count=8)
+    widths = analyze_hand(en).points[0].detail["ev_shove_by_width_bb"]
+    assert widths[str(min(_SHOVE_CALL_WIDTHS))] < 0.0  # возразил
+
+
+# --- Цена не должна опираться на то, что вторая ось уже опровергла ---------------
+
+
+def test_price_does_not_charge_for_a_reproach_the_second_axis_refutes():
+    """A2o: колл плюсовой один на один и минусовой, если малый блайнд тоже войдёт.
+
+    Упрекать игрока за пас на 0.72bb, когда мы сами посчитали, что при входе
+    игрока позади колл теряет 2bb, нельзя: это число ведёт и ранжирование, и
+    сумму потерь руки.
+    """
+    stacks = {**dict.fromkeys(_SIX_MAX_SEATS, 96), "SB": 24, "UTG": 24}
+    labels, seats, posts = _six_max(stacks, "SB")
+    actions = [_shove(labels["UTG"], 24)]
+    actions += [_fold(labels[pos]) for pos in ("HJ", "CO", "BTN")]
+    actions.append(_fold("Hero"))
+    actions.append(_fold(labels["BB"]))
+    raw = _raw(
+        seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["Ah", "2c"]}
+    )
+    res = analyze_hand(enrich(normalize(raw)))
+    p = res.points[0]
+    assert p.detail["ev_call_bb"] > 0.0 > p.detail["ev_call_all_behind_bb"]
+    assert p.ev_diff_bb == 0.0  # упрёк снят, хотя модель одна на один советует колл
+    assert res.total_ev_loss_bb == 0.0
+
+
+# --- Инвариант зоны закреплён в контракте ---------------------------------------
+
+
+def test_point_verdict_rejects_a_broken_zone_invariant():
+    from pydantic import ValidationError
+
+    from harness.contracts import PointVerdict, Range, SpotKind, Zone
+
+    def build(zone: Zone, assumption: Assumption | None) -> PointVerdict:
+        return PointVerdict(
+            dp_index=0,
+            street=Street.PREFLOP,
+            spot=SpotKind.PUSHFOLD_UNOPENED,
+            zone=zone,
+            action_taken="shove",
+            best_action="shove",
+            ev_diff_bb=0.0,
+            assumption=assumption,
+        )
+
+    shown = Assumption(range=Range(weights={"AA": 1.0}), source="model:test", note="модель")
+    with pytest.raises(ValidationError, match="assuming"):
+        build(Zone.STRICT, shown)
+    with pytest.raises(ValidationError, match="assuming"):
+        build(Zone.ASSUMING, None)
+    assert build(Zone.ASSUMING, shown).zone == "assuming"

@@ -20,12 +20,14 @@
 хедз-ап SB против BB решается равновесием `nash_hu`. При трёх и более живых
 мультивей-равновесия у нас нет, колл-диапазоны игроков позади моделируются, и
 вывод обязан быть помечен как опирающийся на модель — если только он от неё не
-зависит. Последнее и проверяет bracket-тест: EV пересчитывается против заведомо
-узкой (`BRACKET_TIGHT`) и заведомо широкой (`BRACKET_WIDE`) модели, и зона
-`strict` ставится, только когда оба конца вилки И сама модель дают ОДИН вердикт
-(почему требуется третье совпадение — в докстринге `zone_for`). Ошибка, которую
-правило предотвращает, ровно одна и односторонняя: объявить устойчивым вывод,
-который на деле держится на догадке, значит переоценить собственную уверенность.
+зависит. Последнее и проверяет bracket-тест: EV пересчитывается на СЕТКЕ ширин
+диапазона, и зона `strict` ставится, только когда вердикт одинаков на всех её
+точках и совпадает с вердиктом самой модели. Опрашивать два конца было бы
+неверно: EV по ширине не монотонна, и вердикт умеет перевернуться внутри
+интервала (см. `_SHOVE_CALL_WIDTHS`). Ошибка, которую правило предотвращает,
+ровно одна и односторонняя: объявить устойчивым вывод, который на деле держится
+на догадке, значит переоценить собственную уверенность. Решение о зоне целиком
+живёт в `zone_for` — снаружи его переопределить негде.
 
 **Живые игроки за героем при колле шова.** `call_shove_ev_bb` считает вскрытие
 один на один. Если за героем остались живые, их возможный колл в модель не
@@ -64,14 +66,13 @@ from harness.analysis.classifier import (
 from harness.analysis.tools.equity import equity_vs_ranges
 from harness.analysis.tools.pot_odds import required_equity
 from harness.analysis.tools.pushfold import (
-    BRACKET_TIGHT,
-    BRACKET_WIDE,
     MAX_DEAD_EXTRA_BB,
     CallerModel,
     call_shove_ev_bb,
     equity_vs_range_classes,
     fold_equity_ok,
     nash_hu,
+    range_of_width,
 )
 from harness.analysis.tools.pushfold import (
     shove_ev_bb as _shove_ev_bb,
@@ -122,6 +123,26 @@ _MAX_MODELLED_CALLERS = 7
 # 0.05bb — меньше половины типичного анте одного игрока (0.125-0.15bb), то есть
 # заведомо мельче зернистости самой структуры.
 _DEAD_STEP_BB = 0.05
+
+# Ширины диапазона, на которых опрашивается устойчивость вердикта. Это НЕ два
+# конца: EV по ширине не монотонна, и минимум лежит внутри интервала. Замер на
+# 10.25bb с анте фикстуры и тремя игроками позади — шов K5o: +1.90bb против 3%
+# колла, -0.01 против 20%, -0.59 против 40%, -0.29 против 60%, +0.02 против 80%,
+# +0.36 против 100%. Опрос концов объявил бы вердикт устойчивым на интервале,
+# внутри которого он дважды меняет знак. Поэтому опрашивается сетка, и `strict`
+# требует одного ответа на ВСЕХ её точках.
+#
+# Нижняя граница 0.20, а не «только премиум» (3%): при 3% колла фолд-эквити
+# делает шов плюсовым чем угодно, поэтому такой конец не способен возразить
+# никогда, и вердикт «надо было пасовать» не мог стать `strict` структурно.
+# Верхняя граница 1.00 — там фолд-эквити отсутствует полностью, и шов держится
+# только на вскрытии.
+_SHOVE_CALL_WIDTHS: tuple[float, ...] = (0.20, 0.35, 0.50, 0.65, 0.80, 1.00)
+
+# Для колла против шова опрашивается ширина диапазона ШОВЕРА. Здесь узкий конец
+# осмыслен и мал: нит, шовящий только премиум, — правдоподобный оппонент, в
+# отличие от поля, коллирующего шов тремя процентами рук.
+_SHOVER_RANGE_WIDTHS: tuple[float, ...] = (0.05, 0.20, 0.40, 0.70, 1.00)
 
 # Итераций Монте-Карло на ветку с двумя и более коллерами. Хедз-ап-ветки идут по
 # предвычисленной таблице эквити и Монте-Карло не трогают вовсе, поэтому платим
@@ -237,75 +258,75 @@ def zone_for(
     live_total: int,
     equilibrium: bool = True,
     best_model: str | None = None,
+    best_interior: Sequence[str] = (),
     best_behind: Sequence[str] = (),
+    unmodelled: str = "",
 ) -> tuple[Zone, str]:
     """Зона доверия точки и причина, по которой она такая (спека §5.5).
 
-    `live_total == 2` при `equilibrium` — настоящий хедз-ап либо SB против BB
-    после пасов: колл-диапазон берётся из равновесия, угадывать нечего.
-    Флаг `equilibrium` нужен потому, что двое живых сами по себе равновесия не
-    дают: шов из ранней позиции, до которого спасовали все, кроме большого
-    блайнда, оставляет за столом двоих, но это уже не та игра, которую решает
-    `nash_hu` — там мёртвый малый блайнд и другой шовер. Такая точка судится
-    вилкой, как мультивей.
+    Здесь решается зона целиком: снаружи не осталось ни одного места, где её
+    можно было бы переопределить. Это требование к читаемости, а не к стилю —
+    изложение (задача 21) обязано объяснить игроку, почему вывод помечен так, а
+    не иначе, и собирать объяснение из двух источников оно не должно.
 
-    При трёх и более живых зона `strict` выдаётся только тогда, когда вердикт не
-    зависит ни от чего немоделированного. Проверяется это вилкой по ДВУМ осям, и
-    `strict` требует одного ответа на всех её концах:
+    Что означают аргументы:
 
-    * ось диапазона — узкий конец, широкий конец и сама модель (`best_model`);
-    * ось игроков позади (`best_behind`) — расчёт в предположении, что живые за
-      героем тоже входят в банк, против расчёта, где не входит никто.
-
-    Вторая ось нужна там, где эти игроки в саму модель не входят: `call_shove_ev_bb`
-    считает вскрытие один на один. Категорическое «живые позади — значит assuming»
-    было бы проще, но оно недо-заявляет: на руке `SAMPLE` герою нужно 0.96% эквити
-    при 54% против любых двух карт, и никакое поведение игрока позади этот колл
-    неверным не сделает. Зона обязана говорить, что обосновано, а не страховаться
-    от всего, чего не умеет посчитать.
-
-    Требование про `best_model` появилось не из соображений строгости, а по факту
-    с реальных рук. Вилка `BRACKET_TIGHT`/`BRACKET_WIDE` собрана как модель
-    КОЛЛ-диапазона (top-40% на широком конце), а против шова моделью служит
-    пуш-сторона равновесия — на 13.5bb это около 50% комбо, то есть ШИРЕ широкого
-    конца. Вилка перестаёт накрывать модель, и её концы могут совпасть между собой,
-    противореча при этом самому выданному вердикту: на фикстуре встретились точки,
-    где модель говорила «колл», оба конца — «фолд», а зона выходила `strict`.
-    Совпадение концов вилки доказывает устойчивость только того вердикта, который
-    они и дают; вердикт, которого не подтверждает ни один из них, держится
-    исключительно на модели и обязан быть помечен `assuming`.
+    * `equilibrium` при `live_total == 2` — настоящий хедз-ап либо SB против BB
+      после пасов: колл-диапазон взят из равновесия, угадывать нечего. Флаг нужен
+      потому, что двое живых сами по себе равновесия не дают: шов из ранней
+      позиции, до которого спасовали все, кроме большого блайнда, оставляет за
+      столом двоих, но это уже другая игра — там мёртвый малый блайнд и другой
+      шовер;
+    * `best_tight`, `best_interior`, `best_wide` — вердикты на СЕТКЕ ширин
+      диапазона, от узкого конца до широкого. Опрашивается интервал, а не два его
+      конца: EV по ширине не монотонна, и вердикт умеет перевернуться внутри
+      (K5o на 10.25bb — см. `_SHOVE_CALL_WIDTHS`);
+    * `best_model` — вердикт самой модели. Он обязан входить в проверку: вилка
+      собрана из долей комбо и модель может лежать за её краем, и тогда концы
+      совпали бы между собой, противореча выданному вердикту;
+    * `best_behind` — вердикты по оси «живые за героем тоже входят в банк».
+      Ось существует там, где этих игроков в модели нет вовсе;
+    * `unmodelled` — непустая строка означает, что какое-то измерение задачи в
+      модель не попало вообще (живой олл-ин позади, слишком много живых для
+      перебора). Тогда проверять нечего и `strict` заявлять не о чем.
     """
+    if unmodelled:
+        return Zone.ASSUMING, unmodelled
     if live_total == 2 and equilibrium:
         return Zone.STRICT, "хедз-ап SB против BB: колл-диапазон взят из равновесия пуш-фолда"
-    by_range = {best_tight, best_wide} | ({best_model} if best_model is not None else set())
+
+    by_range = {best_tight, best_wide, *best_interior}
+    if best_model is not None:
+        by_range.add(best_model)
     by_behind = set(best_behind)
+
     if len(by_range | by_behind) == 1:
         stable = (
-            f"вердикт «{best_tight}» не меняется ни против узкой, ни против широкой "
-            f"модели диапазона"
+            f"вердикт «{best_tight}» не меняется ни на одной ширине модели диапазона"
             + (", ни если живые за героем тоже войдут в банк" if by_behind else "")
             + " — допущение на него не влияет"
         )
         return Zone.STRICT, stable
     if len(by_range) == 1 and by_behind - by_range:
         moved = ", ".join(sorted(by_behind - by_range))
-        by_behind_reason = (
+        return Zone.ASSUMING, (
             f"вердикт «{best_tight}» держится на том, что живые позади не войдут в "
             f"банк: если войдут, лучше «{moved}»"
         )
-        return Zone.ASSUMING, by_behind_reason
-    if best_model is not None and best_model not in (best_tight, best_wide):
-        unsupported = (
-            f"вердикт «{best_model}» держится на модели диапазона: вилка его не "
-            f"подтверждает — против узкой лучше «{best_tight}», против широкой "
-            f"«{best_wide}»"
+    if best_model is not None and best_model not in {best_tight, best_wide, *best_interior}:
+        return Zone.ASSUMING, (
+            f"вердикт «{best_model}» держится на модели диапазона: ни одна ширина "
+            f"вилки его не подтверждает"
         )
-        return Zone.ASSUMING, unsupported
-    unstable = (
-        f"вердикт зависит от модели диапазона: против узкой лучше «{best_tight}», "
-        f"против широкой — «{best_wide}»"
+    if best_tight == best_wide and len(by_range) > 1:
+        return Zone.ASSUMING, (
+            f"на концах интервала вердикт «{best_tight}», но внутри него он "
+            f"переворачивается — устойчивым он не является"
+        )
+    return Zone.ASSUMING, (
+        f"вердикт зависит от модели диапазона: на узком конце лучше «{best_tight}», "
+        f"на широком — «{best_wide}»"
     )
-    return Zone.ASSUMING, unstable
 
 
 def _hero_class(hand: CanonicalHand) -> str | None:
@@ -398,8 +419,14 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
 
     model_ranges = [_call_model(depth, dead_bb) for depth in depths]
     ev_model = ev(model_ranges)
-    ev_tight = ev([BRACKET_TIGHT(depth) for depth in depths])
-    ev_wide = ev([BRACKET_WIDE(depth) for depth in depths])
+    # Опрашивается вся сетка ширин колл-диапазона, а не два конца: EV по ширине
+    # не монотонна (см. `_SHOVE_CALL_WIDTHS`).
+    ev_by_width = {
+        width: ev([range_of_width(_depth_key(depth), width, dead_extra_bb=dead_bb) for depth in depths])
+        for width in _SHOVE_CALL_WIDTHS
+    }
+    ev_tight = ev_by_width[_SHOVE_CALL_WIDTHS[0]]
+    ev_wide = ev_by_width[_SHOVE_CALL_WIDTHS[-1]]
 
     equilibrium_depth = None
     if dp.live_total == 2 and len(behind) == 1 and behind[0].position == "BB":
@@ -407,28 +434,29 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
             min(hero_eff, behind[0].stack_after_ante) / bb
         )
 
-    best_tight, best_wide = _best_of("shove", ev_tight), _best_of("shove", ev_wide)
+    by_width = [_best_of("shove", value) for value in ev_by_width.values()]
+    best_tight, best_wide = by_width[0], by_width[-1]
     best = _best_of("shove", ev_model)
-    bracket_shove = "stable" if {best_tight, best_wide, best} == {best} else "unstable"
+    bracket_shove = "stable" if {*by_width, best} == {best} else "unstable"
+    # Вторая ось (входят ли живые позади) здесь уже внутри модели: перебор
+    # подмножеств интегрирует их поведение с вероятностями, а сетка ширин двигает
+    # сами вероятности от «коллирует каждый пятый» до «коллируют все». Отдельного
+    # конца добавлять нечего — кроме случая, когда живой игрок позади в перебор не
+    # попал вовсе. Тогда измерение вне модели, и решает это `zone_for`.
     zone, why = zone_for(
         best_tight,
         best_wide,
         live_total=dp.live_total,
         equilibrium=equilibrium_depth is not None,
         best_model=best,
-    )
-    # Та же вторая ось, что и при колле шова, но здесь она в основном уже внутри
-    # модели: перебор подмножеств интегрирует поведение игроков позади с их
-    # вероятностями, а вилка диапазонов сдвигает эти вероятности от «почти никто
-    # не коллирует» (узкий конец) до «коллирует каждый третий» (широкий). Поэтому
-    # отдельного конца добавлять нечего — кроме случая, когда живой игрок позади
-    # в модель не попал вовсе. Тогда ось немоделирована, и `strict` заявлять не о
-    # чем, как и при колле шова.
-    if all_in_behind:
-        zone, why = Zone.ASSUMING, (
+        best_interior=by_width[1:-1],
+        unmodelled=(
             f"позади героя {all_in_behind} живых уже в олл-ине: модель шова их не "
             f"перебирает, и их влияние на вердикт не проверено"
-        )
+            if all_in_behind
+            else ""
+        ),
+    )
     taken = "shove" if state.hero_all_in_after else "fold"
     folds_possible = fold_equity_ok(callers(model_ranges))
 
@@ -440,6 +468,7 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
         "ev_shove_bb": round(ev_model, 4),
         "ev_shove_tight_bb": round(ev_tight, 4),
         "ev_shove_wide_bb": round(ev_wide, 4),
+        "ev_shove_by_width_bb": {str(w): round(v, 4) for w, v in ev_by_width.items()},
         "hero_class": hero_cls,
         "depths_bb": [round(_depth_key(depth), 2) for depth in depths],
         "dead_extra_bb": round(dead_bb, 4),
@@ -497,8 +526,13 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
 
     model_range = _push_model(shover_depth_bb, dead_bb)
     ev_model = ev(model_range)
-    ev_tight = ev(BRACKET_TIGHT(shover_depth_bb))
-    ev_wide = ev(BRACKET_WIDE(shover_depth_bb))
+    width_ranges = {
+        width: range_of_width(_depth_key(shover_depth_bb), width, dead_extra_bb=dead_bb)
+        for width in _SHOVER_RANGE_WIDTHS
+    }
+    ev_by_width = {width: ev(rng) for width, rng in width_ranges.items()}
+    ev_tight = ev_by_width[_SHOVER_RANGE_WIDTHS[0]]
+    ev_wide = ev_by_width[_SHOVER_RANGE_WIDTHS[-1]]
 
     # Вторая ось вилки: живые за героем. `call_shove_ev_bb` считает вскрытие один
     # на один, поэтому их возможный вход в банк — величина, которой в модели нет
@@ -533,10 +567,10 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
             )
 
         ev_behind = ev_all(model_range)
-        best_behind = [
-            _best_of("call", ev_all(rng))
-            for rng in (model_range, BRACKET_TIGHT(shover_depth_bb), BRACKET_WIDE(shover_depth_bb))
-        ]
+        ev_behind_by_width = {width: ev_all(rng) for width, rng in width_ranges.items()}
+        best_behind = [_best_of("call", ev_behind), *(
+            _best_of("call", value) for value in ev_behind_by_width.values()
+        )]
 
     equilibrium_depth = None
     if (
@@ -549,13 +583,14 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
             min(state.hero.stack_after_ante, shover.stack_after_ante) / bb
         )
 
-    best_tight, best_wide = _best_of("call", ev_tight), _best_of("call", ev_wide)
+    by_width = [_best_of("call", value) for value in ev_by_width.values()]
+    best_tight, best_wide = by_width[0], by_width[-1]
     best = _best_of("call", ev_model)
     # Две оси разводятся в `detail` намеренно: они отвечают на разные вопросы —
     # «зависит ли вывод от угаданного диапазона» и «зависит ли он от того, войдут
     # ли живые позади». Слепить их в один флаг значило бы лишить изложение
     # возможности назвать причину.
-    bracket_call = "stable" if {best_tight, best_wide, best} == {best} else "unstable"
+    bracket_call = "stable" if {*by_width, best} == {best} else "unstable"
     # «Ось сдвинула вердикт» — значит расчёт с вошедшими в банк игроками позади
     # даёт не то, что выдала модель. Сравнивать надо именно с вердиктом модели, а
     # не с объединением концов вилки: иначе ось молчала бы всякий раз, когда
@@ -569,13 +604,15 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         live_total=dp.live_total,
         equilibrium=equilibrium_depth is not None,
         best_model=best,
+        best_interior=by_width[1:-1],
         best_behind=best_behind,
-    )
-    if behind_unmodelled:
-        zone, why = Zone.ASSUMING, (
+        unmodelled=(
             f"живых за героем {len(behind)} — больше, чем модель вскрытия способна "
             f"перебрать, их влияние на вердикт не проверено"
-        )
+            if behind_unmodelled
+            else ""
+        ),
+    )
     taken = "call" if dp.action.kind is ActionKind.CALL else "fold"
 
     detail: dict[str, object] = {
@@ -584,6 +621,7 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         "ev_call_bb": round(ev_model, 4),
         "ev_call_tight_bb": round(ev_tight, 4),
         "ev_call_wide_bb": round(ev_wide, 4),
+        "ev_call_by_width_bb": {str(w): round(v, 4) for w, v in ev_by_width.items()},
         "hero_class": hero_cls,
         "required_equity": round(required_equity(state.to_call, state.pot_before), 6),
         "shover_depth_bb": round(_depth_key(shover_depth_bb), 2),
@@ -602,7 +640,20 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         zone=zone,
         action_taken=taken,
         best_action=best,
-        ev_diff_bb=round(_taken_ev(taken, "call", ev_model) - max(ev_model, 0.0), 6),
+        # Цена берётся по самому мягкому упрёку среди сценариев второй оси.
+        # Обвинять игрока в потере 0.72bb за пас, когда собственный расчёт при
+        # входе живого позади даёт -2.00bb, нельзя: это число ведёт и
+        # ранжирование, и сумму потерь руки. Ярлык `assuming` предупреждает о
+        # природе вывода, но не отменяет самого числа, а цифру игрок читает
+        # первой. Сетка ширин диапазона в цену НЕ входит: там завышение
+        # объявлено известным свойством модели и покрыто ярлыком зоны.
+        ev_diff_bb=round(
+            max(
+                _taken_ev(taken, "call", value) - max(value, 0.0)
+                for value in ([ev_model] if ev_behind is None else [ev_model, ev_behind])
+            ),
+            6,
+        ),
         assumption=(
             Assumption(
                 range=model_range,

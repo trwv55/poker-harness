@@ -787,17 +787,22 @@ def classes_by_equity_against(rng: Range) -> tuple[str, ...]:
 
 
 @cache
-def _wide_classes(depth_key: float) -> tuple[str, ...]:
-    """Верхние классы против равновесного шова, набирающие долю комбо ближе всего к 40%.
+def _classes_of_width(depth_key: float, dead_key: float, fraction: float) -> tuple[str, ...]:
+    """Верхние классы против равновесного шова, набирающие долю комбо ближе всего к `fraction`.
 
     Граница берётся по КОМБО, а не по числу классов (offsuit-класс весит 12 комбо,
-    suited — 4), и выбирается тот префикс, который ближе к цели: 40% — заявленная
-    ширина, и она обязана быть проверяемой, а не приблизительной.
+    suited — 4), и выбирается тот префикс, который ближе к цели: заявленная ширина
+    обязана быть проверяемой, а не приблизительной.
+
+    Порядок классов считается против равновесного шова ТОЙ ЖЕ игры, включая
+    мёртвые деньги: с анте шов шире, а против широкого шова порядок рук другой
+    (пара против слабого туза переворачивается). Брать здесь безантевое
+    равновесие значило бы ранжировать по игре, в которую никто не играет.
     """
-    push_range, _ = nash_hu(depth_key)
+    push_range, _ = nash_hu(depth_key, dead_extra_bb=dead_key)
     ordered = classes_by_equity_against(push_range)
 
-    target = _WIDE_TARGET_FRACTION * _TOTAL_COMBOS
+    target = fraction * _TOTAL_COMBOS
     cumulative = 0
     best_prefix, best_gap = 0, target
     for position, cls in enumerate(ordered, start=1):
@@ -807,13 +812,33 @@ def _wide_classes(depth_key: float) -> tuple[str, ...]:
     return ordered[:best_prefix]
 
 
+def range_of_width(
+    depth_bb: float, fraction: float, *, dead_extra_bb: float = 0.0
+) -> Range:
+    """Диапазон заданной ширины: верхние `fraction` комбо по силе на этой глубине.
+
+    Семейство, по которому задача 12 опрашивает ВЕСЬ интервал правдоподобных
+    диапазонов, а не два его конца. Опрос концов неверен по существу: EV не
+    монотонна по ширине. На 10.25bb с анте фикстуры шов K5o даёт +1.95bb против
+    3% колла и +0.06bb против 51%, а между ними, против 40%, уходит в минус
+    (-0.05bb) — оба конца сказали бы «шов», хотя внутри интервала вердикт
+    переворачивается.
+    """
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError(f"доля комбо должна лежать в (0, 1], получено {fraction}")
+    classes = _classes_of_width(
+        _bracket_depth_key(depth_bb), round(dead_extra_bb, 4), round(fraction, 4)
+    )
+    return Range(weights=dict.fromkeys(classes, 1.0))
+
+
 def _bracket_depth_key(depth_bb: float) -> float:
     """Глубина, округлённая до сотых и зажатая в окно, где пуш-фолд осмыслен."""
     clamped = min(max(depth_bb, _BRACKET_MIN_DEPTH_BB), _BRACKET_MAX_DEPTH_BB)
     return round(clamped, 2)
 
 
-def _bracket_tight(depth_bb: float) -> Range:
+def _bracket_tight(depth_bb: float, dead_extra_bb: float = 0.0) -> Range:
     """Узкий конец вилки: только премиум (JJ+, AK).
 
     От глубины не зависит: это не выведенная граница, а названный в спецификации
@@ -822,10 +847,10 @@ def _bracket_tight(depth_bb: float) -> Range:
     return Range(weights=dict.fromkeys(_TIGHT_CLASSES, 1.0))
 
 
-def _bracket_wide(depth_bb: float) -> Range:
+def _bracket_wide(depth_bb: float, dead_extra_bb: float = 0.0) -> Range:
     """Широкий конец вилки: top-40% по эквити против равновесного шова на этой глубине."""
-    return Range(weights=dict.fromkeys(_wide_classes(_bracket_depth_key(depth_bb)), 1.0))
+    return range_of_width(depth_bb, _WIDE_TARGET_FRACTION, dead_extra_bb=dead_extra_bb)
 
 
-BRACKET_TIGHT: Callable[[float], Range] = _bracket_tight
-BRACKET_WIDE: Callable[[float], Range] = _bracket_wide
+BRACKET_TIGHT: Callable[..., Range] = _bracket_tight
+BRACKET_WIDE: Callable[..., Range] = _bracket_wide
