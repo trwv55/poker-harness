@@ -173,20 +173,40 @@ def test_scan_daily_classic_runs():
 
 
 def test_prefilter_cheap(monkeypatch):
-    import harness.analysis.tools.equity as eq
+    """Префильтр закрывает точку, не доходя до полного расчёта.
+
+    Брифовская версия этого теста патчила `equity.equity_vs_range` (в
+    единственном числе) — функцию, которую конвейер вообще никогда не
+    вызывает: `preflop.py` импортирует только `equity_vs_ranges` (во
+    множественном), а хедз-ап (как раз этот случай — один живой позади) идёт
+    через табличный `equity_vs_range_classes` в другом модуле (`pushfold.py`).
+    Поэтому счётчик стоял на нуле независимо от того, сработал ли префильтр —
+    тест прошёл бы, даже удали `cheap_fold_verdict` целиком (найдено ревью,
+    не мной; см. отчёт задачи 13).
+
+    Правильная граница — не конкретный инструмент эквити (для разных спотов
+    это разные функции в разных модулях, и синтетика теста конкретно для этого
+    хедз-апа вообще не требует Монте-Карло), а `verdict_for`: именно туда
+    `scan._hand_points` падает, когда `cheap_fold_verdict` возвращает `None`.
+    Ноль вызовов `verdict_for` — это и есть «полный расчёт не потребовался»,
+    сформулированное так, что оно верно для ЛЮБОГО спота, а не только для
+    того инструмента эквити, который эта конкретная синтетика бы задействовала.
+    """
+    import harness.analysis.scan as scan_mod
 
     calls = {"n": 0}
-    real = eq.equity_vs_range
-    monkeypatch.setattr(
-        eq,
-        "equity_vs_range",
-        lambda *a, **k: calls.__setitem__("n", calls["n"] + 1) or real(*a, **k),
-    )
+    real_verdict_for = scan_mod.verdict_for
+
+    def counted_verdict_for(dp, en):
+        calls["n"] += 1
+        return real_verdict_for(dp, en)
+
+    monkeypatch.setattr(scan_mod, "verdict_for", counted_verdict_for)
     # синтетика: HU 10bb, Hero на BTN фолдит 32o без добровольных вложений; Нэш согласен (фолд)
     en = _make_hu_fold_hand(hero_cards=("3c", "2d"), eff_bb=10.0)
     s = scan_tournament([en])
     assert s.items == []  # расхождения нет
-    assert calls["n"] == 0  # EV не считался — сработал префильтр (SCALING §3)
+    assert calls["n"] == 0  # verdict_for не вызван — сработал префильтр (SCALING §3)
 
 
 @requires_fixtures
@@ -199,6 +219,71 @@ def test_scan_pko_bounty_runs():
     assert 0 < s.hands_with_decision <= 172
     assert all(s.items[i].ev_diff_bb <= s.items[i + 1].ev_diff_bb for i in range(len(s.items) - 1))
     assert all(it.ev_diff_bb < -0.1 for it in s.items)
+
+
+# --- Беспроигрышность фильтра на реальных фикстурах (рулинг владельца) ----------
+
+
+def _item_signature(summary: ScanSummary) -> list[tuple]:
+    """Сравнимая форма `items`: цена округлена до 6 знака, порядок как есть."""
+    return [
+        (
+            it.hand_no,
+            it.hand_index,
+            it.hero_class,
+            it.spot.value,
+            it.action_taken,
+            it.best_action,
+            round(it.ev_diff_bb, 6),
+            it.zone.value,
+        )
+        for it in summary.items
+    ]
+
+
+def _assert_prefilter_lossless(path, source_ref, expected_hands, monkeypatch):
+    """Полный расчёт на КАЖДОЙ точке обязан дать тот же список, что и с фильтром.
+
+    Раньше это было проверено ad hoc — ручным прогоном вне сьюта (см. отчёт
+    задачи 13, рулинг владельца, пункт 2) — а значит будущая правка гварда
+    `cheap_fold_verdict`, которая тихо сломает беспроигрышность фильтра на
+    реальных руках, ушла бы незамеченной. Здесь то же самое измерение, но в
+    тесте: сперва обычный прогон (фильтр как есть), затем прогон с
+    `cheap_fold_verdict`, принудительно возвращающим `None` на каждой точке
+    (полный `verdict_for` — единственный источник вердикта), и сравнение
+    списков `items` и `total_loss_bb`. Совпадение — до 6 знака после запятой
+    (`round(ev_diff_bb, 6)`, как и хранит `detail`/`ScanItem`), а не побитовое
+    сравнение float: сама MC точна по сиду, но сравнивать имеет смысл на той
+    точности, которую видит игрок.
+    """
+    import harness.analysis.scan as scan_mod
+
+    ens = [enrich(normalize(r)) for r in parse_file(path.read_text("utf-8"), source_ref)]
+    assert len(ens) == expected_hands
+
+    with_filter = scan_tournament(ens)
+
+    monkeypatch.setattr(scan_mod, "cheap_fold_verdict", lambda dp, en: None)
+    without_filter = scan_tournament(ens)
+
+    assert _item_signature(with_filter) == _item_signature(without_filter)
+    assert with_filter.total_loss_bb == without_filter.total_loss_bb
+    assert with_filter.hands_with_decision == without_filter.hands_with_decision
+    assert with_filter.hands_failed == without_filter.hands_failed == 0
+
+
+@requires_fixtures
+# На тёплом дисковом кэше — секунды; на холодном (первый когда-либо прогон
+# именно этой пары тестов на этой машине) — единицы минут, см. отчёт задачи 13.
+@pytest.mark.slow
+def test_prefilter_is_lossless_on_daily_classic(monkeypatch):
+    _assert_prefilter_lossless(FIXTURE_DAILY, "d", 146, monkeypatch)
+
+
+@requires_fixtures
+@pytest.mark.slow  # см. комментарий у daily-версии выше
+def test_prefilter_is_lossless_on_pko_bounty(monkeypatch):
+    _assert_prefilter_lossless(FIXTURE_PKO, "pko", 172, monkeypatch)
 
 
 # --- Честность гейта: префильтр не имеет права спрятать настоящую ошибку --------
