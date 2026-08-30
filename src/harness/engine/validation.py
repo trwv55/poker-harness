@@ -57,10 +57,14 @@ def _has_duplicate_cards(hand: CanonicalHand) -> bool:
     return len(cards) != len(set(cards))
 
 
-def _forced_blind(hand: CanonicalHand, player: PlayerState, ante: int) -> int:
+def forced_blind(hand: CanonicalHand, player: PlayerState, ante: int) -> int:
     """Вынужденная ставка игрока по его позиции, урезанная остатком стека.
 
     В хедз-апе малый блайнд ставит кнопка — позиции `SB` там просто нет.
+
+    Публичная: этой же формулой аналитическое ядро восстанавливает посты в точке
+    решения (`harness.analysis.classifier`). Считать блайнды двумя разными
+    формулами нельзя — расхождение уехало бы прямо в цену решения.
     """
     heads_up = len(hand.players) == 2
     if player.position == "BB":
@@ -89,7 +93,7 @@ def _source_stacks_end(hand: CanonicalHand) -> dict[str, int]:
         ante = min(hand.ante, player.stack)
         # Игрок без записанных действий на префлопе всё равно поставил блайнд.
         contributed = ante + commits.get(
-            (Street.PREFLOP, player.label), _forced_blind(hand, player, ante)
+            (Street.PREFLOP, player.label), forced_blind(hand, player, ante)
         )
         for street in (Street.FLOP, Street.TURN, Street.RIVER):
             contributed += commits.get((street, player.label), 0)
