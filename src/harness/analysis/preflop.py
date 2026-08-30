@@ -53,7 +53,11 @@
 
 from __future__ import annotations
 
+import atexit
+import json
 from collections.abc import Callable, Sequence
+from hashlib import sha256
+from pathlib import Path
 
 from harness.analysis.classifier import (
     SeatSnapshot,
@@ -181,13 +185,105 @@ _ASSUMPTION_SHOVER = (
 
 # Потолок памяти мультивей-кэша эквити. Воркер живёт долго и разбирает турнир за
 # турниром, поэтому кэш без границы — утечка. При переполнении он сбрасывается
-# целиком: вытеснять по возрасту незачем, повторный расчёт стоит доли секунды, а
+# целиком: вытеснять по возрасту незачем, повторный расчёт стоит доли секунды
+# (при тёплом дисковом кэше — см. ниже) или единиц секунд (при холодном), а
 # детерминизм от сброса не страдает — те же входы дают то же число.
 _EQUITY_MEMO_LIMIT = 4096
 
 _HeroCombo = tuple[str, str]
 _RangeKey = tuple[tuple[str, float], ...]
 _equity_memo: dict[tuple[_HeroCombo, tuple[_RangeKey, ...]], float] = {}
+
+# Сид Монте-Карло зафиксирован здесь явно (а не оставлен дефолтом
+# `equity_vs_ranges`), потому что отпечаток дискового кэша обязан включать его:
+# скрытая смена сида в другом месте молча сделала бы прочитанный с диска ответ
+# соответствующим другому (недетерминированному относительно текущего вызова)
+# розыгрышу.
+_EQUITY_MC_SEED = 42
+
+# Дисковый кэш эквити мультивея (задача 13, рулинг владельца: измерение показало
+# 47.6с на одну точку с несколькими живыми позади — 78% времени дневной
+# фикстуры в восьми точках). `_equity_memo` выше уже ловит повтор ВНУТРИ одного
+# прогона (см. его докстринг) и на дневной фикстуре даёт 81% попаданий, но
+# каждый новый процесс (новый прогон тестов, новый воркер) начинает с нуля —
+# 829 оставшихся промахов пересчитываются заново при каждом холодном старте.
+# Файл ниже переживает процесс: тот же принцип, что и у `nash_hu` (см.
+# `_nash_solution`/`_read_nash_cache`) — JSON-словарь по округлённому отпечатку
+# входов, best-effort запись (не мешает работе, если каталог только для чтения).
+#
+# Сэмплер детерминирован по сиду (`equity.py`, докстринг модуля): одни и те же
+# карты героя, диапазоны, число итераций и сид всегда дают одно и то же число.
+# Поэтому кэш точный — он меняет скорость, а не ответ, и не требует TTL или
+# инвалидации по времени; инвалидируется только явной сменой версии/итераций
+# в отпечатке.
+_EQUITY_CACHE_VERSION = 1
+_EQUITY_CACHE_PATH = Path(__file__).parent / "tools" / "data" / "equity_mc_cache.json"
+_disk_equity_cache: dict[str, float] | None = None  # ленивая загрузка, None = не читали
+
+
+def _equity_cache_fingerprint() -> str:
+    """Отпечаток входов дискового кэша: версия, итерации, сид.
+
+    Без него смена `_MULTIWAY_ITERATIONS` (точность оценки) или сида молча
+    отдавала бы число, посчитанное на ДРУГИХ входах, как если бы оно отвечало
+    на текущий запрос — тот же класс ошибки, что `_nash_fingerprint` закрывает
+    для равновесий.
+    """
+    return f"v{_EQUITY_CACHE_VERSION}-it{_MULTIWAY_ITERATIONS}-seed{_EQUITY_MC_SEED}"
+
+
+def _equity_cache_key(hero: _HeroCombo, range_key: tuple[_RangeKey, ...]) -> str:
+    """Стабильный строковый ключ для JSON: хеш канонического представления входа.
+
+    Сами карты и диапазоны в ключ не годятся напрямую (JSON-ключи — только
+    строки, а вложенные кортежи неудобно сериализовать обратимо), поэтому вход
+    хешируется — так же, как `_nash_fingerprint` хеширует таблицу эквити.
+    """
+    payload = {"hero": list(hero), "ranges": [[[c, w] for c, w in r] for r in range_key]}
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _load_disk_equity_cache() -> dict[str, float]:
+    global _disk_equity_cache
+    if _disk_equity_cache is not None:
+        return _disk_equity_cache
+    try:
+        payload = json.loads(_EQUITY_CACHE_PATH.read_text(encoding="utf-8"))
+        if payload.get("fingerprint") == _equity_cache_fingerprint():
+            _disk_equity_cache = dict(payload.get("entries", {}))
+        else:
+            _disk_equity_cache = {}
+    except (OSError, ValueError, TypeError, AttributeError):
+        _disk_equity_cache = {}
+    return _disk_equity_cache
+
+
+def _save_disk_equity_cache() -> None:
+    """Пишет накопленный кэш на диск — вызывается один раз при выходе процесса.
+
+    Одна запись всего файла в конце, а не на каждый промах: сериализовать и
+    писать словарь целиком на каждую новую запись стоило бы O(n^2) на весь
+    прогон при тысячах записей. Кэш — ускорение, а не источник истины (как и
+    `_write_nash_cache`), поэтому ошибка записи (например, каталог пакета
+    только для чтения) молча проглатывается, а не роняет разбор.
+    """
+    if _disk_equity_cache is None:
+        return
+    try:
+        _EQUITY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _EQUITY_CACHE_PATH.write_text(
+            json.dumps(
+                {"fingerprint": _equity_cache_fingerprint(), "entries": _disk_equity_cache},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass  # тот же принцип, что и у `_write_nash_cache`: без кэша, но не падаем
+
+
+atexit.register(_save_disk_equity_cache)
 
 
 def _model_equity(hero: _HeroCombo, ranges: Sequence[Range]) -> float:
@@ -197,15 +293,26 @@ def _model_equity(hero: _HeroCombo, ranges: Sequence[Range]) -> float:
     посчитано само равновесие: считать Монте-Карло то, что уже посчитано точнее,
     значит вносить шум и расходиться с диапазоном, против которого судим.
     Мультивей-веток в таблице нет — они идут через сэмплер, и их результат
-    запоминается: `shove_ev_bb` перебирает 2^n подмножеств, но разных наборов
-    диапазонов среди них всего единицы.
+    запоминается дважды: в памяти на весь процесс (`_equity_memo`) и на диске
+    между процессами (`_disk_equity_cache`, см. докстринг выше) — `shove_ev_bb`
+    перебирает 2^n подмножеств, но разных наборов диапазонов среди них всего
+    единицы, а те же наборы регулярно повторяются между руками одного скана и
+    между отдельными прогонами.
     """
     if len(ranges) == 1:
         return equity_vs_range_classes(class_of(*hero), ranges[0])
-    key = (hero, tuple(sorted(tuple(sorted(r.weights.items())) for r in ranges)))
+    range_key = tuple(sorted(tuple(sorted(r.weights.items())) for r in ranges))
+    key = (hero, range_key)
     cached = _equity_memo.get(key)
     if cached is None:
-        cached = equity_vs_ranges(hero, list(ranges), iterations=_MULTIWAY_ITERATIONS)
+        disk_cache = _load_disk_equity_cache()
+        disk_key = _equity_cache_key(hero, range_key)
+        cached = disk_cache.get(disk_key)
+        if cached is None:
+            cached = equity_vs_ranges(
+                hero, list(ranges), iterations=_MULTIWAY_ITERATIONS, seed=_EQUITY_MC_SEED
+            )
+            disk_cache[disk_key] = cached
         if len(_equity_memo) >= _EQUITY_MEMO_LIMIT:
             _equity_memo.clear()
         _equity_memo[key] = cached

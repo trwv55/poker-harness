@@ -162,6 +162,7 @@ def _make_multiway_fold_hand(hero_cards: tuple[str, str], eff_bb: float, players
 
 
 @requires_fixtures
+@pytest.mark.slow  # полный скан 146 реальных рук — минуты, не секунды (задача 13, рулинг)
 def test_scan_daily_classic_runs():
     ens = [enrich(normalize(r)) for r in parse_file(FIXTURE_DAILY.read_text("utf-8"), "d")]
     s = scan_tournament(ens)
@@ -189,6 +190,7 @@ def test_prefilter_cheap(monkeypatch):
 
 
 @requires_fixtures
+@pytest.mark.slow  # полный скан 172 реальных рук — минуты, не секунды (задача 13, рулинг)
 def test_scan_pko_bounty_runs():
     """Вторая реальная фикстура — те же инварианты, другой формат (PKO)."""
     ens = [enrich(normalize(r)) for r in parse_file(FIXTURE_PKO.read_text("utf-8"), "pko")]
