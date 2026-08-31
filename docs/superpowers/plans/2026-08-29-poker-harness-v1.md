@@ -1403,7 +1403,7 @@ volumes: { pgdata: {} }
 ### Task 21 (крупнее, спека §13 шаг 7): Изложение — текст вердикта, рендер матрицы, verdict-evals
 
 **Files:**
-- Create: `src/harness/explanation/verdict_text.py`, `src/harness/explanation/range_render.py`, `src/harness/platform/eval_runner.py`, `evals/verdict/checks.py`, `evals/verdict/cases/` — эталоны
+- Create: `src/harness/explanation/verdict_text.py`, `src/harness/explanation/range_render.py`, `src/harness/explanation/hand_replay.py`, `src/harness/platform/eval_runner.py`, `evals/verdict/checks.py`, `evals/verdict/cases/` — эталоны
 - Modify: `src/harness/worker/pipeline.py` (станция explain для `deep_dive`), `src/harness/presentation/messages.py` (вердикт с LLM-текстом), `tests/` — новые файлы по образцу задач 9–18
 - Зависимость: `uv add cairosvg`
 - **Третий компонент — реплей руки по улицам** (`explanation/hand_replay.py`, чистый код, ноль токенов).
