@@ -1406,6 +1406,12 @@ volumes: { pgdata: {} }
 - Create: `src/harness/explanation/verdict_text.py`, `src/harness/explanation/range_render.py`, `src/harness/platform/eval_runner.py`, `evals/verdict/checks.py`, `evals/verdict/cases/` — эталоны
 - Modify: `src/harness/worker/pipeline.py` (станция explain для `deep_dive`), `src/harness/presentation/messages.py` (вердикт с LLM-текстом), `tests/` — новые файлы по образцу задач 9–18
 - Зависимость: `uv add cairosvg`
+- **Третий компонент — реплей руки по улицам** (`explanation/hand_replay.py`, чистый код, ноль токенов).
+  Полная постановка и образец вывода — спека §5.6. Ключевое: новых расчётов нет, всё берётся из
+  `EnrichedHand`; масти выводятся символом и цветом, никогда буквами; объём — 4–5 строк на префлоп-руку,
+  6–8 с постфлопом; точка решения Hero выделяется в потоке действий, а не отдельной строкой.
+  **Промпт вердикта после этого не содержит пересказа руки** — только структурный контекст спота,
+  что снимает класс ошибок «модель переврала ход руки» и сокращает вход и выход.
 
 **Interfaces:**
 - `render_range_png(rng: Range, title: str) -> bytes` — сетка 13×13: ranks `AKQJT98765432`; клетка (i, j): i==j → пара; i<j → `ranks[i]+ranks[j]+"s"`; i>j → `ranks[j]+ranks[i]+"o"`; вес 0..1 — вертикальная доля заливки клетки (SVG rect поверх фона), SVG → PNG cairosvg. Тест: в SVG ровно 169 подписанных клеток, вес 0.5 даёт rect половинной высоты, картинка > 10 КБ.
