@@ -39,3 +39,6 @@ src/harness/analysis/tools/data/nash_hu_*.json
 # Дисковый кэш эквити мультивея (задача 13): тот же принцип — чистый производный
 # артефакт, восстанавливается пересчётом за секунды при пустом кэше.
 src/harness/analysis/tools/data/equity_mc_cache.json
+
+# Визуальные отчёты по фикстурам (scripts/grid_report.py): содержат реальные руки игрока.
+reports/
