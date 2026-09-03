@@ -12,6 +12,12 @@ queued-задачах одного игрока, Finding 1) добавил ещ�
 изменение из Finding 2/Minor — `complete()` больше не даёт зомби-воркеру затереть
 задачу, подхваченную заново, `resume()` больше не переоткрывает задачу не в том
 статусе молча.
+
+Fix round 2 добавил ещё два: `await_user()` получил ту же зомби-защиту, что
+`complete()`/`fail()` в round 1 (Item 1 — контроллер назвал её отдельно, я сам
+заметил дыру раньше, но не трогал без прямого указания), и тест на то, что
+узкий `except` в `claim()` пропускает наружу ПОСТОРОННИЙ `IntegrityError`, а не
+проглатывает вообще любой (Item 2).
 """
 
 from __future__ import annotations
@@ -20,6 +26,8 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from harness.memory.models import Job, async_session_factory
 from harness.memory.repos import PlayersRepo, SessionsRepo
@@ -247,3 +255,88 @@ async def test_resume_requires_awaiting_user(db_factory):
     # только что созданная задача — queued, не awaiting_user
     with pytest.raises(JobPreconditionFailed):
         await q.resume(jid)
+
+
+async def test_await_user_rejects_zombie_worker_after_reclaim(db_factory):
+    """Fix round 2, Item 1: тот же сценарий, что `test_complete_rejects_zombie_
+    worker_after_reclaim` (Finding 2, round 1), только на `await_user()` — эту
+    дыру я сам заметил после round 1, но не трогал без прямого указания
+    контроллера (назвал в Concerns). w1 берёт задачу и зависает, `reap()`
+    возвращает её в очередь, w2 забирает её заново. Без проверки владения
+    "ожившему" w1 ничто не мешало бы молча запарковать в `awaiting_user` живую
+    задачу, которую теперь ведёт w2 — игрок увидел бы вопрос, которого никто не
+    задавал, а настоящая работа w2 зависла бы до следующего `reap()`.
+    """
+    q = JobsQueue(db_factory)
+    player_id, session_id = await _make_scope(db_factory)
+    jid = await q.enqueue(
+        type="screenshot_analyze", player_id=player_id, session_id=session_id, payload={}
+    )
+
+    j1 = await q.claim("w1")
+    assert j1 is not None and j1.id == jid
+
+    async with db_factory() as session:
+        job = await session.get(Job, jid)
+        assert job is not None
+        job.locked_at = datetime.now(UTC) - timedelta(minutes=20)
+        await session.commit()
+    assert await q.reap(older_than_minutes=10) == 1
+
+    j2 = await q.claim("w2")
+    assert j2 is not None and j2.id == jid  # ту же задачу теперь ведёт w2
+
+    with pytest.raises(JobPreconditionFailed):
+        await q.await_user(jid, resume_payload={"station": "vision"}, worker_id="w1")
+
+    # настоящий текущий владелец всё ещё может честно поставить awaiting_user
+    await q.await_user(jid, resume_payload={"station": "vision"}, worker_id="w2")
+    async with db_factory() as session:
+        job = await session.get(Job, jid)
+        assert job is not None
+        assert job.status == "awaiting_user"
+        assert job.payload == {"station": "vision"}
+
+
+async def test_claim_propagates_unrelated_integrity_error(db_factory):
+    """Fix round 2, Item 2: `claim()` обязан проглатывать РОВНО unique-violation
+    по `uq_jobs_player_id_running`, а не любой `IntegrityError` — иначе любой
+    будущий констрейнт на `jobs`, случайно задетый тем же `UPDATE`, молча
+    превратился бы в «пустая очередь» вместо честного падения.
+
+    На сегодняшней схеме `_CLAIM_SQL` не способна нарушить НИКАКОЙ другой
+    констрейнт (трогает только `status`/`locked_by`/`locked_at`/`attempts`),
+    поэтому единственный честный способ проверить узость `except` через
+    публичный `claim()` — завести контрольный, заведомо ПОСТОРОННИЙ уникальный
+    индекс (уникальность `locked_by` среди `running`, не имеет отношения к
+    сериализации по игроку) и убедиться, что его нарушение не тонет в `None`.
+    Никакой конкурентности не нужно: второй `claim()` детерминированно
+    конфликтует с уже закоммиченной строкой первого — без гонки, без ретраев.
+    """
+    q = JobsQueue(db_factory)
+    async with db_factory() as session:
+        await session.execute(
+            text(
+                "create unique index test_only_locked_by_conflict "
+                "on jobs(locked_by) where status='running'"
+            )
+        )
+        await session.commit()
+    try:
+        p1, s1 = await _make_scope(db_factory, tg_user_id=80_001)
+        p2, s2 = await _make_scope(db_factory, tg_user_id=80_002)
+        await q.enqueue(type="hh_scan", player_id=p1, session_id=s1, payload={})
+        await q.enqueue(type="hh_scan", player_id=p2, session_id=s2, payload={})
+
+        first = await q.claim("dup")
+        assert first is not None  # первый воркер спокойно взял свою задачу
+
+        # тот же worker_id для ДРУГОГО игрока — конфликт постороннего индекса,
+        # а не сериализации по игроку (у задач разные player_id, поэтому
+        # uq_jobs_player_id_running здесь вообще ни при чём)
+        with pytest.raises(IntegrityError):
+            await q.claim("dup")
+    finally:
+        async with db_factory() as session:
+            await session.execute(text("drop index if exists test_only_locked_by_conflict"))
+            await session.commit()

@@ -38,11 +38,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import text, update
+from asyncpg.exceptions import UniqueViolationError
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from harness.memory.models import Job
+from harness.memory.models import JOBS_RUNNING_UNIQUE_INDEX, Job
 
 
 class JobPreconditionFailed(Exception):
@@ -89,6 +90,30 @@ _CLAIM_SQL = text(
 _REAP_ERROR = "воркер завис и не ответил — исчерпаны все попытки (reaper)"
 
 
+def _is_running_serialization_conflict(exc: IntegrityError) -> bool:
+    """`claim()` вправе проглотить РОВНО ОДИН конфликт — проигрыш гонки за
+    `JOBS_RUNNING_UNIQUE_INDEX` — и ничего больше (fix round 2, Item 2): широкий
+    `except IntegrityError` ловил вообще любое нарушение целостности, и любой
+    будущий констрейнт на `jobs`, случайно задетый этим же `UPDATE`, молча
+    превратился бы в «пустая очередь» вместо честного падения.
+
+    SQLAlchemy заворачивает исключение asyncpg в свой DBAPI-совместимый класс
+    (`exc.orig`), но не теряет оригинал: он доступен через `exc.orig.__cause__`
+    (`raise ... from ...` внутри диалекта asyncpg) — только там есть
+    `constraint_name`, а не только SQLSTATE класса unique_violation (`23505`),
+    которым могло бы совпасть и нарушение СОВСЕМ ДРУГОГО уникального индекса,
+    если такой когда-нибудь появится на `jobs`. Узость проверена на настоящем
+    Postgres — `test_claim_propagates_unrelated_integrity_error`.
+    """
+    cause = exc.orig.__cause__ if exc.orig is not None else None
+    if not isinstance(cause, UniqueViolationError):
+        return False
+    # asyncpg выставляет constraint_name динамически (из ErrorResponse Postgres),
+    # его нет в статических тайп-стабах — getattr вместо `cause.constraint_name`,
+    # чтобы pyright не спотыкался о реально существующий рантайм-атрибут.
+    return getattr(cause, "constraint_name", None) == JOBS_RUNNING_UNIQUE_INDEX
+
+
 class JobsQueue:
     """Очередь + журнал `jobs`: захват, статусы, эскалация, страховочный reaper."""
 
@@ -126,24 +151,30 @@ class JobsQueue:
     async def claim(self, worker_id: str) -> Job | None:
         """Атомарно забрать одну задачу — `_CLAIM_SQL`, см. докстринг модуля.
 
-        Проигравший гонку за партиционный уникальный индекс (`uq_jobs_player_id_
-        running`, миграция `0002`) получает `IntegrityError` прямо на `execute()`
-        — Postgres не откладывает проверку уникального индекса. Транзакция после
-        этого испорчена (Postgres требует `ROLLBACK`, повторный `commit()` кинул
-        бы `PendingRollbackError`), а не просто "ничего не нашли". Внутри этого же
-        вызова заново не пытаемся: `worker_id` внутри `_CLAIM_SQL` уже выбрал
-        конкретную строку-кандидата и проиграл её конкретному конкуренту — заново
-        выбирать пришлось бы с нуля, отдельным запросом, а вызывающий (воркер в
-        цикле опроса) и так трактует `None` как «сейчас нечего взять» и попробует
-        снова на следующей итерации. Раз `None` — легитимный, ожидаемый исход
-        конфликта, а не признак сбоя, наружу `IntegrityError` не протекает никогда.
+        Проигравший гонку за партиционный уникальный индекс (`JOBS_RUNNING_
+        UNIQUE_INDEX`, миграция `0002`) получает `IntegrityError` прямо на
+        `execute()` — Postgres не откладывает проверку уникального индекса.
+        Транзакция после этого испорчена (Postgres требует `ROLLBACK`, повторный
+        `commit()` кинул бы `PendingRollbackError`), а не просто "ничего не
+        нашли". Внутри этого же вызова заново не пытаемся: `worker_id` внутри
+        `_CLAIM_SQL` уже выбрал конкретную строку-кандидата и проиграл её
+        конкретному конкуренту — заново выбирать пришлось бы с нуля, отдельным
+        запросом, а вызывающий (воркер в цикле опроса) и так трактует `None` как
+        «сейчас нечего взять» и попробует снова на следующей итерации. Раз
+        `None` — легитимный, ожидаемый исход именно ЭТОГО конфликта (см.
+        `_is_running_serialization_conflict`, fix round 2, Item 2) — а не
+        признак сбоя, наружу он не протекает никогда. Любой ДРУГОЙ
+        `IntegrityError` — это не «нечего взять», а настоящая поломка, и
+        перевыбрасывается как есть.
         """
         async with self._session_factory() as session:
             try:
                 result = await session.execute(_CLAIM_SQL, {"worker_id": worker_id})
                 row = result.mappings().first()
                 await session.commit()
-            except IntegrityError:
+            except IntegrityError as exc:
+                if not _is_running_serialization_conflict(exc):
+                    raise
                 await session.rollback()
                 return None
             if row is None:
@@ -201,18 +232,42 @@ class JobsQueue:
                 values={"status": "failed", "error": error, "finished_at": datetime.now(UTC)},
             )
 
-    async def await_user(self, job_id: int, resume_payload: dict) -> None:
+    async def await_user(
+        self, job_id: int, resume_payload: dict, worker_id: str | None = None
+    ) -> None:
         """Точка возврата эскалации (спека §8.3): задача перестаёт быть активной
         для сериализации по игроку (§8.1), но не начинается заново — `payload`
         сливается с накопленным, а не заменяет его, чтобы не потерять чекпоинты
         станций, уже записанные до вопроса игроку (§8.2, например message_id
         прогресс-сообщения).
+
+        Та же дыра, что была у `complete()`/`fail()` до fix round 1, и контроллер
+        назвал её отдельно (fix round 2, Item 1): `reap()` возвращает зависшую
+        задачу в очередь, другой воркер её подхватывает, а «ожившему» зомби-
+        воркеру больше нельзя молча ставить `awaiting_user` — иначе живая задача
+        нового владельца зависла бы в ожидании ответа на вопрос, которого никто
+        не задавал. `worker_id`/предпосылка `status == 'running'` — тот же
+        `_apply_transition`, что у `complete()`/`fail()`, специально не другой
+        приём: контроллер прямо просил ту же форму, а не её вариацию.
+
+        Слияние `payload` читается ОТДЕЛЬНЫМ запросом до атомарного перехода —
+        не через `session.get()` (тот пометил бы объект в identity map и испортил
+        диагностику `_apply_transition` в ветке провала, см. её докстринг), а
+        через точечный `select(Job.payload)`, не трогающий ORM-состояние сессии.
+        Если между этим чтением и переходом владение сменится, атомарный `WHERE`
+        всё равно отклонит запись — вычисленное слияние на основе устаревшего
+        чтения просто не попадёт в БД, а не попадёт молча поверх чужого прогресса.
         """
         async with self._session_factory() as session:
-            job = await self._get_job(session, job_id)
-            job.payload = {**job.payload, **resume_payload}
-            job.status = "awaiting_user"
-            await session.commit()
+            current_payload = await session.scalar(select(Job.payload).where(Job.id == job_id))
+            merged_payload = {**(current_payload or {}), **resume_payload}
+            await self._apply_transition(
+                session,
+                job_id=job_id,
+                expected_status="running",
+                worker_id=worker_id,
+                values={"status": "awaiting_user", "payload": merged_payload},
+            )
 
     async def resume(self, job_id: int) -> None:
         """Ответ игрока получен — `awaiting_user` → `queued`, задачу возьмёт
@@ -276,12 +331,6 @@ class JobsQueue:
             reaped = len(failed.all()) + len(requeued.all())
             await session.commit()
             return reaped
-
-    async def _get_job(self, session: AsyncSession, job_id: int) -> Job:
-        job = await session.get(Job, job_id)
-        if job is None:
-            raise LookupError(f"задача {job_id} не найдена")
-        return job
 
     async def _apply_transition(
         self,

@@ -202,6 +202,15 @@ class EvalCase(Base):
     )
 
 
+# Имя партиционного уникального индекса из `Job.__table_args__` — константа, а
+# не только строковый литерал в `Index(...)` ниже, потому что `platform/queue.py`
+# (fix round 2, Item 2) должен опознать именно ЭТОТ индекс по имени в тексте
+# ошибки Postgres, чтобы отличить его от любого другого возможного нарушения
+# уникальности на `jobs`. Общий источник строки — единственная защита от того,
+# что переименование индекса здесь тихо разойдётся со строкой в `queue.py`.
+JOBS_RUNNING_UNIQUE_INDEX = "uq_jobs_player_id_running"
+
+
 class Job(Base):
     """Очередь + журнал: `jobs` (§8). `session_id NOT NULL` с первой миграции —
     результату всегда есть куда лечь (молчаливое создание сессии — обязанность bot,
@@ -229,7 +238,7 @@ class Job(Base):
         # физически невозможной при любом уровне изоляции и для любого будущего
         # кода, который выставит status='running' в обход claim().
         Index(
-            "uq_jobs_player_id_running",
+            JOBS_RUNNING_UNIQUE_INDEX,
             "player_id",
             unique=True,
             postgresql_where=text("status = 'running'"),
