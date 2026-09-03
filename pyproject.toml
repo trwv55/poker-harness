@@ -11,6 +11,7 @@ dependencies = [
     "pokerkit==0.7.5",
     "psycopg[binary]>=3.3.5",
     "pydantic>=2.7",
+    "pydantic-ai>=2.38.0",
     "sqlalchemy[asyncio]>=2.0.30",
 ]
 
