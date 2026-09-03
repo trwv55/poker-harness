@@ -235,3 +235,68 @@ def test_voluntary_all_in_fold_is_not_forfeited():
     assert en.report.forfeits == []  # живого игрока из руки не вывели
     assert en.verdict.status == "reject"  # лишняя строка названа, а не проглочена
     assert any("A: folds" in r for r in en.verdict.reasons)
+
+
+def _sample_with_moved_button() -> CanonicalHand:
+    """SAMPLE с кнопкой на соседнем месте.
+
+    Кнопка двигается в `RawHand` и рука нормализуется заново — так тест гоняет
+    настоящий вывод позиций из кнопки, а не копию раскладки внутри теста.
+    """
+    raw = parse_hand(SAMPLE, source_ref="x")
+    seats = sorted(s.seat for s in raw.seats)
+    raw.button_seat = seats[(seats.index(raw.button_seat) + 1) % len(seats)]
+    return normalize(raw)
+
+
+def test_wrong_button_is_named_by_blind_check():
+    """Чужая кнопка называется причиной, а не выводится из денежного каскада.
+
+    Косвенно её ловит и движок — сломанный порядок хода даёт `illegal`, а следом
+    расходятся банк, выплаты и сумма фишек. Но ни одно из этих сообщений не
+    говорит, что сломана рассадка. Проверка блайндов говорит.
+    """
+    en = enrich(_sample_with_moved_button())
+    assert en.verdict.status == "reject"
+    named = [r for r in en.verdict.reasons if r.startswith("blind mismatch")]
+    assert len(named) == 1, en.verdict.reasons
+    assert "small_blind" in named[0] and "big_blind" in named[0]
+
+
+def test_wrong_button_on_screenshot_asks_the_player():
+    """Скрин — гипотеза: та же ошибка едет вопросом игроку, а не отказом.
+
+    На скрине эта проверка единственная: истории улиц нет, проиграть руку и
+    упереться в порядок хода нельзя.
+    """
+    hand = _sample_with_moved_button()
+    hand.provenance = Provenance.SCREENSHOT
+    verdict = enrich(hand).verdict
+    assert verdict.status == "escalate"
+    assert "button" in verdict.fields
+    question = verdict.questions[verdict.fields.index("button")]
+    assert "дилера" in question
+
+
+def test_blind_check_is_silent_without_posts():
+    """Нет записанных блайндов — нет и расхождения: выдумывать его нельзя.
+
+    Та же оговорка, что у сверки выплат. Обратная сторона: чтобы проверке было
+    что сверять, извлечение со скрина обязано отдавать блайнды по игрокам,
+    а не только уровень из шапки.
+    """
+    hand = _sample_with_moved_button()
+    hand.posts = []
+    reasons = enrich(hand).verdict.reasons
+    assert not any(r.startswith("blind mismatch") for r in reasons)
+    assert reasons, "остальные проверки обязаны продолжать ловить сдвинутую кнопку"
+
+
+@requires_fixtures
+def test_blind_check_does_not_fire_on_real_hands():
+    """Ноль ложных срабатываний на настоящих руках — иначе проверка вредна."""
+    from harness.parsers.hh_parser import parse_file as _pf
+    hands = _pf(FIXTURE_DAILY.read_text(encoding="utf-8"), source_ref=FIXTURE_DAILY.name)
+    for raw in hands:
+        verdict = enrich(normalize(raw)).verdict
+        assert not any(r.startswith("blind mismatch") for r in verdict.reasons), raw.hand_no

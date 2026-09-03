@@ -17,6 +17,7 @@ from harness.contracts import (
     CanonicalHand,
     EngineReport,
     PlayerState,
+    PostKind,
     Provenance,
     Street,
     ValidationStatus,
@@ -26,10 +27,12 @@ from harness.contracts import (
 _FIELD_STACKS = "stacks"
 _FIELD_ACTIONS = "actions"
 _FIELD_CARDS = "cards"
+_FIELD_BUTTON = "button"
 
 _QUESTIONS: dict[str, str] = {
     _FIELD_ACTIONS: "Ставки и повышения в раздаче распознаны верно?",
     _FIELD_CARDS: "Карты героя и карты на столе распознаны верно?",
+    _FIELD_BUTTON: "Фишка дилера стоит на том игроке?",
 }
 
 
@@ -74,6 +77,54 @@ def forced_blind(hand: CanonicalHand, player: PlayerState, ante: int) -> int:
     else:
         return 0
     return max(min(blind, player.stack - ante), 0)
+
+
+def _blind_mismatch(hand: CanonicalHand) -> str | None:
+    """Сверить блайнды, выведенные из кнопки, с теми, что записал источник.
+
+    Два независимых факта об одной рассадке: позиции нормалайзер считает от места
+    кнопки, а `posts` говорят, кто малый и большой блайнд поставил в реальности.
+    Разошлись — кнопка прочитана не на том месте, и дальше неверна вся раскладка
+    позиций, от которой зависят и диапазоны, и вердикт.
+
+    На hand history проверка дублирует движок: чужая кнопка ломает порядок хода,
+    и реплей упирается в «ход за не тем игроком» (измерено: 636 подмен кнопки на
+    318 руках — 636 отказов). Ценность здесь в том, что причина названа, а не
+    выведена из каскада денежных расхождений.
+
+    **На скриншоте она единственная.** Руку в момент решения проиграть нельзя —
+    истории улиц нет, упереться в порядок хода не во что. Остаются ровно два
+    видимых на столе факта: где лежит фишка дилера и какие ставки стоят перед
+    игроками. Их сверка и есть проверка — тот же приём, что банк как контрольная
+    сумма.
+
+    Молчит, когда сверять нечего: источник не записал блайнды (та же оговорка,
+    что у сверки выплат — выдумывать расхождение из отсутствия данных нельзя).
+    Отсюда требование к схеме извлечения: на живом столе блайнды нужны
+    **по игрокам**, а не только уровень из шапки, иначе проверке нечего сравнивать.
+    """
+    actual: dict[PostKind, str] = {}
+    for post in hand.posts:
+        if post.kind in (PostKind.SMALL_BLIND, PostKind.BIG_BLIND):
+            actual.setdefault(post.kind, post.label)  # первый пост своего вида
+    if not actual:
+        return None
+
+    heads_up = len(hand.players) == 2
+    expected: dict[PostKind, str] = {}
+    for player in hand.players:
+        # В хедз-апе малый блайнд ставит кнопка — позиции SB там нет.
+        if player.position == "BB":
+            expected[PostKind.BIG_BLIND] = player.label
+        elif player.position == "SB" or (heads_up and player.position == "BTN"):
+            expected[PostKind.SMALL_BLIND] = player.label
+
+    wrong = [
+        f"{kind.value}: по кнопке {expected.get(kind, '—')}, источник пишет {label}"
+        for kind, label in sorted(actual.items())
+        if expected.get(kind) != label
+    ]
+    return "blind mismatch: " + "; ".join(wrong) if wrong else None
 
 
 def _source_stacks_end(hand: CanonicalHand) -> dict[str, int]:
@@ -129,6 +180,12 @@ def validate(hand: CanonicalHand, report: EngineReport) -> Verdict:
     reasons: list[str] = []
     fields: list[str] = []
 
+    # Первой: неверная кнопка проявляется каскадом денежных расхождений ниже,
+    # но причина у него одна, и назвать её должна отдельная проверка.
+    blinds = _blind_mismatch(hand)
+    if blinds is not None:
+        reasons.append(blinds)
+        fields.append(_FIELD_BUTTON)
     if report.illegal_actions:
         reasons.append(f"illegal: {report.illegal_actions}")
         fields.append(_FIELD_ACTIONS)

@@ -140,6 +140,7 @@ def normalize(raw: RawHand) -> CanonicalHand:
         button_seat=raw.button_seat,
         players=players,
         dealt=raw.dealt,
+        posts=raw.posts,
         actions=_canonical_actions(raw),
         boards=raw.boards,
         uncalled=raw.uncalled,

@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from harness.contracts.raw import (
     ActionKind,
     Collected,
+    Post,
     Provenance,
     ShowdownEntry,
     Street,
@@ -65,6 +66,11 @@ class CanonicalHand(BaseModel):
     hero_label: str = "Hero"
     players: list[PlayerState]
     dealt: dict[str, list[str]] = {}
+    # Посты анте и блайндов, как их записал источник. Деньги отсюда НЕ берутся:
+    # блайнды уже сидят в `committed_after` первого круга, анте — в `ante`.
+    # Поле держится как независимая улика: позиции выведены из кнопки, а тут
+    # написано, кто блайнды поставил на самом деле — сверка ловит чужую кнопку.
+    posts: list[Post] = []
     actions: list[CanonicalAction] = []
     boards: dict[Street, list[str]] = {}
     uncalled: list[Uncalled] = []
