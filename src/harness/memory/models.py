@@ -220,6 +220,20 @@ class Job(Base):
         ),
         Index("ix_jobs_status_priority_created_at", "status", "priority", "created_at"),
         Index("ix_jobs_player_id_status", "player_id", "status"),
+        # Партиционный уникальный индекс — структурная гарантия «одна активная
+        # задача на игрока» (спека §8.1), а не только фильтр NOT EXISTS в SQL
+        # захвата (`platform/queue.py`, `_CLAIM_SQL`). NOT EXISTS под READ
+        # COMMITTED видит только закоммиченное и не останавливает два конкурентных
+        # claim() над РАЗНЫМИ queued-задачами одного игрока — гонка (задача 15,
+        # fix round 1, 300/300 на реальном Postgres). Индекс делает эту гонку
+        # физически невозможной при любом уровне изоляции и для любого будущего
+        # кода, который выставит status='running' в обход claim().
+        Index(
+            "uq_jobs_player_id_running",
+            "player_id",
+            unique=True,
+            postgresql_where=text("status = 'running'"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)

@@ -7,11 +7,25 @@
 фабрика — открыть и закрыть транзакцию больше некому, кроме самой очереди.
 Поэтому каждый публичный метод — одна транзакция целиком: открыть сессию,
 сделать дело, закоммитить, вернуть результат. Для `claim()` это не стиль, а
-необходимость: `FOR UPDATE SKIP LOCKED` держит лок ровно на время своей
-транзакции, и она обязана закрыться коммитом внутри метода — иначе конкурентные
-воркеры не увидят блокировки друг друга (проверено `test_claim_atomic_two_workers`
-на настоящем Postgres: `db` из задачи 14, откатываемая транзакция, для этого
-принципиально не годится).
+необходимость: `FOR UPDATE SKIP LOCKED` держит лок над строкой-кандидатом ровно
+на время своей транзакции, и та обязана закрыться коммитом внутри метода — иначе
+второй воркер не увидит эту блокировку и получит ту же строку. Гарантия здесь
+именно такая, точечная: она не мешает двум воркерам одновременно взять РАЗНЫЕ
+строки — сериализация по игроку (см. следующий абзац) устроена отдельно.
+
+**Сериализация по игроку — в двух слоях, и оба обязательны (задача 15, fix round
+1).** `NOT EXISTS` внутри `_CLAIM_SQL` — быстрый путь без лишних блокировок в
+общем случае, но сам по себе недостаточен: под READ COMMITTED он видит только
+закоммиченное, а `FOR UPDATE SKIP LOCKED` блокирует только саму строку-кандидата
+`j`, не строки, которые проверяет подзапрос `r`. Из-за этого два конкурентных
+`claim()` могли одновременно выбрать РАЗНЫЕ `queued`-задачи одного игрока — ни
+один не видел решения другого, потому что решение другого ещё не закоммичено
+(воспроизведено на реальном Postgres 16, 300/300). Партиционный уникальный индекс
+`uq_jobs_player_id_running` (миграция `0002`, `on jobs(player_id) WHERE
+status='running'`) — вторая линия защиты и настоящая гарантия: он делает вторую
+одновременную `running`-строку физически невозможной при любом уровне изоляции,
+а `NOT EXISTS` остаётся оптимизацией, которая в большинстве случаев не даёт делу
+дойти до конфликта на индексе.
 
 Приоритеты типов задач (спека §8.1: `screenshot_analyze`/`deep_dive` — 100,
 `hh_scan` — 200 не срочен, `eval_run` — 900 самый терпеливый) `enqueue`
@@ -25,9 +39,22 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from harness.memory.models import Job
+
+
+class JobPreconditionFailed(Exception):
+    """Задача найдена, но её текущее состояние не совпадает с тем, что ожидал
+    вызывающий: `resume()` вызван не на `awaiting_user`, либо `complete()`/`fail()`
+    переданы с `worker_id`, который уже не владелец (`locked_by`) — например,
+    `reap()` успел отдать задачу другому воркеру, пока первый зомби-воркер ещё
+    жив и пытается закрыть то, что ему больше не принадлежит (задача 15, fix
+    round 1, Finding 2). Отдельно от `LookupError` (задачи вовсе нет в БД) —
+    вызывающему важно различать эти два случая, а не получать в обоих один и
+    тот же молчаливый провал.
+    """
 
 # Порядок и значения — спека §8.1 дословно.
 _DEFAULT_PRIORITY_BY_TYPE: dict[str, int] = {
@@ -97,11 +124,28 @@ class JobsQueue:
             return job.id
 
     async def claim(self, worker_id: str) -> Job | None:
-        """Атомарно забрать одну задачу — `_CLAIM_SQL`, см. докстринг модуля."""
+        """Атомарно забрать одну задачу — `_CLAIM_SQL`, см. докстринг модуля.
+
+        Проигравший гонку за партиционный уникальный индекс (`uq_jobs_player_id_
+        running`, миграция `0002`) получает `IntegrityError` прямо на `execute()`
+        — Postgres не откладывает проверку уникального индекса. Транзакция после
+        этого испорчена (Postgres требует `ROLLBACK`, повторный `commit()` кинул
+        бы `PendingRollbackError`), а не просто "ничего не нашли". Внутри этого же
+        вызова заново не пытаемся: `worker_id` внутри `_CLAIM_SQL` уже выбрал
+        конкретную строку-кандидата и проиграл её конкретному конкуренту — заново
+        выбирать пришлось бы с нуля, отдельным запросом, а вызывающий (воркер в
+        цикле опроса) и так трактует `None` как «сейчас нечего взять» и попробует
+        снова на следующей итерации. Раз `None` — легитимный, ожидаемый исход
+        конфликта, а не признак сбоя, наружу `IntegrityError` не протекает никогда.
+        """
         async with self._session_factory() as session:
-            result = await session.execute(_CLAIM_SQL, {"worker_id": worker_id})
-            row = result.mappings().first()
-            await session.commit()
+            try:
+                result = await session.execute(_CLAIM_SQL, {"worker_id": worker_id})
+                row = result.mappings().first()
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                return None
             if row is None:
                 return None
             # Явные именованные поля, а не `Job(**dict(row))`: конструктор
@@ -125,20 +169,37 @@ class JobsQueue:
                 error=row["error"],
             )
 
-    async def complete(self, job_id: int) -> None:
+    async def complete(self, job_id: int, worker_id: str | None = None) -> None:
+        """Закрыть задачу успехом. `worker_id`, если передан, обязан совпасть с
+        `locked_by` — без этой проверки зомби-воркер, чья задача уже вернулась
+        в очередь через `reap()` и подхвачена другим воркером, мог бы молча
+        затереть чужой прогресс (Finding 2, fix round 1). Параметр остаётся
+        опциональным, чтобы не ломать вызовы без него (задача 18 будет передавать
+        его всегда); `status == 'running'` — обязательная предпосылка независимо
+        от `worker_id`: закрывать успехом можно только то, что реально было в
+        работе.
+        """
         async with self._session_factory() as session:
-            job = await self._get_job(session, job_id)
-            job.status = "done"
-            job.finished_at = datetime.now(UTC)
-            await session.commit()
+            await self._apply_transition(
+                session,
+                job_id=job_id,
+                expected_status="running",
+                worker_id=worker_id,
+                values={"status": "done", "finished_at": datetime.now(UTC)},
+            )
 
-    async def fail(self, job_id: int, error: str) -> None:
+    async def fail(self, job_id: int, error: str, worker_id: str | None = None) -> None:
+        """Закрыть задачу неудачей — те же гарантии владения и предпосылки, что
+        у `complete()` (см. её докстринг).
+        """
         async with self._session_factory() as session:
-            job = await self._get_job(session, job_id)
-            job.status = "failed"
-            job.error = error
-            job.finished_at = datetime.now(UTC)
-            await session.commit()
+            await self._apply_transition(
+                session,
+                job_id=job_id,
+                expected_status="running",
+                worker_id=worker_id,
+                values={"status": "failed", "error": error, "finished_at": datetime.now(UTC)},
+            )
 
     async def await_user(self, job_id: int, resume_payload: dict) -> None:
         """Точка возврата эскалации (спека §8.3): задача перестаёт быть активной
@@ -155,12 +216,18 @@ class JobsQueue:
 
     async def resume(self, job_id: int) -> None:
         """Ответ игрока получен — `awaiting_user` → `queued`, задачу возьмёт
-        любой свободный воркер (спека §8.3, шаг 3).
+        любой свободный воркер (спека §8.3, шаг 3). Предпосылка `status ==
+        'awaiting_user'` обязательна (Minor, fix round 1): без неё повторный или
+        запоздавший вызов молча переоткрыл бы уже `done`/`failed`/`running` задачу.
         """
         async with self._session_factory() as session:
-            job = await self._get_job(session, job_id)
-            job.status = "queued"
-            await session.commit()
+            await self._apply_transition(
+                session,
+                job_id=job_id,
+                expected_status="awaiting_user",
+                worker_id=None,
+                values={"status": "queued"},
+            )
 
     async def reap(self, older_than_minutes: int = 10) -> int:
         """Страховка по возрасту лока (спека §8.1): если воркер умер, не дойдя
@@ -215,3 +282,51 @@ class JobsQueue:
         if job is None:
             raise LookupError(f"задача {job_id} не найдена")
         return job
+
+    async def _apply_transition(
+        self,
+        session: AsyncSession,
+        *,
+        job_id: int,
+        expected_status: str,
+        worker_id: str | None,
+        values: dict,
+    ) -> None:
+        """Атомарный переход состояния: один `UPDATE ... WHERE id=... AND
+        status=expected_status [AND locked_by=worker_id] RETURNING id`, а не
+        `session.get()` + мутация + `commit()`. Между чтением и записью в схеме
+        "прочитали — поменяли в Python — закоммитили" есть окно, где статус
+        задачи мог смениться другой транзакцией (например `reap()`) — этот метод
+        существует именно для того, чтобы такого окна не было (Finding 2, fix
+        round 1: тот же принцип, что и партиционный индекс для `claim()`,
+        "гарантия в БД, а не в порядке вызовов Python").
+
+        0 обновлённых строк — это ещё не факт "их запись". Различаем: если
+        задачи вовсе нет — `LookupError` (второй, диагностический запрос — но он
+        случается только на уже исключительном пути, не в общем случае успеха);
+        если есть, но `status`/`locked_by` не совпали с ожиданием —
+        `JobPreconditionFailed`.
+        """
+        conditions = [Job.id == job_id, Job.status == expected_status]
+        if worker_id is not None:
+            conditions.append(Job.locked_by == worker_id)
+        result = await session.execute(
+            update(Job)
+            .where(*conditions)
+            .values(**values)
+            .execution_options(synchronize_session=False)
+            .returning(Job.id)
+        )
+        matched = result.first() is not None
+        if matched:
+            await session.commit()
+            return
+        await session.rollback()
+        job = await session.get(Job, job_id)
+        if job is None:
+            raise LookupError(f"задача {job_id} не найдена")
+        raise JobPreconditionFailed(
+            f"задача {job_id}: ожидали status={expected_status!r}"
+            + (f", locked_by={worker_id!r}" if worker_id is not None else "")
+            + f", а сейчас status={job.status!r}, locked_by={job.locked_by!r}"
+        )
