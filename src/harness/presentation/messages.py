@@ -25,11 +25,25 @@
 «колл вместо шов», и это была самая частая строка во всём продукте. Вместо
 второго словаря словоформ (родительный параллельно именительному — источник
 рассинхрона, стоивший проекту нескольких находок в других модулях) фраза
-переписана как `"{action} (верно: {best})"`: двоеточие после «верно» не
+переписана как `"{action} (лучше: {best})"`: двоеточие после слова не
 требует согласования падежа с существительным перед ним, поэтому одного
 именительного падежа в `_ACTION_WORD` достаточно. `test_..._grammatically_correct`
 пришпиливает буквальный рендер строки — регресс формулировки становится
 красным тестом, а не тем, что заметит игрок раньше нас.
+
+**«Лучше», не «верно» (fix round 2).** Первая правка round 1 заменила
+«вместо» на «верно» и решила падеж, но не честность: «верно: {best}» ЗАЯВЛЯЕТ,
+что сыгранное действие было неверным. В зоне `strict` это ещё защитимо (ядро
+знает точный ответ), но у бОльшей части судимых точек продукта зона —
+`assuming`: там ядро не знает, что альтернатива была верна, оно знает только,
+что она выигрывает EV-ПРИ ДОГАДАННОМ диапазоне оппонента — а угаданный
+диапазон стоит тремя строками выше маркером `_ASSUMING_MARKER` ровно за тем,
+чтобы не выдавать догадку за факт. «Верно» в такой строке отменяет то, что
+утверждает маркер рядом с ней — тот же манёвр, который запрещает правило
+«расхождение, не ошибка» (CLAUDE.md), другими словами. «Лучше» утверждает
+ровно то, что посчитано: у этой строки была выше EV — верно в обеих зонах,
+не спорит с маркером и не требует знания, действительно ли сыгранное было
+ошибкой.
 """
 
 from __future__ import annotations
@@ -163,7 +177,7 @@ def scan_summary_msg(s: ScanSummary, quota_left: int, quota_total: int) -> Msg:
             marker = f" ({_ASSUMING_MARKER})" if item.zone is Zone.ASSUMING else ""
             lines.append(
                 f"№{item.hand_no} · {item.hero_class} · {_spot_word(item.spot)}: "
-                f"{_action_word(item.action_taken)} (верно: {_action_word(item.best_action)}) "
+                f"{_action_word(item.action_taken)} (лучше: {_action_word(item.best_action)}) "
                 f"— {_fmt_bb(item.ev_diff_bb)}{marker}"
             )
             buttons.append([deep_dive_button(item.hand_no)])
@@ -199,7 +213,7 @@ def deep_dive_msg(
             lines.append(
                 f"{_STREET_WORD.get(point.street, point.street.value)} · "
                 f"{_spot_word(point.spot)}: {_action_word(point.action_taken)} "
-                f"(верно: {_action_word(point.best_action)}) — {_fmt_bb(point.ev_diff_bb)}{marker}"
+                f"(лучше: {_action_word(point.best_action)}) — {_fmt_bb(point.ev_diff_bb)}{marker}"
             )
 
     lines.append("")

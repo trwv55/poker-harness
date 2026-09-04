@@ -14,6 +14,14 @@
 (число в заголовке и сумма показанных строк — сознательно РАЗНЫЕ величины, и
 предыдущая версия этого теста их не различала, потому что оба примера
 совпадали численно); тесты на `hands_failed` и на не-минус-ноль `_fmt_bb`.
+
+**Fix round 2.** Round 1 заменило «вместо» (грамматика) на «верно» — падеж
+решён, честность нет: «верно» заявляет, что сыгранное было неправильным, а в
+зоне `assuming` ядро знает только более высокую EV при угаданном диапазоне.
+Слово заменено на «лучше» (истинно в обеих зонах). Guard на «ошиб» (round 1)
+ловит одно написание идеи «не называть решение неправильным»; добавлен
+`test_scan_summary_msg_never_asserts_the_taken_action_was_wrong` — guard на
+«верно» (ловит и «неверно» как подстроку) — второе написание той же идеи.
 """
 
 from __future__ import annotations
@@ -109,6 +117,33 @@ def test_scan_summary_msg_never_says_error_word_with_or_without_items():
     assert "расхожд" in scan_summary_msg(with_items, quota_left=1, quota_total=1).text
 
 
+def test_scan_summary_msg_never_asserts_the_taken_action_was_wrong():
+    """Fix round 2: тот же манёвр, что запрещает «расхождение, не ошибка», под
+    другим словом — «верно»/«неверно» заявляют, что сыгранное было неправильным,
+    но в зоне `assuming` (58 из 77 судимых точек продукта на измеренных данных)
+    ядро знает только, что альтернатива выигрывала EV ПРИ УГАДАННОМ диапазоне,
+    не то, что сыгранное было ошибкой — маркер `_ASSUMING_MARKER` двумя строками
+    выше специально это оговаривает, и «верно» рядом с ним его отменяет.
+
+    Guard на «ошиб» (round 1) ловит одно написание идеи; этот — другое написание
+    той же идеи («верно»/«неверно» — второе ловится как подстрока первого).
+    Собран на смеси `assuming`+пустой сводки, как и парный тест на «ошиб» —
+    чтобы шаблон, безусловно содержащий (или не содержащий) слово, не прошёл
+    случайно.
+    """
+    with_items = ScanSummary(
+        hands_total=5,
+        hands_with_decision=5,
+        items=[_scan_item(hand_no="H1", ev_diff_bb=-5.0, zone=Zone.ASSUMING)],
+        total_loss_bb=-5.0,
+    )
+    without_items = ScanSummary(hands_total=5, hands_with_decision=5, items=[], total_loss_bb=0.0)
+
+    assert "верно" not in scan_summary_msg(with_items, quota_left=1, quota_total=1).text
+    assert "верно" not in scan_summary_msg(without_items, quota_left=1, quota_total=1).text
+    assert "лучше" in scan_summary_msg(with_items, quota_left=1, quota_total=1).text
+
+
 def test_scan_summary_msg_marks_assuming_rows_and_not_strict_rows():
     """Гарантия честности зоны: пометка — у строки `assuming`, и ровно у неё.
 
@@ -142,15 +177,20 @@ def test_scan_summary_msg_item_line_is_grammatically_correct():
     """Пришпиливает буквальный рендер — «вместо» требует родительного падежа
     («вместо шова», не «вместо шов»), первая версия строки была сломана
     именно на этом (fix round 1, Important 1); фраза переписана так, чтобы
-    падеж вообще не был нужен («верно: шов»), и здесь это закреплено буквально,
+    падеж вообще не был нужен («лучше: шов»), и здесь это закреплено буквально,
     а не только проверкой чисел/пометки, которая ловушку не заметила.
+
+    Слово — «лучше», не «верно» (fix round 2): «верно» заявляло бы, что
+    сыгранное было неправильным, а ядро в зоне `assuming` знает только более
+    высокую EV при угаданном диапазоне, не факт правильности альтернативы.
     """
     items = [_scan_item(hand_no="H1", ev_diff_bb=-2.3, zone=Zone.STRICT)]
     s = ScanSummary(hands_total=1, hands_with_decision=1, items=items, total_loss_bb=-2.3)
     msg = scan_summary_msg(s, quota_left=1, quota_total=1)
 
-    assert "№H1 · AA · пуш-фолд: фолд (верно: шов) — −2.3 bb" in msg.text
-    assert "вместо шов" not in msg.text  # старая (сломанная) формулировка
+    assert "№H1 · AA · пуш-фолд: фолд (лучше: шов) — −2.3 bb" in msg.text
+    assert "вместо шов" not in msg.text  # старая (сломанная) формулировка round 1
+    assert "верно" not in msg.text  # старая (нечестная в assuming) формулировка round 2
 
 
 def test_scan_summary_msg_total_loss_label_differs_from_items_sum():
@@ -271,16 +311,20 @@ def test_deep_dive_msg_respects_ranked_order_not_points_order():
 
 def test_deep_dive_msg_point_line_is_grammatically_correct():
     """Тот же пришпиленный рендер, что и у скана, — точка решения в разборе руки
-    строится тем же f-строчным шаблоном и была сломана тем же образом.
+    строится тем же f-строчным шаблоном и была сломана тем же образом (round 1),
+    а затем несла то же нечестное «верно» в зоне `assuming` (round 2): у этой
+    точки ядро знает только, что альтернатива выигрывала EV при угаданном
+    диапазоне, а не что сыгранное было ошибкой.
     """
     res = _mixed_result()
     msg = deep_dive_msg(res, elapsed_s=1, zone=Zone.STRICT, quota_left=1, quota_total=1)
 
-    assert "Префлоп · пуш-фолд: фолд (верно: шов) — −2.3 bb" in msg.text
+    assert "Префлоп · пуш-фолд: фолд (лучше: шов) — −2.3 bb" in msg.text
     assert (
-        "Префлоп · колл шова: колл (верно: шов) — −1.1 bb (по модели диапазонов)" in msg.text
+        "Префлоп · колл шова: колл (лучше: шов) — −1.1 bb (по модели диапазонов)" in msg.text
     )
-    assert "вместо шов" not in msg.text
+    assert "вместо шов" not in msg.text  # старая (грамматически сломанная) формулировка round 1
+    assert "верно" not in msg.text  # старая (нечестная в assuming) формулировка round 2
 
 
 def test_deep_dive_msg_buttons_are_ranges_detail_disagree_with_hand_no():
