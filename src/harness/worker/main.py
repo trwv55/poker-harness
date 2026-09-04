@@ -30,14 +30,23 @@ import httpx
 import structlog
 
 from harness.memory.models import async_session_factory
-from harness.platform.config import Config, MissingEnvVar, optional_env
+from harness.platform.config import Config, EnvVarError, optional_int
 from harness.platform.llm import LLM
 from harness.platform.logs import configure_logging
 from harness.platform.queue import JobsQueue
 from harness.presentation import Btn, Msg
 from harness.worker.pipeline import Deps, run_job
 
-__all__ = ["TelegramSender", "configure_logging", "main", "reap_loop", "worker_loop"]
+__all__ = [
+    "TelegramSender",
+    "configure_logging",
+    "main",
+    "reap_loop",
+    "worker_concurrency",
+    "worker_loop",
+]
+
+_DEFAULT_WORKER_CONCURRENCY = 4
 
 _REAP_INTERVAL_S = 60.0
 _POLL_INTERVAL_S = 1.0
@@ -128,20 +137,33 @@ async def reap_loop(queue: JobsQueue, *, interval_s: float = _REAP_INTERVAL_S) -
             log.exception("reap_failed")
 
 
+def worker_concurrency() -> int:
+    """Сколько корутин крутит ОДИН процесс воркера.
+
+    Не часть общего `Config`/`from_env()` (задача 16, `test_config_from_env_
+    reads_all_six_vars` дословно фиксирует их число): это тюнинг именно воркера,
+    не провайдер-слоя, и делать его обязательной переменной окружения для ВСЕХ
+    потребителей `Config` (бот, evals) значило бы требовать от них знать число,
+    которое их не касается. Дефолт — не угадывание лимита денег/провайдера (то
+    как раз запрещено, спека §7), а число корутин одного процесса.
+
+    Отдельной функцией, а не строкой внутри `main()` (ревью задачи 20, раунд 2):
+    саму `main()` тестом не позовёшь — она уходит в вечный цикл, — и потому
+    откат ЭТОЙ строки к `os.environ.get(..., "4")` оставлял весь прогон зелёным,
+    хотя чинили именно её. Вынесенная функция покрыта тестом напрямую.
+
+    Разбор целого — в `optional_int`, а не здесь: пустое значение считается
+    незаданным (`env_file` в Compose отдаёт `WORKER_CONCURRENCY=` пустой
+    строкой), а мусор вроде `abc` даёт `InvalidEnvVar` с именем переменной, а не
+    голый `ValueError` с трассировкой в цикле рестартов.
+    """
+    return optional_int("WORKER_CONCURRENCY", _DEFAULT_WORKER_CONCURRENCY)
+
+
 async def main() -> None:
     configure_logging()
     cfg = Config.from_env()
-    # Не часть общего `Config`/`from_env()` (задача 16, `test_config_from_env_reads_
-    # all_six_vars` дословно фиксирует их число): это тюнинг именно воркера, не
-    # провайдер-слоя, и делать его обязательной переменной окружения для ВСЕХ
-    # потребителей `Config` (бот, evals) значило бы требовать от них знать число,
-    # которое их не касается. Дефолт — не угадывание лимита денег/провайдера
-    # (то как раз запрещено, спека §7), а число корутин одного процесса.
-    # `optional_env`, а не `os.environ.get(..., "4")`: `env_file` в Compose
-    # отдаёт строку `WORKER_CONCURRENCY=` как ПУСТОЕ значение, дефолт бы не
-    # применился, и `int("")` уронил бы воркер трассировкой в цикле рестартов
-    # (ревью задачи 20; обоснование целиком — в докстринге `optional_env`).
-    worker_concurrency = int(optional_env("WORKER_CONCURRENCY", "4"))
+    concurrency = worker_concurrency()
 
     db_factory = async_session_factory(cfg.database_url)
     queue = JobsQueue(db_factory)
@@ -169,7 +191,7 @@ async def main() -> None:
             process_pool=process_pool,
         )
         async with asyncio.TaskGroup() as tg:
-            for i in range(worker_concurrency):
+            for i in range(concurrency):
                 tg.create_task(worker_loop(deps, worker_id=f"{_PROCESS_ID}-{i}"))
             tg.create_task(reap_loop(queue))
 
@@ -177,11 +199,12 @@ async def main() -> None:
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except MissingEnvVar as exc:
-        # Контейнер без `.env` обязан сказать ОДНОЙ строкой, чего именно не
-        # хватает (задача 20): трассировка на восемь кадров в `docker compose
-        # logs` про непрочитанную переменную — шум, в котором причина теряется, а
-        # `SystemExit` со строкой печатает её в stderr и выходит с кодом 1, без
-        # стека. Ловится только `MissingEnvVar`: любое ДРУГОЕ исключение при
-        # старте — настоящая поломка, и его трассировка нужна целиком.
+    except EnvVarError as exc:
+        # Контейнер с неполным или испорченным конфигом обязан сказать ОДНОЙ
+        # строкой, что именно не так (задача 20): трассировка на восемь кадров в
+        # `docker compose logs` про непрочитанную переменную — шум, в котором
+        # причина теряется, а `SystemExit` со строкой печатает её в stderr и
+        # выходит с кодом 1, без стека. Ловится только `EnvVarError` (не задана
+        # ИЛИ задана мусором, раунд 2 ревью): любое ДРУГОЕ исключение при старте
+        # — настоящая поломка, и его трассировка нужна целиком.
         raise SystemExit(f"{exc}; заполните .env, образец — .env.example") from exc

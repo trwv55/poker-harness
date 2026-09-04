@@ -32,22 +32,34 @@ from aiogram import Bot, Dispatcher
 from harness.bot.handlers import BotDeps
 from harness.bot.router import build_router
 from harness.memory.models import async_session_factory
-from harness.platform.config import Config, MissingEnvVar, optional_env
+from harness.platform.config import Config, EnvVarError, optional_env
 from harness.platform.logs import configure_logging
 from harness.platform.queue import JobsQueue
 
-__all__ = ["main"]
+__all__ = ["data_dir", "main"]
 
 _DEFAULT_DATA_DIR = "/data"
+
+
+def data_dir() -> Path:
+    """Корень тома с файлами игроков — путь, который бот запишет в БД.
+
+    Отдельной функцией, а не строкой внутри `main()` (ревью задачи 20, раунд 2):
+    `main()` уходит в long polling и тестом не вызывается, поэтому откат этой
+    строки к `os.environ.get(..., default)` оставлял бы прогон зелёным — притом
+    что пустое значение из `env_file` дало бы `Path("")`, то есть `Path(".")`, и
+    файлы игроков легли бы в рабочий каталог контейнера вместо тома.
+    """
+    return Path(optional_env("DATA_DIR", _DEFAULT_DATA_DIR))
 
 
 async def main() -> None:
     configure_logging()
     cfg = Config.from_env()
-    data_dir = Path(optional_env("DATA_DIR", _DEFAULT_DATA_DIR))
+    deps_data_dir = data_dir()
 
     db_factory = async_session_factory(cfg.database_url)
-    deps = BotDeps(db_factory=db_factory, queue=JobsQueue(db_factory), data_dir=data_dir)
+    deps = BotDeps(db_factory=db_factory, queue=JobsQueue(db_factory), data_dir=deps_data_dir)
 
     bot = Bot(cfg.telegram_token)
     dispatcher = Dispatcher()
@@ -60,11 +72,12 @@ async def main() -> None:
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except MissingEnvVar as exc:
-        # Контейнер без `.env` обязан сказать ОДНОЙ строкой, чего именно не
-        # хватает (задача 20): трассировка на восемь кадров в `docker compose
-        # logs` про непрочитанную переменную — шум, в котором причина теряется, а
-        # `SystemExit` со строкой печатает её в stderr и выходит с кодом 1, без
-        # стека. Ловится только `MissingEnvVar`: любое ДРУГОЕ исключение при
-        # старте — настоящая поломка, и его трассировка нужна целиком.
+    except EnvVarError as exc:
+        # Контейнер с неполным или испорченным конфигом обязан сказать ОДНОЙ
+        # строкой, что именно не так (задача 20): трассировка на восемь кадров в
+        # `docker compose logs` про непрочитанную переменную — шум, в котором
+        # причина теряется, а `SystemExit` со строкой печатает её в stderr и
+        # выходит с кодом 1, без стека. Ловится только `EnvVarError` (не задана
+        # ИЛИ задана мусором, раунд 2 ревью): любое ДРУГОЕ исключение при старте
+        # — настоящая поломка, и его трассировка нужна целиком.
         raise SystemExit(f"{exc}; заполните .env, образец — .env.example") from exc

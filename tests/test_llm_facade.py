@@ -37,7 +37,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from harness.memory.models import Job, LlmCall, Trace
 from harness.memory.repos import PlayersRepo, SessionsRepo
-from harness.platform.config import Config, MissingEnvVar, optional_env
+from harness.platform.config import Config, InvalidEnvVar, MissingEnvVar, optional_env
 from harness.platform.limiter import _ADVISORY_LOCK_CLASS, PgLimiter, PgLimiterTimeout, _engine_of
 from harness.platform.llm import LLM, LLMProviderError, LLMSchemaError, _sniff_image_media_type
 
@@ -808,6 +808,11 @@ def test_config_from_env_missing_var_fails_loudly(monkeypatch):
 def test_optional_env_treats_empty_value_as_unset(monkeypatch):
     """ПУСТАЯ строка — это незаданная переменная, а не значение.
 
+    **Это регрессионный сторож раунда 1: красный на прежней реализации.**
+    Соседний тест (`..._prefers_value_over_default`) зелёный на обеих и ловит не
+    регресс, а ПЕРЕкоррекцию — сказано явно, потому что при чтении отчёта пару
+    «сторож + страховка» легко принять за два сторожа (ревью, раунд 2).
+
     Не теоретическая придирка, а воспроизведение живого отказа (ревью задачи
     20): `env_file` в Docker Compose ставит строку вида `WORKER_CONCURRENCY=`
     как пустое значение, а не как отсутствие переменной. Голый
@@ -823,11 +828,34 @@ def test_optional_env_treats_empty_value_as_unset(monkeypatch):
 
 
 def test_optional_env_prefers_value_over_default(monkeypatch):
-    """Обратная сторона того же: непустое значение обязано побеждать дефолт —
-    иначе «пустое значит незаданное» превратилось бы в «переменная не читается».
+    """Страховка от перекоррекции, а НЕ регрессионный сторож: этот тест зелёный
+    и на прежней реализации (`os.environ.get(name, default)` заданное значение
+    возвращал верно). Он держит вторую сторону инварианта — «пустое значит
+    незаданное» не имеет права выродиться в «переменная не читается вовсе».
     """
     monkeypatch.setenv("WORKER_CONCURRENCY", "8")
     assert optional_env("WORKER_CONCURRENCY", "4") == "8"
 
     monkeypatch.delenv("WORKER_CONCURRENCY", raising=False)
     assert optional_env("WORKER_CONCURRENCY", "4") == "4"
+
+
+def test_config_from_env_rejects_non_integer_with_named_error(monkeypatch):
+    """Целочисленная переменная, заданная не числом, — `InvalidEnvVar` с именем
+    переменной, а не голый `ValueError` (ревью задачи 20, раунд 2).
+
+    Тот же симптом, что чинил раунд 1, но другой триггер: под
+    `restart: unless-stopped` оператор видит не одну честную строку, а цикл
+    рестартов с трассировкой `invalid literal for int() with base 10`, где имя
+    переменной вообще не названо. Отдельно от `MissingEnvVar`: «не задана» и
+    «задана мусором» требуют разных действий.
+    """
+    monkeypatch.setenv("LLM_VISION_MODEL", "provider:model-x")
+    monkeypatch.setenv("LLM_VERDICT_MODEL", "provider:model-y")
+    monkeypatch.setenv("LLM_MAX_CONCURRENCY", "четыре")
+    monkeypatch.setenv("LLM_MAX_PER_MINUTE", "60")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@h/db")
+    monkeypatch.setenv("TELEGRAM_TOKEN", "не-настоящий-токен")
+
+    with pytest.raises(InvalidEnvVar, match="LLM_MAX_CONCURRENCY"):
+        Config.from_env()
