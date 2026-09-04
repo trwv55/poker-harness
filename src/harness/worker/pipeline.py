@@ -54,12 +54,11 @@ import asyncio
 import time
 from concurrent.futures import Executor
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
 import structlog
-from sqlalchemy import func, select, update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from harness.analysis import analyze_hand
@@ -73,7 +72,13 @@ from harness.contracts import AnalysisResult, EnrichedHand, ValidationStatus, Zo
 from harness.engine import enrich
 from harness.memory.models import Job as JobModel
 from harness.memory.models import Player
-from harness.memory.repos import AnalysesRepo, CalcCacheRepo, HandsRepo, TournamentsRepo
+from harness.memory.repos import (
+    AnalysesRepo,
+    CalcCacheRepo,
+    HandsRepo,
+    QuotaRepo,
+    TournamentsRepo,
+)
 from harness.normalizer import normalize
 from harness.parsers import hh_parser
 from harness.platform.llm import LLM
@@ -95,14 +100,6 @@ _Station = Literal["parse", "validate", "analyze"]
 # по файлу целиком — щедрее; `deep_dive` — одна рука, дёшево даже с запасом.
 _JOB_DEADLINE_S: dict[str, float] = {"hh_scan": 480.0, "deep_dive": 120.0}
 _DEFAULT_JOB_DEADLINE_S = 300.0
-
-# Квота по умолчанию (спека §9, пример дословно: "разборов 17/50 за 24ч") — используется,
-# когда у игрока нет персонального `quota_daily` (players.quota_daily IS NULL). Полное
-# решение о допуске (`allowed`/`hours_to_free`) — задача 19 (bot, §9): здесь только числа
-# для честной подписи сообщения, воркер сам не отказывает в разборе (отказ — до постановки
-# задачи в очередь, не после).
-_QUOTA_TOTAL_DEFAULT = 50
-_INTERACTIVE_JOB_TYPES = ("deep_dive", "screenshot_analyze")
 
 # Закрытый набор причин отказа, которые честно показать игроку (fix round 1,
 # Important 1). `str(exc)` бывает `FileNotFoundError: [Errno 2] ... '/data/hh/
@@ -324,29 +321,17 @@ async def _chat_id(session: AsyncSession, player_id: int) -> int:
 
 async def _quota_numbers(session: AsyncSession, player_id: int) -> tuple[int, int]:
     """Числа для строки «разборов X/Y за 24ч» (спека §9: скользящее окно, SQL-счётчик
-    интерактивных задач). Полная проверка допуска (`allowed`, `hours_to_free`) — задача
-    19 (бот, §9 дословно): бот отказывает ДО постановки в очередь, воркер уже взял
-    задачу в работу и не вправе отказывать — ему нужны только эти два числа для честной
-    подписи сообщения, а не решение "пускать или нет".
+    интерактивных задач).
+
+    Считает `QuotaRepo` (задача 19) — ТА ЖЕ реализация окна, по которой бот решает,
+    пускать ли в разбор. До задачи 19 здесь стоял собственный счётчик-заглушка; два
+    счётчика с одинаковым смыслом разошлись бы молча, и игрок увидел бы «осталось 3»
+    ровно там, где ему отказали. Решение о допуске (`allowed`) воркер не читает
+    намеренно: он уже взял задачу в работу и отказывать не вправе — отказ случается
+    до постановки в очередь, не после.
     """
-    player = await session.get(Player, player_id)
-    total = (
-        player.quota_daily
-        if player is not None and player.quota_daily is not None
-        else _QUOTA_TOTAL_DEFAULT
-    )
-    since = datetime.now(UTC) - timedelta(hours=24)
-    used = await session.scalar(
-        select(func.count())
-        .select_from(JobModel)
-        .where(
-            JobModel.player_id == player_id,
-            JobModel.type.in_(_INTERACTIVE_JOB_TYPES),
-            JobModel.created_at > since,
-        )
-    )
-    left = max(total - int(used or 0), 0)
-    return left, total
+    quota = await QuotaRepo(session).check(player_id)
+    return quota.left, quota.total
 
 
 async def _run_hh_scan(job: JobModel, deps: Deps, trace: Trace) -> None:

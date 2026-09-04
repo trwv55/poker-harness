@@ -42,9 +42,14 @@ from harness.presentation import (
     deep_dive_msg,
     escalation_msg,
     failed_msg,
+    hh_accepted_msg,
+    new_session_msg,
+    photo_soon_msg,
     progress_text,
     quota_exceeded_msg,
     scan_summary_msg,
+    start_msg,
+    unsupported_document_msg,
 )
 
 # --- progress_text -----------------------------------------------------------------
@@ -390,3 +395,49 @@ def test_quota_exceeded_msg_states_hours_and_window():
     assert "5 ч" in msg.text
     assert "24 ч" in msg.text
     assert msg.buttons == []
+
+
+# --- вход игрока (задача 19) ---------------------------------------------------------
+
+
+def test_entry_messages_are_plain_text_without_buttons():
+    """Ни у одного сообщения входа нет кнопок: продукт обещает, что основное
+    действие — не кнопка, и первый экран не начинается с меню.
+    """
+    for msg in (
+        start_msg(),
+        hh_accepted_msg(),
+        unsupported_document_msg(),
+        photo_soon_msg(),
+        new_session_msg("Сессия 4 сен", previous_closed=True),
+    ):
+        assert msg.text.strip()
+        assert msg.buttons == []
+
+
+def test_hh_accepted_msg_promises_nothing_it_cannot_know():
+    """Подтверждение приёма не называет ни числа рук, ни времени ожидания — файл
+    ещё не разобран, и любое такое число было бы выдуманным (CLAUDE.md).
+
+    Проверка «нет цифр» груба намеренно: она ловит и «через ~40 секунд», и «146
+    раздач» — оба способа сказать то, чего бот в этот момент не знает.
+    """
+    assert not any(char.isdigit() for char in hh_accepted_msg().text)
+
+
+def test_new_session_msg_mentions_closing_only_when_something_was_closed():
+    """Первая сессия игрока: закрывать было нечего — и сообщение об этом молчит.
+    Обе стороны проверяются вместе, иначе шаблон, безусловно печатающий (или
+    безусловно не печатающий) фразу, прошёл бы тест случайно.
+    """
+    first = new_session_msg("Сессия 4 сен", previous_closed=False)
+    later = new_session_msg("Сессия 4 сен", previous_closed=True)
+    assert "закрыт" not in first.text
+    assert "закрыт" in later.text
+    assert "Сессия 4 сен" in first.text and "Сессия 4 сен" in later.text
+
+
+def test_photo_soon_msg_names_the_working_path():
+    """Заглушка vision (задача 22) обязана давать рабочий путь, а не только отказ."""
+    text = photo_soon_msg().text
+    assert ".txt" in text and "PokerCraft" in text

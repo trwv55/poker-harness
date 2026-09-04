@@ -1,23 +1,12 @@
 """Точка входа воркера: `claim → run_job` в `WORKER_CONCURRENCY` корутинах, фоновый
 `reap()` раз в минуту, единая настройка логирования (спека §2, §8.1).
 
-**Логирование — одно место на весь процесс (контроллерский рулинг задачи 18, п.4).**
-`configure_logging()` — единственный вызов `structlog.configure()`/`logging.
-basicConfig`-эквивалент во всём проекте: и структлог-события воркера (`_log =
-structlog.get_logger(__name__)` в этом модуле и в `worker/pipeline.py`), и
-stdlib-записи `platform/limiter.py` (задача 16 — `logging.getLogger(__name__).
-warning(...)` на застревании слота лимитера) обязаны выйти через ОДИН и тот же
-форматтер, а не жить каждый в своём формате/потоке — иначе предупреждение
-лимитера о забитом слоте окажется невидимым именно тогда, когда оно важнее всего.
-Собрано по стандартному рецепту интеграции structlog+stdlib logging (`structlog.
-stdlib.ProcessorFormatter`, `foreign_pre_chain`), но не принято на веру: `test_
-worker_pipeline.py::test_configure_logging_routes_limiter_warnings` реально вызывает
-`logging.getLogger("harness.platform.limiter").warning(...)` и проверяет текст на
-выходе — «настроено» и «действительно маршрутизирует» здесь разные утверждения
-(`migrations/env.py`, найдено в этой же задаче, звало `fileConfig()` так, что тихо
-гасило все логгеры, заведённые раньше в процессе, — этот случай уже исправлен, но
-«логирование тихо отключено» остаётся живым классом бага, который стоит проверять,
-а не предполагать).
+**Логирование — одно место на весь проект (контроллерский рулинг задачи 18, п.4).**
+`configure_logging()` жила здесь, пока процесс был один; с появлением бота (задача
+19) она переехала в `platform/logs.py` — общую инфраструктуру обоих процессов — и
+реэкспортируется отсюда, чтобы её вызывающие не переучивались. Рассуждение о том,
+почему настройка обязана быть единственной (структлог воркера и stdlib-логгер
+`platform/limiter.py` должны выйти одним форматтером), — в докстринге нового модуля.
 
 **`worker_id` — уникален между РЕПЛИКАМИ, не только между корутинами одного
 процесса.** Фенсинг `JobsQueue.complete()/fail()/await_user()` (задача 15/18, п.2)
@@ -33,12 +22,9 @@ worker_pipeline.py::test_configure_logging_routes_limiter_warnings` реальн
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import socket
-import sys
 from concurrent.futures import ProcessPoolExecutor
-from typing import TextIO
 
 import httpx
 import structlog
@@ -46,6 +32,7 @@ import structlog
 from harness.memory.models import async_session_factory
 from harness.platform.config import Config
 from harness.platform.llm import LLM
+from harness.platform.logs import configure_logging
 from harness.platform.queue import JobsQueue
 from harness.presentation import Btn, Msg
 from harness.worker.pipeline import Deps, run_job
@@ -57,38 +44,6 @@ _POLL_INTERVAL_S = 1.0
 # Уникален на процесс (см. модульный докстринг) — коротко и достаточно: PID переживает
 # только сам процесс, а следующий деплой этого же контейнера получит новый PID.
 _PROCESS_ID = f"{socket.gethostname()}-{os.getpid()}"
-
-
-def configure_logging(*, stream: TextIO | None = None, level: int = logging.INFO) -> None:
-    """Единственное место настройки логирования (см. модульный докстринг). `stream`
-    — тестовый крюк (прод — `sys.stderr` по умолчанию): тест подставляет `io.
-    StringIO()` и проверяет фактический отрендеренный текст, а не полагается на
-    то, что `caplog`/`capsys` не столкнутся с ручной заменой хендлеров рута,
-    которую делает эта функция.
-    """
-    shared_processors: list[structlog.types.Processor] = [
-        structlog.contextvars.merge_contextvars,
-        structlog.processors.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-    ]
-    structlog.configure(
-        processors=[*shared_processors, structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
-        logger_factory=structlog.stdlib.LoggerFactory(),
-        wrapper_class=structlog.stdlib.BoundLogger,
-        cache_logger_on_first_use=True,
-    )
-    formatter = structlog.stdlib.ProcessorFormatter(
-        processors=[
-            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
-            structlog.processors.JSONRenderer(ensure_ascii=False),
-        ],
-        foreign_pre_chain=shared_processors,
-    )
-    handler = logging.StreamHandler(stream if stream is not None else sys.stderr)
-    handler.setFormatter(formatter)
-    root = logging.getLogger()
-    root.handlers = [handler]
-    root.setLevel(level)
 
 
 def _keyboard(buttons: list[list[Btn]]) -> dict[str, object] | None:

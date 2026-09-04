@@ -26,6 +26,14 @@ __pycache__/
 # приватные данные игрока: реальные hand history в публичный репозиторий не едут
 fixtures/hh/
 
+# Том с файлами, которые прислал игрок (`DATA_DIR/hh/{hash}.txt`, задача 19). В
+# проде это /data внутри контейнера, но локальный запуск с DATA_DIR=./data кладёт
+# сюда настоящие hand history — те же приватные данные, что fixtures/hh/, только
+# чужие. Продублировано в .githooks/pre-push: gitignore не спасает от `git add -f`.
+# Слэш в начале обязателен: без него шаблон накрыл бы и `src/harness/analysis/
+# tools/data/`, где лежит коммитимая таблица эквити.
+/data/
+
 # eval-датасет и промпты: ров продукта, см. docs/publishing-policy.md
 evals/vision/
 evals/e2e/

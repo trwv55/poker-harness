@@ -10,18 +10,19 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from harness.analysis.scan import ScanSummary
 from harness.contracts import AnalysisResult, CanonicalHand, EnrichedHand, Provenance, RawHand
-from harness.memory.models import Analysis, CalcCache, EvalCase, Hand, Player, Tournament
+from harness.memory.models import Analysis, CalcCache, EvalCase, Hand, Job, Player, Tournament
 from harness.memory.models import Session as SessionRow
 
 _MONTHS_RU_ABBR = (
@@ -85,6 +86,32 @@ class SessionsRepo:
         self.db.add(record)
         await self.db.flush()
         return record
+
+    async def close_active(self, player_id: int) -> bool:
+        """Закрыть открытые сессии игрока; вернуть, было ли что закрывать.
+
+        Это первая половина `/new` (задача 19): вторая — `active_or_create()`,
+        который после закрытия неизбежно откроет новую. Отдельный метод, а не
+        параметр `active_or_create`, потому что закрытие — самостоятельное
+        событие с самостоятельным ответом игроку («предыдущая закрыта» говорится
+        только когда предыдущая была).
+
+        Закрываются ВСЕ открытые, а не только самая свежая: `active_or_create()`
+        считает активной последнюю по `started_at`, поэтому вторая забытая
+        открытая строка навсегда осталась бы невидимым мусором, который никакой
+        `/new` больше не тронет. В норме она одна — инвариант поддерживается
+        именно здесь.
+        """
+        result = await self.db.execute(
+            update(SessionRow)
+            .where(SessionRow.player_id == player_id, SessionRow.closed_at.is_(None))
+            .values(closed_at=datetime.now(UTC))
+            .execution_options(synchronize_session=False)
+            .returning(SessionRow.id)
+        )
+        closed = result.all()
+        await self.db.flush()
+        return bool(closed)
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,6 +353,112 @@ class CalcCacheRepo:
         stmt = pg_insert(CalcCache).values(values).on_conflict_do_nothing(index_elements=["key"])
         await self.db.execute(stmt)
         await self.db.flush()
+
+
+# Квота по умолчанию (спека §9, пример дословно: «разборов 17/50 за 24 ч») — действует,
+# когда у игрока нет персонального переопределения (`players.quota_daily IS NULL`).
+QUOTA_DAILY_DEFAULT = 50
+
+# Квоту тратят только ИНТЕРАКТИВНЫЕ задачи (спека §9). `hh_scan` в список не входит
+# намеренно: он дёшев для нас и «поощряется щедрее» — это продуктовый рычаг
+# (SCALING.md), а не недосмотр.
+QUOTA_INTERACTIVE_JOB_TYPES = ("deep_dive", "screenshot_analyze")
+
+# Скользящее окно, а не календарные сутки (спека §9 дословно: ни поля пояса, ни
+# cron-сброса, ни полуночного «обнуления посреди ночной сессии»).
+QUOTA_WINDOW = timedelta(hours=24)
+
+
+@dataclass(frozen=True, slots=True)
+class QuotaCheck:
+    """Решение о допуске плюс числа для подписи сообщения.
+
+    `hours_to_free` осмыслен только при `allowed is False` (иначе 0): это время
+    до момента, когда самая старая задача В ОКНЕ из него выпадет и освободит
+    место — то самое «через сколько», которое показывает `quota_exceeded_msg`.
+    """
+
+    allowed: bool
+    left: int
+    total: int
+    hours_to_free: int
+
+
+class QuotaRepo:
+    """Квота игрока за скользящие 24 ч (спека §9) — ОДНА реализация на два процесса.
+
+    Бот спрашивает «пускать ли» ДО постановки задачи в очередь (задача 19), воркер
+    берёт отсюда же числа для строки «разборов X/Y за 24 ч» (задача 18) — он уже
+    взял задачу в работу и отказывать не вправе. Соблазн держать по счётчику в
+    каждом процессе этот проект уже наказывал (второй словарь словоформ, четыре
+    расхождения с библиотекой по памяти): два SQL с одинаковым смыслом разошлись
+    бы молча, и игрок увидел бы «осталось 3» ровно там, где ему отказали.
+
+    Расход выводится из `jobs` (спека §6: «израсходованное выводится из jobs»), а
+    не хранится счётчиком в `players`: счётчик пришлось бы сбрасывать по
+    расписанию — ровно то, чего скользящее окно и не должно требовать.
+    """
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def check(self, player_id: int) -> QuotaCheck:
+        now = datetime.now(UTC)
+        since = now - QUOTA_WINDOW
+        player = await self.db.get(Player, player_id)
+        total = (
+            player.quota_daily
+            if player is not None and player.quota_daily is not None
+            else QUOTA_DAILY_DEFAULT
+        )
+        used_stmt = (
+            select(func.count()).select_from(Job).where(*self._window_filter(player_id, since))
+        )
+        used = int(await self.db.scalar(used_stmt) or 0)
+        left = max(total - used, 0)
+        if used < total:
+            return QuotaCheck(allowed=True, left=left, total=total, hours_to_free=0)
+        hours = await self._hours_to_free(player_id, since=since, now=now, surplus=used - total)
+        return QuotaCheck(allowed=False, left=left, total=total, hours_to_free=hours)
+
+    @staticmethod
+    def _window_filter(player_id: int, since: datetime) -> tuple[Any, ...]:
+        """Один набор условий на оба запроса окна — чтобы «сколько потрачено» и
+        «когда освободится» не могли начать считать по разным множествам задач."""
+        return (
+            Job.player_id == player_id,
+            Job.type.in_(QUOTA_INTERACTIVE_JOB_TYPES),
+            Job.created_at > since,
+        )
+
+    async def _hours_to_free(
+        self, player_id: int, *, since: datetime, now: datetime, surplus: int
+    ) -> int:
+        """Через сколько часов освободится ПЕРВОЕ место.
+
+        Это не всегда самая старая задача окна: если лимит успели понизить (или
+        задачи проставили в обход бота), в окне может висеть больше задач, чем
+        разрешено, — тогда первое место освободит `surplus`-я по возрасту, а не
+        нулевая. `OFFSET surplus` выражает ровно это и в обычном случае
+        (`used == total`) вырождается в «самая старая».
+
+        Округление вверх: остаток в 10 минут — это «через 1 ч», а не «через 0»
+        (сообщение с «через 0 ч» звучало бы как «уже можно», хотя нельзя).
+        """
+        oldest = await self.db.scalar(
+            select(Job.created_at)
+            .where(*self._window_filter(player_id, since))
+            .order_by(Job.created_at)
+            .offset(surplus)
+            .limit(1)
+        )
+        if oldest is None:
+            # Задач в окне нет, а место всё равно не даётся — значит лимит нулевой
+            # (`quota_daily=0`, доступ отключён вручную). Освобождать нечему, и
+            # честный ответ — полное окно, а не «через 0 ч, попробуйте ещё раз».
+            return int(QUOTA_WINDOW.total_seconds() // 3600)
+        remaining = (oldest + QUOTA_WINDOW) - now
+        return max(1, math.ceil(remaining.total_seconds() / 3600))
 
 
 class EvalCasesRepo:

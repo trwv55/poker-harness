@@ -18,9 +18,14 @@ from harness.presentation.messages import (
     deep_dive_msg,
     escalation_msg,
     failed_msg,
+    hh_accepted_msg,
+    new_session_msg,
+    photo_soon_msg,
     progress_text,
     quota_exceeded_msg,
     scan_summary_msg,
+    start_msg,
+    unsupported_document_msg,
 )
 
 __all__ = [
@@ -31,8 +36,13 @@ __all__ = [
     "escalation_buttons",
     "escalation_msg",
     "failed_msg",
+    "hh_accepted_msg",
+    "new_session_msg",
+    "photo_soon_msg",
     "progress_text",
     "quota_exceeded_msg",
     "scan_summary_msg",
+    "start_msg",
+    "unsupported_document_msg",
     "verdict_buttons",
 ]
