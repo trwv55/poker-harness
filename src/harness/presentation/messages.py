@@ -18,6 +18,18 @@
 `Zone.STRICT` — что нет. Пометка `_ASSUMING_MARKER` показывается ровно там,
 где `zone is Zone.ASSUMING`, и ни разу больше — это и есть honesty-гарантия
 задачи 17, проверенная тестом на обоих направлениях (строка есть/строки нет).
+
+**Грамматика строки решения — намеренно без второго словаря (fix round 1).**
+Первая версия писала `"{action} вместо {best}"`, а «вместо» управляет
+родительным падежом («вместо шов**а**», не «вместо шов») — фраза читалась как
+«колл вместо шов», и это была самая частая строка во всём продукте. Вместо
+второго словаря словоформ (родительный параллельно именительному — источник
+рассинхрона, стоивший проекту нескольких находок в других модулях) фраза
+переписана как `"{action} (верно: {best})"`: двоеточие после «верно» не
+требует согласования падежа с существительным перед ним, поэтому одного
+именительного падежа в `_ACTION_WORD` достаточно. `test_..._grammatically_correct`
+пришпиливает буквальный рендер строки — регресс формулировки становится
+красным тестом, а не тем, что заметит игрок раньше нас.
 """
 
 from __future__ import annotations
@@ -96,9 +108,16 @@ def _spot_word(spot: SpotKind) -> str:
 
 
 def _fmt_bb(value_bb: float) -> str:
-    """Знак минуса типографский (U+2212 «−»), не дефис — так задан бриф."""
-    sign = "−" if value_bb < 0 else ""
-    return f"{sign}{abs(value_bb):.1f} bb"
+    """Знак минуса типографский (U+2212 «−»), не дефис — так задан бриф.
+
+    Знак берётся ПОСЛЕ округления до 0.1, а не до: `-0.03` меньше нуля, но
+    после округления до одного знака превращается в `0.0`, и если решать знак
+    раньше округления, на экране игрока возникает «−0.0 bb» — читается как
+    отдельная (мнимая) отрицательная величина вместо честного нуля (fix round 1).
+    """
+    magnitude = round(abs(value_bb), 1)
+    sign = "−" if value_bb < 0 and magnitude != 0.0 else ""
+    return f"{sign}{magnitude:.1f} bb"
 
 
 def _quota_line(quota_left: int, quota_total: int) -> str:
@@ -116,11 +135,22 @@ def scan_summary_msg(s: ScanSummary, quota_left: int, quota_total: int) -> Msg:
     «Расхождение», не «ошибка» (CLAUDE.md) — скан судит по равновесию и модельным
     диапазонам, не по факту выигрыша раздачи. Строки `zone is Zone.ASSUMING`
     несут `_ASSUMING_MARKER`, строки `strict` — нет.
+
+    Заголовочное число — подписано ровно как «суммарная потеря по всем точкам
+    разбора» (докстринг `ScanSummary.total_loss_bb`, дословно), а не как сумма
+    списка ниже: `total_loss_bb` считает ВСЕ судимые точки файла, `items` —
+    только те дороже порога 0.1bb, и на настоящем турнире первое число обычно
+    ЧУТЬ БОЛЬШЕ суммы вторых. Два разных числа с одинаковой подписью — игрок
+    решает, что мы ошиблись в счёте; разные подписи снимают это (fix round 1).
+
+    `hands_failed` (руки, пропущенные политикой отказа скана) показывается
+    только когда он не ноль — молчание о деградации ровно то, против чего
+    спроектирован весь продукт (fix round 1, дискреционный пункт ревью).
     """
-    lines = [
-        f"Скан завершён: {s.hands_total} рук, {s.hands_with_decision} с решением.",
-        f"Суммарная цена расхождений: {_fmt_bb(s.total_loss_bb)}.",
-    ]
+    lines = [f"Скан завершён: {s.hands_total} рук, {s.hands_with_decision} с решением."]
+    if s.hands_failed:
+        lines.append(f"Раздач не разобрано: {s.hands_failed} — не вошли в сводку.")
+    lines.append(f"Суммарная потеря по всем точкам разбора: {_fmt_bb(s.total_loss_bb)}.")
     buttons: list[list[Btn]] = []
 
     if not s.items:
@@ -133,7 +163,7 @@ def scan_summary_msg(s: ScanSummary, quota_left: int, quota_total: int) -> Msg:
             marker = f" ({_ASSUMING_MARKER})" if item.zone is Zone.ASSUMING else ""
             lines.append(
                 f"№{item.hand_no} · {item.hero_class} · {_spot_word(item.spot)}: "
-                f"{_action_word(item.action_taken)} вместо {_action_word(item.best_action)} "
+                f"{_action_word(item.action_taken)} (верно: {_action_word(item.best_action)}) "
                 f"— {_fmt_bb(item.ev_diff_bb)}{marker}"
             )
             buttons.append([deep_dive_button(item.hand_no)])
@@ -168,8 +198,8 @@ def deep_dive_msg(
             marker = f" ({_ASSUMING_MARKER})" if point.zone is Zone.ASSUMING else ""
             lines.append(
                 f"{_STREET_WORD.get(point.street, point.street.value)} · "
-                f"{_spot_word(point.spot)}: {_action_word(point.action_taken)} вместо "
-                f"{_action_word(point.best_action)} — {_fmt_bb(point.ev_diff_bb)}{marker}"
+                f"{_spot_word(point.spot)}: {_action_word(point.action_taken)} "
+                f"(верно: {_action_word(point.best_action)}) — {_fmt_bb(point.ev_diff_bb)}{marker}"
             )
 
     lines.append("")

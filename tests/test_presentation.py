@@ -6,6 +6,14 @@
 (строгая + предполагающая зона; сообщение со скипом и без), чтобы шаблон,
 безусловно печатающий (или безусловно не печатающий) нужную подстроку, не мог
 пройти тест случайно — см. ловушку, которую описывает бриф задачи.
+
+**Fix round 1.** Добавлены: `test_..._is_grammatically_correct` (пришпиливает
+буквальный рендер строки решения — регресс формулировки «колл вместо шов»
+пойман ревью, не тестом, который проверял только числа и пометку, но не саму
+фразу вокруг них); `test_scan_summary_msg_total_loss_label_differs_from_items_sum`
+(число в заголовке и сумма показанных строк — сознательно РАЗНЫЕ величины, и
+предыдущая версия этого теста их не различала, потому что оба примера
+совпадали численно); тесты на `hands_failed` и на не-минус-ноль `_fmt_bb`.
 """
 
 from __future__ import annotations
@@ -130,6 +138,65 @@ def test_scan_summary_msg_no_items_has_no_buttons():
     assert msg.buttons == []
 
 
+def test_scan_summary_msg_item_line_is_grammatically_correct():
+    """Пришпиливает буквальный рендер — «вместо» требует родительного падежа
+    («вместо шова», не «вместо шов»), первая версия строки была сломана
+    именно на этом (fix round 1, Important 1); фраза переписана так, чтобы
+    падеж вообще не был нужен («верно: шов»), и здесь это закреплено буквально,
+    а не только проверкой чисел/пометки, которая ловушку не заметила.
+    """
+    items = [_scan_item(hand_no="H1", ev_diff_bb=-2.3, zone=Zone.STRICT)]
+    s = ScanSummary(hands_total=1, hands_with_decision=1, items=items, total_loss_bb=-2.3)
+    msg = scan_summary_msg(s, quota_left=1, quota_total=1)
+
+    assert "№H1 · AA · пуш-фолд: фолд (верно: шов) — −2.3 bb" in msg.text
+    assert "вместо шов" not in msg.text  # старая (сломанная) формулировка
+
+
+def test_scan_summary_msg_total_loss_label_differs_from_items_sum():
+    """`total_loss_bb` — по ВСЕМ судимым точкам файла, `items` — только дороже
+    порога 0.1bb (докстринг `ScanSummary.total_loss_bb`) — на настоящем турнире
+    первое обычно больше суммы вторых. Числа здесь НАРОЧНО не совпадают (единый
+    видимый пункт −2.3bb против заголовочных −5.0bb), а подпись заголовка
+    обязана явно называть его «по всем точкам разбора», а не пересказывать
+    список ниже — иначе игрок видит два разных числа под одинаковой подписью
+    и решает, что мы ошиблись в счёте (fix round 1, Important 2; докстринг
+    `scan.py` — требование, которое бриф задачи 17 не унёс, ревью — унесло).
+    """
+    items = [_scan_item(hand_no="H1", ev_diff_bb=-2.3, zone=Zone.STRICT)]
+    s = ScanSummary(hands_total=20, hands_with_decision=15, items=items, total_loss_bb=-5.0)
+    msg = scan_summary_msg(s, quota_left=1, quota_total=1)
+
+    assert "Суммарная потеря по всем точкам разбора: −5.0 bb." in msg.text
+    assert "−2.3 bb" in msg.text  # цена одной показанной строки — другое число
+    assert "Суммарная цена расхождений" not in msg.text  # старая (неточная) подпись
+
+
+def test_scan_summary_msg_surfaces_hands_failed_when_nonzero():
+    s = ScanSummary(
+        hands_total=10, hands_with_decision=8, items=[], total_loss_bb=0.0, hands_failed=2
+    )
+    msg = scan_summary_msg(s, quota_left=1, quota_total=1)
+    assert "Раздач не разобрано: 2" in msg.text
+
+
+def test_scan_summary_msg_omits_hands_failed_line_when_zero():
+    s = ScanSummary(
+        hands_total=10, hands_with_decision=8, items=[], total_loss_bb=0.0, hands_failed=0
+    )
+    msg = scan_summary_msg(s, quota_left=1, quota_total=1)
+    assert "не разобрано" not in msg.text
+
+
+def test_scan_summary_msg_total_loss_near_zero_never_renders_negative_zero():
+    """`_fmt_bb`: знак решается ПОСЛЕ округления, иначе `-0.03` → «−0.0 bb»,
+    что читается как отдельная (мнимая) отрицательная величина (fix round 1)."""
+    s = ScanSummary(hands_total=1, hands_with_decision=1, items=[], total_loss_bb=-0.03)
+    msg = scan_summary_msg(s, quota_left=1, quota_total=1)
+    assert "−0.0 bb" not in msg.text
+    assert "0.0 bb" in msg.text
+
+
 # --- deep_dive_msg -------------------------------------------------------------------
 
 
@@ -202,11 +269,26 @@ def test_deep_dive_msg_respects_ranked_order_not_points_order():
     assert assuming_pos < strict_pos
 
 
+def test_deep_dive_msg_point_line_is_grammatically_correct():
+    """Тот же пришпиленный рендер, что и у скана, — точка решения в разборе руки
+    строится тем же f-строчным шаблоном и была сломана тем же образом.
+    """
+    res = _mixed_result()
+    msg = deep_dive_msg(res, elapsed_s=1, zone=Zone.STRICT, quota_left=1, quota_total=1)
+
+    assert "Префлоп · пуш-фолд: фолд (верно: шов) — −2.3 bb" in msg.text
+    assert (
+        "Префлоп · колл шова: колл (верно: шов) — −1.1 bb (по модели диапазонов)" in msg.text
+    )
+    assert "вместо шов" not in msg.text
+
+
 def test_deep_dive_msg_buttons_are_ranges_detail_disagree_with_hand_no():
     res = _mixed_result(hand_no="H99")
     msg = deep_dive_msg(res, elapsed_s=1, zone=Zone.STRICT, quota_left=1, quota_total=1)
     assert len(msg.buttons) == 1
     row = msg.buttons[0]
+    assert [b.text for b in row] == ["🎯 Диапазоны", "🔍 Подробнее", "✋ Не согласен"]
     assert [b.callback_data for b in row] == ["ranges:H99", "detail:H99", "disagree:H99"]
 
 
