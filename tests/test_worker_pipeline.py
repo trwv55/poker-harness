@@ -33,17 +33,21 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import re
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+from typing import cast
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from harness.engine import enrich
 from harness.memory.models import Job
 from harness.memory.repos import HandsRepo, PlayersRepo, SessionsRepo, TournamentsRepo
 from harness.normalizer import normalize
+from harness.parsers import hh_parser as hh_parser_module
 from harness.parsers.hh_parser import parse_file
 from harness.platform.config import Config
 from harness.platform.llm import LLM
@@ -281,6 +285,100 @@ async def test_resume_skips_done_stations(db_factory, fake_sender, queue, deps, 
     assert await count(db_factory, "hands") == len(raw_hands)  # ни одной новой строки
 
 
+def _small_hh_text(n: int) -> str:
+    """Первые `n` блоков `Poker Hand #...` из `FIXTURE_DAILY` как отдельный
+    маленький HH-текст — резюме-тесты гоняют парсер и энкиш-цикл по нему, а не
+    по всем 146 рукам файла (то дорого — задача 13, `slow`), и всё равно на
+    настоящем тексте, не на синтетике.
+    """
+    full_text = FIXTURE_DAILY.read_text("utf-8")
+    blocks = re.split(r"(?=^Poker Hand #)", full_text, flags=re.MULTILINE)
+    blocks = [b for b in blocks if b.strip()]
+    return "".join(blocks[:n])
+
+
+@requires_fixtures
+async def test_resume_reparses_file_but_skips_already_saved_hands(
+    db_factory, fake_sender, queue, deps, tmp_path, monkeypatch
+):
+    """Фиксирует ровно то, что `test_resume_skips_done_stations` не покрывает
+    (fix round 1, Important 5): та задача входит с `hands_saved=True` и
+    возвращает `tournament_id` НЕ доходя до цикла по рукам вовсе (`pipeline.
+    py`, ветка `if payload.get("hands_saved")`) — резюме "по позиции" (`if idx
+    < existing_raw: continue`, `hand_index = idx` из порядка `list_by_
+    tournament`) не исполняется НИ РАЗУ ни этим тестом, ни сквозным (тот
+    стартует с пустой таблицы, `existing_raw == 0`). Здесь — партийный крах:
+    2 из 5 рук уже сохранены (`raw` есть, `canonical`/`enriched` — нет,
+    `hands_saved` не выставлен), задача обязана распарсить файл ЗАНОВО (parse_
+    file реально вызывается — проверено шпионом, не только выведено из
+    отсутствия `_boom`), но НЕ продублировать уже сохранённые 2 руки и
+    присвоить корректные, непрерывные `hand_index` всем пяти.
+    """
+    player_id, session_id = await _make_scope(db_factory)
+    small_text = _small_hh_text(5)
+    small_file = tmp_path / "small.txt"
+    small_file.write_text(small_text, encoding="utf-8")
+
+    # Независимый источник истины: тот же порядок, что даст `parse_file`
+    # внутри `_run_hh_scan` на этом же файле — не переиспользует внутренности
+    # воркера для проверки его же результата.
+    expected_raw = parse_file(small_text, str(small_file))
+    assert len(expected_raw) == 5, "sanity: файл должен дать ровно 5 рук"
+
+    async with db_factory() as session:
+        tournaments_repo = TournamentsRepo(session)
+        hands_repo = HandsRepo(session)
+        tournament_id = await tournaments_repo.create(
+            session_id=session_id, source_file=str(small_file)
+        )
+        # Только raw двух первых рук — состояние "упали между сохранением руки
+        # №1 и руки №2 в прошлой попытке": raw уже закоммичен, дальше — нет.
+        seeded_ids = [
+            await hands_repo.save_raw(session_id=session_id, tournament_id=tournament_id, raw=raw)
+            for raw in expected_raw[:2]
+        ]
+        await session.commit()
+
+    jid = await queue.enqueue(
+        type="hh_scan",
+        player_id=player_id,
+        session_id=session_id,
+        payload={"source_file": str(small_file), "tournament_id": tournament_id},
+    )
+
+    call_count = 0
+    real_parse_file = hh_parser_module.parse_file
+
+    def _spy_parse_file(text: str, source_ref: str):
+        nonlocal call_count
+        call_count += 1
+        return real_parse_file(text, source_ref)
+
+    monkeypatch.setattr(hh_parser_module, "parse_file", _spy_parse_file)
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    assert call_count == 1  # файл ДЕЙСТВИТЕЛЬНО перепарсен, не пропущен
+
+    assert (await job_status(db_factory, jid)) == "done"
+
+    async with db_factory() as session:
+        records = await HandsRepo(session).list_by_tournament(tournament_id)
+
+    assert len(records) == 5  # не 5+2=7 — старые две не задублированы
+    assert [r.id for r in records[:2]] == seeded_ids  # старые строки не заменены новыми
+    hand_indices: list[int | None] = []
+    hand_nos: list[str] = []
+    for r in records:
+        assert r.canonical is not None  # чекпоинт validate пройден на всех пяти
+        hand_indices.append(r.canonical.hand_index)
+        hand_nos.append(r.canonical.hand_no)
+    assert hand_indices == [0, 1, 2, 3, 4]  # без сдвига
+    assert hand_nos == [r.hand_no for r in expected_raw]
+
+
 # --- отправка: повторный прогон редактирует, а не дублирует -----------------------
 
 
@@ -326,17 +424,33 @@ async def _seed_one_hand_deep_dive_job(
     return jid, raw_hands[0]
 
 
+async def _enqueue_deep_dive_for_missing_hand(
+    queue: JobsQueue, *, player_id: int, session_id: int
+) -> int:
+    """Задача `deep_dive` на заведомо несуществующую руку — естественный, не
+    смонкипатченный источник провала. С fix round 1 (Important 2) вычисление
+    `analyze_hand` для НАЙДЕННОЙ руки идёт через процессный пул: подпроцесс
+    `ProcessPoolExecutor` импортирует `harness.worker.pipeline` заново в своей
+    памяти, и `monkeypatch.setattr("harness.worker.pipeline.analyze_hand", ...)`
+    в тестовом (родительском) процессе до него не долетает — поэтому тесты на
+    отказ используют реальный недостижимый вход (`find_by_hand_no` вернёт
+    `None`, `_run_deep_dive` бросит `LookupError` ещё ДО процессного пула),
+    а не подмену функции.
+    """
+    return await enqueue_deep_dive(
+        queue, "несуществующая-раздача-999", player_id=player_id, session_id=session_id
+    )
+
+
 @requires_fixtures
-async def test_failure_marks_failed_and_notifies(db_factory, fake_sender, queue, deps, monkeypatch):
+async def test_failure_marks_failed_and_notifies(db_factory, fake_sender, queue, deps):
     player_id, session_id = await _make_scope(db_factory)
-    jid, _raw = await _seed_one_hand_deep_dive_job(
-        db_factory, queue, player_id=player_id, session_id=session_id
+    jid = await _enqueue_deep_dive_for_missing_hand(
+        queue, player_id=player_id, session_id=session_id
     )
     async with db_factory() as session:
         await session.execute(text("UPDATE jobs SET max_attempts = 1 WHERE id = :id"), {"id": jid})
         await session.commit()
-
-    monkeypatch.setattr("harness.worker.pipeline.analyze_hand", _boom)
 
     job = await queue.claim("w1")
     assert job is not None
@@ -345,24 +459,28 @@ async def test_failure_marks_failed_and_notifies(db_factory, fake_sender, queue,
 
     assert (await job_status(db_factory, jid)) == "failed"  # после max_attempts
     assert fake_sender.sent  # игроку отправлено уведомление
-    assert "Не получилось разобрать" in fake_sender.sent[-1].text
+    text_sent = fake_sender.sent[-1].text
+    assert "Не получилось разобрать" in text_sent
+    # fix round 1, Important 1: закрытый набор причин, не `str(exc)` буквально —
+    # `LookupError("рука 'несуществующая-раздача-999' не найдена в сессии ...")`
+    # несёт номер "руки" (здесь — заведомо приватного вида идентификатор) прямо
+    # в тексте исключения; в сообщении игроку его быть не должно ни в каком виде.
+    assert "не нашли нужные данные" in text_sent  # честная, закрытая причина
+    assert "несуществующая-раздача-999" not in text_sent  # не техническая деталь
+    assert "LookupError" not in text_sent  # и не имя типа исключения
 
 
 @requires_fixtures
-async def test_failure_before_max_attempts_retries_silently(
-    db_factory, fake_sender, queue, deps, monkeypatch
-):
+async def test_failure_before_max_attempts_retries_silently(db_factory, fake_sender, queue, deps):
     """Дополняет тест выше падением ДО последней попытки (`max_attempts=3` по
     умолчанию, `attempts=1` после первого `claim()`): статус обязан остаться
     `running` (задача ждёт `reap()`, см. докстринг `run_job`), а игрок — не
     получить уведомление о провале, которого по факту ещё нет.
     """
     player_id, session_id = await _make_scope(db_factory)
-    jid, _raw = await _seed_one_hand_deep_dive_job(
-        db_factory, queue, player_id=player_id, session_id=session_id
+    jid = await _enqueue_deep_dive_for_missing_hand(
+        queue, player_id=player_id, session_id=session_id
     )
-
-    monkeypatch.setattr("harness.worker.pipeline.analyze_hand", _boom)
 
     job = await queue.claim("w1")
     assert job is not None
@@ -370,8 +488,8 @@ async def test_failure_before_max_attempts_retries_silently(
     await run_job(job, deps)
 
     assert (await job_status(db_factory, jid)) == "running"  # не failed — рано
-    # Прогресс ("Считаю эквити…") отправляется ДО того, как `analyze_hand`
-    # падает — это не уведомление о провале. Настоящего извещения (`failed_msg`)
+    # Прогресс ("Считаю эквити…") отправляется ДО того, как рука не находится
+    # — это не уведомление о провале. Настоящего извещения (`failed_msg`)
     # быть не должно: провал ещё не окончательный.
     assert not any("Не получилось" in msg.text for msg in fake_sender.sent)
 
@@ -381,10 +499,18 @@ async def test_failure_before_max_attempts_retries_silently(
 
 @requires_fixtures
 async def test_stale_worker_cannot_complete_reclaimed_job(db_factory, fake_sender, queue, deps):
-    """Контроллерский рулинг задачи 18, п.2: `worker_id` из `claim()` обязан
-    доходить до `complete()`/`fail()`. Сценарий — зомби-воркер "ожил" уже после
-    того, как `reap()` вернул его задачу в очередь и её подхватил кто-то другой:
-    результат зомби-попытки не должен затереть состояние нового владельца.
+    """Контроллерский рулинг задачи 18, п.2 + fix round 1, Important 4:
+    `worker_id` из `claim()` обязан доходить до `complete()`/`fail()`, И до
+    каждой записи `jobs.payload`/`hand_id`, И `_send_idempotent` обязана
+    перечитывать `payload` из БД, а не полагаться на снимок, который зомби
+    сделал при захвате. Сценарий — зомби-воркер "ожил" уже ПОСЛЕ того, как
+    `reap()` вернул его задачу в очередь, новый владелец её подхватил и
+    ПОЛНОСТЬЮ довёл до конца (реальная отправка результата игроку) — только
+    тогда зомби, доигрывая ту же станцию по своей устаревшей копии `job`,
+    оказывается перед вопросом, который и проверяет тест: пошлёт ли он игроку
+    ВТОРОЙ экземпляр того же результата (fix round 1 нашёл именно это: старый
+    код снимал `payload` один раз при входе в станцию и не видел, что
+    `result_message_id` новый владелец уже поставил).
     """
     player_id, session_id = await _make_scope(db_factory)
     jid, _raw = await _seed_one_hand_deep_dive_job(
@@ -406,16 +532,154 @@ async def test_stale_worker_cannot_complete_reclaimed_job(db_factory, fake_sende
     assert new_owner is not None
     assert new_owner.locked_by == "w-new"
 
-    # "Ожившая" зомби-попытка старого воркера доигрывает всю станцию (найдёт руку,
-    # посчитает разбор, даже пошлёт сообщение) — но не имеет права закрыть чужую
-    # задачу. `run_job` не бросает исключение (фенсинг проглочен внутри неё).
+    # Новый владелец реально доводит задачу до конца — игрок получает и прогресс,
+    # и результат.
+    await run_job(new_owner, deps)
+    assert (await job_status(db_factory, jid)) == "done"
+    sent_after_new_owner = len(fake_sender.sent)
+    assert sent_after_new_owner >= 1  # результат точно отправлен
+
+    # Зомби "оживает" уже ПОСЛЕ этого и доигрывает свою устаревшую попытку той
+    # же станции по своей копии `job` (`stale_job`, взятой ДО reap()). `run_job`
+    # не бросает исключение наружу (фенсинг проглочен внутри неё) — но и не
+    # имеет права отправить игроку второй экземпляр результата (или прогресса),
+    # ни переписать payload нового владельца.
     await run_job(stale_job, deps)
 
     async with db_factory() as session:
         row = await session.get(Job, jid)
         assert row is not None
-        assert row.status == "running"  # не done — зомби не победил фенсинг
+        assert row.status == "done"  # не тронуто зомби
         assert row.locked_by == "w-new"  # владение нового воркера не тронуто
+
+    # Дубль НЕ отправлен — зомби остановлен на первой же попытке связаться с
+    # игроком (`_send_idempotent` увидела чужого текущего владельца в БД ДО
+    # вызова `Sender.send()`), список отправленного не вырос ни на одно сообщение.
+    assert len(fake_sender.sent) == sent_after_new_owner
+
+
+# --- deep_dive: тоже через процессный пул и тоже с общим кэшем --------------------
+
+
+@requires_fixtures
+async def test_deep_dive_participates_in_shared_calc_cache(
+    db_factory, fake_sender, queue, deps, monkeypatch
+):
+    """fix round 1, Important 2 (calc_cache-половина находки): `deep_dive` обязан
+    читать/писать `calc_cache` тем же путём, что и `hh_scan`. `test_hh_scan_end_
+    to_end` доказывает рост таблицы количественно — на реальных 146 руках Монте-
+    Карло точка гарантированно встретится; одна случайно выбранная рука `deep_
+    dive` такой гарантии не даёт (может целиком закрыться дешёвым правилом зоны,
+    ни разу не позвав `_model_equity`). Здесь — поведенческая проверка вместо
+    количественной: `CalcCacheRepo.get_all`/`.upsert_many` реально вызваны на
+    пути вычисления (`existing is None`), независимо от того, нашлось ли что
+    считать по Монте-Карло именно в этой раздаче.
+    """
+    player_id, session_id = await _make_scope(db_factory)
+    jid, _raw = await _seed_one_hand_deep_dive_job(
+        db_factory, queue, player_id=player_id, session_id=session_id
+    )
+
+    calls = {"get_all": 0, "upsert_many": 0}
+    real_get_all = pipeline_module.CalcCacheRepo.get_all
+    real_upsert_many = pipeline_module.CalcCacheRepo.upsert_many
+
+    async def _spy_get_all(self, prefix):
+        calls["get_all"] += 1
+        return await real_get_all(self, prefix)
+
+    async def _spy_upsert_many(self, prefix, entries):
+        calls["upsert_many"] += 1
+        return await real_upsert_many(self, prefix, entries)
+
+    monkeypatch.setattr(pipeline_module.CalcCacheRepo, "get_all", _spy_get_all)
+    monkeypatch.setattr(pipeline_module.CalcCacheRepo, "upsert_many", _spy_upsert_many)
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    assert (await job_status(db_factory, jid)) == "done"
+    assert calls["get_all"] == 1  # прочитан общий кэш перед расчётом
+    assert calls["upsert_many"] == 1  # досчитанное записано обратно
+
+
+# --- транзакция: закрыта ДО долгого исполнителя, не держится через него -----------
+
+
+@requires_fixtures
+async def test_hh_scan_closes_transaction_before_executor_call(
+    db_factory, fake_sender, queue, process_pool
+):
+    """fix round 1, Important 3: транзакция, открытая чтением `calc_cache`, обязана
+    быть закрыта ДО того, как `run_in_executor` займёт до `_JOB_DEADLINE_S["hh_
+    scan"]` секунд снаружи корутины — иначе соединение простаивает "idle in
+    transaction" всё это время (блокирует autovacuum, а под `idle_in_transaction_
+    session_timeout` соединение обрывается и уносит с собой уже готовый результат
+    на `upsert_many`). Проверка — не по побочным эффектам и не по времени: прямой
+    перехват момента, когда корутина отдаёт работу процессному пулу, и синхронная
+    проверка `AsyncSession.in_transaction()` ИМЕННО в этот момент — той самой
+    сессии, что использует `_run_hh_scan`, перехваченной через `db_factory`.
+    """
+    player_id, session_id = await _make_scope(db_factory)
+    tournament_id, _raw_hands = await _seed_checkpointed_hands(
+        db_factory, session_id=session_id, source_file=FIXTURE_DAILY, n=3
+    )
+    jid = await queue.enqueue(
+        type="hh_scan",
+        player_id=player_id,
+        session_id=session_id,
+        payload={
+            "source_file": str(FIXTURE_DAILY),
+            "tournament_id": tournament_id,
+            "hands_saved": True,
+        },
+    )
+
+    captured_sessions: list[AsyncSession] = []
+
+    def _spy_db_factory_fn() -> AsyncSession:
+        session = db_factory()
+        captured_sessions.append(session)
+        return session
+
+    # `async_sessionmaker.__call__` умеет больше, чем эта функция (kwargs на
+    # переопределение параметров сессии) — здесь используется только базовый
+    # вызов без аргументов, ровно так, как это делает `_run_hh_scan`/`JobsQueue`.
+    spy_db_factory = cast("async_sessionmaker[AsyncSession]", _spy_db_factory_fn)
+
+    class _SpyExecutor:
+        def __init__(self, real_pool):
+            self._real_pool = real_pool
+            self.in_transaction_at_submit: bool | None = None
+
+        def submit(self, fn, *args, **kwargs):
+            # На момент постановки задачи в пул сессия `_run_hh_scan` уже
+            # создана (`captured_sessions` непусто) — синхронная проверка её
+            # состояния прямо здесь, до того как исполнитель реально запустится.
+            if captured_sessions:
+                self.in_transaction_at_submit = captured_sessions[-1].in_transaction()
+            return self._real_pool.submit(fn, *args, **kwargs)
+
+    spy_executor = _SpyExecutor(process_pool)
+    spy_queue = JobsQueue(spy_db_factory)
+    spy_deps = Deps(
+        db_factory=spy_db_factory,
+        queue=spy_queue,
+        sender=fake_sender,
+        # `LLM`/`PgLimiter` требуют настоящий `async_sessionmaker` (читают
+        # `.kw["bind"]` в конструкторе) — станции этой задачи `deps.llm` не
+        # вызывают вовсе, поэтому здесь достаточно настоящей фабрики без шпиона.
+        llm=LLM(_TEST_CFG, db_factory),
+        process_pool=spy_executor,  # type: ignore[arg-type]
+    )
+
+    job = await spy_queue.claim("w1")
+    assert job is not None
+    await run_job(job, spy_deps)
+
+    assert (await job_status(db_factory, jid)) == "done"
+    assert spy_executor.in_transaction_at_submit is False
 
 
 # --- дедлайн задачи: зависшая станция не висит вечно -------------------------------

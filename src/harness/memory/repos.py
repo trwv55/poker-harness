@@ -305,7 +305,15 @@ class CalcCacheRepo:
         self.db = db
 
     async def get_all(self, prefix: str) -> dict[str, float]:
-        stmt = select(CalcCache.key, CalcCache.value).where(CalcCache.key.startswith(prefix))
+        # `autoescape=True` (fix round 1, Minor): без него `startswith()` рендерит
+        # голый `LIKE 'prefix%'`, а `_`/`%`/сам escape-символ внутри `prefix`
+        # остаются активными спецсимволами LIKE, а не буквальным текстом — `_`
+        # это "любой один символ". С одним префиксом сейчас безвредно; со вторым
+        # (например `nash_hu:` — уже с подчёркиванием) станет тихим совпадением
+        # чужого пространства ключей на первом совпавшем символе.
+        stmt = select(CalcCache.key, CalcCache.value).where(
+            CalcCache.key.startswith(prefix, autoescape=True)
+        )
         rows = (await self.db.execute(stmt)).all()
         return {key[len(prefix) :]: float(value) for key, value in rows}
 
