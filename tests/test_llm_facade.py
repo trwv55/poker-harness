@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 
@@ -308,6 +309,56 @@ async def test_call_shares_one_deadline_across_retry_attempts(db_factory, monkey
     assert seen_deadlines[0] == seen_deadlines[1]  # общий дедлайн, не свежий на каждый вызов
 
 
+async def test_call_shares_one_deadline_across_schema_retry_attempts(db_factory, monkeypatch):
+    """Fix round 4, Item 3. Тест выше (`test_call_shares_one_deadline_across_
+    retry_attempts`) доказывает общий дедлайн только на уровне HTTP-ретрая
+    ВНУТРИ одного `_attempt` — ревью показало, что этого недостаточно: перенос
+    вычисления дедлайна из `LLM.__call__` внутрь ЦИКЛА СХЕМА-ретраев (т.е.
+    обратно в `_attempt`, на каждый его вызов заново) не ломает НИ ОДИН
+    существующий тест. `test_call_shares_one_deadline_across_retry_attempts`
+    видит только ОДИН вызов `_attempt` (ретраится HTTP-попытка внутри него),
+    а `test_retry_on_schema_error_then_fail` вообще не инспектирует дедлайны.
+    Именно уровень, ради которого round 3 существовал (6 `slot()` при
+    сочетании HTTP- и схема-ретраев, ~1440с) — оставался защищён только
+    чтением кода, не тестом.
+
+    `FunctionModel`, неизменно отдающая мусор (тот же приём, что `test_retry_
+    on_schema_error_then_fail`), гарантированно вызывает `_attempt` РОВНО
+    `_MAX_SCHEMA_ATTEMPTS=2` раза — `__call__` ловит `UnexpectedModelBehavior`
+    и запускает `_attempt` заново. Реальная пауза ВНУТРИ самой модельной
+    функции (а не между попытками — между схема-ретраями `__call__` вообще не
+    спит) даёт измеримый разрыв между двумя гипотетическими моментами
+    пересчёта дедлайна — тот же урок, что и в тесте выше: без него
+    `time.monotonic()`, вызванный дважды подряд без задержки, может случайно
+    совпасть даже в сломанном коде и ничего не доказать.
+    """
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=15)
+
+    seen_deadlines: list[float | None] = []
+    real_slot = PgLimiter.slot
+
+    @asynccontextmanager
+    async def spying_slot(self: PgLimiter, *, deadline: float | None = None):
+        seen_deadlines.append(deadline)
+        async with real_slot(self, deadline=deadline):
+            yield
+
+    monkeypatch.setattr(PgLimiter, "slot", spying_slot)
+
+    async def garbage(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        await asyncio.sleep(0.05)  # реальный измеримый разрыв между попытками
+        return ModelResponse(parts=[TextPart(content="это не JSON и не вызов инструмента")])
+
+    llm = LLM(cfg, db_factory, model_override=FunctionModel(garbage))
+
+    with pytest.raises(LLMSchemaError):
+        await llm("verdict_text", Out, prompt="скажи привет", trace_id=trace_id)
+
+    assert len(seen_deadlines) == 2  # оба вызова _attempt дошли до slot()
+    assert seen_deadlines[0] is not None
+    assert seen_deadlines[0] == seen_deadlines[1]  # общий дедлайн через СХЕМА-ретрай тоже
+
+
 async def test_limiter_budget_bounds_full_retry_chain_not_multiplied(db_factory, monkeypatch):
     """Наблюдаемое поведение, не только проводка (то, что контроллер попросил
     отдельно): если бы второй `slot()` внутри цепочки ретраев получал СВЕЖИЙ
@@ -505,8 +556,18 @@ async def test_acquire_gives_up_with_diagnostics_when_slot_never_frees(db_factor
     отпускает лок за время теста, и проверяем, что `slot()` сдаётся
     `PgLimiterTimeout`, а не виснет. Оба порога укорочены monkeypatch — иначе тест
     честно ждал бы 120 реальных секунд.
+
+    Текст исключения (fix round 4, Item 2) проверяется отдельно: этот вызов
+    `slot()` — БЕЗ переданного `deadline`, значит бюджет свежий и полный
+    (`_ACQUIRE_TIMEOUT_S`, здесь 0.3с) — ждали ровно его целиком, "оставалось
+    в начале" тоже 0.3с (унаследовать частично исчерпанный бюджет тут неоткуда,
+    это ровно тот "честный простой с нуля", который сообщение обязано отличать
+    от унаследованного). Симметричный случай (унаследованный почти пустой
+    бюджет) — `test_limiter_budget_bounds_full_retry_chain_not_multiplied` ниже,
+    хоть там текст явно не проверяется.
     """
-    monkeypatch.setattr("harness.platform.limiter._ACQUIRE_TIMEOUT_S", 0.3)
+    budget = 0.3
+    monkeypatch.setattr("harness.platform.limiter._ACQUIRE_TIMEOUT_S", budget)
     monkeypatch.setattr("harness.platform.limiter._STALL_LOG_INTERVAL_S", 0.05)
 
     holder = await db_factory.kw["bind"].connect()
@@ -519,7 +580,7 @@ async def test_acquire_gives_up_with_diagnostics_when_slot_never_frees(db_factor
         assert acquired
 
         lim = PgLimiter(db_factory, max_concurrency=1, max_per_minute=1000)
-        with pytest.raises(PgLimiterTimeout):
+        with pytest.raises(PgLimiterTimeout) as exc_info:
             async with lim.slot():
                 pass
     finally:
@@ -527,6 +588,16 @@ async def test_acquire_gives_up_with_diagnostics_when_slot_never_frees(db_factor
             text("SELECT pg_advisory_unlock(:cls, :idx)"), {"cls": _ADVISORY_LOCK_CLASS, "idx": 0}
         )
         await holder.close()
+
+    message = str(exc_info.value)
+    assert "одновременности" in message  # какой именно механизм не открылся
+    assert "ждали" in message and "оставалось" in message  # elapsed + remaining budget — Item 2
+    numbers = [float(n) for n in re.findall(r"(\d+\.\d)с", message)]
+    assert len(numbers) == 2  # "ждали Xс" и "оставалось Yс"
+    # оба числа близки к полному бюджету — унаследовать частичный тут неоткуда
+    # (без переданного deadline эта slot() сама берёт свежий полный бюджет)
+    for value in numbers:
+        assert value == pytest.approx(budget, abs=0.2)
 
 
 async def test_unlock_failure_is_logged_not_raised(db_factory, monkeypatch, caplog):
