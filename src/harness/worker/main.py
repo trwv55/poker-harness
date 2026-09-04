@@ -30,7 +30,7 @@ import httpx
 import structlog
 
 from harness.memory.models import async_session_factory
-from harness.platform.config import Config, MissingEnvVar
+from harness.platform.config import Config, MissingEnvVar, optional_env
 from harness.platform.llm import LLM
 from harness.platform.logs import configure_logging
 from harness.platform.queue import JobsQueue
@@ -137,13 +137,29 @@ async def main() -> None:
     # потребителей `Config` (бот, evals) значило бы требовать от них знать число,
     # которое их не касается. Дефолт — не угадывание лимита денег/провайдера
     # (то как раз запрещено, спека §7), а число корутин одного процесса.
-    worker_concurrency = int(os.environ.get("WORKER_CONCURRENCY", "4"))
+    # `optional_env`, а не `os.environ.get(..., "4")`: `env_file` в Compose
+    # отдаёт строку `WORKER_CONCURRENCY=` как ПУСТОЕ значение, дефолт бы не
+    # применился, и `int("")` уронил бы воркер трассировкой в цикле рестартов
+    # (ревью задачи 20; обоснование целиком — в докстринге `optional_env`).
+    worker_concurrency = int(optional_env("WORKER_CONCURRENCY", "4"))
 
     db_factory = async_session_factory(cfg.database_url)
     queue = JobsQueue(db_factory)
     llm = LLM(cfg, db_factory)
     sender = TelegramSender(cfg.telegram_token)
 
+    # МЕТОД СТАРТА ПРОЦЕССОВ ЗАДАЁТСЯ ОБРАЗОМ, А НЕ ЭТИМ ФАЙЛОМ. На Linux дефолт
+    # `multiprocessing` — `fork` для 3.12/3.13 и `forkserver` начиная с 3.14;
+    # `requires-python` у нас `>=3.12`, а `uv.lock` разрешён и под 3.14, поэтому
+    # какой из двух в силе, решает строка `FROM python:3.12-slim` в Dockerfile
+    # (задача 20, там же обоснование пина). Наблюдаемая разница — не в
+    # корректности: код не имеет права ЗАВИСЕТЬ от метода старта (это отдельно
+    # разобрано в докстринге `_enqueue_deep_dive_for_missing_hand`,
+    # `tests/test_worker_pipeline.py`), и здесь через границу процесса едут
+    # только пиклимые аргументы. Разница в ЦЕНЕ: под `fork` подпроцесс наследует
+    # память родителя (прогретые модульные кэши, загруженная таблица эквити),
+    # под `forkserver` каждый стартует с чистого импорта и греет своё заново.
+    # Смена минорной версии образа меняет стоимость холодного пула молча.
     with ProcessPoolExecutor() as process_pool:
         deps = Deps(
             db_factory=db_factory,

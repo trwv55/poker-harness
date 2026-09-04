@@ -11,16 +11,20 @@
 это путь тома конкретного процесса, и делать его обязательной переменной для ВСЕХ
 потребителей `Config` (воркер, evals) значило бы требовать от них знать то, что их
 не касается. Дефолт `/data` — точка монтирования тома (спека §6: файлы на диске в
-volume), а не угаданное продуктовое число. В деплое (задача 20) переменная всё
-равно задаётся ЯВНО и одинаково у бота и у воркера (docker-compose.yml): путь,
-который бот кладёт в `jobs.payload`, абсолютный, воркер читает файл ровно по нему,
-а совпадение двух независимых дефолтов в двух контейнерах — не гарантия равенства.
+volume), а не угаданное продуктовое число.
+
+**`DATA_DIR` читает только этот процесс** (правка ревью задачи 20: раньше здесь
+было сказано, что переменную читают оба, — воркер её не читает вовсе, он берёт
+готовый абсолютный путь из `jobs.payload`). Отсюда следствие, о котором должен
+знать всякий, кто соберётся менять точку монтирования: путь, вычисленный ЗДЕСЬ,
+уезжает в БД и живёт там столько же, сколько строка задачи и турнира. Держит
+систему вместе не эта переменная, а совпадение точки монтирования тома у бота и
+воркера (`docker-compose.yml`); переменная лишь решает, какой путь бот запишет.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher
@@ -28,7 +32,7 @@ from aiogram import Bot, Dispatcher
 from harness.bot.handlers import BotDeps
 from harness.bot.router import build_router
 from harness.memory.models import async_session_factory
-from harness.platform.config import Config, MissingEnvVar
+from harness.platform.config import Config, MissingEnvVar, optional_env
 from harness.platform.logs import configure_logging
 from harness.platform.queue import JobsQueue
 
@@ -40,7 +44,7 @@ _DEFAULT_DATA_DIR = "/data"
 async def main() -> None:
     configure_logging()
     cfg = Config.from_env()
-    data_dir = Path(os.environ.get("DATA_DIR", _DEFAULT_DATA_DIR))
+    data_dir = Path(optional_env("DATA_DIR", _DEFAULT_DATA_DIR))
 
     db_factory = async_session_factory(cfg.database_url)
     deps = BotDeps(db_factory=db_factory, queue=JobsQueue(db_factory), data_dir=data_dir)

@@ -37,7 +37,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from harness.memory.models import Job, LlmCall, Trace
 from harness.memory.repos import PlayersRepo, SessionsRepo
-from harness.platform.config import Config, MissingEnvVar
+from harness.platform.config import Config, MissingEnvVar, optional_env
 from harness.platform.limiter import _ADVISORY_LOCK_CLASS, PgLimiter, PgLimiterTimeout, _engine_of
 from harness.platform.llm import LLM, LLMProviderError, LLMSchemaError, _sniff_image_media_type
 
@@ -803,3 +803,31 @@ def test_config_from_env_missing_var_fails_loudly(monkeypatch):
 
     with pytest.raises(MissingEnvVar, match="LLM_VISION_MODEL"):
         Config.from_env()
+
+
+def test_optional_env_treats_empty_value_as_unset(monkeypatch):
+    """ПУСТАЯ строка — это незаданная переменная, а не значение.
+
+    Не теоретическая придирка, а воспроизведение живого отказа (ревью задачи
+    20): `env_file` в Docker Compose ставит строку вида `WORKER_CONCURRENCY=`
+    как пустое значение, а не как отсутствие переменной. Голый
+    `os.environ.get(name, default)` вернул бы здесь `""`, дефолт бы не
+    применился, и `int("")` уронил бы воркер трассировкой — в цикле рестартов,
+    потому что `restart: unless-stopped`. Дорога к отказу — ровно та, которую
+    предписывает README: `cp .env.example .env`, оставить необязательную строку
+    пустой, `docker compose up -d`.
+    """
+    monkeypatch.setenv("WORKER_CONCURRENCY", "")
+    assert optional_env("WORKER_CONCURRENCY", "4") == "4"
+    assert int(optional_env("WORKER_CONCURRENCY", "4")) == 4
+
+
+def test_optional_env_prefers_value_over_default(monkeypatch):
+    """Обратная сторона того же: непустое значение обязано побеждать дефолт —
+    иначе «пустое значит незаданное» превратилось бы в «переменная не читается».
+    """
+    monkeypatch.setenv("WORKER_CONCURRENCY", "8")
+    assert optional_env("WORKER_CONCURRENCY", "4") == "8"
+
+    monkeypatch.delenv("WORKER_CONCURRENCY", raising=False)
+    assert optional_env("WORKER_CONCURRENCY", "4") == "4"
