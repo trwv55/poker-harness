@@ -48,6 +48,13 @@ from harness.memory.models import LlmCall
 from harness.platform.config import Config
 from harness.platform.limiter import PgLimiter
 
+# Модульная косвенность вместо прямых вызовов `asyncio.sleep` (fix round 1, small
+# item 4, тот же приём и то же обоснование, что в `limiter.py`): патч `harness.
+# platform.llm._sleep` не задевает глобальный `asyncio.sleep`, а патч `harness.
+# platform.llm.asyncio.sleep` задевал бы его ГЛОБАЛЬНО, для всего процесса, что
+# и произошло в тестах до этого фикса (докстринги утверждали обратное — ложно).
+_sleep = asyncio.sleep
+
 T = TypeVar("T", bound=BaseModel)
 
 # Спека §7 дословно: "ретрай при ответе, не прошедшем pydantic-валидацию (1 повтор,
@@ -58,10 +65,25 @@ _MAX_HTTP_ATTEMPTS = 3
 _HTTP_JITTER_MIN_S = 0.05
 _HTTP_JITTER_MAX_S = 0.15
 
-# GG отдаёт скрины стола PNG (vision-парсер, отдельная задача) — единственный формат
-# вложений v1; заводить параметр под media_type раньше появления второго формата
-# было бы преждевременной обобщённостью.
-_IMAGE_MEDIA_TYPE = "image/png"
+# Магические байты — единственный надёжный способ узнать формат вложения (fix
+# round 1: захардкоженный `image/png` был ПРОСТО НЕВЕРЕН для реального входа —
+# Telegram переотдаёт сжатые фото как JPEG, не PNG; подписанный PNG на самом деле
+# JPEG — это 400 от провайдера на первом же боевом скрине, задача 22). Сигнатуры
+# по первым байтам, не по расширению файла — вызывающий передаёт голые `bytes`,
+# без имени файла.
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+_JPEG_MAGIC = b"\xff\xd8\xff"
+
+
+def _sniff_image_media_type(data: bytes) -> str:
+    if data.startswith(_PNG_MAGIC):
+        return "image/png"
+    if data.startswith(_JPEG_MAGIC):
+        return "image/jpeg"
+    raise ValueError(
+        "неизвестный формат изображения — ни PNG, ни JPEG (первые байты: "
+        f"{data[:8]!r})"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +91,11 @@ class CallMeta:
     """Метаданные одной УСПЕШНОЙ попытки — то, что возвращается вызывающему вместе
     с распарсенным результатом. Не путать со строкой `llm_calls`: та живёт для ВСЕХ
     попыток, включая провалившиеся, эта — только для той, что дошла до успеха.
+
+    `cost_usd` — ОЦЕНКА (PydanticAI/genai-prices по прайс-листу поставщика, best-
+    effort), не выставленный провайдером счёт: CLAUDE.md запрещает выдумывать
+    денежные числа, и непомеченная оценка в колонке `llm_calls.cost` была бы ровно
+    такой выдумкой. Годится для приблизительного мониторинга, не для биллинга.
     """
 
     model: str
@@ -166,7 +193,10 @@ class LLM:
         agent = Agent(model, output_type=schema, retries=0)
         user_prompt: list[str | BinaryContent] = [
             prompt,
-            *(BinaryContent(data=image, media_type=_IMAGE_MEDIA_TYPE) for image in images),
+            *(
+                BinaryContent(data=image, media_type=_sniff_image_media_type(image))
+                for image in images
+            ),
         ]
 
         async with self._local_semaphore:
@@ -211,6 +241,13 @@ class LLM:
         схема) наружу не оборачивается — `__call__` ловит её напрямую и решает,
         тратить ли схема-ретрай; эта функция лишь успевает залогировать строку перед
         тем, как исключение уйдёт выше.
+
+        Третий `except` (fix round 1, discretionary item) ловит ЛЮБОЙ иной сбой
+        (обрыв соединения, таймаут чтения, что угодно не опознанное как 429/5xx или
+        невалидная схема) и закрывает строку `llm_calls` статусом `error` перед тем,
+        как перевыбросить как есть — без него такая строка осталась бы `started`
+        навсегда: у `llm_calls`, в отличие от `jobs`, нет reaper'а, который бы её
+        когда-нибудь закрыл.
         """
         last_http_error: ModelHTTPError | None = None
         for http_attempt in range(_MAX_HTTP_ATTEMPTS):
@@ -232,8 +269,11 @@ class LLM:
                             f"{purpose}: провайдер вернул {exc.status_code} после "
                             f"{http_attempt + 1} попыт(ок)"
                         ) from exc
-                    await asyncio.sleep(_backoff_delay(http_attempt))
+                    await _sleep(_backoff_delay(http_attempt))
                     continue
+                except Exception:
+                    await self._log_finished(call_id, status="error")
+                    raise
 
                 latency_ms = round((time.monotonic() - started) * 1000)
                 usage = result.usage

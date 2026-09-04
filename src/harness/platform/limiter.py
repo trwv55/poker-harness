@@ -13,9 +13,7 @@
   поэтому гарантия кросс-процессная — конкурирующие воркеры (и, отдельно,
   конкурирующие корутины одного воркера — `platform/llm.py`, задача 18,
   `WORKER_CONCURRENCY`) видят локи друг друга ЧЕРЕЗ СУБД, а не через
-  разделяемую память одного процесса, — и не нужен отдельный reaper на смерть
-  воркера, как у `jobs` (задача 15): застрявших слотов после падения соединения
-  не бывает физически, снимает сама СУБД.
+  разделяемую память одного процесса.
 - **Темп** — не лок, а оконный счётчик: `SELECT count(*) FROM llm_calls WHERE
   started_at > now() - interval '60 seconds'`. Строка `llm_calls` пишется
   вызывающим (`LLM.__call__`, не этот модуль) ДО обращения к модели —
@@ -23,6 +21,56 @@
   in-flight строки внутри окна, иначе всплеск нагрузки, когда много вызовов
   одновременно "в полёте", тихо занижает счётчик именно в момент, когда лимит
   важнее всего (спека §7).
+
+**Пиннинг соединения — БЕЗ открытой транзакции (fix round 1, Important 3).**
+Первая версия держала слот через `AsyncSession` без промежуточных `commit()`
+— это работало (см. ниже, "Найденный баг"), но ценой одной долгой ОТКРЫТОЙ
+транзакции на всё время удержания слота, вплоть до конца вызова модели.
+Ревью указало на две реальные цены такого дизайна, не гипотетические:
+(1) читающий `SELECT` окна темпа держит `ACCESS SHARE` на `llm_calls` до конца
+транзакции — миграция (`ALTER TABLE llm_calls`, `ACCESS EXCLUSIVE`) встаёт в
+очередь за K такими транзакциями, а следом в очередь за самой миграцией
+встают уже ВСЕ новые обращения к `llm_calls` (и `SELECT` темпа, и `INSERT`
+`_log_started`) — весь LLM-конвейер стопорится на время самого длинного
+вызова модели, при обычной миграции; (2) `idle_in_transaction_session_
+timeout` на managed Postgres молча убивает бэкенд посреди вызова модели —
+рвёт advisory-лок (K оказывается превышен, в логе ничего), и последующий
+`pg_advisory_unlock` в `finally` падает на мёртвом соединении.
+
+Лок Postgres-уровня СЕССИИ переживает и `COMMIT`, и `ROLLBACK` — держать
+транзакцию открытой была не необходимость лока, а следствие того, что для
+пиннинга соединения использовался `AsyncSession` (ORM-сессия начинает
+транзакцию неявно на первом операторе). Правильный инструмент для «закрепить
+физическое соединение, не открывая транзакцию» — сырое `AsyncConnection` в
+режиме `AUTOCOMMIT`: `execution_options(isolation_level="AUTOCOMMIT")`
+коммитит каждый оператор сам по себе, но соединение остаётся закреплено за
+этим объектом `AsyncConnection`, пока его явно не закрыть — id бэкенда
+(`pg_backend_pid()`) проверен неизменным через несколько операторов подряд
+(`test_pinned_connection_survives_autocommit_statement_boundaries`).
+
+**Самолечение утёкшего лока при получении соединения (fix round 1,
+Important 1).** Если `finally` не успевает разблокировать (падение воркера,
+разрыв соединения, отмена задачи посреди удержания), соединение всё равно
+возвращается в пул при закрытии — сброс пула это `ROLLBACK`, который
+session-scoped advisory-лок НЕ снимает. Локи Postgres реентерабельны на
+уровне сессии: следующий `slot()`, которому пул отдаст то же физическое
+соединение, получит `pg_try_advisory_lock` `True` не потому что слот и
+правда свободен, а потому что это его же собственная (унаследованная от
+покойника) сессия. `SELECT pg_advisory_unlock_all()` сразу после получения
+свежезакреплённого соединения — безопасно ВСЕГДА: если предыдущий держатель
+жив, соединение не могло бы быть выдано повторно (пул отдаёт соединение
+эксклюзивно), а если локи на нём остались — их владелец по определению уже
+не существует.
+
+**Опрос ограничен по времени и не молчит (fix round 1, Important 2).** Без
+этого утечка из Important 1 (или любая другая причина затора) вырождается в
+вечный неотличимый от нормальной работы стопор всего конвейера: `_wait_for_
+rate_window`/`_acquire_advisory_lock` логируют предупреждение каждые
+`_STALL_LOG_INTERVAL_S` секунд ожидания и сдаются `PgLimiterTimeout`, если
+ожидание перевалило за `_ACQUIRE_TIMEOUT_S`, — не потому что долгое ожидание
+темпа/слота само по себе ошибка (это и есть работа лимитера под честной
+нагрузкой), а потому что ожидание, которое не заканчивается НИКОГДА и никак
+не сигнализирует об этом, неотличимо от повисшего процесса.
 
 Внутрипроцессный `asyncio.Semaphore` в этом модуле НЕ живёт: он допустим лишь
 как дешёвый предфильтр внутри `LLM.__call__`, источником истины не является —
@@ -32,12 +80,26 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
+
+logger = logging.getLogger(__name__)
+
+# Модульная косвенность вместо прямых вызовов `asyncio.sleep` (fix round 1,
+# small item 4): `asyncio` — общий процессный модуль, `monkeypatch.setattr(
+# "harness.platform.limiter.asyncio.sleep", ...)` в тестах патчил бы его
+# ГЛОБАЛЬНО (для всего процесса, не только для этого файла) — рабочий, но
+# вводящий в заблуждение приём, который эта задача уже один раз обещала не
+# повторять (ложный докстринг у корректного кода — тот самый анти-паттерн).
+# `_sleep` — атрибут ИМЕННО этого модуля; патч `harness.platform.limiter.
+# _sleep` не задевает ничего за его пределами.
+_sleep = asyncio.sleep
 
 # Namespace для pg_try_advisory_lock — первый аргумент без смысла сам по себе,
 # нужен только чтобы не столкнуться с локами других подсистем на том же
@@ -51,11 +113,36 @@ _ADVISORY_LOCK_CLASS = 0x4C4C4D
 _JITTER_MIN_S = 0.05
 _JITTER_MAX_S = 0.15
 
+# fix round 1, Important 2: не тихое зависание навсегда — периодический сигнал
+# в лог, затем явная сдача. Оба числа — инженерные, не из спеки: ожидание темпа
+# и слота одновременности — ОЖИДАЕМОЕ поведение лимитера под честной нагрузкой,
+# 120с — щедрый потолок для "что-то структурно сломано", не для "многовато
+# работы".
+_STALL_LOG_INTERVAL_S = 5.0
+_ACQUIRE_TIMEOUT_S = 120.0
+
 _RATE_WINDOW_SQL = text(
     "SELECT count(*) FROM llm_calls WHERE started_at > now() - interval '60 seconds'"
 )
 _TRY_LOCK_SQL = text("SELECT pg_try_advisory_lock(:cls, :idx)")
 _UNLOCK_SQL = text("SELECT pg_advisory_unlock(:cls, :idx)")
+_UNLOCK_ALL_SQL = text("SELECT pg_advisory_unlock_all()")
+
+
+class PgLimiterTimeout(Exception):
+    """Окно темпа или слот одновременности не открылись за `_ACQUIRE_TIMEOUT_S`
+    (fix round 1, Important 2) — явная ошибка вместо вечного молчаливого
+    ожидания, из которого снаружи никак не отличить нормальную очередь под
+    нагрузкой от структурной поломки (например, утёкший лок, который
+    самолечение при следующем чекауте того же физического соединения ещё не
+    успело подобрать)."""
+
+
+class PgLimiterUnlockFailed(Exception):
+    """`pg_advisory_unlock` вернул `false` — слот, который этот `slot()` считал
+    своим, к моменту освобождения им не был (fix round 1, small item: house-
+    style из `queue.py` — раскрывать нарушенный инвариант, не проглатывать
+    булев результат молча)."""
 
 
 def _jitter() -> float:
@@ -65,7 +152,11 @@ def _jitter() -> float:
 class PgLimiter:
     """Пул из `max_concurrency` слотов плюс окно `max_per_minute` вызовов в минуту,
     оба — над `session_factory` (задача 14: тот же `async_sessionmaker`, что и у
-    `JobsQueue`, `db_factory` в тестах).
+    `JobsQueue`, `db_factory` в тестах). Физическое соединение для `slot()`
+    достаётся напрямую из движка (`session_factory.kw["bind"]` — тот же приём,
+    что `db_factory` в `conftest.py`), а не через `session_factory()`: нужно
+    сырое `AsyncConnection` с `AUTOCOMMIT`, не ORM-сессию (см. модульный
+    докстринг, "Пиннинг соединения").
     """
 
     def __init__(
@@ -76,60 +167,87 @@ class PgLimiter:
         max_per_minute: int,
     ) -> None:
         self._session_factory = session_factory
+        self._engine = session_factory.kw["bind"]
         self._max_concurrency = max_concurrency
         self._max_per_minute = max_per_minute
 
     @asynccontextmanager
     async def slot(self) -> AsyncIterator[None]:
-        """Выделенное соединение на всё время удержания слота — то самое, у
-        которого нужно спросить `pg_advisory_unlock` при выходе: advisory-лок
-        привязан к СЕССИИ, снять его с другого соединения нельзя (в отличие от
-        обычных блокировок строк). Порядок — сначала темп, потом одновременность
-        (бриф задачи 16 дословно): нет смысла держать слот в очереди перед
-        локом, если вызов и так упрётся в темп на следующем шаге.
-
-        Ни в опросе темпа, ни в опросе слотов НЕТ промежуточных `commit()` —
-        не только за ненадобностью (Postgres READ COMMITTED и так даёт свежий
-        снапшот на каждый новый оператор внутри одной и той же транзакции, а
-        функции advisory-локов вообще нетранзакционны), а потому что он ломает
-        саму гарантию: `commit()` завершает текущую транзакцию сессии и
-        возвращает её соединение в пул СРАЗУ — не по выходу из `async with`, а
-        по факту коммита. Освободившееся соединение пул может тут же отдать
-        ДРУГОЙ параллельной `slot()`, и её `pg_try_advisory_lock` на том же
-        (физическом!) соединении, где секунду назад закрепился этот же лок,
-        увидит его как СВОЙ (advisory-локи в Postgres реентерабельны на уровне
-        сессии) и молча "заберёт" чужой слот. Воспроизведено и исправлено по
-        живому: с `commit()` после каждого опроса `test_limiter_serializes_
-        across_connections` ловил интерлив `["a-in", "b-in", "a-out", "b-out"]`
-        стабильно — advisory-лок технически держался (два РАЗНЫХ соединения на
-        старте, `pg_backend_pid()` отличался), но соединение, на котором он
-        держался, не оставалось закреплено за одной логической `slot()` от
-        входа до выхода.
+        """Выделенное соединение на всё время удержания слота, закреплённое БЕЗ
+        открытой транзакции (`AUTOCOMMIT` — см. модульный докстринг). Порядок —
+        сначала самолечение, потом темп, потом одновременность (бриф задачи 16:
+        "сначала темп, потом одновременность" — самолечение добавлено round 1
+        перед обоими, иначе унаследованный чужой лок мог бы исказить оба опроса
+        не только одновременности).
         """
-        async with self._session_factory() as session:
-            await self._wait_for_rate_window(session)
-            slot_index = await self._acquire_advisory_lock(session)
+        conn = await self._engine.connect()
+        conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+        try:
+            # Important 1: любой advisory-лок, оставшийся на ЭТОМ физическом
+            # соединении от предыдущего держателя, — заведомо чужой и заведомо
+            # брошенный (пул не мог бы выдать соединение, которое кто-то ещё
+            # держит живым) — см. модульный докстринг.
+            await conn.execute(_UNLOCK_ALL_SQL)
+            await self._wait_for_rate_window(conn)
+            slot_index = await self._acquire_advisory_lock(conn)
             try:
                 yield
             finally:
-                await session.execute(
+                released = await conn.scalar(
                     _UNLOCK_SQL, {"cls": _ADVISORY_LOCK_CLASS, "idx": slot_index}
                 )
-                await session.commit()
+                if not released:
+                    raise PgLimiterUnlockFailed(
+                        f"pg_advisory_unlock({_ADVISORY_LOCK_CLASS}, {slot_index}) "
+                        "вернул false — слот не был занят этим соединением к моменту "
+                        "разблокировки"
+                    )
+        finally:
+            await conn.close()
 
-    async def _wait_for_rate_window(self, session: AsyncSession) -> None:
+    async def _wait_for_rate_window(self, conn: AsyncConnection) -> None:
+        started = time.monotonic()
+        last_log = started
         while True:
-            count = await session.scalar(_RATE_WINDOW_SQL)
+            count = await conn.scalar(_RATE_WINDOW_SQL)
             if count is not None and count < self._max_per_minute:
                 return
-            await asyncio.sleep(_jitter())
+            elapsed = time.monotonic() - started
+            if elapsed > _ACQUIRE_TIMEOUT_S:
+                raise PgLimiterTimeout(
+                    f"темп: окно ({self._max_per_minute}/мин) не освободилось за "
+                    f"{_ACQUIRE_TIMEOUT_S:.0f}с"
+                )
+            if time.monotonic() - last_log >= _STALL_LOG_INTERVAL_S:
+                logger.warning(
+                    "PgLimiter: жду окно темпа (%s/мин) уже %.0fс",
+                    self._max_per_minute,
+                    elapsed,
+                )
+                last_log = time.monotonic()
+            await _sleep(_jitter())
 
-    async def _acquire_advisory_lock(self, session: AsyncSession) -> int:
+    async def _acquire_advisory_lock(self, conn: AsyncConnection) -> int:
+        started = time.monotonic()
+        last_log = started
         while True:
             for slot_index in range(self._max_concurrency):
-                acquired = await session.scalar(
+                acquired = await conn.scalar(
                     _TRY_LOCK_SQL, {"cls": _ADVISORY_LOCK_CLASS, "idx": slot_index}
                 )
                 if acquired:
                     return slot_index
-            await asyncio.sleep(_jitter())
+            elapsed = time.monotonic() - started
+            if elapsed > _ACQUIRE_TIMEOUT_S:
+                raise PgLimiterTimeout(
+                    f"слот одновременности: ни один из {self._max_concurrency} не "
+                    f"освободился за {_ACQUIRE_TIMEOUT_S:.0f}с"
+                )
+            if time.monotonic() - last_log >= _STALL_LOG_INTERVAL_S:
+                logger.warning(
+                    "PgLimiter: жду слот одновременности (K=%s) уже %.0fс",
+                    self._max_concurrency,
+                    elapsed,
+                )
+                last_log = time.monotonic()
+            await _sleep(_jitter())
