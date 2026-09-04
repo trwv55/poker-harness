@@ -33,9 +33,11 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
 import re
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -429,13 +431,25 @@ async def _enqueue_deep_dive_for_missing_hand(
 ) -> int:
     """Задача `deep_dive` на заведомо несуществующую руку — естественный, не
     смонкипатченный источник провала. С fix round 1 (Important 2) вычисление
-    `analyze_hand` для НАЙДЕННОЙ руки идёт через процессный пул: подпроцесс
-    `ProcessPoolExecutor` импортирует `harness.worker.pipeline` заново в своей
-    памяти, и `monkeypatch.setattr("harness.worker.pipeline.analyze_hand", ...)`
-    в тестовом (родительском) процессе до него не долетает — поэтому тесты на
-    отказ используют реальный недостижимый вход (`find_by_hand_no` вернёт
-    `None`, `_run_deep_dive` бросит `LookupError` ещё ДО процессного пула),
-    а не подмену функции.
+    `analyze_hand` для НАЙДЕННОЙ руки идёт через процессный пул, и монкипатч
+    `harness.worker.pipeline.analyze_hand` в тестовом (родительском) процессе
+    туда ненадёжно доходит: `ProcessPoolExecutor` умеет запускать воркеров ДВУМЯ
+    разными способами (`multiprocessing` start method), и результат зависит от
+    того, какой из них в силе (fix round 2, Item 2 — прежняя версия этого
+    докстринга формулировала это как универсальное правило, а не так). На
+    `spawn` (дефолт на macOS, где разрабатывался этот код, и на Windows)
+    подпроцесс — новый интерпретатор, который переимпортирует `harness.worker.
+    pipeline` с нуля, и патч родителя туда физически не долетает. На `fork`
+    (дефолт на Linux, где этот код разворачивается — Docker-образ задачи 20)
+    подпроцесс копирует память родителя В МОМЕНТ форка: если это происходит
+    ПОСЛЕ того, как патч уже применён, воркер его унаследует и увидит. Раз
+    результат зависит от платформы и от момента, когда пул реально форкнул
+    своих воркеров относительно `monkeypatch.setattr(...)` — полагаться на
+    патч через границу процесса нельзя ни при каких обстоятельствах: тест,
+    зелёный на dev-машине (macOS), может провалиться в CI/проде (Linux) или
+    наоборот. Отсюда — реальный недостижимый вход (`find_by_hand_no` вернёт
+    `None`, `_run_deep_dive` бросит `LookupError` ещё ДО процессного пула), а
+    не подмена функции внутри него.
     """
     return await enqueue_deep_dive(
         queue, "несуществующая-раздача-999", player_id=player_id, session_id=session_id
@@ -499,18 +513,25 @@ async def test_failure_before_max_attempts_retries_silently(db_factory, fake_sen
 
 @requires_fixtures
 async def test_stale_worker_cannot_complete_reclaimed_job(db_factory, fake_sender, queue, deps):
-    """Контроллерский рулинг задачи 18, п.2 + fix round 1, Important 4:
-    `worker_id` из `claim()` обязан доходить до `complete()`/`fail()`, И до
-    каждой записи `jobs.payload`/`hand_id`, И `_send_idempotent` обязана
-    перечитывать `payload` из БД, а не полагаться на снимок, который зомби
-    сделал при захвате. Сценарий — зомби-воркер "ожил" уже ПОСЛЕ того, как
-    `reap()` вернул его задачу в очередь, новый владелец её подхватил и
-    ПОЛНОСТЬЮ довёл до конца (реальная отправка результата игроку) — только
-    тогда зомби, доигрывая ту же станцию по своей устаревшей копии `job`,
-    оказывается перед вопросом, который и проверяет тест: пошлёт ли он игроку
-    ВТОРОЙ экземпляр того же результата (fix round 1 нашёл именно это: старый
-    код снимал `payload` один раз при входе в станцию и не видел, что
-    `result_message_id` новый владелец уже поставил).
+    """fix round 1, Important 4: `_send_idempotent` обязана перечитывать
+    `payload`+`locked_by` из БД непосредственно перед отправкой, а не
+    полагаться на снимок, который зомби сделал при захвате. Сценарий — зомби-
+    воркер "ожил" уже ПОСЛЕ того, как `reap()` вернул его задачу в очередь,
+    новый владелец её подхватил и ПОЛНОСТЬЮ довёл до конца (реальная отправка
+    результата игроку) — только тогда зомби, доигрывая ту же станцию по своей
+    устаревшей копии `job`, оказывается перед вопросом, который и проверяет
+    тест: пошлёт ли он игроку ВТОРОЙ экземпляр того же результата (fix round
+    1 нашёл именно это: старый код снимал `payload` один раз при входе в
+    станцию и не видел, что `result_message_id` новый владелец уже поставил).
+
+    **Чего этот тест НЕ проверяет (fix round 2, Item 1).** Пред-чек владения в
+    `_send_idempotent` останавливает зомби на первой же `_ensure_progress` —
+    `run_job` ловит `JobPreconditionFailed` до того, как дело доходит до
+    `_finish_fenced`/`deps.queue.complete()`. Значит фенсинг САМОГО `complete()`
+    (что `worker_id=job.locked_by` реально доходит до `JobsQueue.complete()`)
+    этот сценарий больше не задевает вовсе — его проверяет отдельный,
+    следующий тест (`test_finish_fenced_does_not_complete_job_with_stale_
+    worker_id`), юнитом на `_finish_fenced`, а не через `run_job` целиком.
     """
     player_id, session_id = await _make_scope(db_factory)
     jid, _raw = await _seed_one_hand_deep_dive_job(
@@ -558,7 +579,79 @@ async def test_stale_worker_cannot_complete_reclaimed_job(db_factory, fake_sende
     assert len(fake_sender.sent) == sent_after_new_owner
 
 
+@requires_fixtures
+async def test_finish_fenced_does_not_complete_job_with_stale_worker_id(db_factory, queue, deps):
+    """Восстанавливает гарантию, которую `test_stale_worker_cannot_complete_
+    reclaimed_job` больше не задевает (fix round 2, Item 1): `_finish_fenced`
+    обязана передавать `job.locked_by` в `deps.queue.complete()`, и когда он
+    не совпадает с текущим владельцем строки, переход обязан быть отклонён —
+    не только "какой-то другой механизм остановил зомби раньше", а именно
+    ЭТА конкретная передача параметра. Юнит на `_finish_fenced` напрямую, в
+    обход всей станции и `run_job`: `stale_job.locked_by` заведомо не тот, что
+    сейчас в `jobs.locked_by` (задачу успел подхватить кто-то другой).
+    """
+    player_id, session_id = await _make_scope(db_factory)
+    jid = await enqueue_deep_dive(queue, "неважно-для-этого-теста", player_id=player_id, session_id=session_id)
+    real_owner = await queue.claim("w-real")
+    assert real_owner is not None
+    assert real_owner.locked_by == "w-real"
+
+    # Не настоящая захваченная задача — тот же `id`, но заведомо чужой
+    # `locked_by`: `_finish_fenced` смотрит только на эти два поля `job`.
+    stale_job = Job(id=jid, locked_by="w-stale")
+
+    completed = await pipeline_module._finish_fenced(deps, stale_job, outcome="complete")
+
+    assert completed is False  # переход отклонён фенсингом, не притворился успешным
+    async with db_factory() as session:
+        row = await session.get(Job, jid)
+        assert row is not None
+        assert row.status == "running"  # НЕ done — с чужим worker_id завершить нельзя
+        assert row.locked_by == "w-real"  # владение настоящего воркера не тронуто
+
+
 # --- deep_dive: тоже через процессный пул и тоже с общим кэшем --------------------
+
+
+@requires_fixtures
+def _call_with_pid(fn, args):
+    """Функция верхнего уровня (не замыкание — обязана быть пиклимой для
+    настоящего `ProcessPoolExecutor`): оборачивает вызываемое и возвращает
+    `os.getpid()` вместе с результатом (fix round 2, Item 3) — единственный
+    надёжный сигнал "это реально выполнилось в другом процессе", который не
+    подделать случайно совпавшим числом вызовов `CalcCacheRepo` до/после.
+    """
+    return os.getpid(), fn(*args)
+
+
+class _PidCapturingExecutor:
+    """Оборачивает настоящий `ProcessPoolExecutor`: делегирует расчёт ему как
+    есть, но перехватывает PID процесса, который РЕАЛЬНО его выполнил.
+    Инлайн-выполнение (или `ThreadPoolExecutor`, дефолт `run_in_executor(None,
+    ...)` при `process_pool=None`) делит PID с этим тестовым процессом —
+    отдельные потоки, не отдельные процессы; отдельный PID даёт только
+    настоящий отдельный процесс, а его подделать конструкцией теста нельзя.
+    """
+
+    def __init__(self, real_pool: ProcessPoolExecutor) -> None:
+        self._real_pool = real_pool
+        self.worker_pid: int | None = None
+
+    def submit(self, fn, *args, **kwargs):
+        inner_future = self._real_pool.submit(_call_with_pid, fn, args)
+        outer_future: Future = Future()
+
+        def _on_done(f: Future) -> None:
+            try:
+                pid, result = f.result()
+            except BaseException as exc:  # noqa: BLE001 — прокинуть как есть
+                outer_future.set_exception(exc)
+                return
+            self.worker_pid = pid
+            outer_future.set_result(result)
+
+        inner_future.add_done_callback(_on_done)
+        return outer_future
 
 
 @requires_fixtures
@@ -574,6 +667,15 @@ async def test_deep_dive_participates_in_shared_calc_cache(
     количественной: `CalcCacheRepo.get_all`/`.upsert_many` реально вызваны на
     пути вычисления (`existing is None`), независимо от того, нашлось ли что
     считать по Монте-Карло именно в этой раздаче.
+
+    **fix round 2, Item 3.** Одних счётчиков вызовов `CalcCacheRepo` было
+    недостаточно: те вызовы происходят ДО/ПОСЛЕ `run_in_executor`, не внутри
+    него, — они совпали бы по числу и если бы `_analyze_hand_with_cache`
+    считался инлайн, без какого-либо исполнителя вовсе (замени `process_pool`
+    на `None` мысленно — тест остался бы зелёным, пока луп события блокируется
+    заново, ровно тот дефект, который чинил Important 2). `_PidCapturingExecutor`
+    добавляет позитивный сигнал: PID процесса, реально выполнившего расчёт,
+    обязан отличаться от PID этого тестового процесса.
     """
     player_id, session_id = await _make_scope(db_factory)
     jid, _raw = await _seed_one_hand_deep_dive_job(
@@ -595,13 +697,19 @@ async def test_deep_dive_participates_in_shared_calc_cache(
     monkeypatch.setattr(pipeline_module.CalcCacheRepo, "get_all", _spy_get_all)
     monkeypatch.setattr(pipeline_module.CalcCacheRepo, "upsert_many", _spy_upsert_many)
 
+    assert deps.process_pool is not None
+    pid_executor = _PidCapturingExecutor(deps.process_pool)
+    pid_deps = replace(deps, process_pool=pid_executor)
+
     job = await queue.claim("w1")
     assert job is not None
-    await run_job(job, deps)
+    await run_job(job, pid_deps)
 
     assert (await job_status(db_factory, jid)) == "done"
     assert calls["get_all"] == 1  # прочитан общий кэш перед расчётом
     assert calls["upsert_many"] == 1  # досчитанное записано обратно
+    assert pid_executor.worker_pid is not None  # расчёт реально отправлен в исполнитель
+    assert pid_executor.worker_pid != os.getpid()  # и выполнен в ДРУГОМ процессе, не инлайн
 
 
 # --- транзакция: закрыта ДО долгого исполнителя, не держится через него -----------
