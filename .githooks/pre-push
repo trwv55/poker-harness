@@ -21,6 +21,15 @@ FORBIDDEN_PATHS='^(evals/vision/|evals/e2e/|\.claude/screens/|fixtures/hh/.+\.tx
 # .githooks/ и политика содержат сам шаблон поиска — иначе хук блокировал бы себя.
 HAND_ALLOWLIST='^(tests/test_hh_parser\.py|src/harness/parsers/hh_parser\.py|docs/superpowers/(plans|specs)/|\.githooks/|docs/publishing-policy\.md$)'
 
+# Маркер руки ищется ВМЕСТЕ со структурным спутником. Одного «Poker Hand #» мало:
+# код законно упоминает его как разделитель или в докстринге, а настоящая рука
+# всегда несёт ещё и раздачу карт, посты блайндов или места за столом.
+# Привязка к началу строки НЕ подходит: реальный образец в tests/test_hh_parser.py
+# встроен как `SAMPLE = \"\"\"Poker Hand #...`, то есть не с начала строки, и такое
+# правило пропустило бы именно тот случай, ради которого хук написан.
+HAND_MARKER='Poker Hand #'
+HAND_COMPANION='(\*\*\* HOLE CARDS \*\*\*|posts (small|big) blind|^Seat [0-9]+:|Dealt to )'
+
 # Секреты: ключи провайдеров, токен бота, токен GitHub.
 SECRET_RE='(sk-ant-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{36}|xoxb-[A-Za-z0-9-]{20,}|\b[0-9]{8,10}:[A-Za-z0-9_-]{35}\b)'
 
@@ -52,7 +61,8 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
         fi
 
         if ! printf '%s' "$f" | grep -Eq "$HAND_ALLOWLIST"; then
-            if printf '%s' "$content" | grep -q 'Poker Hand #'; then
+            if printf '%s' "$content" | grep -qF "$HAND_MARKER" \
+               && printf '%s' "$content" | grep -Eq "$HAND_COMPANION"; then
                 say "РЕАЛЬНАЯ РУКА ВНЕ СПИСКА ИСКЛЮЧЕНИЙ: $f"
                 BLOCKED=1
             fi
