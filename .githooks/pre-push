@@ -15,7 +15,10 @@ BLOCKED=0
 say() { printf '%s\n' "$*" >&2; }
 
 # Пути, которых не должно быть в публичной истории.
-FORBIDDEN_PATHS='^(evals/vision/|evals/e2e/|\.claude/screens/|fixtures/hh/.+\.txt$|\.env$|src/harness/parsers/prompts/|data/)'
+# `reports/` — вывод scripts/grid_report.py. Проверка по содержимому его не поймает:
+# HTML-отчёт несёт номера турнирных рук (`TM…`), но не маркер `Poker Hand #`,
+# на который смотрит контентный фильтр ниже. Значит, ловится он только путём.
+FORBIDDEN_PATHS='^(evals/vision/|evals/e2e/|\.claude/screens/|fixtures/hh/.+\.txt$|\.env$|src/harness/parsers/prompts/|data/|reports/)'
 
 # Файлы, которым разрешено содержать образец реальной руки (осознанное решение владельца).
 # .githooks/ и политика содержат сам шаблон поиска — иначе хук блокировал бы себя.
