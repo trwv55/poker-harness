@@ -45,6 +45,7 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from harness.memory.models import LlmCall
+from harness.platform import limiter as _limiter_module
 from harness.platform.config import Config
 from harness.platform.limiter import PgLimiter
 
@@ -54,6 +55,19 @@ from harness.platform.limiter import PgLimiter
 # platform.llm.asyncio.sleep` задевал бы его ГЛОБАЛЬНО, для всего процесса, что
 # и произошло в тестах до этого фикса (докстринги утверждали обратное — ложно).
 _sleep = asyncio.sleep
+
+# `_limiter_module._ACQUIRE_TIMEOUT_S` — обращение через модуль, не через `from
+# ... import _ACQUIRE_TIMEOUT_S` (fix round 3, Item 1: найдено на живом коде —
+# первая версия этого файла именно так и импортировала константу, и тест на
+# разделяемый дедлайн, `test_limiter_budget_bounds_full_retry_chain_not_
+# multiplied`, завис на реальные ~120с вместо монкипатченных долей секунды).
+# `from module import NAME` копирует ЗНАЧЕНИЕ на момент импорта — `monkeypatch.
+# setattr("harness.platform.limiter._ACQUIRE_TIMEOUT_S", ...)` меняет атрибут
+# ИСХОДНОГО модуля, а уже скопированное в `llm.py` число остаётся прежним. Тот
+# же класс ошибки, что и с `asyncio.sleep` выше, только в обратную сторону:
+# там прямая ссылка на модуль патчилась ШИРЕ, чем нужно, здесь — импорт
+# значения не патчился бы ВООБЩЕ.
+
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -196,6 +210,19 @@ class LLM:
         подряд (задача 18, `Deps.llm` — общий на все `run_job`), а `llm_calls.trace_id`
         обязан указывать на трейс ИМЕННО этого вызова, не на трейс, с которым фасад
         был бы создан когда-то давно.
+
+        Дедлайн лимитера (fix round 3, Item 1) считается ЗДЕСЬ, один раз на всю
+        цепочку ретраев (схема- и HTTP-), и передаётся в каждый `self._limiter.
+        slot()` неизменным — не заново на каждой попытке. Иначе полная цепочка
+        (до `_MAX_HTTP_ATTEMPTS × _MAX_SCHEMA_ATTEMPTS` разных `slot()`) могла
+        бы суммарно ждать лимитер в разы дольше окна `JobsQueue.reap()`, ради
+        которого `_ACQUIRE_TIMEOUT_S` вообще считался (см. `limiter.py`,
+        докстринг константы) — задача выглядела бы зависшей, reap() отдал бы
+        её другому воркеру, и провайдеру заплатили бы за неё дважды. Считается
+        ДО входа в цикл ретраев (а не внутри `_attempt`, который его получает
+        готовым) — время ожидания лимитера бюджетируется, время самого ответа
+        модели — нет: `_attempt` передаёт дедлайн в `slot()`, но НЕ трогает его
+        вокруг `agent.run()` (см. докстринг `_attempt`).
         """
         model: Model | str = (
             self._model_override if self._model_override is not None else self._resolve_model(purpose)
@@ -211,6 +238,7 @@ class LLM:
         ]
 
         async with self._local_semaphore:
+            deadline = time.monotonic() + _limiter_module._ACQUIRE_TIMEOUT_S
             last_schema_error: UnexpectedModelBehavior | None = None
             for _schema_attempt in range(_MAX_SCHEMA_ATTEMPTS):
                 try:
@@ -221,6 +249,7 @@ class LLM:
                         purpose=purpose,
                         provider=provider,
                         model_name=model_name,
+                        deadline=deadline,
                     )
                 except UnexpectedModelBehavior as exc:
                     last_schema_error = exc
@@ -245,6 +274,7 @@ class LLM:
         purpose: str,
         provider: str,
         model_name: str,
+        deadline: float,
     ) -> tuple[T, CallMeta]:
         """Один "логический" вызов модели с точки зрения `__call__` — но внутри до
         `_MAX_HTTP_ATTEMPTS` попыток на 429/5xx, каждая со своей строкой `llm_calls`
@@ -268,10 +298,18 @@ class LLM:
         'error'`, и `CancelledError` ОБЯЗАНА быть перевыброшена — проглоченная
         отмена ломает распространение отмены по всему дереву задач, а не только
         эту попытку.
+
+        `deadline` — общий бюджет ожидания лимитера на ВСЮ цепочку ретраев
+        (fix round 3, Item 1; считает `__call__`, один раз). Передаётся в
+        `self._limiter.slot()` НЕИЗМЕНЁННЫМ на каждой из `_MAX_HTTP_ATTEMPTS`
+        попыток этой функции — свежего отсчёта здесь больше нет. Не
+        применяется к `agent.run()`: время ответа модели дедлайн не считает
+        (см. докстринг `__call__`) — таймаут самого запроса к провайдеру не
+        входит в периметр этой задачи.
         """
         last_http_error: ModelHTTPError | None = None
         for http_attempt in range(_MAX_HTTP_ATTEMPTS):
-            async with self._limiter.slot():
+            async with self._limiter.slot(deadline=deadline):
                 call_id = await self._log_started(
                     trace_id=trace_id, provider=provider, model=model_name, purpose=purpose
                 )

@@ -67,11 +67,30 @@ session-scoped advisory-лок НЕ снимает. Локи Postgres реент
 вечный неотличимый от нормальной работы стопор всего конвейера: `_wait_for_
 rate_window`/`_acquire_advisory_lock` логируют предупреждение каждые
 `_STALL_LOG_INTERVAL_S` секунд ожидания и сдаются `PgLimiterTimeout`, если
-ожидание перевалило за `_ACQUIRE_TIMEOUT_S` (число и его обоснование —
-см. константу ниже), — не потому что долгое ожидание темпа/слота само по себе
+ожидание перевалило за дедлайн (число и его обоснование — см. `_ACQUIRE_
+TIMEOUT_S` ниже), — не потому что долгое ожидание темпа/слота само по себе
 ошибка (это и есть работа лимитера под честной нагрузкой), а потому что
 ожидание, которое не заканчивается НИКОГДА и никак не сигнализирует об этом,
 неотличимо от повисшего процесса.
+
+**Один дедлайн на всю логическую попытку, не свежий на каждый `slot()`
+(fix round 3, Item 1).** round 2 дало каждому `slot()` СВОЙ собственный
+`_ACQUIRE_TIMEOUT_S`-бюджет, посчитанный от момента входа именно в этот
+вызов — и там же честно указало следствие: `LLM.__call__` (задача 16) зовёт
+`slot()` до `_MAX_HTTP_ATTEMPTS × _MAX_SCHEMA_ATTEMPTS` раз подряд при
+ретраях, и КАЖДЫЙ раз мог получить полный свежий бюджет — контроллер поймал,
+что это ломает саму связь с `JobsQueue.reap()`, ради которой число вообще
+считалось (см. `_ACQUIRE_TIMEOUT_S`). `slot(deadline=...)` принимает
+АБСОЛЮТНЫЙ `time.monotonic()`-порог — вызывающий (`LLM.__call__`) считает его
+ОДИН РАЗ на всю цепочку ретраев и передаёт тот же самый дедлайн в каждый
+`slot()`; `_wait_for_rate_window`/`_acquire_advisory_lock` меряются с НИМ, а не
+заводят свой отсчёт заново. Дедлайн покрывает только ожидание лимитера (окно
+темпа + очередь за слотом), не время самого ответа модели — здоровый, но
+медленный вызов провайдера не должен считаться зависанием и падать раньше
+срока (см. `LLM.__call__`, где дедлайн вычисляется один раз ДО начала попыток
+и ничего не знает про `agent.run()`). Без переданного `deadline` (прямой вызов
+`slot()` в обход `LLM`, как в части тестов этого файла) — собственный свежий
+бюджет `_ACQUIRE_TIMEOUT_S`, как раньше.
 
 **Провал `pg_advisory_unlock` — логируется, не поднимается (fix round 2,
 Item 1 — реверс собственного рулинга round 1).** Прошлая версия делала здесь
@@ -143,23 +162,24 @@ _STALL_LOG_INTERVAL_S = 5.0
 # после `older_than_minutes=10` (600с) молчания. Если лимитер будет ждать
 # слот/окно ДОЛЬШЕ этого порога, reaper успеет отдать ТУ ЖЕ задачу другому
 # воркеру, пока первый всё ещё сидит внутри `slot()` — одна и та же задача
-# обрабатывается дважды одновременно. 120с — заведомо внутри 600-секундного
-# окна, с запасом на то, чтобы вызывающий (LLM._attempt, задача 16) успел
-# честно завершиться отказом до того, как reaper вообще заметит зависание.
+# обрабатывается дважды, и провайдеру платят за неё дважды (задача 15,
+# ограждение по `worker_id`/`locked_by`, не даёт зомби-воркеру ПОРТИТЬ
+# состояние второго — но не отменяет то, что провайдер уже вызван повторно).
 #
-# Важно: темп и одновременность — НЕЗАВИСИМЫЕ ожидания одного `slot()`
-# (сначала одно, потом другое), поэтому в худшем случае — если окно темпа
-# освободилось только к самой границе, а слот одновременности пришлось ждать
-# отдельно — один вызов `slot()` может стоять до ~240с, не 120с, прежде чем
-# сдаться `PgLimiterTimeout`. 240с всё ещё заведомо внутри 600-секундного окна
-# reaper'а, но это стоит знать явно, а не переоткрывать при инциденте: полная
-# цепочка вызова `LLM.__call__` (до `_MAX_HTTP_ATTEMPTS` × `_MAX_SCHEMA_
-# ATTEMPTS` разных `slot()`) в патологическом худшем случае может звать
-# `slot()` несколько раз подряд — арифметически кратно 240с, а не одному разу;
-# на практике для этого пришлось бы, чтобы окно/слот были насыщены на КАЖДОЙ
-# из нескольких независимых попыток подряд — сценарий не невозможный, но
-# существенно менее вероятный, чем разовое насыщение. Явно поднято как
-# concern в отчёте задачи 16, не решено самостоятельным уменьшением констант.
+# round 2 посчитала отсюда и худший случай ОДНОГО `slot()` (темп и слот —
+# независимые ожидания подряд, ~240с), и худший случай ПОЛНОЙ цепочки ретраев
+# `LLM.__call__` (до 6 разных `slot()`, арифметически ~1440с) — и второе число
+# ЛОМАЛО связь с 600-секундным окном reaper'а, ради которой всё считалось
+# (fix round 3, Item 1): свежий бюджет на каждый `slot()` означал, что
+# 120с — это цена ОДНОГО ожидания, а не гарантия для целого вызова. Фикс —
+# структурный, не числовой: `LLM.__call__` считает ОДИН дедлайн на всю
+# цепочку ретраев (`time.monotonic() + _ACQUIRE_TIMEOUT_S`, один раз, до
+# первой попытки) и передаёт его в КАЖДЫЙ `slot()` той же цепочки
+# (`slot(deadline=...)`, см. модульный докстринг и `LLM.__call__`) — бюджет
+# расходуется один раз, не начинается заново на каждом ретрае. Худший случай
+# ПОЛНОЙ цепочки теперь СНОВА ~120с (плюс время самого ответа модели —
+# дедлайн его не считает, см. модульный докстринг), а не ~1440с: отношение к
+# окну reaper'а верно по построению, не по отдельно поддерживаемому числу.
 _ACQUIRE_TIMEOUT_S = 120.0
 
 _RATE_WINDOW_SQL = text(
@@ -171,12 +191,14 @@ _UNLOCK_ALL_SQL = text("SELECT pg_advisory_unlock_all()")
 
 
 class PgLimiterTimeout(Exception):
-    """Окно темпа или слот одновременности не открылись за `_ACQUIRE_TIMEOUT_S`
-    (fix round 1, Important 2) — явная ошибка вместо вечного молчаливого
-    ожидания, из которого снаружи никак не отличить нормальную очередь под
-    нагрузкой от структурной поломки (например, утёкший лок, который
-    самолечение при следующем чекауте того же физического соединения ещё не
-    успело подобрать)."""
+    """Окно темпа или слот одновременности не открылись до дедлайна (fix round
+    1, Important 2; дедлайн — общий на всю цепочку ретраев с round 3, Item 1)
+    — явная ошибка вместо вечного молчаливого ожидания, из которого снаружи
+    никак не отличить нормальную очередь под нагрузкой от структурной поломки
+    (например, утёкший лок, который самолечение при следующем чекауте того же
+    физического соединения ещё не успело подобрать). Сообщение называет,
+    какой именно механизм — темп или одновременность — не открылся: это то,
+    что делает падение диагностируемым, а не просто "лимитер не пустил"."""
 
 
 def _jitter() -> float:
@@ -221,14 +243,23 @@ class PgLimiter:
         self._max_per_minute = max_per_minute
 
     @asynccontextmanager
-    async def slot(self) -> AsyncIterator[None]:
+    async def slot(self, *, deadline: float | None = None) -> AsyncIterator[None]:
         """Выделенное соединение на всё время удержания слота, закреплённое БЕЗ
         открытой транзакции (`AUTOCOMMIT` — см. модульный докстринг). Порядок —
         сначала самолечение, потом темп, потом одновременность (бриф задачи 16:
         "сначала темп, потом одновременность" — самолечение добавлено round 1
         перед обоими, иначе унаследованный чужой лок мог бы исказить оба опроса
         не только одновременности).
+
+        `deadline` — абсолютный `time.monotonic()`-порог, общий на всю
+        цепочку ретраев одного логического вызова (fix round 3, Item 1; см.
+        модульный докстринг и `LLM.__call__`, который считает его один раз).
+        Не передан — собственный свежий бюджет `_ACQUIRE_TIMEOUT_S`, как было
+        до round 3 (прямой вызов `slot()` в обход `LLM`).
         """
+        effective_deadline = (
+            deadline if deadline is not None else time.monotonic() + _ACQUIRE_TIMEOUT_S
+        )
         conn = await self._engine.connect()
         conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
         try:
@@ -237,8 +268,8 @@ class PgLimiter:
             # брошенный (пул не мог бы выдать соединение, которое кто-то ещё
             # держит живым) — см. модульный докстринг.
             await conn.execute(_UNLOCK_ALL_SQL)
-            await self._wait_for_rate_window(conn)
-            slot_index = await self._acquire_advisory_lock(conn)
+            await self._wait_for_rate_window(conn, effective_deadline)
+            slot_index = await self._acquire_advisory_lock(conn, effective_deadline)
             try:
                 yield
             finally:
@@ -271,31 +302,35 @@ class PgLimiter:
         finally:
             await conn.close()
 
-    async def _wait_for_rate_window(self, conn: AsyncConnection) -> None:
-        started = time.monotonic()
-        last_log = started
+    async def _wait_for_rate_window(self, conn: AsyncConnection, deadline: float) -> None:
+        """`deadline` — общий бюджет всей цепочки ретраев (fix round 3, Item 1),
+        не свежий отсчёт от входа в эту функцию — см. `slot()`/модульный
+        докстринг."""
+        last_log = time.monotonic()
         while True:
             count = await conn.scalar(_RATE_WINDOW_SQL)
             if count is not None and count < self._max_per_minute:
                 return
-            elapsed = time.monotonic() - started
-            if elapsed > _ACQUIRE_TIMEOUT_S:
+            now = time.monotonic()
+            if now >= deadline:
                 raise PgLimiterTimeout(
-                    f"темп: окно ({self._max_per_minute}/мин) не освободилось за "
-                    f"{_ACQUIRE_TIMEOUT_S:.0f}с"
+                    f"темп: окно ({self._max_per_minute}/мин) не освободилось до дедлайна"
                 )
-            if time.monotonic() - last_log >= _STALL_LOG_INTERVAL_S:
+            if now - last_log >= _STALL_LOG_INTERVAL_S:
                 logger.warning(
-                    "PgLimiter: жду окно темпа (%s/мин) уже %.0fс",
+                    "PgLimiter: жду окно темпа (%s/мин), осталось %.0fс до дедлайна",
                     self._max_per_minute,
-                    elapsed,
+                    deadline - now,
                 )
-                last_log = time.monotonic()
-            await _sleep(_jitter())
+                last_log = now
+            await _sleep(min(_jitter(), max(0.0, deadline - now)))
 
-    async def _acquire_advisory_lock(self, conn: AsyncConnection) -> int:
-        started = time.monotonic()
-        last_log = started
+    async def _acquire_advisory_lock(self, conn: AsyncConnection, deadline: float) -> int:
+        """`deadline` — тот же общий бюджет, что у `_wait_for_rate_window`
+        (fix round 3, Item 1): если темп уже съел большую часть бюджета,
+        одновременности достаётся то, что осталось, а не новый полный отсчёт.
+        """
+        last_log = time.monotonic()
         while True:
             for slot_index in range(self._max_concurrency):
                 acquired = await conn.scalar(
@@ -303,17 +338,17 @@ class PgLimiter:
                 )
                 if acquired:
                     return slot_index
-            elapsed = time.monotonic() - started
-            if elapsed > _ACQUIRE_TIMEOUT_S:
+            now = time.monotonic()
+            if now >= deadline:
                 raise PgLimiterTimeout(
                     f"слот одновременности: ни один из {self._max_concurrency} не "
-                    f"освободился за {_ACQUIRE_TIMEOUT_S:.0f}с"
+                    "освободился до дедлайна"
                 )
-            if time.monotonic() - last_log >= _STALL_LOG_INTERVAL_S:
+            if now - last_log >= _STALL_LOG_INTERVAL_S:
                 logger.warning(
-                    "PgLimiter: жду слот одновременности (K=%s) уже %.0fс",
+                    "PgLimiter: жду слот одновременности (K=%s), осталось %.0fс до дедлайна",
                     self._max_concurrency,
-                    elapsed,
+                    deadline - now,
                 )
-                last_log = time.monotonic()
-            await _sleep(_jitter())
+                last_log = now
+            await _sleep(min(_jitter(), max(0.0, deadline - now)))

@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from contextlib import asynccontextmanager
 
 import pytest
 from pydantic import BaseModel
@@ -241,6 +243,156 @@ async def test_backoff_exhausted_raises_provider_error(db_factory, monkeypatch):
 
     rows = await fetch_all(db_factory, "select status from llm_calls order by id")
     assert rows == [("error",), ("error",), ("error",)]
+
+
+async def test_call_shares_one_deadline_across_retry_attempts(db_factory, monkeypatch):
+    """Fix round 3, Item 1: контроллер поймал, что round-2 дизайн (свежий
+    `_ACQUIRE_TIMEOUT_S`-бюджет на КАЖДЫЙ `slot()`) ломает саму связь с окном
+    `JobsQueue.reap()`, ради которой число вообще считалось — полная цепочка
+    ретраев `LLM.__call__` могла суммарно ждать лимитер в разы дольше 600с
+    (round-2 отчёт: ~1440с в патологическом худшем случае). Фикс структурный:
+    `__call__` считает ОДИН дедлайн до начала цикла ретраев и передаёт его в
+    каждый `slot()` неизменным.
+
+    Проверяем это напрямую и детерминированно — не через тайминг (тот тест
+    ниже, `test_limiter_budget_bounds_full_retry_chain_not_multiplied`, а
+    этот не зависит от реального времени вообще): подменяем `PgLimiter.slot`
+    шпионом, который просто записывает полученный `deadline` и делегирует
+    настоящей реализации. При retryable `ModelHTTPError` `_attempt` вызывает
+    `slot()` второй раз — оба вызова обязаны получить ОДНО И ТО ЖЕ число, не
+    два разных `time.monotonic() + бюджет`, посчитанных в разное время.
+
+    Бэкофф-пауза между попытками НЕ обнулена полностью (`real_sleep(0.05)`,
+    не `real_sleep(0)`) — намеренно: между двумя попытками должен пройти
+    измеримый реальный кусок времени, иначе "вычислен заново" и "передан тем
+    же" от вычисления `time.monotonic()` дважды подряд без задержки могут
+    случайно дать одинаковые на вид числа даже в СЛОМАННОМ коде (проверено на
+    практике при подготовке этого раунда — без задержки тест проходил и с
+    внесённым багом тоже, ничего не доказывая).
+    """
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=12)
+
+    seen_deadlines: list[float | None] = []
+    real_slot = PgLimiter.slot
+
+    @asynccontextmanager
+    async def spying_slot(self: PgLimiter, *, deadline: float | None = None):
+        seen_deadlines.append(deadline)
+        async with real_slot(self, deadline=deadline):
+            yield
+
+    monkeypatch.setattr(PgLimiter, "slot", spying_slot)
+
+    attempts = {"n": 0}
+
+    def flaky(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        attempts["n"] += 1
+        if attempts["n"] < 2:
+            raise ModelHTTPError(status_code=503, model_name="test", body="upstream busy")
+        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={"text": "ok"})])
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        await real_sleep(0.05)  # см. докстринг — реальный измеримый разрыв, не ноль
+
+    monkeypatch.setattr("harness.platform.llm._sleep", fake_sleep)
+
+    llm = LLM(cfg, db_factory, model_override=FunctionModel(flaky))
+    out, _meta = await llm("verdict_text", Out, prompt="скажи привет", trace_id=trace_id)
+
+    assert isinstance(out, Out)
+    assert attempts["n"] == 2  # ретрай реально случился — иначе второй slot() не вызывался бы
+    assert len(seen_deadlines) == 2
+    assert seen_deadlines[0] is not None
+    assert seen_deadlines[0] == seen_deadlines[1]  # общий дедлайн, не свежий на каждый вызов
+
+
+async def test_limiter_budget_bounds_full_retry_chain_not_multiplied(db_factory, monkeypatch):
+    """Наблюдаемое поведение, не только проводка (то, что контроллер попросил
+    отдельно): если бы второй `slot()` внутри цепочки ретраев получал СВЕЖИЙ
+    `_ACQUIRE_TIMEOUT_S`, полное время до провала росло бы с числом попыток.
+    С общим дедлайном вторая попытка наследует ОСТАВШИЙСЯ бюджет первой —
+    падение приходит примерно за один бюджет, не за два.
+
+    Окно темпа (`max_per_minute=1`) занято одной засеянной строкой; управляемый
+    `_sleep`-триггер (та же техника, что `test_rate_window_blocks`) освобождает
+    её ПОСЛЕ того, как первая попытка успела съесть заметную долю бюджета
+    (не мгновенно) — так разница между «общий бюджет» и «свежий на попытку»
+    измерима, а не тонет в шуме. Собственная строка `_log_started` первой
+    попытки сразу же вновь занимает окно для второй — и на этот раз ничего его
+    не освобождает: вторая попытка обязана упасть `PgLimiterTimeout` в пределах
+    ОСТАВШЕГОСЯ, не нового, бюджета.
+    """
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=13)
+    budget = 0.5
+    monkeypatch.setattr("harness.platform.limiter._ACQUIRE_TIMEOUT_S", budget)
+    monkeypatch.setattr("harness.platform.limiter._STALL_LOG_INTERVAL_S", 0.02)
+
+    narrow_cfg = Config(
+        llm_vision_model=cfg.llm_vision_model,
+        llm_verdict_model=cfg.llm_verdict_model,
+        llm_max_concurrency=4,
+        llm_max_per_minute=1,
+        database_url=cfg.database_url,
+        telegram_token=cfg.telegram_token,
+    )
+
+    async with db_factory() as session:
+        seed = LlmCall(trace_id=trace_id, provider="anthropic", model="test", purpose="verdict_text")
+        session.add(seed)
+        await session.commit()
+        seed_id = seed.id
+
+    real_sleep = asyncio.sleep
+    freed_once = False
+    wait_started: float | None = None
+
+    async def fake_limiter_sleep(seconds: float) -> None:
+        nonlocal freed_once, wait_started
+        now = time.monotonic()
+        if wait_started is None:
+            wait_started = now
+        # Освобождаем окно только после того, как первая попытка успела
+        # прождать заметную долю бюджета — иначе разница между общим и
+        # свежим бюджетом тонет в шуме одного быстрого цикла опроса.
+        if not freed_once and now - wait_started >= budget * 0.5:
+            freed_once = True
+            async with db_factory() as session:
+                await session.execute(
+                    text("UPDATE llm_calls SET started_at = now() - interval '2 minutes' WHERE id = :id"),
+                    {"id": seed_id},
+                )
+                await session.commit()
+        await real_sleep(0.02)
+
+    monkeypatch.setattr("harness.platform.limiter._sleep", fake_limiter_sleep)
+
+    async def fake_llm_sleep(seconds: float) -> None:
+        await real_sleep(0)
+
+    monkeypatch.setattr("harness.platform.llm._sleep", fake_llm_sleep)
+
+    attempts = {"n": 0}
+
+    def flaky(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        attempts["n"] += 1
+        raise ModelHTTPError(status_code=503, model_name="test", body="upstream busy")
+
+    llm = LLM(narrow_cfg, db_factory, model_override=FunctionModel(flaky))
+    started = time.monotonic()
+    with pytest.raises(PgLimiterTimeout):
+        await llm("verdict_text", Out, prompt="скажи привет", trace_id=trace_id)
+    elapsed = time.monotonic() - started
+
+    # Модель звалась ровно один раз: первая попытка дошла до agent.run() и
+    # получила retryable ModelHTTPError, вторая не дошла даже до него — упала
+    # в самом slot(), до всякого обращения к модели.
+    assert attempts["n"] == 1
+    # Общий бюджет:~1x budget суммарно на обе попытки. Свежий бюджет на
+    # попытку дал бы ~0.5x (первая) + 1x (вторая, заново) = ~1.5x и больше.
+    assert elapsed < budget * 1.3
+    assert elapsed > budget * 0.6  # не упало мгновенно по случайной причине
 
 
 async def test_pinned_connection_survives_autocommit_statement_boundaries(db_factory):
