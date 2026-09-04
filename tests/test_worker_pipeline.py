@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
 import re
@@ -42,6 +43,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -76,6 +78,15 @@ _TEST_CFG = Config(
 
 def _boom(*args: object, **kwargs: object) -> None:
     raise RuntimeError("эта функция не должна была вызываться в этом тесте")
+
+
+def _raise_for_log() -> None:
+    """Падает из ИМЕНОВАННОЙ функции с локальной переменной-приманкой: имя кадра
+    доказывает, что в логе трейсбек, а не repr; приманка — что локали в лог не
+    утекают (см. `test_configure_logging_renders_real_tracebacks`).
+    """
+    приватное_содержимое_руки = "тут лежало бы содержимое файла игрока"  # noqa: F841
+    raise RuntimeError("падение станции разбора")
 
 
 class FakeSender:
@@ -857,3 +868,45 @@ def test_configure_logging_routes_limiter_warnings_through_structlog():
     output = buf.getvalue()
     assert "лимитер: слот занят дольше обычного" in output
     assert "warning" in output.lower()  # уровень добавлен структлог-процессором
+
+
+def test_configure_logging_renders_real_tracebacks():
+    """Fix round 2 задачи 19: в логе обязан быть ТРЕЙСБЕК, а не repr исключения.
+
+    Дефект, который тут пришпилен, глазами не читался — цепочка процессоров
+    выглядела законченной, а на выходе были три разных огрызка: `exc_info=exc`
+    рендерился как `"RuntimeError('...')"` (без места падения), `.exception()`
+    — как `"exc_info": true` (исключения нет вовсе), stdlib-путь — как
+    `"<traceback object at 0x...>"`. Под это попадали ВСЕ пути отказа продукта,
+    и в первый настоящий сбой в проде мы бы узнали только сам факт сбоя.
+
+    Проверяются все три формы вызова, потому что рендерились они по-разному, и
+    ищется имя функции из трейсбека (`_raise_for_log`) — именно оно отличает
+    настоящий трейсбек от repr, который тоже содержит и текст, и класс ошибки.
+    """
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    log = structlog.get_logger("тест")
+    try:
+        for emit in (
+            lambda exc: log.error("structlog_exc_info", exc_info=exc),
+            lambda exc: log.exception("structlog_exception"),
+            lambda exc: logging.getLogger("harness.platform.limiter").exception("stdlib"),
+        ):
+            try:
+                _raise_for_log()
+            except RuntimeError as exc:
+                emit(exc)
+    finally:
+        logging.getLogger().handlers = []
+
+    lines = [line for line in buf.getvalue().splitlines() if line.strip()]
+    assert len(lines) == 3
+    for line in lines:
+        record = json.loads(line)
+        assert "Traceback (most recent call last)" in record["exception"]
+        assert "_raise_for_log" in record["exception"], "repr вместо трейсбека"
+        assert "падение станции" in record["exception"]
+        # Локали в лог не попадают (`format_exc_info`, не `dict_tracebacks` с
+        # `show_locals=True`): в них лежало бы содержимое hand history игрока.
+        assert "приватное_содержимое_руки" not in line

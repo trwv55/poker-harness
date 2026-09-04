@@ -28,6 +28,29 @@ limiter").warning(...)` и проверяет текст на выходе — �
 «действительно маршрутизирует» здесь разные утверждения (`migrations/env.py`,
 найдено в той же задаче, звал `fileConfig()` так, что тихо гасил все логгеры,
 заведённые раньше в процессе).
+
+**`format_exc_info` — почему он здесь и почему не `dict_tracebacks`
+(fix round 2 задачи 19).** Без него в логах не было НИ ОДНОГО трейсбека, и это
+не читалось глазами: цепочка выглядела законченной, а рендерились три разных
+огрызка — `log.error(..., exc_info=exc)` давал `"exc_info":
+"RuntimeError('...')"` (repr без места падения), `log.exception(...)` —
+`"exc_info": true` (исключения нет вовсе), stdlib-путь — `["<class
+'RuntimeError'>", ..., "<traceback object at 0x...>"]`. Под это попадали все
+до единого пути отказа продукта (`worker/main.py`, `worker/pipeline.py`,
+`bot/router.py`), то есть в первый же настоящий сбой в проде мы бы узнали, что
+он случился, и ничего — где.
+
+Процессор стоит в `shared_processors`, а не в списке самого форматтера: так он
+отрабатывает у структлог-событий в момент ВЫЗОВА (внутри `except`-блока, где
+`sys.exc_info()` заведомо жив) и у stdlib-записей через `foreign_pre_chain` —
+оба пути одним и тем же кодом.
+
+`dict_tracebacks` (структурированный трейсбек, красивее для агрегаторов) не
+взят сознательно: `ExceptionDictTransformer` по умолчанию идёт с
+`show_locals=True`, а локальные переменные наших станций — это `raw_text` с
+содержимым hand history игрока и путь к его файлу. Строчный трейсбек
+(`traceback.format_exception`, никаких локалей) — единственный вариант, который
+не превращает лог в новое место утечки приватных данных.
 """
 
 from __future__ import annotations
@@ -52,6 +75,7 @@ def configure_logging(*, stream: TextIO | None = None, level: int = logging.INFO
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.format_exc_info,
     ]
     structlog.configure(
         processors=[*shared_processors, structlog.stdlib.ProcessorFormatter.wrap_for_formatter],

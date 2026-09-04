@@ -162,22 +162,34 @@ async def _seed_hand(db_factory, *, session_id: int, hand_no: str) -> int:
         return hand_id
 
 
-async def _warm_pool(db_factory, connections: int = 2) -> None:
-    """Держать N соединений открытыми одновременно, чтобы пул их создал заранее.
+_RENDEZVOUS_TIMEOUT_S = 10.0
 
-    Без этого конкурентный тест не проверяет то, что обещает (этот проект уже
-    ловил такое однажды): первая корутина получает готовое соединение из пула и
-    успевает СДЕЛАТЬ ВСЁ И ЗАКОММИТИТЬ, пока вторая ждёт установления нового
-    TCP-соединения с Postgres. Гонка не воспроизводится, тест зелёный при любой
-    реализации — проверено falsификацией, см. отчёт fix round 1.
+
+def _rendezvous(monkeypatch, repo: type, method: str) -> None:
+    """Заставить обе корутины ВОЙТИ в спорный участок прежде, чем любая из него
+    выйдет: обёртка над `repo.method` ждёт барьера на двоих (fix round 2).
+
+    Зачем структурно, а не «прогревом пула», как было в fix round 1. Прогрев
+    делал гонку воспроизводимой, но держался на допущении, которое ничем не
+    проверялось: проигравший успевает дойти до спорного оператора за меньшее
+    число round-trip'ов, чем победителю нужно на коммит. Допущение верное
+    сегодня и молчаливое — один лишний запрос в любой из веток, и тест
+    ЗЕЛЕНЕЕТ, ничего не проверяя. Этот проект уже трижды ловил тесты, переставшие
+    доходить до собственной ветки, дважды — в этой задаче. Барьер превращает
+    одновременность из следствия таймингов в предусловие теста: пока обе
+    корутины не вошли, ни одна не двинется дальше.
+
+    Таймаут обязателен: если будущая правка оставит в спорном участке одну
+    корутину, барьер иначе повесил бы прогон навсегда. С ним — громкий отказ.
     """
-    sessions = [db_factory() for _ in range(connections)]
-    try:
-        for session in sessions:
-            await session.execute(text("SELECT 1"))
-    finally:
-        for session in sessions:
-            await session.close()
+    barrier = asyncio.Barrier(2)
+    original = getattr(repo, method)
+
+    async def waiting(self, *args, **kwargs):
+        await asyncio.wait_for(barrier.wait(), timeout=_RENDEZVOUS_TIMEOUT_S)
+        return await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(repo, method, waiting)
 
 
 async def _set_job_age(db_factory, job_id: int, age: timedelta) -> None:
@@ -307,7 +319,7 @@ async def test_reupload_after_failed_scan_retries_on_the_same_tournament(db_fact
     assert "внутренняя причина" not in again.text
 
 
-async def test_two_files_at_once_from_a_new_player_create_one_player(db_factory, deps):
+async def test_two_files_at_once_from_a_new_player_create_one_player(db_factory, deps, monkeypatch):
     """Два файла подряд от НЕЗНАКОМОГО игрока обрабатываются одновременно:
     `players.tg_user_id` уникален, и «прочитали — не нашли — вставили» без
     `ON CONFLICT` роняло вторую транзакцию `IntegrityError` (fix round 1).
@@ -317,7 +329,7 @@ async def test_two_files_at_once_from_a_new_player_create_one_player(db_factory,
     пробуждения сессия уже создана и видна — тест про сессии был бы зелёным и без
     лока (проверено falsификацией), поэтому он живёт отдельно, на ЗНАКОМОМ игроке.
     """
-    await _warm_pool(db_factory)
+    _rendezvous(monkeypatch, PlayersRepo, "get_or_create")
 
     first, second = await asyncio.gather(
         handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=b"file one", filename="a.txt"),
@@ -329,17 +341,23 @@ async def test_two_files_at_once_from_a_new_player_create_one_player(db_factory,
     assert len(await fetch_all(db_factory, "select * from jobs")) == 2
 
 
-async def test_two_files_at_once_from_a_known_player_share_one_session(db_factory, deps):
+async def test_two_files_at_once_from_a_known_player_share_one_session(
+    db_factory, deps, monkeypatch
+):
     """Игрок уже заведён — вставки в `players` нет, и ничто, кроме лока в
     `active_or_create`, не мешает двум одновременным файлам открыть ДВЕ сессии и
     разложить вечер по двум контейнерам (fix round 1).
+
+    Обе корутины обязаны войти в `active_or_create` прежде, чем любая выйдет
+    (`_rendezvous`, fix round 2) — одновременность здесь предусловие теста, а не
+    следствие того, сколько round-trip'ов кому досталось.
     """
     await _seed_player(db_factory)  # игрок и его сессия закрыты предыдущим коммитом
     async with db_factory() as session:
         await SessionsRepo(session).close_active(1)
         await session.commit()
 
-    await _warm_pool(db_factory)
+    _rendezvous(monkeypatch, SessionsRepo, "active_or_create")
 
     await asyncio.gather(
         handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=b"file one", filename="a.txt"),
