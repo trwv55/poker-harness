@@ -24,6 +24,7 @@ sha256, пишет байты на диск и кладёт путь в `jobs.pa
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -39,11 +40,13 @@ from harness.bot.handlers import (
     handle_new_session,
     handle_start,
 )
+from harness.contracts import Provenance, RawHand
 from harness.memory.models import Job
-from harness.memory.repos import PlayersRepo, SessionsRepo
+from harness.memory.repos import HandsRepo, PlayersRepo, SessionsRepo
 from harness.platform.queue import JobsQueue
 from harness.presentation import (
     hh_accepted_msg,
+    hh_duplicate_msg,
     new_session_msg,
     quota_exceeded_msg,
     start_msg,
@@ -123,6 +126,60 @@ async def _seed_jobs(
     return ids
 
 
+def _synthetic_raw(hand_no: str) -> RawHand:
+    """Минимальная, но НАСТОЯЩАЯ `RawHand` — не словарь и не сырой INSERT.
+
+    Поиск сессии по номеру раздачи читает `hands.raw->>'hand_no'`, то есть то,
+    что туда положил `model_dump(mode="json")` контракта. Подделать строку `hands`
+    голым SQL значило бы проверять запрос против собственной выдумки о формате
+    jsonb, а не против того, что пишет прод.
+    """
+    return RawHand(
+        provenance=Provenance.HAND_HISTORY,
+        source_ref="synthetic",
+        hand_no=hand_no,
+        tournament_id="T1",
+        tournament_name="Synthetic",
+        level=1,
+        sb=10,
+        bb=20,
+        ante=2,
+        timestamp=datetime(2026, 9, 4, 12, 0, tzinfo=UTC),
+        table_name="1",
+        max_seats=9,
+        button_seat=1,
+        seats=[],
+        posts=[],
+    )
+
+
+async def _seed_hand(db_factory, *, session_id: int, hand_no: str) -> int:
+    async with db_factory() as session:
+        hand_id = await HandsRepo(session).save_raw(
+            session_id=session_id, raw=_synthetic_raw(hand_no)
+        )
+        await session.commit()
+        return hand_id
+
+
+async def _warm_pool(db_factory, connections: int = 2) -> None:
+    """Держать N соединений открытыми одновременно, чтобы пул их создал заранее.
+
+    Без этого конкурентный тест не проверяет то, что обещает (этот проект уже
+    ловил такое однажды): первая корутина получает готовое соединение из пула и
+    успевает СДЕЛАТЬ ВСЁ И ЗАКОММИТИТЬ, пока вторая ждёт установления нового
+    TCP-соединения с Postgres. Гонка не воспроизводится, тест зелёный при любой
+    реализации — проверено falsификацией, см. отчёт fix round 1.
+    """
+    sessions = [db_factory() for _ in range(connections)]
+    try:
+        for session in sessions:
+            await session.execute(text("SELECT 1"))
+    finally:
+        for session in sessions:
+            await session.close()
+
+
 async def _set_job_age(db_factory, job_id: int, age: timedelta) -> None:
     async with db_factory() as session:
         job = await session.get(Job, job_id)
@@ -189,6 +246,111 @@ async def test_second_file_same_session(db_factory, deps):
     assert len(tournaments) == 2
     assert {j["session_id"] for j in jobs} == {sessions[0]["id"]}
     assert {t["session_id"] for t in tournaments} == {sessions[0]["id"]}
+
+
+async def test_same_file_twice_is_not_analysed_twice(db_factory, deps):
+    """Тот же файл, присланный дважды: второй раз не заводится ни турнир, ни
+    задача (fix round 1). Без этого игрок получал бы вторую копию всех `hands` в
+    одной сессии и две одинаковые сводки.
+    """
+    first = await handle_document(
+        deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="t.txt"
+    )
+    second = await handle_document(
+        deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="снова-он.txt"
+    )
+
+    assert first == hh_accepted_msg()
+    assert second == hh_duplicate_msg()
+    assert len(await fetch_all(db_factory, "select * from jobs")) == 1
+    assert len(await fetch_all(db_factory, "select * from tournaments")) == 1
+    assert len(await fetch_all(db_factory, "select * from sessions")) == 1
+
+
+async def test_different_files_in_one_session_are_both_accepted(db_factory, deps):
+    """Защита от дубля не должна ловить РАЗНЫЕ файлы: имя на диске — хэш
+    содержимого, и второй турнир вечера обязан приниматься как обычно.
+    """
+    await handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=b"file one", filename="a.txt")
+    second = await handle_document(
+        deps, tg_user_id=_TG_USER_ID, file_bytes=b"file two", filename="b.txt"
+    )
+
+    assert second == hh_accepted_msg()
+    assert len(await fetch_all(db_factory, "select * from jobs")) == 2
+    assert len(await fetch_all(db_factory, "select * from tournaments")) == 2
+
+
+async def test_reupload_after_failed_scan_retries_on_the_same_tournament(db_factory, deps):
+    """Скан провалился — повторная загрузка это законная повторная попытка, а не
+    дубль: новая задача ставится, но турнир переиспользуется (его чекпоинты
+    пропустят руки, сохранённые до сбоя).
+    """
+    await handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="t.txt")
+    async with db_factory() as session:
+        job = await session.get(Job, 1)
+        assert job is not None
+        job.status = "failed"
+        job.error = "внутренняя причина, игроку не показывается"
+        await session.commit()
+
+    again = await handle_document(
+        deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="t.txt"
+    )
+
+    assert again == hh_accepted_msg()
+    jobs = await fetch_all(db_factory, "select * from jobs order by id")
+    tournaments = await fetch_all(db_factory, "select * from tournaments")
+    assert len(jobs) == 2 and len(tournaments) == 1
+    assert jobs[-1]["payload"]["tournament_id"] == tournaments[0]["id"]
+    # Внутренний текст `jobs.error` не участвует ни в одном ответе игроку.
+    assert "внутренняя причина" not in again.text
+
+
+async def test_two_files_at_once_from_a_new_player_create_one_player(db_factory, deps):
+    """Два файла подряд от НЕЗНАКОМОГО игрока обрабатываются одновременно:
+    `players.tg_user_id` уникален, и «прочитали — не нашли — вставили» без
+    `ON CONFLICT` роняло вторую транзакцию `IntegrityError` (fix round 1).
+
+    Проверяет РОВНО это. Сериализация сессий сюда не входит: вставка игрока с
+    `ON CONFLICT` сама заставляет второго ждать коммита первого, и к моменту его
+    пробуждения сессия уже создана и видна — тест про сессии был бы зелёным и без
+    лока (проверено falsификацией), поэтому он живёт отдельно, на ЗНАКОМОМ игроке.
+    """
+    await _warm_pool(db_factory)
+
+    first, second = await asyncio.gather(
+        handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=b"file one", filename="a.txt"),
+        handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=b"file two", filename="b.txt"),
+    )
+
+    assert first == hh_accepted_msg() and second == hh_accepted_msg()
+    assert len(await fetch_all(db_factory, "select * from players")) == 1
+    assert len(await fetch_all(db_factory, "select * from jobs")) == 2
+
+
+async def test_two_files_at_once_from_a_known_player_share_one_session(db_factory, deps):
+    """Игрок уже заведён — вставки в `players` нет, и ничто, кроме лока в
+    `active_or_create`, не мешает двум одновременным файлам открыть ДВЕ сессии и
+    разложить вечер по двум контейнерам (fix round 1).
+    """
+    await _seed_player(db_factory)  # игрок и его сессия закрыты предыдущим коммитом
+    async with db_factory() as session:
+        await SessionsRepo(session).close_active(1)
+        await session.commit()
+
+    await _warm_pool(db_factory)
+
+    await asyncio.gather(
+        handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=b"file one", filename="a.txt"),
+        handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=b"file two", filename="b.txt"),
+    )
+
+    opened = await fetch_all(db_factory, "select * from sessions where closed_at is null")
+    assert len(opened) == 1, "гонка раздвоила вечер игрока"
+    jobs = await fetch_all(db_factory, "select * from jobs")
+    assert len(jobs) == 2
+    assert {j["session_id"] for j in jobs} == {opened[0]["id"]}
 
 
 async def test_non_txt_document_refused_without_side_effects(db_factory, deps, tmp_path: Path):
@@ -328,6 +490,27 @@ async def test_quota_counts_only_interactive_jobs(db_factory, deps):
     assert (await check_quota(deps, player_id)).allowed is False
 
 
+async def test_failed_jobs_do_not_spend_quota(db_factory, deps):
+    """Задача, упавшая по НАШЕЙ причине, не стоит игроку разбора (рулинг fix
+    round 1): полоса наших сбоев иначе съедала бы чужой день целиком.
+    """
+    player_id, session_id = await _seed_player(db_factory, quota_daily=1)
+    job_ids = await _seed_jobs(
+        db_factory, player_id=player_id, session_id=session_id, ages=[timedelta(minutes=5)]
+    )
+    assert (await check_quota(deps, player_id)).allowed is False  # пока задача успешна
+
+    async with db_factory() as session:
+        job = await session.get(Job, job_ids[0])
+        assert job is not None
+        job.status = "failed"
+        job.error = "боевой текст ошибки с путём /data/hh/deadbeef.txt"
+        await session.commit()
+
+    freed = await check_quota(deps, player_id)
+    assert freed.allowed is True and freed.left == 1
+
+
 async def test_quota_default_total_without_personal_override(db_factory, deps):
     """`players.quota_daily IS NULL` — действует дефолт (спека §9, пример «17/50»),
     а не «безлимит» и не ноль."""
@@ -341,12 +524,13 @@ async def test_quota_default_total_without_personal_override(db_factory, deps):
 
 
 async def test_deep_dive_callback_enqueues_silently(db_factory, deps):
-    """Нажатие кнопки под сводкой ставит `deep_dive` в активную сессию и НИЧЕГО
-    не отвечает: дальше говорит воркер (прогресс-сообщение, задача 18), а второй
-    текст от бота был бы дублем.
+    """Нажатие кнопки под сводкой ставит `deep_dive` в сессию, где лежит раздача,
+    и НИЧЕГО не отвечает: дальше говорит воркер (прогресс-сообщение, задача 18),
+    а второй текст от бота был бы дублем.
     """
     await handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="t.txt")
     active = await fetch_one(db_factory, "select * from sessions")
+    await _seed_hand(db_factory, session_id=active["id"], hand_no="RC1234")
 
     result = await handle_deep_dive_callback(deps, tg_user_id=_TG_USER_ID, hand_no="RC1234")
 
@@ -355,6 +539,62 @@ async def test_deep_dive_callback_enqueues_silently(db_factory, deps):
     assert jobs[-1]["type"] == "deep_dive"
     assert jobs[-1]["payload"] == {"hand_no": "RC1234"}
     assert jobs[-1]["session_id"] == active["id"]
+
+
+async def test_deep_dive_goes_to_the_session_that_holds_the_hand(db_factory, deps):
+    """Кнопка под сводкой ЗАКРЫТОГО вечера работает (рулинг fix round 1).
+
+    Разбор ищет руку как `find_by_hand_no(job.session_id, hand_no)`, поэтому
+    задача, поставленная в активную сессию, не нашла бы раздачу из прошлой и
+    отказала бы честно и бессмысленно. Анализ принадлежит сессии, где рука живёт.
+    """
+    await handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="t.txt")
+    old_session = await fetch_one(db_factory, "select * from sessions")
+    await _seed_hand(db_factory, session_id=old_session["id"], hand_no="RC1234")
+
+    await handle_new_session(deps, tg_user_id=_TG_USER_ID)  # прошлый вечер закрыт
+    sessions = await fetch_all(db_factory, "select * from sessions order by id")
+    assert sessions[-1]["id"] != old_session["id"] and sessions[-1]["closed_at"] is None
+
+    assert await handle_deep_dive_callback(deps, tg_user_id=_TG_USER_ID, hand_no="RC1234") is None
+
+    job = (await fetch_all(db_factory, "select * from jobs order by id"))[-1]
+    assert job["type"] == "deep_dive"
+    assert job["session_id"] == old_session["id"], "задача ушла в активную сессию, а не в свою"
+
+
+async def test_deep_dive_never_resolves_into_another_players_session(db_factory, deps):
+    """Область поиска — сессии ЭТОГО игрока: `hand_no` уникален в рамках
+    источника, а не глобально, и одинаковый номер у двух игроков не должен
+    отправлять разбор одного в сессию другого.
+    """
+    stranger_id, stranger_session = await _seed_player(db_factory, tg_user_id=999)
+    await _seed_hand(db_factory, session_id=stranger_session, hand_no="RC1234")
+
+    await handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="t.txt")
+    own_session = await fetch_one(
+        db_factory, f"select * from sessions where id <> {stranger_session}"
+    )
+
+    await handle_deep_dive_callback(deps, tg_user_id=_TG_USER_ID, hand_no="RC1234")
+
+    job = (await fetch_all(db_factory, "select * from jobs where type = 'deep_dive'"))[-1]
+    assert job["session_id"] == own_session["id"]
+    assert job["session_id"] != stranger_session
+    assert job["player_id"] != stranger_id
+
+
+async def test_deep_dive_falls_back_to_active_session_when_hand_is_unknown(db_factory, deps):
+    """Раздачи нет ни в одной сессии игрока — ставим в активную и даём воркеру
+    отказать своим единым текстом, а не заводим второй путь отказа.
+    """
+    await handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="t.txt")
+    active = await fetch_one(db_factory, "select * from sessions")
+
+    assert await handle_deep_dive_callback(deps, tg_user_id=_TG_USER_ID, hand_no="НЕТ-ТАКОЙ") is None
+
+    job = (await fetch_all(db_factory, "select * from jobs order by id"))[-1]
+    assert job["type"] == "deep_dive" and job["session_id"] == active["id"]
 
 
 async def test_deep_dive_callback_refuses_when_quota_exhausted(db_factory, deps):

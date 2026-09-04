@@ -39,10 +39,12 @@ from harness.contracts import (
 from harness.presentation import (
     Btn,
     Msg,
+    bot_failure_msg,
     deep_dive_msg,
     escalation_msg,
     failed_msg,
     hh_accepted_msg,
+    hh_duplicate_msg,
     new_session_msg,
     photo_soon_msg,
     progress_text,
@@ -407,6 +409,8 @@ def test_entry_messages_are_plain_text_without_buttons():
     for msg in (
         start_msg(),
         hh_accepted_msg(),
+        hh_duplicate_msg(),
+        bot_failure_msg(),
         unsupported_document_msg(),
         photo_soon_msg(),
         new_session_msg("Сессия 4 сен", previous_closed=True),
@@ -441,3 +445,17 @@ def test_photo_soon_msg_names_the_working_path():
     """Заглушка vision (задача 22) обязана давать рабочий путь, а не только отказ."""
     text = photo_soon_msg().text
     assert ".txt" in text and "PokerCraft" in text
+
+
+def test_hh_duplicate_msg_offers_a_way_out():
+    """Отказ от повторного разбора обязан назвать путь дальше — иначе игрок,
+    которому ДЕЙСТВИТЕЛЬНО нужен тот же турнир заново, упирается в тупик."""
+    assert "/new" in hh_duplicate_msg().text
+
+
+def test_bot_failure_msg_says_whose_side_it_is_without_the_reason():
+    """Причина сбоя — ops-данные (лог, `jobs.error`), игроку уходит только факт
+    и предложение повторить. Никакого «Traceback», путей и имён исключений."""
+    text = bot_failure_msg().text
+    assert "нашей стороне" in text
+    assert not any(word in text for word in ("Error", "Traceback", "/data", "Exception"))

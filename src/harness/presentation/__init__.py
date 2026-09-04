@@ -15,10 +15,12 @@ from harness.presentation.keyboards import (
 )
 from harness.presentation.messages import (
     Msg,
+    bot_failure_msg,
     deep_dive_msg,
     escalation_msg,
     failed_msg,
     hh_accepted_msg,
+    hh_duplicate_msg,
     new_session_msg,
     photo_soon_msg,
     progress_text,
@@ -31,12 +33,14 @@ from harness.presentation.messages import (
 __all__ = [
     "Btn",
     "Msg",
+    "bot_failure_msg",
     "deep_dive_button",
     "deep_dive_msg",
     "escalation_buttons",
     "escalation_msg",
     "failed_msg",
     "hh_accepted_msg",
+    "hh_duplicate_msg",
     "new_session_msg",
     "photo_soon_msg",
     "progress_text",

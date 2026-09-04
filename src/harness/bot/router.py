@@ -10,13 +10,28 @@
 Ответ на callback (`deep:`) — `Msg | None`, и `None` здесь значимо: успешная
 постановка задачи молчит, потому что дальше говорит воркер (одно редактируемое
 сообщение прогресса, SESSIONS_UX). Отвечает бот только отказом по квоте.
+
+**Сбой обработчика тоже говорит игроку** (fix round 1). Исключение, вылетевшее из
+хендлера, aiogram логирует и глотает — для игрока это неотличимо от того, что бот
+просто не заметил его файл. `on_error` (наблюдатель `router.errors`) закрывает
+это одним местом на все входы сразу: причина уходит в лог целиком, игрок получает
+`bot_failure_msg()` из `presentation`. Ровно тот же раздел ответственности, что у
+воркера между `jobs.error` и `failed_msg`.
 """
 
 from __future__ import annotations
 
+import structlog
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    ErrorEvent,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from harness.bot.handlers import (
     BotDeps,
@@ -25,9 +40,11 @@ from harness.bot.handlers import (
     handle_new_session,
     handle_start,
 )
-from harness.presentation import Msg, photo_soon_msg
+from harness.presentation import Msg, bot_failure_msg, photo_soon_msg
 
 __all__ = ["DEEP_DIVE_PREFIX", "build_router"]
+
+_log = structlog.get_logger(__name__)
 
 # Префикс `callback_data` кнопки «разобрать» (`presentation/keyboards.py`,
 # `deep_dive_button`). Держится строкой в одном месте, чтобы фильтр роутера и
@@ -50,9 +67,11 @@ async def _download(bot: Bot, file_id: str) -> bytes:
     """Скачать документ целиком в память.
 
     Оба `None` ниже — состояния Bot API, которых при вызове `download_file` без
-    `destination` не бывает: они есть только в типах. Поэтому здесь громкое
-    исключение (его увидит лог), а не тихий `return` — молчание в ответ на
-    присланный файл выглядело бы для игрока как «бот сломался и не признаётся».
+    `destination` не бывает: они есть только в типах. Бросать здесь можно именно
+    потому, что ниже есть `on_error`: он превращает любое исключение обработчика
+    в лог плюс `bot_failure_msg()` игроку. Без него исход был бы тот же, что у
+    тихого `return` — aiogram записал бы трейсбек и замолчал, а игрок остался бы
+    ни с чем (первая версия этого докстринга утверждала обратное — fix round 1).
     """
     file = await bot.get_file(file_id)
     if file.file_path is None:
@@ -119,5 +138,25 @@ def build_router(deps: BotDeps) -> Router:
         # `worker/pipeline.py::_chat_id`) — не полагаемся на `callback.message`,
         # которого у старого сообщения может уже не быть.
         await bot.send_message(callback.from_user.id, msg.text, reply_markup=_markup(msg))
+
+    @router.errors()
+    async def on_error(event: ErrorEvent, bot: Bot) -> None:
+        """Единственное место, где сбой обработчика превращается в слова игроку.
+
+        Текст — из `presentation` и без единой подробности: причина целиком
+        уходит в лог (`exc_info`), как `jobs.error` у воркера. Ответ шлём в
+        приватный чат по `tg_user_id` того, кто прислал обновление; если и это
+        не проходит (`TelegramAPIError` — Телеграм недоступен, чат заблокирован),
+        молчим уже осознанно и с записью в лог, а не потому, что не подумали.
+        """
+        _log.error("bot_handler_failed", exc_info=event.exception)
+        source = event.update.message or event.update.callback_query
+        if source is None or source.from_user is None:
+            return
+        msg = bot_failure_msg()
+        try:
+            await bot.send_message(source.from_user.id, msg.text)
+        except TelegramAPIError:
+            _log.exception("bot_failure_notice_undelivered")
 
     return router

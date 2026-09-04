@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -53,13 +53,43 @@ class PlayersRepo:
         self.db = db
 
     async def get_or_create(self, tg_user_id: int) -> Player:
+        """Найти игрока или завести — безопасно при гонке (fix round 1 задачи 19).
+
+        «Прочитали — не нашли — вставили» перестало быть безобидным, как только
+        появился первый вызывающий с настоящей конкурентностью: два файла,
+        присланных незнакомым игроком подряд, обрабатываются двумя транзакциями
+        сразу, обе не находят строку и обе вставляют — вторая получает
+        `IntegrityError` на `players.tg_user_id`, и обработчик падает на ровном
+        месте. `ON CONFLICT DO NOTHING` превращает это в ноль вернувшихся строк:
+        проигравший ждёт коммита победителя (Postgres блокирует его на самом
+        конфликте), после чего просто перечитывает готовую строку — под READ
+        COMMITTED она ему уже видна.
+        """
         player = await self.db.scalar(select(Player).where(Player.tg_user_id == tg_user_id))
         if player is not None:
             return player
-        player = Player(tg_user_id=tg_user_id)
-        self.db.add(player)
-        await self.db.flush()
-        return player
+        created_id = await self.db.scalar(
+            pg_insert(Player)
+            .values(tg_user_id=tg_user_id)
+            .on_conflict_do_nothing(index_elements=["tg_user_id"])
+            .returning(Player.id)
+        )
+        if created_id is None:
+            player = await self.db.scalar(select(Player).where(Player.tg_user_id == tg_user_id))
+            if player is None:  # pragma: no cover — конфликт был, а строки нет
+                raise LookupError(f"игрок tg_user_id={tg_user_id} исчез после конфликта вставки")
+            return player
+        created = await self.db.scalar(select(Player).where(Player.id == created_id))
+        if created is None:  # pragma: no cover — только что вставленная строка
+            raise LookupError(f"игрок {created_id} не найден сразу после вставки")
+        return created
+
+
+# Пространство имён advisory-локов для `sessions` (первый аргумент двухаргументной
+# формы — тот же приём, что `0x4C4C4D` у лимитера): ключ лока — пара
+# (это пространство, player_id), поэтому с локами `platform/limiter.py` он не
+# пересекается ни при каком player_id.
+_SESSIONS_LOCK_NS = 0x53455353  # "SESS"
 
 
 class SessionsRepo:
@@ -72,6 +102,22 @@ class SessionsRepo:
         self.db = db
 
     async def active_or_create(self, player_id: int) -> SessionRow:
+        """Активная сессия игрока или новая. Сериализовано по игроку (fix round 1).
+
+        У `sessions` нет уникального ключа, на который можно было бы повесить
+        `ON CONFLICT` (одному игроку положено много сессий за жизнь), поэтому
+        гонка «прочитали — не нашли — вставили» здесь не падает, а тихо
+        расходится: два одновременных файла открыли бы ДВЕ сессии, и вечер игрока
+        распался бы на два контейнера. Транзакционный advisory-лок по игроку
+        (снимается коммитом, тот же инструмент, что у лимитера в
+        `platform/limiter.py`) выстраивает такие транзакции в очередь: второй
+        читает уже закоммиченную сессию первого. Ждут друг друга только
+        транзакции ОДНОГО игрока — на чужие уплаты этот лок не влияет.
+        """
+        await self.db.execute(
+            text("SELECT pg_advisory_xact_lock(:ns, :player_id)"),
+            {"ns": _SESSIONS_LOCK_NS, "player_id": player_id},
+        )
         stmt = (
             select(SessionRow)
             .where(SessionRow.player_id == player_id, SessionRow.closed_at.is_(None))
@@ -201,6 +247,33 @@ class HandsRepo:
         record = await self.db.scalar(stmt)
         return self._to_record(record) if record is not None else None
 
+    async def find_session_by_hand_no(self, player_id: int, hand_no: str) -> int | None:
+        """В какой сессии ЭТОГО игрока лежит раздача с таким номером (fix round 1).
+
+        Кнопка «разобрать» несёт только `hand_no` (`keyboards.deep_dive_button`),
+        а разбор ищет руку как `find_by_hand_no(job.session_id, hand_no)` — значит
+        задачу надо ставить в ту сессию, где рука ЛЕЖИТ, а не в ту, что сейчас
+        активна. Иначе нажатие под сводкой вечера, закрытого командой `/new`,
+        обречено на честный, но бессмысленный отказ.
+
+        Область поиска — строго сессии этого игрока (JOIN по `sessions.player_id`):
+        `hand_no` уникален в рамках источника, а не глобально, и без этого условия
+        номер одного игрока мог бы разрешиться в чужую сессию.
+
+        Одна и та же раздача может лежать в нескольких сессиях игрока (тот же файл
+        загружен второй раз в другой вечер) — берём самую свежую по `hands.id`:
+        содержимое раздачи идентично, поэтому выбор безопасен, а свежая сессия
+        ближе к тому, на что игрок сейчас смотрит.
+        """
+        stmt = (
+            select(Hand.session_id)
+            .join(SessionRow, SessionRow.id == Hand.session_id)
+            .where(SessionRow.player_id == player_id, Hand.raw["hand_no"].astext == hand_no)
+            .order_by(Hand.id.desc())
+            .limit(1)
+        )
+        return await self.db.scalar(stmt)
+
     def _to_record(self, record: Hand) -> HandRecord:
         return HandRecord(
             id=record.id,
@@ -293,6 +366,20 @@ class TournamentsRepo:
         await self.db.flush()
         return record.id
 
+    async def find_in_session(self, session_id: int, source_file: str) -> int | None:
+        """Турнир этого файла в этой сессии, если он уже заведён (fix round 1).
+
+        Имя файла — sha256 содержимого (`bot/handlers.py`), поэтому совпадение
+        пути значит совпадение байтов, а не просто похожее имя. Нужно, чтобы
+        повторная загрузка не заводила вторую строку `tournaments` на тот же
+        файл: продолжать разбор в уже существующей — это ещё и чекпоинты
+        (`_run_hh_scan` пропускает руки, которые в ней уже сохранены).
+        """
+        stmt = select(Tournament.id).where(
+            Tournament.session_id == session_id, Tournament.source_file == source_file
+        )
+        return await self.db.scalar(stmt)
+
     async def save_scan_summary(self, tournament_id: int, summary: ScanSummary) -> None:
         record = await self._get_row(tournament_id)
         record.scan_summary = summary.model_dump(mode="json")
@@ -303,6 +390,37 @@ class TournamentsRepo:
         if record is None:
             raise LookupError(f"турнир {tournament_id} не найден")
         return record
+
+
+class JobsRepo:
+    """Чтение `jobs` для решений бота. Записью и жизненным циклом задач владеет
+    `platform/queue.py` — сюда попадают только вопросы, на которые надо ответить
+    внутри чужой, уже открытой транзакции (у очереди каждый метод открывает свою).
+    """
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def last_scan_status(self, session_id: int, source_file: str) -> str | None:
+        """Статус последней задачи `hh_scan` по этому файлу в этой сессии; `None`
+        — такой задачи не было.
+
+        Поиск по `payload["source_file"]`, а не по колонке: связи `jobs` →
+        `tournaments` в схеме нет, а путь в payload и есть то, по чему воркер
+        читает файл. Тот же идиом обращения к jsonb, что у
+        `HandsRepo.find_by_hand_no` (`raw["hand_no"].astext`).
+        """
+        stmt = (
+            select(Job.status)
+            .where(
+                Job.session_id == session_id,
+                Job.type == "hh_scan",
+                Job.payload["source_file"].astext == source_file,
+            )
+            .order_by(Job.id.desc())
+            .limit(1)
+        )
+        return await self.db.scalar(stmt)
 
 
 class CalcCacheRepo:
@@ -424,10 +542,19 @@ class QuotaRepo:
     @staticmethod
     def _window_filter(player_id: int, since: datetime) -> tuple[Any, ...]:
         """Один набор условий на оба запроса окна — чтобы «сколько потрачено» и
-        «когда освободится» не могли начать считать по разным множествам задач."""
+        «когда освободится» не могли начать считать по разным множествам задач.
+
+        `status != 'failed'` — рулинг fix round 1: задача, упавшая по НАШЕЙ
+        внутренней причине (`jobs.error` хранит её текст), не должна стоить
+        игроку разбора из дневного лимита. Полоса наших сбоев иначе съедала бы
+        чужой день целиком. Обратной стороны — «злоупотребление провалами» —
+        здесь нет: провалившаяся задача не дала игроку никакого результата, так
+        что выигрывать в этом размене нечего.
+        """
         return (
             Job.player_id == player_id,
             Job.type.in_(QUOTA_INTERACTIVE_JOB_TYPES),
+            Job.status != "failed",
             Job.created_at > since,
         )
 
