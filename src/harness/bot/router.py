@@ -40,7 +40,12 @@ from harness.bot.handlers import (
     handle_new_session,
     handle_start,
 )
-from harness.presentation import Msg, bot_failure_msg, photo_soon_msg
+from harness.presentation import (
+    Msg,
+    bot_failure_msg,
+    button_not_ready_msg,
+    photo_soon_msg,
+)
 
 __all__ = ["DEEP_DIVE_PREFIX", "build_router"]
 
@@ -139,16 +144,42 @@ def build_router(deps: BotDeps) -> Router:
         # которого у старого сообщения может уже не быть.
         await bot.send_message(callback.from_user.id, msg.text, reply_markup=_markup(msg))
 
+    @router.callback_query()
+    async def on_unhandled_callback(callback: CallbackQuery) -> None:
+        """Ответ на любую кнопку, у которой обработчика ещё нет (round 5, Item G).
+
+        Регистрируется ПОСЛЕ `on_deep_dive` и без фильтра: aiogram отдаёт
+        обновление первому подошедшему обработчику, поэтому `deep:` по-прежнему
+        уходит наверх, а всё остальное — сюда. Сейчас «остальное» это три кнопки
+        под каждым разбором (`ranges:`, `detail:`, `disagree:` из
+        `keyboards.verdict_buttons`, контракт задачи 21): они стоят под ЕДИНСТВЕННЫМ
+        сообщением, которое умеет присылать путь разбора, и до этой правки ни одна
+        из них не отвечала ничего — Телеграм крутил «часики», пока не сдавался с
+        ошибкой. Кнопки не убраны намеренно: их обещает план, а честный ответ
+        «ещё не работает» — не то же самое, что их отсутствие.
+
+        В лог идёт только ПРЕФИКС `callback_data`: за ним следует номер руки, а
+        это приватные данные игрока (docs/publishing-policy.md).
+        """
+        prefix = (callback.data or "").split(":", 1)[0]
+        _log.info("callback_without_handler", prefix=prefix)
+        await callback.answer(button_not_ready_msg().text)
+
     @router.errors()
     async def on_error(event: ErrorEvent, bot: Bot) -> None:
         """Единственное место, где сбой обработчика превращается в слова игроку.
 
         Текст — из `presentation` и без единой подробности: причина уходит в лог
-        трейсбеком целиком, как `jobs.error` у воркера. «Целиком» — не фигура
-        речи и заслуга не этой строки: до fix round 2 `exc_info` рендерился в
-        JSON как repr исключения без единого кадра стека, и это утверждение было
-        ложным; трейсбек появляется `format_exc_info` в `platform/logs.py`, и
-        держит его там регрессионный тест, а не намерение. Ответ шлём в
+        трейсбеком целиком — тот же раздел ответственности, что у воркера между
+        `jobs.error` и `failed_msg`, но НЕ тот же объём: `jobs.error` хранит
+        `str(exc)`, одну строку без кадров стека, а здесь в лог идёт полный
+        трейсбек (round 5, Item K.2 — прежняя формулировка сравнивала эти два
+        места как равные и тем самым занижала одно и завышала другое). «Целиком»
+        — не фигура речи и заслуга не этой строки: до fix round 2 `exc_info`
+        рендерился в JSON как repr исключения без единого кадра стека, и это
+        утверждение было ложным; трейсбек появляется `format_exc_info` в
+        `platform/logs.py`, и держит его там регрессионный тест, а не намерение.
+        Ответ шлём в
         приватный чат по `tg_user_id` того, кто прислал обновление; если и это
         не проходит (`TelegramAPIError` — Телеграм недоступен, чат заблокирован),
         молчим уже осознанно и с записью в лог, а не потому, что не подумали.

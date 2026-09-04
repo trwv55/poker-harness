@@ -20,8 +20,14 @@ from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from harness.analysis.scan import ScanSummary
-from harness.contracts import AnalysisResult, CanonicalHand, EnrichedHand, Provenance, RawHand
+from harness.contracts import (
+    AnalysisResult,
+    CanonicalHand,
+    EnrichedHand,
+    Provenance,
+    RawHand,
+    ScanSummary,
+)
 from harness.memory.models import Analysis, CalcCache, EvalCase, Hand, Job, Player, Tournament
 from harness.memory.models import Session as SessionRow
 
@@ -87,8 +93,28 @@ class PlayersRepo:
 
 # Пространство имён advisory-локов для `sessions` (первый аргумент двухаргументной
 # формы — тот же приём, что `0x4C4C4D` у лимитера): ключ лока — пара
-# (это пространство, player_id), поэтому с локами `platform/limiter.py` он не
-# пересекается ни при каком player_id.
+# (это пространство, player_id), поэтому за один и тот же КЛЮЧ с локами
+# `platform/limiter.py` он не борется ни при каком player_id.
+#
+# **Пространства имён — не вся защита, и это существенно (round 5, Item M).**
+# Лимитер на каждом входе в `slot()` выполняет `SELECT pg_advisory_unlock_all()`
+# на соединении из ТОГО ЖЕ движка приложения, а `unlock_all` пространств имён не
+# различает вовсе: он снимает все advisory-локи УРОВНЯ СЕССИИ, которые держит то
+# соединение, чьи бы они ни были. Разные ключи от него не спасают.
+#
+# Спасает то, что этот лок — `pg_advisory_XACT_lock`: транзакционные локи живут
+# отдельно, снимаются коммитом и для `pg_advisory_unlock_all()` невидимы. Отсюда
+# инвариант всей системы, а не одного этого файла:
+#
+#     на движке приложения никто не берёт advisory-лок УРОВНЯ СЕССИИ, кроме
+#     самого `PgLimiter` — тот держит для этого собственное закреплённое
+#     соединение и сам же убирает за собой.
+#
+# Правка `pg_advisory_xact_lock` → `pg_advisory_lock` выглядела бы безобидной и
+# по-прежнему согласовывалась бы с абзацем про пространства имён — а
+# сериализация сессий тихо перестала бы работать при первом же вызове модели.
+# Поэтому инвариант держит не комментарий, а тест:
+# `test_sessions_lock_is_transaction_scoped` (tests/test_memory.py).
 _SESSIONS_LOCK_NS = 0x53455353  # "SESS"
 
 
@@ -109,10 +135,12 @@ class SessionsRepo:
         гонка «прочитали — не нашли — вставили» здесь не падает, а тихо
         расходится: два одновременных файла открыли бы ДВЕ сессии, и вечер игрока
         распался бы на два контейнера. Транзакционный advisory-лок по игроку
-        (снимается коммитом, тот же инструмент, что у лимитера в
-        `platform/limiter.py`) выстраивает такие транзакции в очередь: второй
-        читает уже закоммиченную сессию первого. Ждут друг друга только
-        транзакции ОДНОГО игрока — на чужие уплаты этот лок не влияет.
+        (снимается коммитом; у лимитера в `platform/limiter.py` инструмент
+        РОДСТВЕННЫЙ, но не тот же — там лок уровня СЕССИИ, и разница между ними
+        несущая: см. комментарий к `_SESSIONS_LOCK_NS` выше) выстраивает такие
+        транзакции в очередь: второй читает уже закоммиченную сессию первого.
+        Ждут друг друга только транзакции ОДНОГО игрока — на чужие уплаты этот
+        лок не влияет.
         """
         await self.db.execute(
             text("SELECT pg_advisory_xact_lock(:ns, :player_id)"),

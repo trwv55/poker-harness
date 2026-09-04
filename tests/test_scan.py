@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 import pytest
 
 from harness.analysis.preflop import cheap_fold_verdict
-from harness.analysis.scan import ScanItem, ScanSummary, scan_tournament
+from harness.analysis.scan import scan_tournament
 from harness.contracts import (
     ActionKind,
     Assumption,
@@ -22,6 +22,8 @@ from harness.contracts import (
     Provenance,
     RawAction,
     RawHand,
+    ScanItem,
+    ScanSummary,
     SeatInfo,
     Street,
     Zone,

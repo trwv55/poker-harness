@@ -40,11 +40,13 @@ from harness.bot.handlers import (
     handle_new_session,
     handle_start,
 )
+from harness.bot.router import build_router
 from harness.contracts import Provenance, RawHand
 from harness.memory.models import Job
 from harness.memory.repos import HandsRepo, PlayersRepo, SessionsRepo
 from harness.platform.queue import JobsQueue
 from harness.presentation import (
+    button_not_ready_msg,
     hh_accepted_msg,
     hh_duplicate_msg,
     new_session_msg,
@@ -629,3 +631,40 @@ async def test_deep_dive_callback_refuses_when_quota_exhausted(db_factory, deps)
     assert msg == quota_exceeded_msg(23)
     jobs = await fetch_all(db_factory, "select * from jobs")
     assert len(jobs) == 1  # ничего не добавилось
+
+
+# --- кнопки без обработчика: ответ вместо «часиков» (round 5, Item G) ---------------
+
+
+async def test_every_verdict_button_gets_an_answer_not_a_spinner(deps):
+    """`keyboards.verdict_buttons` вешает под КАЖДЫМ разбором три кнопки —
+    `ranges:`, `detail:`, `disagree:` — а хендлер в роутере до round 5 был
+    зарегистрирован только на `deep:`. Нажатие любой из трёх не отвечало ничего:
+    Телеграм крутит «часики» на кнопке, пока не сдаётся с ошибкой, — и это под
+    единственным сообщением, которое умеет присылать путь разбора.
+
+    Проверяем два утверждения сразу: catch-all существует и стоит ПОСЛЕДНИМ
+    (иначе он перехватил бы `deep:` у настоящего обработчика), и его тело
+    действительно отвечает текстом из `presentation`.
+    """
+    router = build_router(deps)
+    handlers = router.callback_query.handlers
+    assert len(handlers) >= 2
+    assert handlers[0].filters, "обработчик `deep:` обязан иметь свой фильтр"
+    assert not handlers[-1].filters, "catch-all обязан быть без фильтра и последним"
+
+    answered: list[str] = []
+
+    class _FakeCallback:
+        """Ровно то, чего касается тело хендлера: `data` и `answer(text)`."""
+
+        def __init__(self, data: str) -> None:
+            self.data = data
+
+        async def answer(self, text: str | None = None, **_kwargs: object) -> None:
+            answered.append(text or "")
+
+    for prefix in ("ranges:", "detail:", "disagree:"):
+        await handlers[-1].call(_FakeCallback(f"{prefix}TM123"))
+
+    assert answered == [button_not_ready_msg().text] * 3

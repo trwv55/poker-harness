@@ -44,9 +44,20 @@ from typing import cast
 
 import pytest
 import structlog
+from pydantic import BaseModel
+from pydantic_ai.models.test import TestModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from harness.contracts import (
+    AnalysisResult,
+    Assumption,
+    PointVerdict,
+    Range,
+    SpotKind,
+    Street,
+    Zone,
+)
 from harness.engine import enrich
 from harness.memory.models import Job
 from harness.memory.repos import HandsRepo, PlayersRepo, SessionsRepo, TournamentsRepo
@@ -56,10 +67,17 @@ from harness.parsers.hh_parser import parse_file
 from harness.platform.config import Config
 from harness.platform.llm import LLM
 from harness.platform.queue import JobsQueue
-from harness.presentation import Msg
+from harness.presentation import Msg, deep_dive_msg
 from harness.worker import pipeline as pipeline_module
 from harness.worker.main import configure_logging
-from harness.worker.pipeline import Deps, run_job
+from harness.worker.pipeline import (
+    Deps,
+    HandDataMissing,
+    SourceFileUnavailable,
+    _hand_zone,
+    _public_failure_reason,
+    run_job,
+)
 from tests.conftest import FIXTURE_DAILY, requires_fixtures
 
 # Тестовый `Config` — те же плейсхолдеры, что в `test_llm_facade.py`: `LLM` внутри
@@ -910,3 +928,183 @@ def test_configure_logging_renders_real_tracebacks():
         # Локали в лог не попадают (`format_exc_info`, не `dict_tracebacks` с
         # `show_locals=True`): в них лежало бы содержимое hand history игрока.
         assert "приватное_содержимое_руки" not in line
+
+
+# --- round 5: строка traces под llm_calls, честная зона, отказ без утечек -----------
+
+
+class _Out(BaseModel):
+    text: str
+
+
+def _point(*, dp_index: int, zone: Zone) -> PointVerdict:
+    """Точка решения нужной зоны — минимальная валидная форма контракта
+    (`assumption` обязателен ровно при `assuming`, см. `PointVerdict`).
+    """
+    return PointVerdict(
+        dp_index=dp_index,
+        street=Street.PREFLOP,
+        spot=SpotKind.PUSHFOLD_UNOPENED,
+        zone=zone,
+        action_taken="fold",
+        best_action="shove",
+        ev_diff_bb=-1.5,
+        assumption=(
+            None
+            if zone is Zone.STRICT
+            else Assumption(range=Range(weights={"AA": 1.0}), source="model:test")
+        ),
+    )
+
+
+async def test_llm_call_from_inside_a_job_has_a_trace_row_to_reference(db_factory, queue, deps):
+    """Round 5, Item D: `llm_calls.trace_id` — FK NOT NULL на `traces`, а строка
+    `traces` писалась только в `flush()`, то есть В КОНЦЕ попытки. Любая станция,
+    позвавшая `deps.llm(...)`, ложилась нарушением внешнего ключа на ПЕРВОМ же
+    вызове. Держалось это лишь тем, что станции v1-HH модель не зовут вовсе
+    (`grep 'deps\\.llm' src/harness/worker/` — пусто); задача 21 (`explain`)
+    упёрлась бы в это сразу.
+
+    Тест зовёт фасад из джоб-подобного контекста — изнутри `_dispatch`, с тем
+    самым `trace`, который завёл `run_job`, — то есть ровно так, как это будет
+    делать станция. Против прежнего порядка он падает с `ForeignKeyViolationError`.
+    """
+    player_id, session_id = await _make_scope(db_factory)
+    jid = await queue.enqueue(
+        type="deep_dive", player_id=player_id, session_id=session_id, payload={"hand_no": "X"}
+    )
+
+    seen_trace_ids: list[int] = []
+
+    async def fake_dispatch(job, deps_, trace, started_at):
+        seen_trace_ids.append(trace.trace_id)
+        await deps_.llm("verdict_text", _Out, prompt="скажи привет", trace_id=trace.trace_id)
+
+    llm = LLM(_TEST_CFG, db_factory, model_override=TestModel())
+    job = await queue.claim("w1")
+    assert job is not None
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(pipeline_module, "_dispatch", fake_dispatch)
+        await run_job(job, replace(deps, llm=llm))
+
+    assert (await job_status(db_factory, jid)) == "done", "вызов модели не должен ломать задачу"
+    async with db_factory() as session:
+        rows = (
+            await session.execute(text("SELECT trace_id, status FROM llm_calls ORDER BY id"))
+        ).all()
+    assert [r.status for r in rows] == ["ok"]
+    assert [r.trace_id for r in rows] == seen_trace_ids  # ссылается на трейс ЭТОЙ попытки
+    assert await count(db_factory, "traces") == 1  # одна строка на попытку, не две
+
+
+async def test_trace_row_survives_a_crashed_attempt_and_is_not_duplicated(db_factory, queue, deps):
+    """Обратная сторона Item D: строка `traces` заводится в начале, а `flush()`
+    её ОБНОВЛЯЕТ. Значит (а) провалившаяся попытка по-прежнему оставляет
+    диагностический след — свойство, ради которого `flush` вообще звался в
+    `finally`, — и (б) вторая строка на ту же попытку не появляется.
+    """
+    player_id, session_id = await _make_scope(db_factory)
+    await queue.enqueue(
+        type="deep_dive", player_id=player_id, session_id=session_id, payload={"hand_no": "X"}
+    )
+
+    async def exploding_dispatch(job, deps_, trace, started_at):
+        async with trace.span("analyze"):
+            raise RuntimeError("станция упала")
+
+    job = await queue.claim("w1")
+    assert job is not None
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(pipeline_module, "_dispatch", exploding_dispatch)
+        await run_job(job, deps)
+
+    async with db_factory() as session:
+        rows = (await session.execute(text("SELECT spans FROM traces"))).scalars().all()
+    assert len(rows) == 1
+    assert [span["name"] for span in rows[0]] == ["analyze"]
+    assert "станция упала" in rows[0][0]["error"]
+
+
+async def test_run_job_swallows_a_failure_of_the_queue_transition(db_factory, queue, deps):
+    """Round 5, Item E: `run_job` обещала «никогда не бросает исключение наружу»,
+    но `_finish_fenced` ловит только `JobPreconditionFailed` — `LookupError` или
+    ошибка SQLAlchemy из `complete()`/`fail()` улетали в цикл воркера. То же
+    касалось `trace.flush()` в `finally`: ввод-вывод в БД вообще без `try`.
+
+    Здесь ломается `queue.complete` — самая узкая имитация того же класса сбоя.
+    Требование: `run_job` возвращается молча (с логом), цикл воркера жив.
+    """
+    player_id, session_id = await _make_scope(db_factory)
+    await queue.enqueue(
+        type="deep_dive", player_id=player_id, session_id=session_id, payload={"hand_no": "X"}
+    )
+
+    async def ok_dispatch(job, deps_, trace, started_at):
+        return None
+
+    async def broken_complete(*args: object, **kwargs: object) -> None:
+        raise LookupError("задача исчезла из БД между станцией и завершением")
+
+    job = await queue.claim("w1")
+    assert job is not None
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(pipeline_module, "_dispatch", ok_dispatch)
+        mp.setattr(JobsQueue, "complete", broken_complete)
+        await run_job(job, deps)  # красный до Item E: LookupError улетал сюда
+
+
+def test_public_failure_reason_does_not_dress_up_a_plain_key_error():
+    """Round 5, Item I: `_PUBLIC_FAILURE_REASONS` ключевался на `LookupError` —
+    предке `KeyError` и `IndexError`. Промах по словарю (`payload["hand_no"]`,
+    `_STATION_TEXT[station]`, любой `dict` внутри парсера) выдавал игроку
+    уверенное и конкретное «не нашли нужные данные по этой раздаче» про совсем
+    другую поломку. Набор причин верен, ключ был неверен.
+    """
+    generic = "внутренняя ошибка сервиса"
+    assert _public_failure_reason(KeyError("hand_no")) == generic
+    assert _public_failure_reason(IndexError("ranked[0]")) == generic
+    assert _public_failure_reason(FileNotFoundError("/data/hh/abc.txt")) == generic
+    # Доменные исключения — по-прежнему свои конкретные причины.
+    assert _public_failure_reason(HandDataMissing("рука не найдена")) == (
+        "не нашли нужные данные по этой раздаче"
+    )
+    assert _public_failure_reason(SourceFileUnavailable("файл не прочитан")) == (
+        "файл раздач недоступен"
+    )
+
+
+def test_hand_zone_says_nothing_when_nothing_was_judged():
+    """Round 5, Item H: `zone = ... if result.ranked else Zone.STRICT` ставил самую
+    уверенную подпись продукта под сообщением «точек с вердиктом нет». CLAUDE.md
+    разрешает `strict` только там, где вывод не опирается на угаданный диапазон —
+    а вывода тут нет вообще, значит нет и зоны.
+    """
+    result = AnalysisResult(hand_no="TM1", points=[], ranked=[])
+    assert _hand_zone(result) is None
+    msg = deep_dive_msg(result, elapsed_s=3, zone=None, quota_left=1, quota_total=5)
+    assert "зона" not in msg.text
+    assert "строго" not in msg.text
+    assert "точек с вердиктом нет" in msg.text
+
+
+def test_hand_zone_is_the_weakest_of_all_judged_points_not_the_first():
+    """Вторая половина Item H: зона бралась у ПЕРВОЙ точки `ranked`, поэтому шапка
+    «зона: строго» могла стоять над строками, каждая из которых помечена «(по
+    модели диапазонов)». Слабейшее звено определяет, чему можно верить.
+    """
+    strict_point = _point(dp_index=0, zone=Zone.STRICT)
+    assuming_point = _point(dp_index=1, zone=Zone.ASSUMING)
+
+    mixed = AnalysisResult(hand_no="TM1", points=[strict_point, assuming_point], ranked=[0, 1])
+    assert _hand_zone(mixed) is Zone.ASSUMING
+    assert "зона: предполагая" in deep_dive_msg(mixed, 1, _hand_zone(mixed), 1, 5).text
+
+    all_strict = AnalysisResult(hand_no="TM1", points=[strict_point], ranked=[0])
+    assert _hand_zone(all_strict) is Zone.STRICT
+    assert "зона: строго" in deep_dive_msg(all_strict, 1, _hand_zone(all_strict), 1, 5).text
+
+    # Незасуженные точки на зону руки не влияют — судится только `ranked`.
+    unranked_assuming = AnalysisResult(
+        hand_no="TM1", points=[strict_point, assuming_point], ranked=[0]
+    )
+    assert _hand_zone(unranked_assuming) is Zone.STRICT

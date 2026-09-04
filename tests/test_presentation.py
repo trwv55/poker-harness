@@ -26,12 +26,13 @@
 
 from __future__ import annotations
 
-from harness.analysis.scan import ScanItem, ScanSummary
 from harness.contracts import (
     AnalysisResult,
     Assumption,
     PointVerdict,
     Range,
+    ScanItem,
+    ScanSummary,
     SpotKind,
     Street,
     Zone,
@@ -242,6 +243,49 @@ def test_scan_summary_msg_total_loss_near_zero_never_renders_negative_zero():
     msg = scan_summary_msg(s, quota_left=1, quota_total=1)
     assert "−0.0 bb" not in msg.text
     assert "0.0 bb" in msg.text
+
+
+def test_scan_summary_msg_caps_the_list_and_says_how_many_were_found():
+    """Round 5, Item J: список пунктов ничем не ограничивался, а Телеграм режет
+    `sendMessage` на 4096 символах — при ~85 символах на строку сообщение
+    ломалось бы примерно с 48-го пункта. И ломалось бы дорого:
+    `TelegramSender.send` делает `raise_for_status()`, задача уходит в ретрай, и
+    игрок платит тремя полными пересканами файла, прежде чем услышит хоть что-то.
+
+    Обрезка обязана быть ГРОМКОЙ: молча показать 20 из 60 — та же деградация без
+    огласки, против которой уже стоит `hands_failed`.
+    """
+    items = [
+        _scan_item(hand_no=f"H{i}", ev_diff_bb=-10.0 + i * 0.01, zone=Zone.STRICT)
+        for i in range(60)
+    ]
+    s = ScanSummary(hands_total=200, hands_with_decision=180, items=items, total_loss_bb=-120.0)
+
+    msg = scan_summary_msg(s, quota_left=1, quota_total=5)
+
+    item_lines = [line for line in msg.text.splitlines() if line.startswith("№")]
+    assert len(item_lines) == 20
+    assert len(msg.buttons) == 20  # кнопка ровно под каждой показанной строкой
+    assert "20" in msg.text and "60" in msg.text, "сколько показано и сколько найдено"
+    assert len(msg.text) < 4096  # телеграмный предел одного сообщения
+    # Показаны самые дорогие: `items` приходят отсортированными по цене.
+    assert item_lines[0].startswith("№H0")
+    assert "№H59" not in msg.text
+
+
+def test_scan_summary_msg_does_not_mention_a_cap_it_did_not_apply():
+    """Обратная сторона: пока пунктов меньше потолка, заголовок обязан остаться
+    прежним. Измеренные фикстуры дают девять — типичный случай не должен
+    обрастать оговоркой про обрезку, которой не было.
+    """
+    items = [_scan_item(hand_no=f"H{i}", ev_diff_bb=-1.0, zone=Zone.STRICT) for i in range(9)]
+    s = ScanSummary(hands_total=146, hands_with_decision=100, items=items, total_loss_bb=-9.0)
+
+    msg = scan_summary_msg(s, quota_left=1, quota_total=5)
+
+    assert "Топ расхождений:" in msg.text
+    assert "показаны" not in msg.text.lower()
+    assert len([line for line in msg.text.splitlines() if line.startswith("№")]) == 9
 
 
 # --- deep_dive_msg -------------------------------------------------------------------

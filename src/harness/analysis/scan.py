@@ -41,64 +41,28 @@
 стороне, а не молчаливым: это не «выдать пробел за верную игру» (запрещённый
 `error_cost.py` манёвр — там `ev_diff_bb = 0` для несчитанной точки), а прямое
 «эту раздачу разобрать не удалось» на уровне всего файла.
+
+**Типы результата живут в `contracts`, не здесь (round 5, Item L).** `ScanItem`/
+`ScanSummary` — общий словарь конвейера наравне с `AnalysisResult`/`PointVerdict`:
+их читают `memory.repos` (колонка `tournaments.scan_summary`) и
+`presentation.messages` (сводка игроку). Пока они объявлялись в этом модуле,
+импорт ТИПА тянул за собой весь счётный пакет — `pokerkit` и `eval7` — в образ
+бота, которому считать нечего. Считает по-прежнему этот модуль; описывает —
+`contracts.analysis`.
 """
 
 from __future__ import annotations
 
-from pydantic import BaseModel
-
 from harness.analysis.error_cost import is_judged, total_ev_loss_bb
 from harness.analysis.preflop import cheap_fold_verdict, verdict_for
-from harness.contracts import EnrichedHand, PointVerdict, SpotKind, Zone
+from harness.contracts import EnrichedHand, PointVerdict, ScanItem, ScanSummary
 
-__all__ = ["ScanItem", "ScanSummary", "scan_tournament"]
+__all__ = ["scan_tournament"]
 
 # Порог, дороже которого расхождение попадает в список (спека задачи 13).
 # Ниже — сумма всё равно учтена в `total_loss_bb`, но строкой сводки не
 # становится: цена в копейки не то, ради чего игрок кликает в разбор.
 _MIN_REPORTED_LOSS_BB = 0.1
-
-
-class ScanItem(BaseModel):
-    """Одна точка расхождения в сводке — по цене, с зоной доверия рядом."""
-
-    hand_no: str
-    hand_index: int | None
-    hero_class: str
-    spot: SpotKind
-    action_taken: str
-    best_action: str
-    ev_diff_bb: float  # < -0.1bb — иначе точка не попала бы в список
-    zone: Zone
-
-
-class ScanSummary(BaseModel):
-    """Сводка по турниру: сколько рук, сколько с решением, список расхождений.
-
-    `total_loss_bb` — суммарная потеря по ВСЕМ судимым точкам файла (то же, что
-    дал бы `sum(total_ev_loss_bb(...))` по каждой руке), а не только по тем, что
-    попали в `items`: список ограничен порогом 0.1bb ради актуальности, но общая
-    цена турнира не должна тихо терять мелкие расхождения. Соответственно
-    `total_loss_bb` по модулю обычно ЧУТЬ БОЛЬШЕ суммы `ev_diff_bb` из `items` —
-    это не расхождение чисел, а сумма с порогом отображения против суммы без него.
-
-    `hands_failed` — руки, пропущенные политикой отказа скана (см. докстринг
-    модуля): расчёт разошёлся с движком по деньгам, и цену решения на такой
-    руке доверять нельзя. Поле не в брифе задачи 13 дословно, но необходимо,
-    чтобы пропуск был виден, а не тихим.
-    """
-
-    hands_total: int
-    hands_with_decision: int
-    items: list[ScanItem]
-    # Полная цена турнира по ВСЕМ судимым точкам файла, включая те дешевле
-    # 0.1bb, что не попали в `items` ниже, — НЕ сумма `ev_diff_bb` по `items`.
-    # Названо явно здесь, а не только в докстринге класса: изложение (задача
-    # 17) обязано подписать это число как «суммарная потеря по всем точкам
-    # разбора», а не как «сумма списка ниже» — иначе игрок увидит два разных
-    # числа рядом и решит, что одно из них ошибка.
-    total_loss_bb: float
-    hands_failed: int = 0
 
 
 def _hand_points(en: EnrichedHand) -> list[PointVerdict]:

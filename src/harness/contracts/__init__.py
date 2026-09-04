@@ -11,6 +11,8 @@ from harness.contracts.analysis import (
     AnalysisResult,
     Assumption,
     PointVerdict,
+    ScanItem,
+    ScanSummary,
     SpotKind,
     Zone,
 )
@@ -65,6 +67,8 @@ __all__ = [
     "Range",
     "RawAction",
     "RawHand",
+    "ScanItem",
+    "ScanSummary",
     "SeatInfo",
     "ShowdownEntry",
     "SidePot",

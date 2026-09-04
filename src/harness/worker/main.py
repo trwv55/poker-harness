@@ -8,6 +8,14 @@
 почему настройка обязана быть единственной (структлог воркера и stdlib-логгер
 `platform/limiter.py` должны выйти одним форматтером), — в докстринге нового модуля.
 
+**Останов — по сигналу, и это не украшение (round 5, Item F).** Воркер работает
+PID 1 в своём контейнере, а PID 1 не получает сигналов, на которые сам не
+подписался: без обработчиков SIGTERM от `docker compose stop`/`up -d` уходил в
+пустоту, и каждый деплой заканчивался SIGKILL'ом по истечении grace-периода —
+с зависшими до `reap()` задачами, незакрытыми строками `llm_calls` и
+пропущенным сбросом эквити-кэша. Обоснование целиком — в докстринге
+`_install_stop_handlers`, последовательность останова — в `_run_until_stopped`.
+
 **`worker_id` — уникален между РЕПЛИКАМИ, не только между корутинами одного
 процесса.** Фенсинг `JobsQueue.complete()/fail()/await_user()` (задача 15/18, п.2)
 сверяет `worker_id` с `jobs.locked_by`: если два контейнера (`docker compose up
@@ -23,8 +31,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import socket
+from asyncio import FIRST_COMPLETED
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import suppress
 
 import httpx
 import structlog
@@ -50,8 +61,44 @@ _DEFAULT_WORKER_CONCURRENCY = 4
 
 _REAP_INTERVAL_S = 60.0
 _POLL_INTERVAL_S = 1.0
-# Уникален на процесс (см. модульный докстринг) — коротко и достаточно: PID переживает
-# только сам процесс, а следующий деплой этого же контейнера получит новый PID.
+
+# Сколько ждать завершения уже начатых задач после SIGTERM, прежде чем отменить их
+# намеренно (round 5, Item F). Не «сколько может идти задача»: её бюджет — до 480с
+# (`pipeline._JOB_DEADLINE_S`), и ждать столько на каждом деплое неприемлемо. Это
+# окно для тех, кто и так почти закончил; остальные получают ОТМЕНУ, а не
+# SIGKILL, и разница существенна — отмена доводит `except asyncio.CancelledError`
+# в `platform/llm.py` (строка `llm_calls` закрывается, у неё нет reaper'а) и
+# позволяет процессу выйти штатно, отработав `atexit`-сброс эквити-кэша
+# (`analysis/preflop.py`). Сама задача при этом не теряется: строка остаётся
+# `running`, и `reap()` вернёт её в очередь — ровно тот путь, что описан в
+# `docker-compose.yml` у сервиса `worker`.
+# Держать МЕНЬШЕ, чем `stop_grace_period` воркера в compose (30s), иначе Docker
+# убьёт процесс раньше, чем эта последовательность доиграет.
+_SHUTDOWN_GRACE_S = 20.0
+
+# Уникален между ПРОЦЕССАМИ, живущими ОДНОВРЕМЕННО, — и ровно это от него
+# требуется: фенсинг сравнивает `worker_id` с `jobs.locked_by` в моменте (см.
+# модульный докстринг).
+#
+# Различает их целиком хостнейм, не PID (round 5, Item K.8: здесь стояло
+# «следующий деплой этого же контейнера получит новый PID» — неверно). В образе
+# нет ни `ENTRYPOINT`-обёртки, ни `init:` в compose, поэтому воркер стартует
+# PID 1 ВСЕГДА, и вторая половина пары постоянна. Что до первой — измерено на
+# Docker 29 при подготовке этой правки:
+#   * реплики `--scale worker=2` получают РАЗНЫЕ хостнеймы (id контейнера), и
+#     дыра, ради которой пара вообще собрана, закрыта;
+#   * `up --force-recreate` (обычный деплой) даёт новый контейнер и новый
+#     хостнейм — id тоже новый;
+#   * а `restart` того же контейнера (и авто-рестарт по `restart:
+#     unless-stopped`) переиспользует контейнер, то есть и хостнейм: `_PROCESS_
+#     ID` повторяется в точности.
+# Последнее не открывает дыры — задачи умершего процесса подбирает `reap()`,
+# сбрасывая `locked_by`, — но означает, что «после перезапуска id заведомо
+# другой» опорой быть не может. Если понадобится различать ЗАПУСКИ (а не живые
+# процессы), сюда придётся добавить что-то ещё, например `uuid4()`.
+#
+# Явный `hostname:` в compose сломал бы главное свойство: все реплики получили
+# бы одно имя. Его там нет и быть не должно.
 _PROCESS_ID = f"{socket.gethostname()}-{os.getpid()}"
 
 
@@ -100,35 +147,69 @@ class TelegramSender:
         response.raise_for_status()
 
 
+async def _sleep_or_stop(stop: asyncio.Event | None, seconds: float) -> None:
+    """Пауза, которую прерывает сигнал останова. Без `stop` — обычный `sleep`
+    (тесты и прямые вызовы циклов). С ним — останов не ждёт конца интервала:
+    иначе `reap_loop` со своей минутой съедал бы весь бюджет `stop_grace_period`
+    в одиночку.
+    """
+    if stop is None:
+        await asyncio.sleep(seconds)
+        return
+    with suppress(TimeoutError):
+        await asyncio.wait_for(stop.wait(), timeout=seconds)
+
+
 async def worker_loop(
-    deps: Deps, worker_id: str, *, poll_interval_s: float = _POLL_INTERVAL_S
+    deps: Deps,
+    worker_id: str,
+    *,
+    poll_interval_s: float = _POLL_INTERVAL_S,
+    stop: asyncio.Event | None = None,
 ) -> None:
-    """`claim → run_job`, вечно. Пустая очередь — обычное состояние (спека §8.1),
-    не ошибка: `claim() is None` просто ждёт следующего опроса.
+    """`claim → run_job`, пока не попросят остановиться. Пустая очередь — обычное
+    состояние (спека §8.1), не ошибка: `claim() is None` просто ждёт следующего
+    опроса.
+
+    `stop` (round 5, Item F) — «больше не брать новых задач». Проверяется ПЕРЕД
+    `claim()`, а не после: задача, взятая уже во время останова, была бы взята
+    только затем, чтобы через секунду быть отменённой, и до `reap()` пролежала бы
+    `running` зря. Начатую задачу цикл при этом доводит до конца — принудительную
+    отмену, если она не успевает, делает `main()` по истечении своего окна.
     """
     log = structlog.get_logger(__name__)
-    while True:
+    while stop is None or not stop.is_set():
         job = await deps.queue.claim(worker_id)
         if job is None:
-            await asyncio.sleep(poll_interval_s)
+            await _sleep_or_stop(stop, poll_interval_s)
             continue
         structlog.contextvars.bind_contextvars(worker_id=worker_id)
         try:
             await run_job(job, deps)
         except Exception:
-            # `run_job` по контракту не бросает исключений наружу (см. её докстринг)
-            # — этот `except` только на случай будущей регрессии контракта: одна
-            # сломанная задача не имеет права остановить цикл воркера целиком.
+            # `run_job` не выпускает `Exception` наружу — это обеспечено её
+            # внешним `except`, а не только обещано в докстринге (round 5, Item
+            # E). Но выживание цикла воркера не имеет права держаться на
+            # свойстве соседнего модуля: сюда же попадёт и любой будущий путь,
+            # который это свойство нарушит. Сеть настоящая, а не декоративная —
+            # одна сломанная задача не имеет права остановить воркер целиком.
             log.exception("run_job_raised_unexpectedly", job_id=job.id)
         finally:
             structlog.contextvars.unbind_contextvars("worker_id")
 
 
-async def reap_loop(queue: JobsQueue, *, interval_s: float = _REAP_INTERVAL_S) -> None:
+async def reap_loop(
+    queue: JobsQueue,
+    *,
+    interval_s: float = _REAP_INTERVAL_S,
+    stop: asyncio.Event | None = None,
+) -> None:
     """Раз в минуту (спека §8.1) подбирает задачи, зависшие дольше окна `reap()`."""
     log = structlog.get_logger(__name__)
-    while True:
-        await asyncio.sleep(interval_s)
+    while stop is None or not stop.is_set():
+        await _sleep_or_stop(stop, interval_s)
+        if stop is not None and stop.is_set():
+            return
         try:
             reaped = await queue.reap()
             if reaped:
@@ -158,6 +239,72 @@ def worker_concurrency() -> int:
     голый `ValueError` с трассировкой в цикле рестартов.
     """
     return optional_int("WORKER_CONCURRENCY", _DEFAULT_WORKER_CONCURRENCY)
+
+
+def _install_stop_handlers() -> asyncio.Event:
+    """SIGTERM/SIGINT → `asyncio.Event`, на который смотрят оба цикла.
+
+    **Почему это обязательно, а не удобно (round 5, Item F).** Воркер — PID 1
+    своего контейнера (`command:` в compose, никакого `init:`), а у PID 1 в Linux
+    НЕТ диспозиции сигнала по умолчанию: ядро доставляет процессу с PID 1 только
+    те сигналы, на которые он сам поставил обработчик. Без этой функции `docker
+    compose stop`/`up -d` (то есть КАЖДЫЙ деплой) отправлял SIGTERM в пустоту,
+    десять секунд ждал и убивал процесс SIGKILL'ом. Цена платилась трижды, и
+    каждый раз — за уже написанную защиту: задачи оставались `running` до
+    `reap()` через десять минут; `except asyncio.CancelledError` в
+    `platform/llm.py`, написанный ровно затем, чтобы строки `llm_calls` не
+    зависали в `started` (reaper'а у них нет), не выполнялся никогда;
+    `atexit`-сброс дискового эквити-кэша (`analysis/preflop.py`) пропускался, и
+    следующий контейнер грел кэш заново. Асимметрия была невидима, потому что
+    бот на aiogram ставит обработчики сам и выходит штатно.
+
+    `loop.add_signal_handler` (а не `signal.signal`) — обработчик исполняется в
+    цикле событий, между шагами корутин, а не посреди произвольного байткода.
+    """
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop.set)
+    return stop
+
+
+async def _run_until_stopped(tasks: list[asyncio.Task[None]], stop: asyncio.Event) -> None:
+    """Крутить циклы до сигнала останова, затем свернуться (round 5, Item F).
+
+    Раньше здесь стояла `asyncio.TaskGroup`, и от неё унаследованы два свойства,
+    которые обязаны сохраниться: упавший цикл валит ВЕСЬ процесс (под `restart:
+    unless-stopped` это перезапуск с чистого листа, а не воркер, тихо доживающий с
+    тремя корутинами из четырёх), и его исключение уходит наружу с трассировкой,
+    а не тонет в `gather(..., return_exceptions=True)`. TaskGroup при этом не
+    подходит: она ждёт завершения всех задач и не умеет «доиграть отведённое
+    время, потом отменить».
+    """
+    log = structlog.get_logger(__name__)
+    stop_waiter = asyncio.create_task(stop.wait())
+    done, _pending = await asyncio.wait([*tasks, stop_waiter], return_when=FIRST_COMPLETED)
+    stop_waiter.cancel()
+
+    # Первым завершился не сигнал, а сам цикл — значит, он упал (штатно ни один
+    # из них не заканчивается до `stop`). Останавливаем процесс целиком.
+    died = [t for t in done if t is not stop_waiter and not t.cancelled()]
+    failures = [exc for t in died if (exc := t.exception()) is not None]
+    if died:
+        stop.set()
+
+    log.info("worker_shutdown_started", grace_s=_SHUTDOWN_GRACE_S)
+    _finished, still_running = await asyncio.wait(tasks, timeout=_SHUTDOWN_GRACE_S)
+    if still_running:
+        # Отмена, а не «ждём дальше»: см. `_SHUTDOWN_GRACE_S`. Задача остаётся
+        # `running` и вернётся в очередь через `reap()` — это дешевле, чем быть
+        # убитым SIGKILL посреди вызова модели.
+        log.warning("worker_shutdown_cancelling", tasks=len(still_running))
+        for task in still_running:
+            task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    log.info("worker_shutdown_done")
+
+    if failures:
+        raise failures[0]
 
 
 async def main() -> None:
@@ -190,10 +337,13 @@ async def main() -> None:
             llm=llm,
             process_pool=process_pool,
         )
-        async with asyncio.TaskGroup() as tg:
-            for i in range(concurrency):
-                tg.create_task(worker_loop(deps, worker_id=f"{_PROCESS_ID}-{i}"))
-            tg.create_task(reap_loop(queue))
+        stop = _install_stop_handlers()
+        tasks = [
+            asyncio.create_task(worker_loop(deps, worker_id=f"{_PROCESS_ID}-{i}", stop=stop))
+            for i in range(concurrency)
+        ]
+        tasks.append(asyncio.create_task(reap_loop(queue, stop=stop)))
+        await _run_until_stopped(tasks, stop)
 
 
 if __name__ == "__main__":

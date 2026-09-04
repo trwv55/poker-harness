@@ -16,6 +16,7 @@ from harness.presentation.keyboards import (
 from harness.presentation.messages import (
     Msg,
     bot_failure_msg,
+    button_not_ready_msg,
     deep_dive_msg,
     escalation_msg,
     failed_msg,
@@ -34,6 +35,7 @@ __all__ = [
     "Btn",
     "Msg",
     "bot_failure_msg",
+    "button_not_ready_msg",
     "deep_dive_button",
     "deep_dive_msg",
     "escalation_buttons",

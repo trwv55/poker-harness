@@ -67,8 +67,14 @@ from harness.analysis.preflop import (
     equity_cache_fingerprint,
     equity_cache_seed,
 )
-from harness.analysis.scan import ScanSummary, scan_tournament
-from harness.contracts import AnalysisResult, EnrichedHand, ValidationStatus, Zone
+from harness.analysis.scan import scan_tournament
+from harness.contracts import (
+    AnalysisResult,
+    EnrichedHand,
+    ScanSummary,
+    ValidationStatus,
+    Zone,
+)
 from harness.engine import enrich
 from harness.memory.models import Job as JobModel
 from harness.memory.models import Player
@@ -101,19 +107,51 @@ _Station = Literal["parse", "validate", "analyze"]
 _JOB_DEADLINE_S: dict[str, float] = {"hh_scan": 480.0, "deep_dive": 120.0}
 _DEFAULT_JOB_DEADLINE_S = 300.0
 
+
+class SourceFileUnavailable(OSError):
+    """Файл раздач, на который ссылается задача, не прочитался (round 5, Item I).
+
+    Своё исключение, а не голый `FileNotFoundError`: причина отказа игроку
+    выбирается по ТИПУ, и тип обязан значить ровно то, что мы утверждаем в
+    тексте. Поднимается ровно в одном месте — там, где мы сами открываем
+    `payload["source_file"]`, — и потому «файл раздач недоступен» под ним верно
+    всегда, а не «обычно».
+    """
+
+
+class HandDataMissing(LookupError):
+    """Нужной руки (или её чекпоинта) нет в базе — round 5, Item I.
+
+    Отдельный тип по той же причине, что и `SourceFileUnavailable`. До этой
+    правки на его месте стоял базовый `LookupError`, а он — предок `KeyError` и
+    `IndexError`: любой промах по словарю (`payload["hand_no"]`, `_STATION_TEXT
+    [station]`, что угодно внутри парсера) выдавал игроку уверенное и конкретное
+    «не нашли нужные данные по этой раздаче» про совсем другую поломку.
+    """
+
+
 # Закрытый набор причин отказа, которые честно показать игроку (fix round 1,
 # Important 1). `str(exc)` бывает `FileNotFoundError: [Errno 2] ... '/data/hh/
 # {hash}.txt'` (путь на диске), номер руки, текст ошибки SQLAlchemy — ровно то,
 # что публикационная политика репозитория (fixtures/hh, номера рук как приватные
 # данные игрока) запрещает публиковать, а правило единого голоса (presentation
 # формулирует то, что видит игрок, а не необработанное исключение) запрещает
-# показывать буквально. Внутренняя причина никуда не девается — `jobs.error`
-# (queue.fail) и лог (`_log.error` в `run_job`) остаются полными и точными,
-# это ops-данные, не то, что уходит в Sender.
+# показывать буквально. Внутренняя причина никуда не девается: `jobs.error`
+# (queue.fail) хранит `str(exc)`, а лог (`_log.error`/`_log.warning` в `run_job`)
+# — и `repr(exc)`, и трейсбек через `exc_info` (round 5, Item K.1: до этой правки
+# трейсбека не было, и «полный и точный» было верно только про `jobs.error`).
+# Это ops-данные, не то, что уходит в Sender.
+#
+# Ключи — доменные исключения ЭТОГО модуля, не встроенные типы (round 5, Item I):
+# закрытый набор причин верен, а вот опознавать их по `FileNotFoundError`/
+# `LookupError` было нельзя — второй накрывает `KeyError` и `IndexError`, то есть
+# почти любой баг в коде. Исключение — `TimeoutError`: он называет ИСХОД («не
+# уложились в срок»), а не место поломки, и остаётся верным независимо от того,
+# кто его поднял.
 _PUBLIC_FAILURE_REASON_DEFAULT = "внутренняя ошибка сервиса"
 _PUBLIC_FAILURE_REASONS: tuple[tuple[type[BaseException], str], ...] = (
-    (FileNotFoundError, "файл раздач недоступен"),
-    (LookupError, "не нашли нужные данные по этой раздаче"),
+    (SourceFileUnavailable, "файл раздач недоступен"),
+    (HandDataMissing, "не нашли нужные данные по этой раздаче"),
     (TimeoutError, "расчёт не уложился в отведённое время"),
 )
 
@@ -238,10 +276,18 @@ async def _fenced_update(
 async def _sync_payload(
     session: AsyncSession, job_id: int, worker_id: str | None, payload: dict[str, Any]
 ) -> None:
-    """Записать текущий чекпоинт `jobs.payload` — единственное место в этом модуле,
-    где обновление таблицы `jobs` не идёт через `JobsQueue` (тот не даёт менять
-    `payload` без смены статуса, а резюме нужно делать это посреди `running`, не
-    трогая статус). Фенсинг — через `_fenced_update` (см. её докстринг).
+    """Записать текущий чекпоинт `jobs.payload` в обход `JobsQueue`: тот не даёт
+    менять `payload` без смены статуса, а резюме нужно делать это посреди
+    `running`, не трогая статус. Фенсинг — через `_fenced_update` (см. её
+    докстринг).
+
+    «Единственное такое место в модуле» здесь стояло неверно (round 5, Item K.6)
+    — и, что показательно, было дописано раундом, который сам же и добавил
+    остальные: `jobs` мимо очереди пишут ещё `_send_idempotent` (сохраняет
+    `message_id` только что отправленного сообщения) и `_run_deep_dive`
+    (`hand_id` разобранной руки). Общего у всех трёх ровно одно, и оно
+    существенно: каждое идёт через `_fenced_update`, то есть ни одно не может
+    записать в задачу, которой этот воркер уже не владеет.
     """
     await _fenced_update(session, job_id, worker_id, payload=payload)
 
@@ -348,7 +394,15 @@ async def _run_hh_scan(job: JobModel, deps: Deps, trace: Trace) -> None:
             async with trace.span("parse"):
                 payload = await _ensure_progress(deps, session, job.id, worker_id, chat_id, "parse")
                 source_file = payload["source_file"]
-                raw_text = Path(source_file).read_text(encoding="utf-8")
+                try:
+                    raw_text = Path(source_file).read_text(encoding="utf-8")
+                except OSError as exc:
+                    # Единственное место, где мы сами открываем файл игрока, —
+                    # значит единственное, про которое мы вправе сказать игроку
+                    # «файл раздач недоступен» (round 5, Item I). Ловится `OSError`
+                    # целиком, не только `FileNotFoundError`: права, битый том,
+                    # оборванный NFS — для игрока это одно и то же «не читается».
+                    raise SourceFileUnavailable(f"файл раздач не прочитан: {exc}") from exc
                 # Импорт модулем, а не `from ... import parse_file` (задача 18,
                 # falsификация `test_resume_skips_done_stations`): тест ломает
                 # ИМЕННО `harness.parsers.hh_parser.parse_file` через monkeypatch,
@@ -447,6 +501,27 @@ async def _run_hh_scan(job: JobModel, deps: Deps, trace: Trace) -> None:
         await session.commit()
 
 
+def _hand_zone(result: AnalysisResult) -> Zone | None:
+    """Зона доверия ВСЕЙ руки — из всех судимых точек, консервативно (round 5, Item H).
+
+    Два правила, оба из CLAUDE.md («`strict` — только когда вывод не опирается на
+    угаданный диапазон»):
+
+    * судить нечего (`ranked` пуст) — зоны нет вовсе, `None`. Раньше здесь стоял
+      `Zone.STRICT`, и игрок получал самую уверенную подпись продукта под
+      сообщением «по этой раздаче точек с вердиктом нет»: строгость там, где не
+      было вывода;
+    * есть хоть одна точка `assuming` — вся рука `assuming`. Раньше зона бралась
+      у ПЕРВОЙ точки `ranked`, поэтому шапка «зона: строго» могла стоять над
+      строками, каждая из которых помечена «(по модели диапазонов)». Слабейшее
+      звено определяет, чему можно верить, — не самое дорогое.
+    """
+    zones = {result.points[idx].zone for idx in result.ranked}
+    if not zones:
+        return None
+    return Zone.STRICT if zones == {Zone.STRICT} else Zone.ASSUMING
+
+
 async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: float) -> int | None:
     """Возвращает `hand_id` разобранной руки — `run_job` кладёт его в `traces.hand_id`
     (не в `_run_hh_scan`: там рук много, ни одна не выделена)."""
@@ -462,9 +537,9 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
             payload = await _ensure_progress(deps, session, job.id, worker_id, chat_id, "analyze")
             hand = await hands_repo.find_by_hand_no(job.session_id, hand_no)
             if hand is None:
-                raise LookupError(f"рука {hand_no!r} не найдена в сессии {job.session_id}")
+                raise HandDataMissing(f"рука {hand_no!r} не найдена в сессии {job.session_id}")
             if hand.enriched is None:
-                raise LookupError(f"рука {hand_no!r} ещё не прошла чекпоинт enriched")
+                raise HandDataMissing(f"рука {hand_no!r} ещё не прошла чекпоинт enriched")
 
             await _fenced_update(session, job.id, worker_id, hand_id=hand.id)
 
@@ -489,7 +564,7 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
                 await session.commit()
 
         elapsed_s = round(deps.clock() - started_at)
-        zone = result.points[result.ranked[0]].zone if result.ranked else Zone.STRICT
+        zone = _hand_zone(result)
         quota_left, quota_total = await _quota_numbers(session, job.player_id)
         msg = deep_dive_msg(result, elapsed_s, zone, quota_left, quota_total)
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
@@ -577,8 +652,24 @@ async def _notify_failure(deps: Deps, job: JobModel, reason: str) -> None:
 
 async def run_job(job: JobModel, deps: Deps) -> None:
     """Одна попытка одной задачи: станция(и) по `job.type`, трейс, финальный переход
-    очереди. Никогда не бросает исключение наружу — вызывающий (`worker/main.py`,
-    цикл `claim → run_job`) не обязан оборачивать каждый вызов в свой `try`, а
+    очереди.
+
+    **Наружу не летит ни одно `Exception` — и теперь это обеспечено, а не заявлено
+    (round 5, Item E).** Обещание стояло здесь и раньше, но было ложным: `finally:
+    await trace.flush(...)` делал ввод-вывод в БД вообще без `try`, а
+    `_finish_fenced` ловит только `JobPreconditionFailed` — `LookupError` из
+    `complete()`/`fail()` или любая ошибка SQLAlchemy улетали в цикл воркера.
+    Теперь всё тело, включая `flush`, обёрнуто внешним `except Exception`, который
+    логирует крах с трейсбеком; задача остаётся `running` и достаётся `reap()` —
+    честная деградация вместо остановленной корутины воркера.
+
+    `asyncio.CancelledError` — намеренное и единственное исключение из этого
+    правила: она `BaseException`, а не `Exception`, и проглотить её значило бы
+    сломать останов воркера по SIGTERM (`worker/main.py`), где отмена и есть
+    штатный способ свернуть работу. Наружу она обязана уйти.
+
+    Обещание не отменяет `except` в самом цикле воркера: цикл, чьё выживание
+    держится на докстринге соседнего модуля, — это не гарантия. Оба слоя нужны.
     `attempts < max_attempts` — легитимный "ещё не готово", не сбой цикла.
 
     **Политика ретрая — намеренно НЕ немедленный реквеуинг.** У `JobsQueue` нет
@@ -604,28 +695,43 @@ async def run_job(job: JobModel, deps: Deps) -> None:
     trace = Trace(deps.db_factory, clock=deps.clock)
     hand_id: int | None = None
     try:
-        deadline = _JOB_DEADLINE_S.get(job.type, _DEFAULT_JOB_DEADLINE_S)
-        started_at = deps.clock()
+        # Строка `traces` — ДО станций (round 5, Item D): на неё ссылается
+        # `llm_calls.trace_id` (FK NOT NULL), а `LLM` пишет свою строку до
+        # обращения к модели. См. модульный докстринг `platform/trace.py`.
+        await trace.open(job.id)
         try:
-            hand_id = await asyncio.wait_for(
-                _dispatch(job, deps, trace, started_at), timeout=deadline
-            )
-        except JobPreconditionFailed:
-            _log.warning(
-                "job_fencing_lost_ownership_mid_station", job_id=job.id, worker_id=job.locked_by
-            )
-            return
-        except Exception as exc:  # noqa: BLE001 — намеренно: станция может упасть
-            # чем угодно (парсер, БД, дедлайн-таймаут) — политика ретрая/отказа
-            # ниже одна и та же для любой причины, различать типы здесь незачем.
-            if job.attempts < job.max_attempts:
-                _log.warning("job_attempt_failed_will_retry", error=repr(exc))
+            deadline = _JOB_DEADLINE_S.get(job.type, _DEFAULT_JOB_DEADLINE_S)
+            started_at = deps.clock()
+            try:
+                hand_id = await asyncio.wait_for(
+                    _dispatch(job, deps, trace, started_at), timeout=deadline
+                )
+            except JobPreconditionFailed:
+                _log.warning(
+                    "job_fencing_lost_ownership_mid_station",
+                    job_id=job.id,
+                    worker_id=job.locked_by,
+                )
                 return
-            _log.error("job_failed", error=repr(exc))
-            if await _finish_fenced(deps, job, outcome="fail", error=str(exc)):
-                await _notify_failure(deps, job, _public_failure_reason(exc))
-        else:
-            await _finish_fenced(deps, job, outcome="complete")
+            except Exception as exc:  # noqa: BLE001 — намеренно: станция может упасть
+                # чем угодно (парсер, БД, дедлайн-таймаут) — политика ретрая/отказа
+                # ниже одна и та же для любой причины, различать типы здесь незачем.
+                # `exc_info=exc` обязателен (round 5, Item K.1): без него в лог
+                # уходил один `repr(exc)` без места падения — то есть ровно тот
+                # симптом, который чинила задача 19 и который её собственный
+                # докстринг (`platform/logs.py`) числил среди уже исправленных.
+                if job.attempts < job.max_attempts:
+                    _log.warning("job_attempt_failed_will_retry", error=repr(exc), exc_info=exc)
+                    return
+                _log.error("job_failed", error=repr(exc), exc_info=exc)
+                if await _finish_fenced(deps, job, outcome="fail", error=str(exc)):
+                    await _notify_failure(deps, job, _public_failure_reason(exc))
+            else:
+                await _finish_fenced(deps, job, outcome="complete")
+        finally:
+            await trace.flush(hand_id=hand_id)
+    except Exception:  # noqa: BLE001 — см. докстринг: это и есть та граница,
+        # на которой обещание «наружу ничего не летит» становится правдой.
+        _log.exception("job_run_crashed", job_id=job.id)
     finally:
-        await trace.flush(job.id, hand_id=hand_id)
         structlog.contextvars.unbind_contextvars("job_id", "job_type")

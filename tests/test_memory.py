@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 
 import pytest
@@ -20,11 +21,23 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from harness.contracts import AnalysisResult, RawHand
 from harness.engine import enrich
 from harness.memory.models import EvalCase, Job
-from harness.memory.repos import AnalysesRepo, EvalCasesRepo, HandsRepo, PlayersRepo, SessionsRepo
+from harness.memory.repos import (
+    _SESSIONS_LOCK_NS,
+    AnalysesRepo,
+    EvalCasesRepo,
+    HandsRepo,
+    PlayersRepo,
+    SessionsRepo,
+)
 from harness.normalizer import normalize
 from harness.parsers.hh_parser import parse_hand
+from harness.platform.limiter import PgLimiter
 from tests.test_contracts import make_min_raw
 from tests.test_hh_parser import SAMPLE
+
+# Ожидание конкурента после освобождения лока: обычные миллисекунды, потолок — на
+# случай, если сериализация сломается так, что вторая корутина не проснётся вовсе.
+_RIVAL_TIMEOUT_S = 10.0
 
 _ALL_TABLES = {
     "players",
@@ -219,3 +232,64 @@ async def test_db_factory_cleans_state_between_tests(db_factory):
         player = await PlayersRepo(s).get_or_create(tg_user_id=555)
         await s.commit()
         assert player.id == 1  # RESTART IDENTITY — счётчик начат заново
+
+
+async def test_sessions_lock_is_transaction_scoped(db_factory):
+    """Round 5, Item M — инвариант, который комментарий назвать не может.
+
+    `PgLimiter.slot()` первым делом выполняет `SELECT pg_advisory_unlock_all()`
+    на соединении из ТОГО ЖЕ движка приложения, а `unlock_all` пространств имён
+    не различает вовсе: он снимает все advisory-локи УРОВНЯ СЕССИИ этого
+    соединения, чьи бы они ни были. Значит `SessionsRepo` защищён не тем, что у
+    него свой namespace (так было написано), а тем, что его лок ТРАНЗАКЦИОННЫЙ
+    (`pg_advisory_xact_lock`) — такие живут отдельно и для `unlock_all` невидимы.
+
+    Правка `pg_advisory_xact_lock` → `pg_advisory_lock` согласовывалась бы с
+    прежним комментарием слово в слово и молча отменила бы сериализацию сессий
+    при первом же вызове модели. Этот тест её ловит: после коммита в `pg_locks`
+    не должно остаться ни одного advisory-лока в namespace сессий — с
+    session-scoped локом он пережил бы и коммит, и возврат соединения в пул
+    (сброс пула — это `ROLLBACK`, а он такие локи не снимает).
+    """
+    async with db_factory() as session:
+        player = await PlayersRepo(session).get_or_create(tg_user_id=90210)
+        await SessionsRepo(session).active_or_create(player.id)
+        await session.commit()
+
+    async with db_factory() as probe:
+        held = await probe.scalar(
+            text(
+                "SELECT count(*) FROM pg_locks "
+                "WHERE locktype = 'advisory' AND classid = :ns"
+            ),
+            {"ns": _SESSIONS_LOCK_NS},
+        )
+    assert held == 0, "лок сессий пережил коммит — значит он уровня СЕССИИ, а не транзакции"
+
+
+async def test_limiter_unlock_all_does_not_steal_the_sessions_lock(db_factory):
+    """Вторая половина Item M — то самое последствие, ради которого инвариант и
+    существует. Пока `SessionsRepo` держит свой лок в ОТКРЫТОЙ транзакции,
+    `PgLimiter.slot()` (со своим `pg_advisory_unlock_all()`) работает на том же
+    движке — и сериализация обязана уцелеть: второй писатель по-прежнему ждёт.
+    """
+    lim = PgLimiter(db_factory, max_concurrency=1, max_per_minute=1000)
+    async with db_factory() as holder:
+        player = await PlayersRepo(holder).get_or_create(tg_user_id=90211)
+        await holder.commit()
+        player_id = player.id
+
+        # Лок взят и НЕ отпущен: транзакция ещё открыта.
+        await SessionsRepo(holder).active_or_create(player_id)
+
+        async with lim.slot():  # внутри — pg_advisory_unlock_all() на общем движке
+            pass
+
+        async with db_factory() as rival:
+            waiting = asyncio.create_task(SessionsRepo(rival).active_or_create(player_id))
+            done, _ = await asyncio.wait({waiting}, timeout=1.0)
+            assert not done, "конкурент прошёл лок — сериализация сессий снята"
+
+            await holder.commit()  # отпускаем лок
+            await asyncio.wait_for(waiting, timeout=_RIVAL_TIMEOUT_S)
+            await rival.rollback()

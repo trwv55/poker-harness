@@ -52,8 +52,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from harness.analysis.scan import ScanSummary
-from harness.contracts.analysis import AnalysisResult, SpotKind, Zone
+from harness.contracts.analysis import AnalysisResult, ScanSummary, SpotKind, Zone
 from harness.contracts.raw import Street
 from harness.presentation.keyboards import (
     Btn,
@@ -65,6 +64,7 @@ from harness.presentation.keyboards import (
 __all__ = [
     "Msg",
     "bot_failure_msg",
+    "button_not_ready_msg",
     "deep_dive_msg",
     "escalation_msg",
     "failed_msg",
@@ -111,6 +111,20 @@ _ZONE_WORD: dict[Zone, str] = {Zone.STRICT: "строго", Zone.ASSUMING: "пр
 
 # Пометка честности зоны (бриф задачи 17, дословно) — только у строк `assuming`.
 _ASSUMING_MARKER = "по модели диапазонов"
+
+# Потолок строк сводки скана (round 5, Item J). `ScanSummary.items` ничем не
+# ограничен — это правильно для данных (`tournaments.scan_summary` хранит их
+# целиком), но у Телеграма `sendMessage` жёстко ограничен 4096 символами, а
+# строка пункта вместе с кнопкой стоит ~85 символов: примерно с 48-го пункта
+# сообщение перестало бы отправляться ВООБЩЕ. Отказ при этом не тихий и не
+# дешёвый: `TelegramSender.send` делает `raise_for_status()`, задача уходит в
+# ретрай и игрок платит тремя полными пересканами файла, прежде чем услышит
+# хоть что-то. Измеренные фикстуры дают 9 пунктов — то есть само по себе это
+# не выстрелит завтра, и именно поэтому ограничения тут и не было.
+# 20 — с запасом внутри лимита (~1.8 тыс. символов) и всё ещё осмысленный
+# список: сводка нужна, чтобы выбрать, что разбирать, а не чтобы прочитать
+# турнир целиком.
+_MAX_RENDERED_SCAN_ITEMS = 20
 
 _STATION_TEXT: dict[str, str] = {
     "parse": "Читаю стол…",
@@ -167,6 +181,11 @@ def scan_summary_msg(s: ScanSummary, quota_left: int, quota_total: int) -> Msg:
     `hands_failed` (руки, пропущенные политикой отказа скана) показывается
     только когда он не ноль — молчание о деградации ровно то, против чего
     спроектирован весь продукт (fix round 1, дискреционный пункт ревью).
+
+    Список обрезается `_MAX_RENDERED_SCAN_ITEMS` (round 5, Item J — обоснование
+    числа там же) и, если обрезан, говорит об этом прямо: сколько найдено и
+    сколько показано. Молча показать 20 из 60 — та же деградация без огласки,
+    что и `hands_failed` абзацем выше.
     """
     lines = [f"Скан завершён: {s.hands_total} рук, {s.hands_with_decision} с решением."]
     if s.hands_failed:
@@ -178,9 +197,16 @@ def scan_summary_msg(s: ScanSummary, quota_left: int, quota_total: int) -> Msg:
         lines.append("")
         lines.append("Расхождений дороже 0.1 bb не найдено.")
     else:
+        shown = s.items[:_MAX_RENDERED_SCAN_ITEMS]
         lines.append("")
-        lines.append("Топ расхождений:")
-        for item in s.items:
+        if len(shown) < len(s.items):
+            lines.append(
+                f"Топ расхождений — показаны {len(shown)} самых дорогих "
+                f"из {len(s.items)} найденных:"
+            )
+        else:
+            lines.append("Топ расхождений:")
+        for item in shown:
             marker = f" ({_ASSUMING_MARKER})" if item.zone is Zone.ASSUMING else ""
             lines.append(
                 f"№{item.hand_no} · {item.hero_class} · {_spot_word(item.spot)}: "
@@ -197,7 +223,7 @@ def scan_summary_msg(s: ScanSummary, quota_left: int, quota_total: int) -> Msg:
 def deep_dive_msg(
     res: AnalysisResult,
     elapsed_s: int,
-    zone: Zone,
+    zone: Zone | None,
     quota_left: int,
     quota_total: int,
     dev_line: str | None = None,
@@ -208,6 +234,18 @@ def deep_dive_msg(
     Точки берутся в порядке `res.ranked` (самая дорогая первой) — это уже
     отфильтрованный и отранжированный список судимых точек (`error_cost.py`),
     без точек-пробелов, которым нечего показать честно.
+
+    **`zone=None` — «зоны нет», и тогда её нет и в строке (round 5, Item H).**
+    Прежняя сигнатура требовала `Zone`, и вызывающий, которому нечего было
+    сказать (ни одной судимой точки), подставлял `Zone.STRICT` — самую
+    уверенную подпись продукта под сообщением «точек с вердиктом нет». CLAUDE.md
+    разрешает `strict` только там, где вывод не опирается на угаданный диапазон;
+    вывода в этом случае нет вообще, а значит нет и зоны. Молчание тут честнее
+    любого слова, поэтому сегмент просто исчезает из статус-строки.
+
+    Зона относится ко ВСЕЙ руке, поэтому вызывающий обязан выводить её из всех
+    судимых точек, а не из первой (`worker.pipeline._hand_zone` — единственный
+    такой вызывающий; там же и правило: «строго» только если строги все).
     """
     lines = [f"Рука {res.hand_no}", ""]
 
@@ -224,7 +262,8 @@ def deep_dive_msg(
             )
 
     lines.append("")
-    status = f"⏱ {elapsed_s}с · зона: {_ZONE_WORD[zone]} · {_quota_line(quota_left, quota_total)}"
+    zone_segment = "" if zone is None else f"зона: {_ZONE_WORD[zone]} · "
+    status = f"⏱ {elapsed_s}с · {zone_segment}{_quota_line(quota_left, quota_total)}"
     lines.append(status)
     if dev_line is not None:
         lines.append(dev_line)
@@ -240,6 +279,19 @@ def escalation_msg(field: str, question: str, options: list[str]) -> Msg:
 def failed_msg(reason_public: str) -> Msg:
     """Разбор не удался — честная причина без внутренней кухни, без кнопок."""
     return Msg(text=f"Не получилось разобрать раздачу: {reason_public}")
+
+
+def button_not_ready_msg() -> Msg:
+    """Кнопка нажата, а обработчика у неё ещё нет (round 5, Item G).
+
+    Три кнопки под каждым разбором (`keyboards.verdict_buttons`) — контракт
+    задачи 21, они стоят под сообщением уже сейчас, а разбирать нажатие пока
+    некому. Без ответа Телеграм крутит «часики» на кнопке, пока не свалится в
+    ошибку — молчание, неотличимое от поломки. Текст короткий намеренно: он
+    показывается всплывающим уведомлением callback-ответа, а у того жёсткий
+    лимит около 200 символов.
+    """
+    return Msg(text="Эта кнопка ещё не работает — появится вместе с разбором словами.")
 
 
 def quota_exceeded_msg(hours_to_free: int) -> Msg:

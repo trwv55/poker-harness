@@ -246,6 +246,53 @@ async def test_backoff_exhausted_raises_provider_error(db_factory, monkeypatch):
     assert rows == [("error",), ("error",), ("error",)]
 
 
+async def test_backoff_sleeps_outside_the_concurrency_slot(db_factory, monkeypatch):
+    """Round 5, Item C: бэкофф-пауза не имеет права держать слот одновременности.
+    Слот ограничивает одновременную НАГРУЗКУ на провайдера, а спящая корутина его
+    не нагружает; до этой правки `_sleep` стоял ВНУТРИ `async with slot()`, и под
+    штормом 429 — ровно там, где лимитер и нужен, — каждый ретрай на 1–4с занимал
+    один из K кросс-процессных слотов вхолостую.
+
+    Проверяется порядком событий, а не таймингом: шпион на `PgLimiter.slot`
+    пишет `enter`/`exit`, шпион на `llm._sleep` — `sleep`. Утверждение —
+    «ни одного `sleep` между `enter` и его `exit`»; на прежнем коде
+    последовательность была бы `enter sleep exit ...`.
+    """
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=13)
+
+    events: list[str] = []
+    real_slot = PgLimiter.slot
+
+    @asynccontextmanager
+    async def spying_slot(self: PgLimiter, *, deadline: float | None = None):
+        async with real_slot(self, deadline=deadline):
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+    monkeypatch.setattr(PgLimiter, "slot", spying_slot)
+
+    def always_429(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise ModelHTTPError(status_code=429, model_name="test", body="rate limited")
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        events.append("sleep")
+        await real_sleep(0)
+
+    monkeypatch.setattr("harness.platform.llm._sleep", fake_sleep)
+
+    llm = LLM(cfg, db_factory, model_override=FunctionModel(always_429))
+    with pytest.raises(LLMProviderError):
+        await llm("verdict_text", Out, prompt="скажи привет", trace_id=trace_id)
+
+    # Три попытки, две паузы между ними, и ни одной паузы внутри слота.
+    assert events == ["enter", "exit", "sleep", "enter", "exit", "sleep", "enter", "exit"]
+
+
 async def test_call_shares_one_deadline_across_retry_attempts(db_factory, monkeypatch):
     """Fix round 3, Item 1: контроллер поймал, что round-2 дизайн (свежий
     `_ACQUIRE_TIMEOUT_S`-бюджет на КАЖДЫЙ `slot()`) ломает саму связь с окном
