@@ -10,14 +10,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from harness.analysis.scan import ScanSummary
 from harness.contracts import AnalysisResult, CanonicalHand, EnrichedHand, Provenance, RawHand
-from harness.memory.models import Analysis, EvalCase, Hand, Player
+from harness.memory.models import Analysis, CalcCache, EvalCase, Hand, Player, Tournament
 from harness.memory.models import Session as SessionRow
 
 _MONTHS_RU_ABBR = (
@@ -136,6 +140,41 @@ class HandsRepo:
 
     async def get(self, hand_id: int) -> HandRecord:
         record = await self._get_row(hand_id)
+        return self._to_record(record)
+
+    async def list_by_tournament(self, tournament_id: int) -> list[HandRecord]:
+        """Все руки турнира, в порядке вставки (задача 18: тот же порядок, в
+        котором их отдал `parse_file` — резюме читает `hand_index` руки N по
+        позиции N в этом списке, не переразбирая файл заново, см. `run_job`).
+        """
+        stmt = select(Hand).where(Hand.tournament_id == tournament_id).order_by(Hand.id)
+        rows = (await self.db.scalars(stmt)).all()
+        return [self._to_record(row) for row in rows]
+
+    async def count_by_tournament(self, tournament_id: int) -> int:
+        """Сколько рук турнира уже сохранены — дешёвая проверка резюме без
+        десериализации jsonb в контракты (в отличие от `list_by_tournament`).
+        """
+        stmt = select(func.count()).select_from(Hand).where(Hand.tournament_id == tournament_id)
+        return int(await self.db.scalar(stmt) or 0)
+
+    async def find_by_hand_no(self, session_id: int, hand_no: str) -> HandRecord | None:
+        """Рука по номеру раздачи внутри сессии — вход станции `deep_dive`
+        (задача 18): кнопка «разобрать» под строкой скана несёт только
+        `hand_no` (`keyboards.deep_dive_button`), не `hand_id`, поэтому найти
+        строку `hands` можно только по значению внутри `raw` (колонки-номера
+        у таблицы нет — заводить её ради одного запроса дороже, чем прочитать
+        jsonb: `hand_no` уникален не глобально, а в рамках источника, и поиск
+        по `raw`, а не `canonical`, работает даже до чекпоинта нормализации).
+        """
+        stmt = select(Hand).where(
+            Hand.session_id == session_id,
+            Hand.raw["hand_no"].astext == hand_no,
+        )
+        record = await self.db.scalar(stmt)
+        return self._to_record(record) if record is not None else None
+
+    def _to_record(self, record: Hand) -> HandRecord:
         return HandRecord(
             id=record.id,
             session_id=record.session_id,
@@ -207,6 +246,78 @@ class AnalysesRepo:
             verdict_text=record.verdict_text,
             range_images=record.range_images,
         )
+
+
+class TournamentsRepo:
+    """`tournaments`: HH-вход и сводка скана (задача 18, встык с `hh_scan`).
+
+    `create()` — единственный чекпоинт, которого не было в схеме до этой задачи:
+    `tournament_id` уходит в `jobs.payload` сразу после вставки (§8.2, `run_job`),
+    и повторная попытка той же задачи находит его там же, а не заводит вторую
+    строку `tournaments` на тот же файл.
+    """
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def create(self, *, session_id: int, source_file: str) -> int:
+        record = Tournament(session_id=session_id, source_file=source_file)
+        self.db.add(record)
+        await self.db.flush()
+        return record.id
+
+    async def save_scan_summary(self, tournament_id: int, summary: ScanSummary) -> None:
+        record = await self._get_row(tournament_id)
+        record.scan_summary = summary.model_dump(mode="json")
+        await self.db.flush()
+
+    async def _get_row(self, tournament_id: int) -> Tournament:
+        record = await self.db.get(Tournament, tournament_id)
+        if record is None:
+            raise LookupError(f"турнир {tournament_id} не найден")
+        return record
+
+
+class CalcCacheRepo:
+    """`calc_cache`: кэш расчётов, общий между турнирами и пользователями (§6).
+
+    Ключ — сигнатура спота (уровень классов рук и квантованных глубин), не
+    конкретная раздача, поэтому одна и та же строка годится любому будущему
+    скану, который посчитает тот же спот (задача 13: 655× на прогретом кэше).
+    Значения детерминированы сидом сэмплера (`analysis.preflop`, `_EQUITY_MC_
+    SEED`) — конфликтов при параллельной записи одного и того же ключа в
+    принципе не бывает (два воркера, посчитавшие один спот, посчитают ОДНО и
+    то же число), поэтому `ON CONFLICT DO NOTHING` дешевле и настолько же
+    корректен, как `DO UPDATE`: переписывать существующую строку нечем и
+    незачем.
+
+    `prefix` (не часть ключа спота, а версия/отпечаток сэмплера —
+    `analysis.preflop.equity_cache_fingerprint()`) отделяет один набор входов
+    (число итераций Монте-Карло, сид) от другого: смена итераций не должна
+    тихо отдать число, посчитанное на старых — старые строки просто перестают
+    совпадать по префиксу и остаются неиспользуемым, но безвредным мусором
+    (тот же приём, что у дискового кэша в `preflop.py`, перенесённый в общее
+    хранилище — контроллерский рулинг задачи 18, п.1: без него холодные
+    минуты скана возвращались бы при каждом масштабировании воркера).
+    """
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def get_all(self, prefix: str) -> dict[str, float]:
+        stmt = select(CalcCache.key, CalcCache.value).where(CalcCache.key.startswith(prefix))
+        rows = (await self.db.execute(stmt)).all()
+        return {key[len(prefix) :]: float(value) for key, value in rows}
+
+    async def upsert_many(self, prefix: str, entries: Mapping[str, float]) -> None:
+        if not entries:
+            return
+        values: list[dict[str, Any]] = [
+            {"key": f"{prefix}{key}", "value": value} for key, value in entries.items()
+        ]
+        stmt = pg_insert(CalcCache).values(values).on_conflict_do_nothing(index_elements=["key"])
+        await self.db.execute(stmt)
+        await self.db.flush()
 
 
 class EvalCasesRepo:

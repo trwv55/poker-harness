@@ -55,7 +55,7 @@ from __future__ import annotations
 
 import atexit
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from hashlib import sha256
 from pathlib import Path
 
@@ -284,6 +284,44 @@ def _save_disk_equity_cache() -> None:
 
 
 atexit.register(_save_disk_equity_cache)
+
+
+def equity_cache_fingerprint() -> str:
+    """Публичная обёртка над `_equity_cache_fingerprint()` — задача 18 использует
+    её как пространство имён ключей в `calc_cache` (Postgres), тем же приёмом,
+    что и дисковый кэш выше: смена версии/итераций/сида меняет отпечаток, и
+    старые строки просто перестают совпадать по префиксу, вместо того чтобы
+    молча выдать число, посчитанное на других входах, за ответ на текущий
+    запрос.
+    """
+    return _equity_cache_fingerprint()
+
+
+def equity_cache_seed(entries: Mapping[str, float]) -> None:
+    """Домешать во внутрипроцессный кэш строки, посчитанные ДРУГИМ процессом
+    (задача 18, контроллерский рулинг п.1: `calc_cache` в Postgres — общее
+    хранилище между воркерами, дисковый файл — только между прогонами ОДНОГО
+    процесса). Вызывающий (воркер) читает `calc_cache` ДО передачи руки в
+    процессный пул и сюда сеет результат — дальше `_model_equity` видит эти
+    записи как обычные попадания кэша, не отличая их от посчитанных на месте.
+
+    `_load_disk_equity_cache()` вызывается первой, чтобы не затереть уже
+    прочитанное с диска: сид — это ДОБАВКА к существующему кэшу процесса, а не
+    его замена.
+    """
+    _load_disk_equity_cache().update(entries)
+
+
+def equity_cache_export() -> dict[str, float]:
+    """Снимок текущего внутрипроцессного кэша целиком — задача 18 сохраняет его
+    обратно в `calc_cache` после скана (`ON CONFLICT DO NOTHING`, см.
+    `CalcCacheRepo`: значения детерминированы, переписывать существующую
+    строку нечем). Копия, а не сама ссылка — вызывающий кладёт результат в
+    аргумент `run_in_executor`, который пересекает границу процесса
+    сериализацией, а не разделяемой памятью, и мутация оригинала после
+    экспорта не имеет права тихо просочиться в уже отправленный снимок.
+    """
+    return dict(_load_disk_equity_cache())
 
 
 def _model_equity(hero: _HeroCombo, ranges: Sequence[Range]) -> float:

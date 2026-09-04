@@ -6,6 +6,7 @@ dependencies = [
     "alembic>=1.19.1",
     "asyncpg>=0.31.0",
     "eval7>=0.1.11",
+    "httpx>=0.28.1",
     # Точный пин, а не диапазон: реплей опирается на внутреннее состояние
     # PokerKit (`State.statuses`), и патч-релиз может увести его из-под нас.
     "pokerkit==0.7.5",
@@ -13,6 +14,7 @@ dependencies = [
     "pydantic>=2.7",
     "pydantic-ai>=2.38.0",
     "sqlalchemy[asyncio]>=2.0.30",
+    "structlog>=26.1.0",
 ]
 
 [dependency-groups]
