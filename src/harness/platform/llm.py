@@ -70,9 +70,16 @@ _HTTP_JITTER_MAX_S = 0.15
 # Telegram переотдаёт сжатые фото как JPEG, не PNG; подписанный PNG на самом деле
 # JPEG — это 400 от провайдера на первом же боевом скрине, задача 22). Сигнатуры
 # по первым байтам, не по расширению файла — вызывающий передаёт голые `bytes`,
-# без имени файла.
+# без имени файла. GIF и WebP добавлены round 2, Item 3: пересланный стикер или
+# нетипичный документ прежде поднимал бы `ValueError` до вызова модели вместо
+# того, чтобы быть прочитанным — оба формата провайдер принимает.
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 _JPEG_MAGIC = b"\xff\xd8\xff"
+_GIF_MAGICS = (b"GIF87a", b"GIF89a")
+# WebP — контейнер RIFF: 4 байта "RIFF", 4 байта длины (не проверяем — не часть
+# сигнатуры формата), 4 байта "WEBP".
+_RIFF_MAGIC = b"RIFF"
+_WEBP_MAGIC = b"WEBP"
 
 
 def _sniff_image_media_type(data: bytes) -> str:
@@ -80,9 +87,13 @@ def _sniff_image_media_type(data: bytes) -> str:
         return "image/png"
     if data.startswith(_JPEG_MAGIC):
         return "image/jpeg"
+    if data.startswith(_GIF_MAGICS):
+        return "image/gif"
+    if data[:4] == _RIFF_MAGIC and data[8:12] == _WEBP_MAGIC:
+        return "image/webp"
     raise ValueError(
-        "неизвестный формат изображения — ни PNG, ни JPEG (первые байты: "
-        f"{data[:8]!r})"
+        "неизвестный формат изображения — ни PNG, ни JPEG, ни GIF, ни WebP "
+        f"(первые байты: {data[:12]!r})"
     )
 
 
@@ -248,6 +259,15 @@ class LLM:
         как перевыбросить как есть — без него такая строка осталась бы `started`
         навсегда: у `llm_calls`, в отличие от `jobs`, нет reaper'а, который бы её
         когда-нибудь закрыл.
+
+        Отмена — ОТДЕЛЬНЫЙ `except` перед ним, не покрывается третьим (fix round
+        2, Item 2): `asyncio.CancelledError` наследуется от `BaseException`, не
+        от `Exception`, и «любой иной сбой» её не ловит — а в асинхронном
+        воркере с таймаутами отмена и есть самый частый вид «сбоя», не редкое
+        исключение из него. Строка `llm_calls` закрывается тем же `status=
+        'error'`, и `CancelledError` ОБЯЗАНА быть перевыброшена — проглоченная
+        отмена ломает распространение отмены по всему дереву задач, а не только
+        эту попытку.
         """
         last_http_error: ModelHTTPError | None = None
         for http_attempt in range(_MAX_HTTP_ATTEMPTS):
@@ -258,6 +278,9 @@ class LLM:
                 started = time.monotonic()
                 try:
                     result = await agent.run(user_prompt)
+                except asyncio.CancelledError:
+                    await self._log_finished(call_id, status="error")
+                    raise
                 except UnexpectedModelBehavior:
                     await self._log_finished(call_id, status="schema_error")
                     raise

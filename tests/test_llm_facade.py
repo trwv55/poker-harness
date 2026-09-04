@@ -20,6 +20,7 @@ Postgres — сессионные, не транзакционные), а зна
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 from pydantic import BaseModel
@@ -34,12 +35,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from harness.memory.models import Job, LlmCall, Trace
 from harness.memory.repos import PlayersRepo, SessionsRepo
 from harness.platform.config import Config, MissingEnvVar
-from harness.platform.limiter import (
-    _ADVISORY_LOCK_CLASS,
-    PgLimiter,
-    PgLimiterTimeout,
-    PgLimiterUnlockFailed,
-)
+from harness.platform.limiter import _ADVISORY_LOCK_CLASS, PgLimiter, PgLimiterTimeout, _engine_of
 from harness.platform.llm import LLM, LLMProviderError, LLMSchemaError, _sniff_image_media_type
 
 # Строки моделей ниже никогда не резолвятся в реального провайдера — во всех тестах
@@ -381,28 +377,83 @@ async def test_acquire_gives_up_with_diagnostics_when_slot_never_frees(db_factor
         await holder.close()
 
 
-async def test_unlock_failure_raises_instead_of_swallowing(db_factory, monkeypatch):
-    """Small item: `pg_advisory_unlock` возвращающий `false` — сигнал, что
-    инвариант слота нарушен, не то, что можно молча проигнорировать (house-style
-    `queue.py`: раскрывать нарушенный инвариант, не проглатывать булев результат).
-    Подменяем сам SQL юнлока на заведомо возвращающий `false` — реальный сценарий
-    рассинхрона (лок снят кем-то ещё до `finally`) труднодостижим детерминированно,
-    а эта подмена бьёт точно в проверяемую ветку кода.
+async def test_unlock_failure_is_logged_not_raised(db_factory, monkeypatch, caplog):
+    """Fix round 2, Item 1 — реверс round-1 рулинга: `pg_advisory_unlock`,
+    вернувший `false`, теперь только `logger.error`, не `raise`. Тело `slot()`
+    успешно — вызывающий не должен получить исключение вместо результата: то же
+    самое, что происходило бы при `raise` — вызывающий воспринял бы успешный
+    (уже оплаченный) вызов провалившимся и ретраил бы его повторно ("платим
+    дважды", см. докстринг `slot()`).
     """
     monkeypatch.setattr("harness.platform.limiter._UNLOCK_SQL", text("SELECT false"))
     lim = PgLimiter(db_factory, max_concurrency=1, max_per_minute=1000)
-    with pytest.raises(PgLimiterUnlockFailed):
+
+    with caplog.at_level(logging.ERROR, logger="harness.platform.limiter"):
+        async with lim.slot():
+            pass  # тело "успешно" — не должно обернуться исключением снаружи
+
+    assert any("pg_advisory_unlock" in r.message for r in caplog.records)
+
+
+async def test_unlock_exception_is_logged_not_raised(db_factory, monkeypatch, caplog):
+    """Расширение Item 1 за буквальный периметр "false" (отмечено в отчёте): если
+    сам вызов `pg_advisory_unlock` падает исключением (а не просто возвращает
+    `false` — например, соединение оборвалось), это тоже не должно подменять
+    исход тела — тот же принцип из того же обоснования. Подмена `_UNLOCK_SQL` на
+    вызов несуществующей функции даёт настоящее исключение SQLAlchemy/asyncpg,
+    не искусственный мок.
+    """
+    monkeypatch.setattr(
+        "harness.platform.limiter._UNLOCK_SQL",
+        text("SELECT pg_advisory_unlock_totally_made_up(:cls, :idx)"),
+    )
+    lim = PgLimiter(db_factory, max_concurrency=1, max_per_minute=1000)
+
+    with caplog.at_level(logging.ERROR, logger="harness.platform.limiter"):
         async with lim.slot():
             pass
 
+    assert any("pg_advisory_unlock" in r.message for r in caplog.records)
 
-def test_sniff_image_media_type_png_and_jpeg():
-    """Small item: захардкоженный `image/png` был неверен для реального входа —
-    Telegram переотдаёт сжатые фото как JPEG (владелец продукта, fix round 1).
-    Магические байты, не расширение файла — вызывающий передаёт голые `bytes`.
+
+async def test_body_exception_survives_unlock_failure(db_factory, monkeypatch, caplog):
+    """Главная регрессия round 2, Item 1 (то, что контроллер просил проверить
+    отдельно): исключение из ТЕЛА `slot()` обязано долететь до вызывающего БЕЗ
+    ИЗМЕНЕНИЙ, даже если юнлок при выходе тоже проваливается. `raise` в
+    `finally` вокруг `yield` заменял бы `BodyBoom` на `PgLimiterUnlockFailed`
+    (round-1 версия) — настоящая причина падения выжила бы только в
+    `__context__`, а вызывающий получил бы не тот тип исключения, который
+    реально всё объясняет.
+    """
+    monkeypatch.setattr("harness.platform.limiter._UNLOCK_SQL", text("SELECT false"))
+    lim = PgLimiter(db_factory, max_concurrency=1, max_per_minute=1000)
+
+    class BodyBoom(Exception):
+        pass
+
+    with (
+        caplog.at_level(logging.ERROR, logger="harness.platform.limiter"),
+        pytest.raises(BodyBoom),
+    ):
+        async with lim.slot():
+            raise BodyBoom("настоящая причина падения")
+
+    assert any("pg_advisory_unlock" in r.message for r in caplog.records)
+
+
+def test_sniff_image_media_type_recognizes_all_four_formats():
+    """Round 1: захардкоженный `image/png` был неверен для реального входа —
+    Telegram переотдаёт сжатые фото как JPEG. Round 2, Item 3: GIF/WebP
+    добавлены следом — пересланный стикер или нетипичный документ иначе поднял
+    бы `ValueError` до вызова модели вместо того, чтобы быть прочитанным, а оба
+    формата провайдер принимает. Магические байты, не расширение файла —
+    вызывающий передаёт голые `bytes`.
     """
     assert _sniff_image_media_type(b"\x89PNG\r\n\x1a\n" + b"...") == "image/png"
     assert _sniff_image_media_type(b"\xff\xd8\xff" + b"...") == "image/jpeg"
+    assert _sniff_image_media_type(b"GIF89a" + b"...") == "image/gif"
+    assert _sniff_image_media_type(b"GIF87a" + b"...") == "image/gif"
+    assert _sniff_image_media_type(b"RIFF" + b"\x00\x00\x00\x00" + b"WEBP" + b"...") == "image/webp"
     with pytest.raises(ValueError):
         _sniff_image_media_type(b"not-an-image-at-all")
 
@@ -450,6 +501,52 @@ async def test_unexpected_exception_finalizes_row_as_error(db_factory):
 
     rows = await fetch_all(db_factory, "select status from llm_calls")
     assert rows == [("error",)]
+
+
+async def test_cancellation_finalizes_row_and_repropagates(db_factory):
+    """Fix round 2, Item 2: `asyncio.CancelledError` наследуется от
+    `BaseException`, не от `Exception` — третий `except Exception` (пункт выше)
+    её НЕ ловит, а в асинхронном воркере с таймаутами отмена — самый частый вид
+    незапланированного выхода, не редкий случай. Отдельный `except
+    asyncio.CancelledError` обязан и закрыть строку `llm_calls`, и
+    перевыбросить — проглоченная отмена ломает распространение отмены по
+    дереву задач, не только эту попытку.
+
+    Настоящая отмена, не имитация: задача создаётся, получает время дойти до
+    `await asyncio.sleep(10)` внутри `agent.run()`, затем `task.cancel()` —
+    ровно то, что происходит, когда внешний таймаут отменяет застрявший вызов.
+    """
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=10)
+
+    async def slow(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        await asyncio.sleep(10)
+        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={"text": "ok"})])
+
+    llm = LLM(cfg, db_factory, model_override=FunctionModel(slow))
+    task = asyncio.ensure_future(
+        llm("verdict_text", Out, prompt="скажи привет", trace_id=trace_id)
+    )
+    await asyncio.sleep(0.1)  # дать корутине дойти до agent.run() -> asyncio.sleep(10)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    rows = await fetch_all(db_factory, "select status from llm_calls")
+    assert rows == [("error",)]
+
+
+def test_engine_of_rejects_non_engine_bind():
+    """Fix round 2, Item 4: `session_factory.kw["bind"]` типизирован SQLAlchemy
+    как `Any` — конструктор `async_sessionmaker` не проверяет `bind` сам
+    (принимает что угодно молча). `_engine_of` — единственное место, где
+    `PgLimiter` действительно проверяет, что там реально `AsyncEngine`, вместо
+    того чтобы упасть тремя уровнями глубже внутри `slot()` с непонятным
+    `AttributeError`.
+    """
+    fake_factory = async_sessionmaker(bind="не движок, а строка")  # pyright: ignore[reportArgumentType]
+    with pytest.raises(TypeError, match="AsyncEngine"):
+        _engine_of(fake_factory)
 
 
 def test_config_from_env_reads_all_six_vars(monkeypatch):

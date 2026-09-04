@@ -19,7 +19,19 @@ from harness.memory.models import Base
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # `disable_existing_loggers=False` — стандартный `True` из stdlib молча
+    # отключает (`.disabled = True`) ЛЮБОЙ логгер, уже созданный к этому
+    # моменту в процессе и не перечисленный в `[loggers]` alembic.ini (там
+    # только root/sqlalchemy/alembic). Найдено на живом коде (задача 16, fix
+    # round 2): `tests/conftest.py`, фикстура `pg`, вызывает `command.upgrade`
+    # в этом же процессе — и логгеры `harness.platform.limiter`/`.llm`
+    # (создаются `logging.getLogger(__name__)` при импорте модуля, до того как
+    # эта фикстура вообще запускается) молча переставали писать куда бы то ни
+    # было, без единой ошибки. Не только тестовая проблема: то же самое ждало
+    # бы любой процесс, который вызовет `alembic.command.upgrade(...)`
+    # программно (не отдельным CLI-шагом) после того, как что-то уже завело
+    # свой логгер.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

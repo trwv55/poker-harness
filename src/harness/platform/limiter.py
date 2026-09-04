@@ -67,10 +67,30 @@ session-scoped advisory-лок НЕ снимает. Локи Postgres реент
 вечный неотличимый от нормальной работы стопор всего конвейера: `_wait_for_
 rate_window`/`_acquire_advisory_lock` логируют предупреждение каждые
 `_STALL_LOG_INTERVAL_S` секунд ожидания и сдаются `PgLimiterTimeout`, если
-ожидание перевалило за `_ACQUIRE_TIMEOUT_S`, — не потому что долгое ожидание
-темпа/слота само по себе ошибка (это и есть работа лимитера под честной
-нагрузкой), а потому что ожидание, которое не заканчивается НИКОГДА и никак
-не сигнализирует об этом, неотличимо от повисшего процесса.
+ожидание перевалило за `_ACQUIRE_TIMEOUT_S` (число и его обоснование —
+см. константу ниже), — не потому что долгое ожидание темпа/слота само по себе
+ошибка (это и есть работа лимитера под честной нагрузкой), а потому что
+ожидание, которое не заканчивается НИКОГДА и никак не сигнализирует об этом,
+неотличимо от повисшего процесса.
+
+**Провал `pg_advisory_unlock` — логируется, не поднимается (fix round 2,
+Item 1 — реверс собственного рулинга round 1).** Прошлая версия делала здесь
+`raise PgLimiterUnlockFailed(...)`: формально верный house-style («раскрывать
+нарушенный инвариант, не глотать булев результат», см. `queue.py`), но неверный
+именно в этом месте. `raise` внутри `finally` вокруг `yield` ЗАМЕНЯЕТ собой то,
+что происходило в теле `slot()` — не дополняет, а подменяет: настоящая ошибка
+тела (`LLMProviderError` и т.п.) становится `PgLimiterUnlockFailed`, а
+реальная причина выживает только в `__context__`; хуже — успешный, уже
+СПИСАННЫЙ У ПРОВАЙДЕРА вызов (строка `llm_calls` уже `status='ok'`) превращался
+бы в исключение для вызывающего, который честно ретраил бы то, что на самом
+деле уже прошло и было оплачено. Лимитер существует, чтобы контролировать
+расходы на провайдера — превращать успех в повторный платный вызов ровно
+противоположно его смыслу. Пойманная неудача `pg_advisory_unlock` — что
+`false`, что исключение из самого вызова (соединение оборвалось) — теперь
+только `logger.error`/`logger.exception`, исход тела `slot()` уходит наружу
+нетронутым. Не замалчивание: пробой лока громко виден в логе, а самолечение
+(`pg_advisory_unlock_all()`, Important 1 выше) снимет утечку принудительно при
+следующем чекауте этого же физического соединения.
 
 Внутрипроцессный `asyncio.Semaphore` в этом модуле НЕ живёт: он допустим лишь
 как дешёвый предфильтр внутри `LLM.__call__`, источником истины не является —
@@ -87,7 +107,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker
 
 logger = logging.getLogger(__name__)
 
@@ -114,11 +134,32 @@ _JITTER_MIN_S = 0.05
 _JITTER_MAX_S = 0.15
 
 # fix round 1, Important 2: не тихое зависание навсегда — периодический сигнал
-# в лог, затем явная сдача. Оба числа — инженерные, не из спеки: ожидание темпа
-# и слота одновременности — ОЖИДАЕМОЕ поведение лимитера под честной нагрузкой,
-# 120с — щедрый потолок для "что-то структурно сломано", не для "многовато
-# работы".
+# в лог, затем явная сдача.
 _STALL_LOG_INTERVAL_S = 5.0
+
+# 120с — не вкусовое число, а отношение к другому таймауту системы (round 2,
+# ответ контроллера на concern round 1): `JobsQueue.reap()` (задача 15) по
+# умолчанию считает воркера зависшим и ставит его задачу обратно в очередь
+# после `older_than_minutes=10` (600с) молчания. Если лимитер будет ждать
+# слот/окно ДОЛЬШЕ этого порога, reaper успеет отдать ТУ ЖЕ задачу другому
+# воркеру, пока первый всё ещё сидит внутри `slot()` — одна и та же задача
+# обрабатывается дважды одновременно. 120с — заведомо внутри 600-секундного
+# окна, с запасом на то, чтобы вызывающий (LLM._attempt, задача 16) успел
+# честно завершиться отказом до того, как reaper вообще заметит зависание.
+#
+# Важно: темп и одновременность — НЕЗАВИСИМЫЕ ожидания одного `slot()`
+# (сначала одно, потом другое), поэтому в худшем случае — если окно темпа
+# освободилось только к самой границе, а слот одновременности пришлось ждать
+# отдельно — один вызов `slot()` может стоять до ~240с, не 120с, прежде чем
+# сдаться `PgLimiterTimeout`. 240с всё ещё заведомо внутри 600-секундного окна
+# reaper'а, но это стоит знать явно, а не переоткрывать при инциденте: полная
+# цепочка вызова `LLM.__call__` (до `_MAX_HTTP_ATTEMPTS` × `_MAX_SCHEMA_
+# ATTEMPTS` разных `slot()`) в патологическом худшем случае может звать
+# `slot()` несколько раз подряд — арифметически кратно 240с, а не одному разу;
+# на практике для этого пришлось бы, чтобы окно/слот были насыщены на КАЖДОЙ
+# из нескольких независимых попыток подряд — сценарий не невозможный, но
+# существенно менее вероятный, чем разовое насыщение. Явно поднято как
+# concern в отчёте задачи 16, не решено самостоятельным уменьшением констант.
 _ACQUIRE_TIMEOUT_S = 120.0
 
 _RATE_WINDOW_SQL = text(
@@ -138,25 +179,34 @@ class PgLimiterTimeout(Exception):
     успело подобрать)."""
 
 
-class PgLimiterUnlockFailed(Exception):
-    """`pg_advisory_unlock` вернул `false` — слот, который этот `slot()` считал
-    своим, к моменту освобождения им не был (fix round 1, small item: house-
-    style из `queue.py` — раскрывать нарушенный инвариант, не проглатывать
-    булев результат молча)."""
-
-
 def _jitter() -> float:
     return random.uniform(_JITTER_MIN_S, _JITTER_MAX_S)
+
+
+def _engine_of(session_factory: async_sessionmaker[AsyncSession]) -> AsyncEngine:
+    """`session_factory.kw["bind"]` — тот же приём, что `db_factory` в
+    `conftest.py`, но `sessionmaker.kw` типизирован SQLAlchemy как `dict[str,
+    Any]` — pyright не может подтвердить отсюда, что это именно `AsyncEngine`
+    (fix round 2, Item 4). Явная проверка — не формальность: если когда-нибудь
+    `PgLimiter` создадут от sessionmaker'а без движка или с другим `bind`,
+    лучше `TypeError` здесь, в конструкторе, чем `AttributeError` тремя
+    уровнями глубже внутри `slot()` на первом же вызове.
+    """
+    engine = session_factory.kw["bind"]
+    if not isinstance(engine, AsyncEngine):
+        raise TypeError(
+            f"session_factory.kw['bind'] — не AsyncEngine, а {type(engine)!r}"
+        )
+    return engine
 
 
 class PgLimiter:
     """Пул из `max_concurrency` слотов плюс окно `max_per_minute` вызовов в минуту,
     оба — над `session_factory` (задача 14: тот же `async_sessionmaker`, что и у
-    `JobsQueue`, `db_factory` в тестах). Физическое соединение для `slot()`
-    достаётся напрямую из движка (`session_factory.kw["bind"]` — тот же приём,
-    что `db_factory` в `conftest.py`), а не через `session_factory()`: нужно
-    сырое `AsyncConnection` с `AUTOCOMMIT`, не ORM-сессию (см. модульный
-    докстринг, "Пиннинг соединения").
+    `JobsQueue`, `db_factory` в тестах) — конструктор принимает именно его, для
+    единообразия с `JobsQueue`/`LLM`, хотя внутри `slot()` работает не с ним, а
+    с движком (`_engine_of`, см. выше): нужно сырое `AsyncConnection` с
+    `AUTOCOMMIT`, не ORM-сессию (см. модульный докстринг, "Пиннинг соединения").
     """
 
     def __init__(
@@ -166,8 +216,7 @@ class PgLimiter:
         max_concurrency: int,
         max_per_minute: int,
     ) -> None:
-        self._session_factory = session_factory
-        self._engine = session_factory.kw["bind"]
+        self._engine = _engine_of(session_factory)
         self._max_concurrency = max_concurrency
         self._max_per_minute = max_per_minute
 
@@ -193,14 +242,31 @@ class PgLimiter:
             try:
                 yield
             finally:
-                released = await conn.scalar(
-                    _UNLOCK_SQL, {"cls": _ADVISORY_LOCK_CLASS, "idx": slot_index}
-                )
-                if not released:
-                    raise PgLimiterUnlockFailed(
-                        f"pg_advisory_unlock({_ADVISORY_LOCK_CLASS}, {slot_index}) "
-                        "вернул false — слот не был занят этим соединением к моменту "
-                        "разблокировки"
+                # fix round 2, Item 1: НИЧЕГО отсюда не поднимается наружу —
+                # ни `false` от `pg_advisory_unlock`, ни исключение из самого
+                # вызова (соединение оборвалось) — только громкий лог. См.
+                # модульный докстринг: `raise` здесь подменял бы исход тела
+                # `yield`, вплоть до превращения оплаченного успеха в ошибку.
+                try:
+                    released = await conn.scalar(
+                        _UNLOCK_SQL, {"cls": _ADVISORY_LOCK_CLASS, "idx": slot_index}
+                    )
+                    if not released:
+                        logger.error(
+                            "PgLimiter: pg_advisory_unlock(%s, %s) вернул false — "
+                            "слот, который держало это соединение, свободным к "
+                            "моменту освобождения не значился; самолечение снимет "
+                            "утечку на следующем чекауте этого соединения",
+                            _ADVISORY_LOCK_CLASS,
+                            slot_index,
+                        )
+                except Exception:
+                    logger.exception(
+                        "PgLimiter: pg_advisory_unlock(%s, %s) сам упал — "
+                        "соединение могло оборваться; самолечение снимет утечку "
+                        "на следующем чекауте этого соединения",
+                        _ADVISORY_LOCK_CLASS,
+                        slot_index,
                     )
         finally:
             await conn.close()
