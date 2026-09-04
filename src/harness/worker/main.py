@@ -30,7 +30,7 @@ import httpx
 import structlog
 
 from harness.memory.models import async_session_factory
-from harness.platform.config import Config
+from harness.platform.config import Config, MissingEnvVar
 from harness.platform.llm import LLM
 from harness.platform.logs import configure_logging
 from harness.platform.queue import JobsQueue
@@ -159,4 +159,13 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except MissingEnvVar as exc:
+        # Контейнер без `.env` обязан сказать ОДНОЙ строкой, чего именно не
+        # хватает (задача 20): трассировка на восемь кадров в `docker compose
+        # logs` про непрочитанную переменную — шум, в котором причина теряется, а
+        # `SystemExit` со строкой печатает её в stderr и выходит с кодом 1, без
+        # стека. Ловится только `MissingEnvVar`: любое ДРУГОЕ исключение при
+        # старте — настоящая поломка, и его трассировка нужна целиком.
+        raise SystemExit(f"{exc}; заполните .env, образец — .env.example") from exc

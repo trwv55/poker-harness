@@ -1,0 +1,155 @@
+# Деплой v1 (спека §12): `postgres`, `bot`, `worker` на одном VPS; миграции —
+# отдельный одноразовый шаг `migrate`, а не entrypoint приложений.
+#
+# Порядок деплоя и бэкап — в README, раздел «Деплой».
+#
+# ====== ОБЩИЙ ТОМ ДЛЯ ФАЙЛОВ ИГРОКА ======
+# Бот сохраняет присланный hand history в `DATA_DIR/hh/{sha256}.txt` и кладёт
+# АБСОЛЮТНЫЙ путь в `jobs.payload.source_file` (`bot/handlers.py`); воркер читает
+# файл ровно по этому пути (`worker/pipeline.py`, `Path(source_file).read_text()`).
+# Это разные контейнеры, поэтому нужны две вещи, и обе — здесь:
+#   (1) один и тот же том `hh_files`, смонтированный в оба сервиса;
+#   (2) ОДИНАКОВАЯ точка монтирования и явный `DATA_DIR` в обоих: путь в БД
+#       абсолютный и записан ботом, так что разъехавшиеся точки монтирования
+#       дадут `FileNotFoundError` на первом же файле, причём не при старте, а
+#       посреди разбора.
+# Дефолт `/data` в коде (`bot/main.py`) существует, но полагаться на него здесь
+# нельзя: у бота и воркера это должно быть ОДНО значение, а совпадение двух
+# независимых дефолтов — не гарантия, а совпадение.
+#
+# Том именованный, а НЕ bind-mount `./data:/data`, и это осознанно: в нём лежат
+# сырые hand history игроков, и рабочее дерево репозитория — последнее место, где
+# им место (docs/publishing-policy.md; `/data/` закрыт .gitignore и pre-push
+# хуком ровно на случай локального запуска с `DATA_DIR=./data`). Именованный том
+# живёт в /var/lib/docker/volumes и в дерево репозитория не попадает вовсе.
+
+name: poker-harness
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: harness
+      POSTGRES_USER: harness
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?не задан PG_PASSWORD — скопируйте .env.example в .env и заполните}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Healthcheck не украшение: и `migrate`, и приложения ждут по нему. Голый
+    # `depends_on` гарантирует только то, что контейнер СОЗДАН, а `alembic
+    # upgrade head` сразу после `up` успевает постучаться в ещё не поднявшийся
+    # Postgres и упасть «connection refused» — то есть ровно на первом шаге
+    # деплоя, где это дороже всего.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U harness -d harness"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  migrate:
+    build: .
+    # Один и тот же тег у всех трёх сервисов — это и есть «один образ» из шапки
+    # Dockerfile, сделанное проверяемым: `docker compose images` показывает у
+    # поднятых bot и worker ОДИН image id, то есть развезти версию того, кто
+    # записал файл, и того, кто его читает, нельзя даже случайно.
+    image: poker-harness:local
+    # Образ собирается под amd64 намеренно: eval7 не публикует ни sdist, ни
+    # колёса под linux/arm64 (см. шапку Dockerfile). На amd64-хосте строка
+    # ничего не меняет, на arm — честно включает эмуляцию вместо непонятной
+    # ошибки резолвера в середине сборки.
+    platform: linux/amd64
+    # `profiles` — чтобы сервис НЕ стартовал вместе с `up`: миграции катятся
+    # одним явным шагом (`docker compose run --rm migrate`), а не каждым
+    # рестартом контейнера. `run` включает профиль сам, отдельный флаг не нужен.
+    profiles: ["tools"]
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      # Драйвер здесь psycopg (СИНХРОННЫЙ), а у приложений ниже — asyncpg, и это
+      # не опечатка: `migrations/env.py` держит обычный `engine_from_config`
+      # (миграции — одноразовый шаг, корутины им не нужны), а рантайм работает
+      # через `create_async_engine` (`memory/models.py`). Одна переменная на оба
+      # случая невозможна в принципе, поэтому DSN собирается здесь, из пароля, а
+      # не приходит целиком из `.env`.
+      DATABASE_URL: postgresql+psycopg://harness:${PG_PASSWORD:?не задан PG_PASSWORD}@postgres:5432/harness
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  bot:
+    build: .
+    image: poker-harness:local
+    platform: linux/amd64
+    command: ["python", "-m", "harness.bot.main"]
+    # `environment` перекрывает `env_file` — это свойство compose здесь работает
+    # на нас: топология (имя сервиса БД, точка монтирования тома) задаётся
+    # композицией и не может быть случайно переопределена строкой в `.env`.
+    environment:
+      DATABASE_URL: postgresql+asyncpg://harness:${PG_PASSWORD:?не задан PG_PASSWORD}@postgres:5432/harness
+      DATA_DIR: /data
+    # `required: false`: `.env` — обычный источник секретов на VPS, но не
+    # единственно возможный (systemd, менеджер секретов, окружение оболочки).
+    # Отсутствие файла само по себе не ошибка; отсутствие ПЕРЕМЕННОЙ — ошибка, и
+    # процесс называет её одной строкой при старте (`Config.from_env`).
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - hh_files:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: .
+    image: poker-harness:local
+    platform: linux/amd64
+    command: ["python", "-m", "harness.worker.main"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://harness:${PG_PASSWORD:?не задан PG_PASSWORD}@postgres:5432/harness
+      # Тот же том и та же точка монтирования, что у бота, — см. шапку файла.
+      DATA_DIR: /data
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - hh_files:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Убийство воркера на середине задачи её не теряет: строка остаётся
+    # заблокированной, и `reap()` соседнего (или перезапущенного) воркера
+    # возвращает её в очередь через окно аренды — спека §8.1.
+    restart: unless-stopped
+    # ====== `WORKER_CONCURRENCY`, ПРОЦЕССНЫЙ ПУЛ И `--scale worker=2` ======
+    # `WORKER_CONCURRENCY` (из `.env`, дефолт 4) — это число КОРУТИН одного
+    # процесса, то есть сколько задач разбирается одновременно. Тяжёлый счёт при
+    # этом уходит в `ProcessPoolExecutor()` БЕЗ `max_workers`, а это
+    # `os.cpu_count()` процессов — число ядер ХОСТА, и оно не уменьшается от
+    # cgroup-лимита `cpus:` (тот режет долю процессорного времени, а не видимое
+    # число ядер) и на 3.12 не уменьшается даже от `cpuset`: пул берёт именно
+    # `os.cpu_count()` (проверено в собранном образе: `concurrent/futures/
+    # process.py:673`), а `os.process_cpu_count()`, который учитывает affinity,
+    # в 3.12 не существует вовсе и используется пулом только с 3.13. Отсюда два
+    # вывода, которые лучше знать до, а не после:
+    #   1. `docker compose up -d --scale worker=2` на VPS с 2–4 vCPU НЕ удваивает
+    #      пропускную способность. Он удваивает число процессов, дерущихся за те
+    #      же ядра, и удваивает память: каждый процесс пула заново импортирует
+    #      pokerkit/eval7 и греет свои кэши. Реплики имеют смысл, когда добавлены
+    #      ядра (или когда воркеры разъехались по хостам), а не когда очередь
+    #      длинная.
+    #   2. Вертикальная настройка на одном хосте — это `WORKER_CONCURRENCY`, а
+    #      размер процессного пула сегодня не настраивается ничем: он не читает
+    #      ни переменную окружения, ни лимит контейнера. Если понадобится держать
+    #      воркер в рамках части ядер, сначала придётся сделать размер пула
+    #      настраиваемым (правка в `worker/main.py`), а не дописывать `cpus:`
+    #      сюда — лимит на уровне compose даст не «меньше процессов», а те же
+    #      процессы на меньшей доле CPU.
+
+volumes:
+  pgdata: {}
+  # Файлы, присланные игроками (`DATA_DIR/hh/{sha256}.txt`). Общий для `bot` и
+  # `worker`, переживает пересборку образа и `up -d`; удаляется только явным
+  # `docker compose down -v` — вместе с БД.
+  hh_files: {}

@@ -11,7 +11,10 @@
 это путь тома конкретного процесса, и делать его обязательной переменной для ВСЕХ
 потребителей `Config` (воркер, evals) значило бы требовать от них знать то, что их
 не касается. Дефолт `/data` — точка монтирования тома (спека §6: файлы на диске в
-volume), а не угаданное продуктовое число.
+volume), а не угаданное продуктовое число. В деплое (задача 20) переменная всё
+равно задаётся ЯВНО и одинаково у бота и у воркера (docker-compose.yml): путь,
+который бот кладёт в `jobs.payload`, абсолютный, воркер читает файл ровно по нему,
+а совпадение двух независимых дефолтов в двух контейнерах — не гарантия равенства.
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ from aiogram import Bot, Dispatcher
 from harness.bot.handlers import BotDeps
 from harness.bot.router import build_router
 from harness.memory.models import async_session_factory
-from harness.platform.config import Config
+from harness.platform.config import Config, MissingEnvVar
 from harness.platform.logs import configure_logging
 from harness.platform.queue import JobsQueue
 
@@ -51,4 +54,13 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except MissingEnvVar as exc:
+        # Контейнер без `.env` обязан сказать ОДНОЙ строкой, чего именно не
+        # хватает (задача 20): трассировка на восемь кадров в `docker compose
+        # logs` про непрочитанную переменную — шум, в котором причина теряется, а
+        # `SystemExit` со строкой печатает её в stderr и выходит с кодом 1, без
+        # стека. Ловится только `MissingEnvVar`: любое ДРУГОЕ исключение при
+        # старте — настоящая поломка, и его трассировка нужна целиком.
+        raise SystemExit(f"{exc}; заполните .env, образец — .env.example") from exc
