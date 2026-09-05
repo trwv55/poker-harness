@@ -153,12 +153,90 @@ def _create_state(hand: CanonicalHand, seating: list[str]) -> State:
     )
 
 
+def _playable(state: State, index: int) -> int:
+    """Фишки игрока, которыми ещё играется текущий круг торговли.
+
+    Остаток стека плюс уже поставленное в этом круге. Именно остаток стека сам по
+    себе для глубины не годится: у игрока в олл-ине он равен нулю, и любой счёт
+    «по остаткам» такого игрока просто не видит.
+
+    Префлоп `bets` несёт блайнд и всё добровольное, а анте к этому моменту уже
+    собрано в банк, поэтому величина равна стартовому стеку за вычетом анте —
+    ровно той глубине, которой индексируется равновесие пуш-фолда
+    (`analysis.classifier.SeatSnapshot.stack_after_ante`). Это не совпадение
+    формул, а требование: гейт глубины обязан пускать к модели то же, что модель
+    считает. Затянуто тестом
+    `tests/test_preflop_analysis.py::test_eff_stack_is_the_depth_the_model_indexes_by`
+    (настоящая рука с анте 750); на обеих фикстурах сверено 2536 раз
+    игрок×точка, ноль расхождений.
+
+    Постфлоп `bets` обнуляются на границе улицы, поэтому там это стек, с которым
+    игрок вошёл в улицу: деньги прошлых улиц уже в банке и в глубину не входят.
+    """
+    return state.stacks[index] + state.bets[index]
+
+
+def _effective_stack(state: State, actor: int, aggressor: int | None) -> int:
+    """Глубина, на которую играется решение: против того, чью ставку отвечают.
+
+    Раньше здесь стоял максимум остатков стека по всем живым оппонентам, и это
+    был структурный дефект: у игрока в олл-ине остаток нулевой, поэтому максимум
+    **никогда** его не выбирал — он всегда предпочитал любого, у кого фишки ещё
+    есть. Герой, отвечающий на шов, мерился против игрока, которого в этом
+    решении нет вовсе: шов на 2.1bb получал глубину 30.7bb по стеку постороннего
+    и вылетал из пуш-фолд-зоны как «слишком глубокий».
+
+    Оппонент — последний, кто ставил или повышал в текущем круге: именно его
+    ставку решающий коллирует или сбрасывает, и именно его диапазоном спот
+    моделируется (`analysis.classifier.TableState.aggressor` — тот же игрок,
+    восстановленный из строк руки независимо от движка).
+
+    Три случая, которые эта величина обязана держать:
+
+    1. **Мультивей.** Герой отвечает на шов A, а живой B с глубоким стеком ещё в
+       руке. Меряем против A. Цена ЭТОГО решения ограничена шовом A, и модель
+       судит его против диапазона A; глубина обязана называть ту же величину,
+       иначе гейт допускает к модели не то, что модель считает. Проиграть герой
+       может и B — но это не вопрос глубины, а вопрос допущения, и он уже задан
+       отдельной осью: `analysis.preflop._facing_shove_verdict` пересчитывает EV
+       со входом всех живых, кроме героя и шовера, и при сдвиге вердикта роняет
+       зону в `assuming`. Учесть B ещё и в глубине значило бы применить одну
+       поправку дважды и молча выбросить чистый пуш-фолд-спот вместо того, чтобы
+       честно пометить его допущением.
+    2. **Агрессора нет вовсе** — неоткрытый банк (до решающего только посты и
+       лимпы) или круг, в котором ещё никто не ставил. Отвечать не на что,
+       конкретного оппонента у решения нет, и величина возвращается к своему
+       общему смыслу — потолок руки: больше, чем есть у самого глубокого живого
+       оппонента, выиграть или проиграть нельзя. Одним числом такой спот и не
+       описывается: против каждого живого глубина своя, и модель шова считает их
+       по отдельности (`_unopened_verdict`: `min(глубина героя, глубина
+       позади_i)` для каждого игрока позади). Одно число здесь — гейт
+       применимости, и берётся самый глубокий: шов героя на 40bb остаётся
+       решением на 40bb, даже если один из оппонентов позади сидит с 3bb. Взять
+       самого короткого значило бы объявить пуш-фолдом любой спот, где за столом
+       нашёлся хоть один короткий стек.
+    3. **Постфлоп.** Числитель SPR — стек на входе в улицу (см. `_playable`), то
+       есть штатный числитель SPR из учебника, а не «остаток после собственной
+       ставки». Знаменателем как был, так и остаётся банк на момент решения:
+       ставки текущей улицы в него входят, поэтому против ставки отношение выйдет
+       ниже учебного. Это свойство `pot_before`, а не глубины, и разбирать его
+       место — ступень 2 (постфлоп пока не оценивается вовсе).
+    """
+    if aggressor is not None and aggressor != actor and state.statuses[aggressor]:
+        return min(_playable(state, actor), _playable(state, aggressor))
+    rivals = [
+        _playable(state, i) for i in state.player_indices if i != actor and state.statuses[i]
+    ]
+    return min(_playable(state, actor), max(rivals)) if rivals else _playable(state, actor)
+
+
 def _decision_point(
     state: State,
     hand: CanonicalHand,
     seating: list[str],
     action: CanonicalAction,
     index: int,
+    aggressor: int | None,
 ) -> DecisionPoint:
     """Снимок состояния перед решением игрока.
 
@@ -169,8 +247,10 @@ def _decision_point(
     завысить шансы банка. На тестовой руке это даёт 14532, а `pot_before + to_call`
     — 14673, ровно тот мейн-пот, который записал рум.
 
-    `eff_stack` — минимум из остатка стека решающего и наибольшего остатка среди
-    живых оппонентов: больше этого в руке выиграть или проиграть нельзя.
+    `eff_stack` — глубина решения против того, чью ставку отвечают, см.
+    `_effective_stack`. `aggressor` — место последнего, кто ставил или повышал в
+    этом круге, или `None`, если таких не было.
+
     `live_total` и `live_behind` — вход правила зоны доверия: сколько игроков ещё
     в руке и сколько из них ходят после решающего в текущем круге.
     """
@@ -183,10 +263,7 @@ def _decision_point(
     committed = [-state.payoffs[i] for i in state.player_indices]
     ceiling = committed[actor] + state.stacks[actor]
     pot_before = sum(min(amount, ceiling) for amount in committed)
-    opponents = [
-        state.stacks[i] for i in state.player_indices if i != actor and state.statuses[i]
-    ]
-    eff_stack = min(state.stacks[actor], max(opponents)) if opponents else state.stacks[actor]
+    eff_stack = _effective_stack(state, actor, aggressor)
     spr = eff_stack / pot_before if street is not Street.PREFLOP and pot_before else None
     return DecisionPoint(
         index=index,
@@ -233,6 +310,12 @@ class _Replay:
         self.forfeits: list[str] = []
         self._street_index = self.state.street_index
         self._uncalled = 0
+        # Место последнего, кто ставил или повышал в текущем круге, — оппонент,
+        # против которого меряется глубина решения (см. `_effective_stack`).
+        # Ведём его реплеем, а не выводим из `state.bets`: там ставку агрессора
+        # уравнивает коллер, и по одним суммам последний агрессор от уравнявшего
+        # неотличим.
+        self._aggressor: int | None = None
 
     def run(self) -> None:
         for _ in range(_MAX_STEPS):
@@ -402,6 +485,9 @@ class _Replay:
             street = _STREET_BY_INDEX[self._street_index]
             self.pot_by_street[street] = self._pot_now()
         self._street_index = self.state.street_index
+        # Новая улица — торговля начинается заново, прежний агрессор к ней
+        # отношения не имеет.
+        self._aggressor = None
 
     def _deal_hole(self) -> None:
         index = self.state.hole_dealee_index
@@ -443,7 +529,9 @@ class _Replay:
             return False
         if action.label == self.hand.hero_label:
             self.points.append(
-                _decision_point(self.state, self.hand, self.seating, action, len(self.points))
+                _decision_point(
+                    self.state, self.hand, self.seating, action, len(self.points), self._aggressor
+                )
             )
 
         try:
@@ -451,6 +539,10 @@ class _Replay:
         except ValueError as exc:
             self.illegal.append(f"{action.raw_line}: {exc}")
             return False
+        # После применения, а не до: снимок точки решения обязан видеть агрессора,
+        # которому решающий отвечает, а не самого решающего.
+        if action.kind in (ActionKind.BET, ActionKind.RAISE):
+            self._aggressor = actor
 
         if action.kind != ActionKind.FOLD and self.state.bets[actor] != action.committed_after:
             self.illegal.append(

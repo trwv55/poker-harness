@@ -134,6 +134,97 @@ def test_decision_point_pot_is_only_what_hero_can_win():
     assert dp.pot_before + dp.to_call == 14673
 
 
+def _short_shove_against_deep_hand() -> CanonicalHand:
+    """Короткий стек шовит, у Hero глубокий стек, и позади него ещё живой глубокий игрок.
+
+    Раздача построена ровно под дефект: живой оппонент, которого решение не
+    касается, здесь ГЛУБЖЕ шовера. Старая формула (максимум ОСТАТКОВ стеков) в
+    ней обязана взять именно его — у шовера остаток нулевой, и максимум его
+    никогда не выберет.
+    """
+    raw = RawHand(
+        provenance=Provenance.HAND_HISTORY,
+        source_ref="x",
+        hand_no="S1",
+        tournament_id="1",
+        tournament_name="T",
+        level=1,
+        sb=1000,
+        bb=2000,
+        ante=200,
+        timestamp=datetime(2026, 8, 21, 3, 4, 5),  # noqa: DTZ001
+        table_name="1",
+        max_seats=3,
+        button_seat=1,
+        seats=[
+            SeatInfo(seat=1, label="shover", stack=6200),  # 3.1bb, из них 0.1bb анте
+            SeatInfo(seat=2, label="Hero", stack=80_000),  # 40bb
+            SeatInfo(seat=3, label="deep", stack=80_000),  # 40bb, ходит ПОСЛЕ Hero
+        ],
+        posts=[
+            Post(label="shover", kind=PostKind.ANTE, amount=200),
+            Post(label="Hero", kind=PostKind.ANTE, amount=200),
+            Post(label="deep", kind=PostKind.ANTE, amount=200),
+            Post(label="Hero", kind=PostKind.SMALL_BLIND, amount=1000),
+            Post(label="deep", kind=PostKind.BIG_BLIND, amount=2000),
+        ],
+        actions=[
+            RawAction(
+                street=Street.PREFLOP,
+                label="shover",
+                kind=ActionKind.RAISE,
+                amount=6000,
+                to_amount=6000,
+                is_all_in=True,
+                raw_line="shover: raises 6,000 to 6,000 and is all-in",
+            ),
+            RawAction(
+                street=Street.PREFLOP, label="Hero", kind=ActionKind.FOLD, raw_line="Hero: folds"
+            ),
+            RawAction(
+                street=Street.PREFLOP, label="deep", kind=ActionKind.FOLD, raw_line="deep: folds"
+            ),
+        ],
+        dealt={"Hero": ["Ks", "Qd"]},
+        uncalled=[Uncalled(label="shover", amount=4000)],
+        collected=[Collected(label="shover", amount=5600)],
+        summary=SummaryInfo(total_pot=5600, rake=0, jackpot=0, bingo=0, fortune=0, tax=0),
+    )
+    return normalize(raw)
+
+
+def test_eff_stack_is_measured_against_the_shover():
+    """Глубина решения — против того, чью ставку Hero отвечает, а не против стола.
+
+    Шов на 3bb здесь и есть весь спот: больше 3bb в этом решении не разыграть.
+    Прежняя формула брала максимум ОСТАТКОВ живых оппонентов, а у шовера остаток
+    нулевой — она выбирала глубокого игрока позади и объявляла тот же спот
+    39-битовым, то есть «глубже пуш-фолд-зоны». На реальных данных так вылетели
+    из разбора 23 точки, где Hero отвечал на олл-ин.
+
+    Числа теста подобраны так, что подмена оппонента видна в самом значении:
+    3.0bb против 38.9bb — не округление, а другой игрок.
+    """
+    en = enrich(_short_shove_against_deep_hand())
+    assert en.verdict.status == "pass"
+    assert en.report.illegal_actions == []
+    dp = next(d for d in en.report.decision_points if d.label == "Hero")
+    assert dp.to_call == 5000  # шов 6000 против 1000 малого блайнда Hero
+
+    # Стек шовера за вычетом анте: 6200 - 200. Анте — мёртвые деньги, уже в
+    # банке, и глубиной игры они не являются (та же величина, которой
+    # индексируется равновесие: `classifier.SeatSnapshot.stack_after_ante`).
+    assert dp.eff_stack == 6000
+    assert dp.eff_stack_bb == 3.0
+
+    # Контрольная величина: то, что дала бы старая формула. Живой глубокий
+    # игрок позади здесь есть, и он в 13 раз глубже шовера — если тест
+    # когда-нибудь снова начнёт мерить против него, он покажет 38.9bb.
+    deep_behind = 80_000 - 200 - 2000
+    assert deep_behind / 2000 > 15.0
+    assert dp.eff_stack != deep_behind
+
+
 @requires_fixtures
 def test_forfeit_of_blind_all_in_is_honoured():
     """Реальная рука: рум пишет `folds` игроку, ушедшему в олл-ин блайндом.

@@ -10,7 +10,12 @@ from datetime import UTC, datetime
 import pytest
 
 from harness.analysis import analyze_hand
-from harness.analysis.classifier import classify
+from harness.analysis.classifier import (
+    PUSHFOLD_MAX_EFF_BB,
+    classify,
+    spot_for,
+    table_state,
+)
 from harness.analysis.error_cost import rank_points, total_ev_loss_bb
 from harness.analysis.preflop import zone_for
 from harness.contracts import (
@@ -213,7 +218,79 @@ def _make_facing_shove_hand(hero_cards: tuple[str, str], eff_bb: float, shover_b
     return enrich(normalize(raw))
 
 
+def _make_shove_with_deep_player_behind(shover_bb: float, hero_bb: float, deep_bb: float):
+    """UTG шовит коротким стеком, Hero в SB пасует, а глубокий BB ещё не ходил.
+
+    Здесь ровно та форма, на которой ломалась глубина: живой игрок, которого
+    решение Hero не касается, глубже шовера. Все, кто между ними, пасуют — они
+    из живых выбывают и на прежнюю формулу не влияли бы.
+    """
+    deep = round(deep_bb * _BB)
+    stacks = dict.fromkeys(_SIX_MAX_SEATS, deep)
+    stacks["UTG"] = round(shover_bb * _BB)
+    stacks["SB"] = round(hero_bb * _BB)
+    stacks["BB"] = deep
+    labels, seats, posts = _six_max(stacks, "SB")
+    actions = [_shove(labels["UTG"], stacks["UTG"])]
+    actions += [_fold(labels[pos]) for pos in ("HJ", "CO", "BTN")]
+    actions += [_fold("Hero"), _fold(labels["BB"])]
+    raw = _raw(
+        seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["Kd", "Qs"]}
+    )
+    return enrich(normalize(raw))
+
+
 # --- Тесты плана ----------------------------------------------------------------
+
+
+def test_short_shove_stays_in_pushfold_zone_with_deep_player_behind():
+    """Шов короткого стека судится как пуш-фолд, даже когда позади живой глубокий игрок.
+
+    Гейт глубины обязан спрашивать «на какую глубину играется ЭТО решение», а
+    ответ на него даёт шовер: больше его стека в решении не разыграть. Прежняя
+    формула брала максимум остатков живых оппонентов и в этой раздаче выбирала
+    BB — игрока, чьей ставку Hero не отвечает, — после чего спот вылетал из
+    разбора как «глубже пуш-фолд-зоны».
+
+    Тест разводит две причины, по которым точка могла бы попасть в зону: он
+    проверяет не только класс спота (у классификатора есть и другие гейты,
+    любой из которых мог бы дать тот же класс), но и само число глубины и то,
+    что альтернативный кандидат в оппоненты заведомо за границей зоны.
+    """
+    en = _make_shove_with_deep_player_behind(shover_bb=3.0, hero_bb=40.0, deep_bb=40.0)
+    dp = next(d for d in en.report.decision_points if d.label == "Hero")
+    state = table_state(dp, en)
+
+    shover = state.aggressor
+    assert shover is not None and shover.behind == 0  # перед Hero олл-ин
+    deep = next(s for s in state.seats if s.position == "BB")
+    assert deep.live and not deep.acted  # он ещё в руке и ходит после Hero
+    # Кандидат, которого выбирала прежняя формула, — заведомо за границей зоны:
+    # без правильного выбора оппонента этот тест не может пройти случайно.
+    assert deep.behind / _BB > PUSHFOLD_MAX_EFF_BB
+
+    assert dp.eff_stack == shover.stack_after_ante == 6
+    assert dp.eff_stack_bb == 3.0
+    assert spot_for(dp, state) == "pushfold_facing_shove"
+
+
+def test_eff_stack_is_the_depth_the_model_indexes_by():
+    """Глубина движка и глубина модели — одна величина, посчитанная двумя путями.
+
+    Движок считает её реплеем (`stacks + bets` в PokerKit), анализ — по строкам
+    руки (`stack_after_ante`). Расхождение означало бы, что гейт пускает к модели
+    не то, что модель считает: анте здесь не косметика, а решение о том, входит
+    ли оно в глубину (не входит — это мёртвые деньги, равновесие берёт их
+    отдельным слагаемым). Рука настоящая и с анте 750.
+    """
+    en = enrich(normalize(parse_hand(SAMPLE, source_ref="x")))
+    dp = next(d for d in en.report.decision_points if d.label == "Hero")
+    state = table_state(dp, en)
+    assert state.aggressor is not None
+    assert dp.eff_stack == min(state.hero.stack_after_ante, state.aggressor.stack_after_ante)
+    assert dp.eff_stack == 3891 - 750  # стек Hero без анте
+
+
 
 
 def test_fixture_hand_correct_call_not_flagged():
