@@ -16,7 +16,6 @@ from harness.analysis.preflop import cheap_fold_verdict
 from harness.analysis.scan import scan_tournament
 from harness.contracts import (
     ActionKind,
-    Assumption,
     Post,
     PostKind,
     Provenance,
@@ -336,20 +335,22 @@ def test_cheap_fold_verdict_hu_is_strict_no_assumption():
     assert point.ev_diff_bb == 0.0
 
 
-def test_cheap_fold_verdict_multiway_is_assuming_with_shown_range():
-    """Мультивей-фолд, закрытый префильтром, обязан нести допущение (правило зоны).
+def test_cheap_fold_verdict_does_not_close_a_multiway_point():
+    """Мультивей дешёвый лукап больше не закрывает — ни вердиктом, ни допущением.
 
-    Мультивей-равновесия у нас нет (задача 12), и дешёвый лукап здесь опирается
-    на равновесный чарт ОДНОГО оппонента на самой короткой глубине — то есть
-    сам является допущением и обязан быть показан игроку, а не выдан за точный
-    расчёт (контракт `PointVerdict._assumption_matches_zone`).
+    Раньше он выдавал здесь «фолд верен» с показанным допущением. Теперь у такой
+    точки два исхода, и оба без вердикта: контрольная сумма модели снимает её
+    прямо тут (этот случай), а если модель проверку проходит — точка уходит на
+    полный расчёт, потому что устойчивость вердикта к ширине колл-диапазона
+    лукап не проверяет вовсе. Уверенности выше, чем у полного расчёта, у него
+    остаться не должно.
     """
     en = _make_multiway_fold_hand(hero_cards=("3c", "2d"), eff_bb=8.0, players_behind=3)
     dp = en.report.decision_points[0]
     point = cheap_fold_verdict(dp, en)
     assert point is not None
-    assert point.zone is Zone.ASSUMING
-    assert isinstance(point.assumption, Assumption)
+    assert point.best_action == "" and point.assumption is None
+    assert "модель не годится" in point.detail["unjudged"]
 
 
 def _make_fold_with_short_allin_bb(hero_cards: tuple[str, str], eff_bb: float):

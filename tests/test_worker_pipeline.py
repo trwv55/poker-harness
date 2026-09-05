@@ -269,9 +269,12 @@ async def test_hh_scan_end_to_end(db_factory, fake_sender, queue, deps):
     assert (await job_status(db_factory, jid)) == "done"
     assert fake_sender.edits  # прогресс редактировался
     final = fake_sender.sent[-1]
-    assert "bb" in final.text and any(
-        b.callback_data.startswith("deep:") for row in final.buttons for b in row
-    )
+    # Кнопка «разобрать» стоит под КАЖДЫМ пунктом списка расхождений, а список на
+    # этой фикстуре пуст: точки, где вердикт держался на модели колл-диапазонов,
+    # вердикта больше не получают. Проверяется то, что от состава списка не
+    # зависит, — что игроку ушла именно сводка скана с числом в bb; раскладку
+    # кнопок под пунктами закрывает `test_presentation`.
+    assert "Скан завершён: 146 рук" in final.text and "bb" in final.text
     assert await count(db_factory, "hands") == 146  # артефакты записаны
     assert await count(db_factory, "traces") == 1
     # Контроллерский рулинг задачи 18, п.1: эквити-кэш скана обязан осесть в

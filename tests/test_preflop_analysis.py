@@ -503,23 +503,6 @@ def test_rank_points_orders_by_loss_and_skips_unjudged():
 # --- Зона: когда допущение несёт нагрузку ---------------------------------------
 
 
-def test_marginal_multiway_shove_is_assuming_with_shown_range():
-    """Q9o на 10bb в двоих позади: против узкой модели шов плюсовой, против широкой — нет.
-
-    Вердикт держится на догадке о том, как широко коллируют, — значит он обязан
-    быть помечен `assuming`, а сама догадка показана игроку диапазоном.
-    """
-    en = _make_multiway_shove_hand(hero_cards=("Qc", "9d"), eff_bb=10.0, players_behind=2)
-    p = analyze_hand(en).points[0]
-    assert p.zone == "assuming" and p.detail["bracket"] == "unstable"
-    values = list(p.detail["ev_shove_by_width_bb"].values())
-    assert min(values) < 0.0 < max(values)  # на разных ширинах вердикт разный
-    assert p.best_action == "fold" and p.action_taken == "shove" and p.ev_diff_bb < 0.0
-    assert p.assumption is not None
-    assert p.assumption.source == "model:nash_hu_call"
-    assert 0.0 < p.assumption.range.fraction_of_hands() < 1.0
-
-
 def test_two_live_without_equilibrium_shape_is_judged_by_bracket():
     """Шов ранней позиции, до которого спасовали все, кроме BB, — не игра `nash_hu`.
 
@@ -550,6 +533,91 @@ def test_shove_without_fold_equity_is_marked():
     p = analyze_hand(en).points[0]
     assert p.spot == "pushfold_unopened"
     assert p.detail["fold_equity_ok"] is False
+
+
+# --- Контрольная сумма модели стола и неустойчивая вилка -------------------------
+
+
+def test_a_shove_the_model_says_is_almost_always_answered_gets_no_verdict():
+    """Модель колла раздаёт КАЖДОМУ позади одну и ту же сторону равновесия.
+
+    На пятерых позади это даёт вероятность прохода шова 0.16 и полтора
+    отвечающих в среднем — стол, которого не бывает. Цена шова, посчитанная по
+    такой модели, арифметически верна и при этом описывает не эту раздачу,
+    поэтому вердикта здесь нет вовсе (решение владельца 2026-09-06).
+    """
+    en = _make_multiway_shove_hand(hero_cards=("Ad", "5d"), eff_bb=12.0, players_behind=5)
+    p = analyze_hand(en).points[0]
+
+    assert p.spot == "pushfold_unopened"
+    assert p.best_action == ""  # вердикта нет
+    assert p.ev_diff_bb == 0.0 and p.assumption is None
+    reason = p.detail["unjudged"]
+    assert "цену шова" in reason and "модель" in reason
+    # Язык игрока (SESSIONS_UX): без внутренней кухни.
+    assert not any(word in reason for word in ("колл-диапазон", "равновеси", "хедз-ап"))
+
+
+def test_a_realistic_calling_model_passes_the_checksum():
+    """Защита от того, чтобы правка сняла вообще всё: тесная модель проходит.
+
+    Тот же спот (пятеро позади, 12bb), но колл-диапазоны реалистичной ширины
+    10% вместо равновесных 33%: `p_all_fold` 0.63 против порога 0.20 и 0.44
+    отвечающих против порога 1.0 — контрольная сумма молчит, и точка судится.
+    """
+    from harness.analysis.preflop import _call_model, _model_checksum, _table_dead_bb
+    from harness.analysis.tools.pushfold import CallerModel, range_of_width
+
+    en = _make_multiway_shove_hand(hero_cards=("Ad", "5d"), eff_bb=12.0, players_behind=5)
+    dp = en.report.decision_points[0]
+    state = table_state(dp, en)
+    behind = [s for s in state.behind_hero if s.behind > 0]
+    dead_bb = _table_dead_bb(state)
+    depths = [min(state.hero.stack_after_ante, s.stack_after_ante) / en.hand.bb for s in behind]
+
+    def callers(ranges):
+        return [
+            CallerModel(call_range=rng, behind_bb=s.behind / en.hand.bb, posted_bb=0.0)
+            for s, rng in zip(behind, ranges, strict=True)
+        ]
+
+    equilibrium = callers([_call_model(d, dead_bb) for d in depths])
+    realistic = callers([range_of_width(d, 0.10, dead_extra_bb=dead_bb) for d in depths])
+
+    assert _model_checksum(equilibrium, "A5s") != ""
+    assert _model_checksum(realistic, "A5s") == ""
+
+
+def test_an_unstable_bracket_gets_no_point_estimate():
+    """Q9o на 10bb в двоих позади: вердикт переворачивается внутри вилки ширин.
+
+    Контрольную сумму этот спот проходит (проход шова 0.40, отвечающих 0.74),
+    снимает вердикт именно неустойчивость вилки: одного числа тут нет, а
+    показанное было бы точечной оценкой того, что от ширины и зависит.
+    """
+    en = _make_multiway_shove_hand(hero_cards=("Qc", "9d"), eff_bb=10.0, players_behind=2)
+    p = analyze_hand(en).points[0]
+
+    assert p.spot == "pushfold_unopened"
+    assert p.best_action == "" and p.ev_diff_bb == 0.0 and p.assumption is None
+    reason = p.detail["unjudged"]
+    assert "переворачивается" in reason
+    assert "цену шова" not in reason  # причина именно вилки, а не контрольной суммы
+    # Числа расчёта остаются в вердикте: по ним видно, что вилка и правда рвётся —
+    # против узкой модели шов плюсовой, против широкой минусовой.
+    assert p.detail["bracket"] == "unstable"
+    values = list(p.detail["ev_shove_by_width_bb"].values())
+    assert min(values) < 0.0 < max(values)
+
+
+def test_an_unstable_bracket_facing_a_shove_gets_no_point_estimate():
+    """То же правило на другом споте: колл против шова, вилка по диапазону шовера."""
+    en = _make_facing_shove_hand(hero_cards=("Kd", "Ts"), eff_bb=12.0, shover_bb=12.0)
+    p = analyze_hand(en).points[0]
+
+    assert p.spot == "pushfold_facing_shove"
+    assert p.best_action == "" and p.ev_diff_bb == 0.0 and p.assumption is None
+    assert "переворачивается" in p.detail["unjudged"]
 
 
 # --- Квантование глубины --------------------------------------------------------
@@ -912,7 +980,9 @@ def test_a_forfeited_seat_behind_hero_is_not_an_all_in():
 
     assert {s.label for s in state.all_in_besides_hero} == {labels["UTG"]}
     p = analyze_hand(en).points[0]
-    assert p.spot == "pushfold_facing_shove" and p.best_action != ""
+    # Точка дошла до модели колла шова: если бы форфейтное место считалось живым
+    # олл-ином, спот снялся бы с оценки раньше и `method` бы не появился.
+    assert p.spot == "pushfold_facing_shove" and p.detail["method"] == "call_ev"
     # CO, BTN и SB — все живые за героем помимо шовера; форфейтного BB среди них нет.
     assert p.detail["live_others"] == 3
 
@@ -983,8 +1053,9 @@ def test_a_forfeited_small_blind_does_not_open_the_heads_up_equilibrium():
     p = analyze_hand(en).points[0]
     assert p.spot == "pushfold_unopened"
     assert "равновеси" not in p.detail["zone_reason"]
-    cheap = cheap_fold_verdict(dp, en)
-    assert cheap is not None and "равновеси" not in cheap.detail["zone_reason"]
+    # Дешёвый лукап закрывает только равновесную форму; здесь гейт закрыт, и он
+    # отдаёт точку полному расчёту вместо того, чтобы назвать её равновесием.
+    assert cheap_fold_verdict(dp, en) is None
 
 
 def test_an_ante_only_forfeit_does_not_open_the_heads_up_equilibrium():
@@ -1031,7 +1102,9 @@ def test_an_ante_only_forfeit_does_not_open_the_heads_up_equilibrium():
     p = analyze_hand(en).points[0]
     assert p.spot == "pushfold_unopened"
     assert "равновеси" not in p.detail["zone_reason"]
-    assert p.zone == "assuming" and p.assumption is not None
+    # Гейт закрыт — значит вилка вердикт не держит, и точечной оценки у точки нет
+    # (`_UNSTABLE_SHOVE`). Было бы открыто равновесие — вердикт бы остался.
+    assert p.detail["bracket"] == "unstable" and p.best_action == ""
 
 
 def test_a_dead_small_blind_is_not_the_heads_up_equilibrium_against_a_shove():
@@ -1065,7 +1138,9 @@ def test_a_dead_small_blind_is_not_the_heads_up_equilibrium_against_a_shove():
     p = analyze_hand(en).points[0]
     assert p.spot == "pushfold_facing_shove"
     assert "равновеси" not in p.detail["zone_reason"]
-    assert p.zone == "assuming" and p.assumption is not None
+    # Тот же вывод, что и у шова в неоткрытый банк: гейт закрыт, вилка не держит,
+    # точечной оценки нет (`_UNSTABLE_CALL`).
+    assert p.detail["bracket"] == "unstable" and p.best_action == ""
 
 
 def test_a_forfeited_seat_could_not_have_answered_the_shove():
@@ -1334,14 +1409,17 @@ def test_ante_can_flip_the_verdict_from_mistake_to_correct():
     """Ровно тот отказ, ради которого правилась игра: верный шов помечался ошибкой.
 
     K9o, шов 10bb с CO при трёх игроках позади. Без анте модель насчитывает
-    -0.29bb («вы ошиблись»), с анте стола — +0.52bb («сыграно верно»). Ложное
-    обвинение учит пасовать там, где надо входить, и рушит доверие при первой же
-    сверке с солвером.
+    минус («вы ошиблись»), с анте стола — плюс. Ложное обвинение учит пасовать
+    там, где надо входить, и рушит доверие при первой же сверке с солвером.
+
+    Обе точки контрольная сумма снимает с оценки (трое позади по модели дают
+    больше одного отвечающего), поэтому знак читается из посчитанной EV шова, а
+    не из `best_action`: правится игра, которую решает равновесие, и она обязана
+    оставаться исправленной независимо от того, выдаётся ли по ней вердикт.
     """
     dry = analyze_hand(_ante_table_shove(0, hero_cards=("Kc", "9d"))).points[0]
     ante = analyze_hand(_ante_table_shove(5, hero_cards=("Kc", "9d"))).points[0]
-    assert dry.best_action == "fold" and dry.ev_diff_bb < -0.2
-    assert ante.best_action == "shove" and ante.ev_diff_bb == 0.0
+    assert dry.detail["ev_shove_bb"] < 0.0 < ante.detail["ev_shove_bb"]
 
 
 # --- Живые игроки за героем при колле шова --------------------------------------
@@ -1394,8 +1472,9 @@ def test_players_behind_axis_is_computed_and_can_disagree():
     p = analyze_hand(enrich(normalize(raw))).points[0]
     assert p.detail["ev_call_bb"] > 0.0 > p.detail["ev_call_all_behind_bb"]
     assert p.detail["behind_axis"] == "unstable"
-    assert p.zone == "assuming" and p.assumption is not None
-    assert "позади" in p.assumption.note
+    # Вилка по диапазону шовера на этой руке тоже рвётся, поэтому точечной оценки
+    # у точки нет (`_UNSTABLE_CALL`); ось при этом посчитана и видна в `detail`.
+    assert p.best_action == "" and p.detail["bracket"] == "unstable"
 
 
 def test_zone_for_takes_the_players_behind_axis():
@@ -1428,8 +1507,9 @@ def test_k5o_interior_reversal_is_assuming():
     # то, что видит опрос интервала: внутри вердикт обратный
     assert min(values[1:-1]) < 0.0
     assert p.detail["dead_extra_bb"] == pytest.approx(1.0, abs=0.03)
-    assert p.zone == "assuming" and p.assumption is not None
     assert "внутри" in p.detail["zone_reason"]
+    # Разворот внутри интервала — ровно тот случай, в котором точечной оценки нет.
+    assert p.best_action == ""
 
 
 def test_premium_tight_end_never_objects_and_that_is_honest():
@@ -1452,8 +1532,9 @@ def test_premium_tight_end_never_objects_and_that_is_honest():
     widths = p.detail["ev_shove_by_width_bb"]
     assert widths[_PREMIUM_KEY] > 1.0  # мусорный шов против премиум-поля прибылен
     assert min(widths.values()) < 0.0  # но не против поля, которое коллирует
-    assert p.best_action == "fold"
-    assert p.zone == "assuming" and p.assumption is not None
+    # Вердикт «пас был верен» тут и правда держится на том, как часто отвечают, —
+    # поэтому точечной оценки у точки нет вовсе.
+    assert p.best_action == ""
 
 
 # --- Цена не должна опираться на то, что вторая ось уже опровергла ---------------
@@ -1511,8 +1592,9 @@ def test_a_verdict_that_flips_with_the_players_behind_names_the_fork():
     assert split.detail["ev_call_bb"] > 0.0 > split.detail["ev_call_all_behind_bb"]
     assert split.detail["best_vs_one"] == "call"
     assert split.detail["best_all_behind"] == "fold"
-    assert split.best_action == "зависит от того, войдут ли игроки позади"
-    assert split.ev_diff_bb == 0.0
+    # Вилка по диапазону шовера на этой руке рвётся, и точечной оценки у точки
+    # нет (`_UNSTABLE_CALL`) — развилка остаётся в `detail` двумя вердиктами.
+    assert split.best_action == "" and split.ev_diff_bb == 0.0
 
     agreed = hand(["Ah", "Ad"], hero_calls=True)
     assert agreed.detail["best_vs_one"] == agreed.detail["best_all_behind"] == "call"
