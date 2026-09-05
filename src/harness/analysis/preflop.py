@@ -33,6 +33,8 @@
 один на один, поэтому вход живых позади в модель не входит. Он считается второй
 осью вилки (`ev_call_all_behind_bb`) и попадает в `zone_for`: если вердикт от неё
 меняется, зона `assuming`, а цена берётся по самому мягкому из двух сценариев.
+Когда два сценария дают разный оптимум, цена по этому правилу равна нулю, и
+`best_action` называет развилку вместо одного действия (`_BEST_DEPENDS_ON_BEHIND`).
 Живой БЕЗ фишек за спиной так не считается — его вход не развилка, и такая точка
 остаётся без вердикта (см. границы ниже).
 
@@ -177,6 +179,17 @@ _SHOVER_RANGE_WIDTHS: tuple[float, ...] = (0.05, 0.20, 0.40, 0.70, 1.00)
 # порядка 20bb, то есть вклад шума в EV — единицы тысячных bb, на два порядка
 # ниже шкалы, на которой вердикт меняется.
 _MULTIWAY_ITERATIONS = 20_000
+
+# Что стоит вместо одного действия, когда две точки модели дают разный оптимум:
+# `call_shove_ev_bb` против одного диапазона и тот же расчёт с вошедшими в банк
+# живыми позади (`ev_call_all_behind_bb`). Цена такой точки — 0.0: правило
+# самого мягкого упрёка (см. `ev_diff_bb` в `_facing_shove_verdict`) берёт
+# сценарий, в котором сыгранное действие и есть лучшее. Одно название действия
+# рядом с нулём читалось бы как бесплатное расхождение, поэтому называется сама
+# развилка, а оба вердикта по отдельности лежат в `detail`
+# (`best_vs_one`, `best_all_behind`). Закреплено
+# `test_a_verdict_that_flips_with_the_players_behind_names_the_fork`.
+_BEST_DEPENDS_ON_BEHIND = "зависит от того, войдут ли игроки позади"
 
 _ASSUMPTION_CALLERS = (
     "колл-диапазоны игроков позади смоделированы: мультивей-равновесия в v1 нет"
@@ -857,6 +870,8 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
     # интереснее всего.
     behind_moved = bool(set(best_behind) - {best})
     behind_axis = None if not best_behind else ("unstable" if behind_moved else "stable")
+    best_all_behind = None if ev_behind is None else _best_of("call", ev_behind)
+    verdict_splits = best_all_behind is not None and best_all_behind != best
     zone, why = zone_for(
         best_tight,
         best_wide,
@@ -890,6 +905,11 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         # функции не допускает — см. `test_a_player_who_already_called_the_shove_is_not_priced`.
         "live_others": len(behind),
         "behind_axis": behind_axis,
+        # Обе точки модели по отдельности: против одного диапазона и с вошедшими
+        # в банк живыми позади. Когда они расходятся, `best_action` называет
+        # развилку, а не одно из этих действий.
+        "best_vs_one": best,
+        "best_all_behind": best_all_behind,
         "ev_call_all_behind_bb": None if ev_behind is None else round(ev_behind, 4),
         "zone_reason": why,
     }
@@ -899,7 +919,7 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         spot=spot,
         zone=zone,
         action_taken=taken,
-        best_action=best,
+        best_action=_BEST_DEPENDS_ON_BEHIND if verdict_splits else best,
         # Цена берётся по самому мягкому упрёку среди сценариев второй оси.
         # Обвинять игрока в потере 0.72bb за пас, когда собственный расчёт при
         # входе живого позади даёт -2.00bb, нельзя: это число ведёт и

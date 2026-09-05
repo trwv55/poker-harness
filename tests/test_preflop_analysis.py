@@ -1402,6 +1402,43 @@ def test_price_does_not_charge_for_a_reproach_the_second_axis_refutes():
     assert res.total_ev_loss_bb == 0.0
 
 
+def test_a_verdict_that_flips_with_the_players_behind_names_the_fork():
+    """Две точки модели дают разный оптимум — вместо одного действия названа развилка.
+
+    Тот же A2o против шова, что и в тесте выше: `ev_call_bb` плюсовой,
+    `ev_call_all_behind_bb` минусовой. Цена по правилу самого мягкого упрёка
+    равна 0.0, и одно названное действие рядом с нулём выглядело бы бесплатным
+    расхождением. Оба вердикта при этом остаются в `detail` по отдельности.
+
+    Вторая половина теста — та же рука с AA, где обе точки модели согласны:
+    там называется действие, а не развилка, иначе правило срабатывало бы всегда
+    и ничего не различало.
+    """
+    stacks = {**dict.fromkeys(_SIX_MAX_SEATS, 96), "SB": 24, "UTG": 24}
+    labels, seats, posts = _six_max(stacks, "SB")
+
+    def hand(hero_cards: list[str], hero_calls: bool):
+        actions = [_shove(labels["UTG"], 24)]
+        actions += [_fold(labels[pos]) for pos in ("HJ", "CO", "BTN")]
+        actions.append(_call("Hero", 23, all_in=True) if hero_calls else _fold("Hero"))
+        actions.append(_fold(labels["BB"]))
+        raw = _raw(
+            seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": hero_cards}
+        )
+        return analyze_hand(enrich(normalize(raw))).points[0]
+
+    split = hand(["Ah", "2c"], hero_calls=False)
+    assert split.detail["ev_call_bb"] > 0.0 > split.detail["ev_call_all_behind_bb"]
+    assert split.detail["best_vs_one"] == "call"
+    assert split.detail["best_all_behind"] == "fold"
+    assert split.best_action == "зависит от того, войдут ли игроки позади"
+    assert split.ev_diff_bb == 0.0
+
+    agreed = hand(["Ah", "Ad"], hero_calls=True)
+    assert agreed.detail["best_vs_one"] == agreed.detail["best_all_behind"] == "call"
+    assert agreed.best_action == "call"
+
+
 # --- Инвариант зоны закреплён в контракте ---------------------------------------
 
 
