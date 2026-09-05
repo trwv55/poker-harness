@@ -17,7 +17,12 @@ from harness.analysis.classifier import (
     table_state,
 )
 from harness.analysis.error_cost import rank_points, total_ev_loss_bb
-from harness.analysis.preflop import zone_for
+from harness.analysis.preflop import (
+    _rivals_when_shoved,
+    _shover,
+    cheap_fold_verdict,
+    zone_for,
+)
 from harness.contracts import (
     ActionKind,
     Assumption,
@@ -890,6 +895,76 @@ def test_a_forfeited_seat_before_hero_is_not_an_all_in():
 
     assert {s.label for s in state.all_in_besides_hero} == {labels["UTG"]}
     assert spot_for(dp, state) == "pushfold_facing_shove"
+
+
+def test_live_total_of_the_table_leaves_out_a_forfeited_seat():
+    """Состав стола считается один раз и без форфейта; движковое число его держит.
+
+    `dp.live_total` снят реплеем в момент решения героя, а строка `folds`
+    форфейтного места стоит позже, поэтому движок в этот момент считает его
+    живым. `table_state` читает `report.forfeits` и не считает — обе величины
+    тест сравнивает на одной точке.
+    """
+    en, labels, blind = _make_forfeit_hand("HJ")
+    dp = next(d for d in en.report.decision_points if d.label == "Hero")
+    state = table_state(dp, en)
+    assert dp.live_total == 6
+    assert state.live_total == 5
+    assert labels[blind] in state.forfeits
+
+
+def test_a_forfeited_small_blind_does_not_open_the_heads_up_equilibrium():
+    """Двое живых после вычета форфейта — ещё не та игра, для которой есть равновесие.
+
+    Hero на BTN, малый блайнд отдал стек посту и получил от рума `folds` (его
+    строка стоит после решения героя), большой блайнд жив. Живых помимо
+    форфейта двое, и один из них в BB, — но малый блайнд вложил в банк больше
+    своего анте, а `nash_hu` таких денег не получает: `_table_dead_bb` считает
+    только анте. Зона обязана определяться вилкой, а не равновесием.
+    """
+    stacks = {**dict.fromkeys(_SIX_MAX_SEATS, 20), "SB": _SB}
+    labels, seats, posts = _six_max(stacks, "BTN")
+    actions = [
+        _fold(labels["UTG"]),
+        _fold(labels["HJ"]),
+        _fold(labels["CO"]),
+        _fold("Hero"),
+        _fold(labels["SB"]),
+    ]
+    raw = _raw(
+        seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["7c", "2d"]}
+    )
+    en = enrich(normalize(raw))
+    assert en.report.forfeits == [labels["SB"]]
+    dp = en.report.decision_points[0]
+    state = table_state(dp, en)
+    # Форма, на которой гейт равновесия и открывался бы: живых двое, позади один
+    # и он в большом блайнде.
+    assert dp.live_total == 3 and state.live_total == 2
+    assert [s.position for s in state.behind_hero] == ["BB"]
+
+    p = analyze_hand(en).points[0]
+    assert p.spot == "pushfold_unopened"
+    assert "равновеси" not in p.detail["zone_reason"]
+    cheap = cheap_fold_verdict(dp, en)
+    assert cheap is not None and "равновеси" not in cheap.detail["zone_reason"]
+
+
+def test_a_forfeited_seat_could_not_have_answered_the_shove():
+    """Состав на момент шова тоже без форфейта: движок вычеркнул место из руки.
+
+    Фильтр `_rivals_when_shoved` знает только пасы и олл-ины, записанные ДО
+    шова, а `folds` форфейта стоит после решения героя — без чтения форфейтов
+    место остаётся в наборе тех, кто мог ответить на шов.
+    """
+    en, labels, blind = _make_forfeit_hand("HJ")
+    dp = next(d for d in en.report.decision_points if d.label == "Hero")
+    state = table_state(dp, en)
+    shover = _shover(state)
+    assert shover is not None and shover.label == labels["UTG"]
+    rivals = {s.label for s in _rivals_when_shoved(en.hand, dp, state, shover)}
+    assert labels[blind] not in rivals
+    assert rivals == {"Hero", labels["CO"], labels["BTN"], labels["SB"]}
 
 
 def test_a_limped_pot_is_not_a_shove():

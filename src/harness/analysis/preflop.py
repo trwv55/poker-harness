@@ -556,8 +556,12 @@ def _rivals_when_shoved(
     не даёт шоверу ни фолд-эквити, ни диапазона колла. Правило закреплено по
     составу, а не по числу.
 
-    Оба свойства закреплены: `test_shover_depth_counts_only_those_live_when_he_shoved`
-    проверяет число, `test_shover_depth_ignores_a_player_already_all_in_when_the_shove_landed`
+    Место, вычеркнутое движком из руки (`state.forfeits`), не входит тоже:
+    закреплено `test_a_forfeited_seat_could_not_have_answered_the_shove`.
+
+    Остальные два свойства закреплены:
+    `test_shover_depth_counts_only_those_live_when_he_shoved` проверяет число,
+    `test_shover_depth_ignores_a_player_already_all_in_when_the_shove_landed`
     — состав.
     """
     target = action_index(hand, dp)
@@ -572,7 +576,24 @@ def _rivals_when_shoved(
         for action in hand.actions[:shove_at]
         if action.kind is ActionKind.FOLD or action.is_all_in
     }
+    gone |= state.forfeits
     return [seat for seat in state.seats if seat.label != shover.label and seat.label not in gone]
+
+
+def _nothing_dead_besides(state: TableState, opponent: SeatSnapshot) -> bool:
+    """Кроме героя и названного места, никто не вложил в банк больше своего анте.
+
+    Гейт равновесия в `_unopened_verdict` и `cheap_fold_verdict` требует ровно
+    той игры, которую считает `nash_hu`: два места и мёртвые деньги, равные
+    сумме анте (`_table_dead_bb`). Чужая вынужденная ставка в банке этой суммой
+    не учитывается, поэтому равновесие индексировалось бы не по тем деньгам.
+    Закреплено `test_a_forfeited_small_blind_does_not_open_the_heads_up_equilibrium`.
+    """
+    return all(
+        seat.contributed == seat.ante
+        for seat in state.seats
+        if seat.label not in (state.hero.label, opponent.label)
+    )
 
 
 def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) -> PointVerdict:
@@ -642,10 +663,13 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
     ev_wide = ev_by_width[str(_SHOVE_CALL_WIDTHS[-1])]
 
     equilibrium_depth = None
-    if dp.live_total == 2 and len(behind) == 1 and behind[0].position == "BB":
-        equilibrium_depth = _equilibrium_depth(
-            min(hero_eff, behind[0].stack_after_ante) / bb
-        )
+    if (
+        state.live_total == 2
+        and len(behind) == 1
+        and behind[0].position == "BB"
+        and _nothing_dead_besides(state, behind[0])
+    ):
+        equilibrium_depth = _equilibrium_depth(min(hero_eff, behind[0].stack_after_ante) / bb)
 
     by_width = [_best_of("shove", value) for value in ev_by_width.values()]
     best_tight, best_wide = by_width[0], by_width[-1]
@@ -659,7 +683,7 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
     zone, why = zone_for(
         best_tight,
         best_wide,
-        live_total=dp.live_total,
+        live_total=state.live_total,
         equilibrium=equilibrium_depth is not None,
         best_model=best,
         best_interior=by_width[1:-1],
@@ -808,7 +832,7 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
 
     equilibrium_depth = None
     if (
-        dp.live_total == 2
+        state.live_total == 2
         and state.hero.position == "BB"
         and shover.position in ("SB", "BTN")
         and state.voluntary_actors == (shover.label,)
@@ -835,7 +859,7 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
     zone, why = zone_for(
         best_tight,
         best_wide,
-        live_total=dp.live_total,
+        live_total=state.live_total,
         equilibrium=equilibrium_depth is not None,
         best_model=best,
         best_interior=by_width[1:-1],
@@ -1028,7 +1052,12 @@ def cheap_fold_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | No
         return None
 
     equilibrium_depth = None
-    if dp.live_total == 2 and len(behind) == 1 and behind[0].position == "BB":
+    if (
+        state.live_total == 2
+        and len(behind) == 1
+        and behind[0].position == "BB"
+        and _nothing_dead_besides(state, behind[0])
+    ):
         equilibrium_depth = _equilibrium_depth(min(hero_eff, behind[0].stack_after_ante) / bb)
 
     if equilibrium_depth is not None:

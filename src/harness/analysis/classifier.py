@@ -75,6 +75,18 @@ class TableState:
     voluntary_actors: tuple[str, ...]  # кто именно — в порядке хода
     aggressor: SeatSnapshot | None  # последний, кто ставил или повышал до героя
     hero_all_in_after: bool  # после своего действия герой остался без фишек
+    forfeits: frozenset[str]  # места, которые движок вычеркнул из руки (`EngineReport.forfeits`)
+
+    @property
+    def live_total(self) -> int:
+        """Сколько мест ещё в руке, считая героя.
+
+        Единственный счётчик живых в анализе: `dp.live_total` снят реплеем в
+        момент решения героя, а форфейт исполняется движком там, где стоит его
+        строка `folds`, — она может стоять и позже. Расхождение закреплено
+        `test_live_total_of_the_table_leaves_out_a_forfeited_seat`.
+        """
+        return sum(1 for s in self.seats if s.live)
 
     @property
     def behind_hero(self) -> tuple[SeatSnapshot, ...]:
@@ -228,6 +240,7 @@ def table_state(dp: DecisionPoint, en: EnrichedHand) -> TableState:
         voluntary_actors=tuple(voluntary),
         aggressor=by_label[aggressor] if aggressor is not None else None,
         hero_all_in_after=hero_after <= 0,
+        forfeits=frozenset(en.report.forfeits),
     )
     _cross_check(state, dp)
     return state
