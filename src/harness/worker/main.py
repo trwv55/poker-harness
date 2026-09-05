@@ -161,6 +161,14 @@ class TelegramDeliveryError(RuntimeError):
         self.description = description
 
 
+# Кусок `description`, которым Bot API отвечает на редактирование, ничего не
+# меняющее. Подстрока, а не полное совпадение: дальше в той же строке Телеграм
+# дописывает подробности («specified new message content and reply markup are
+# exactly the same as a current content and reply markup of the message»), и
+# держать их дословно значило бы завязаться на формулировку целиком.
+_MESSAGE_NOT_MODIFIED = "message is not modified"
+
+
 class TelegramSender:
     """`Sender` поверх Bot API — прямые HTTP-вызовы (`sendMessage`/`editMessageText`),
     без aiogram: тот приходит вместе с ботом (задача 19), а односторонней доставке
@@ -169,9 +177,11 @@ class TelegramSender:
     В сеть тесты не ходят (то же ограничение, что у `platform/llm.py`, задача 16),
     но сама обёртка тестами покрыта: `httpx.MockTransport` подставляется через
     `client=` и позволяет проверить ФАКТИЧЕСКОЕ тело запроса и разбор ответа —
-    ровно те два места, где живая приёмка 2026-09-05 нашла дефекты (`null` в
-    `reply_markup` и токен в тексте исключения). Оркестрация (`run_job`)
-    по-прежнему тестируется против `FakeSender`.
+    ровно те два места, где живая приёмка нашла дефекты. Их набралось четыре
+    подряд (`null` в `reply_markup`, токен в тексте исключения, потерянный
+    `description`, отказ на неизменившемся сообщении), и все четыре — в коде,
+    который до приёмки считался слишком тонким, чтобы его проверять.
+    Оркестрация (`run_job`) по-прежнему тестируется против `FakeSender`.
     """
 
     def __init__(self, token: str, *, client: httpx.AsyncClient | None = None) -> None:
@@ -215,7 +225,30 @@ class TelegramSender:
         return int(response.json()["result"]["message_id"])
 
     async def edit(self, chat_id: int, message_id: int, msg: Msg) -> None:
-        await self._call("editMessageText", _payload(msg, chat_id=chat_id, message_id=message_id))
+        """Отредактировать сообщение. «Нечего менять» — это УСПЕХ, а не отказ.
+
+        Живая приёмка 2026-09-06, job 1, попытка 3 из 3: попытка 2 уже перевела
+        сообщение прогресса в «Считаю эквити…», ретрай вошёл в ту же станцию и
+        отправил тот же текст. Bot API считает это ошибкой —
+        `400 Bad Request: message is not modified: ...`, — а для нас цель
+        достигнута: сообщение УЖЕ говорит то, что мы хотели сказать. Отказ здесь
+        превращал здоровый ретрай в жёсткий `failed`, причём воспроизводимо: так
+        кончался бы КАЖДЫЙ повтор любой станции, успевшей отредактировать
+        прогресс.
+
+        Отличается по `description`, не по коду ответа: 400 у Bot API — общий код
+        на всё «запрос не принят», и глушить его целиком значило бы проглотить и
+        реальные отказы. Что остальные 400 по-прежнему поднимают исключение,
+        закреплено `test_edit_still_raises_on_any_other_bad_request`; сам случай
+        — `test_edit_treats_an_unchanged_message_as_delivered`.
+        """
+        try:
+            await self._call(
+                "editMessageText", _payload(msg, chat_id=chat_id, message_id=message_id)
+            )
+        except TelegramDeliveryError as exc:
+            if _MESSAGE_NOT_MODIFIED not in exc.description:
+                raise
 
 
 async def _sleep_or_stop(stop: asyncio.Event | None, seconds: float) -> None:

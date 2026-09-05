@@ -385,3 +385,44 @@ async def test_sender_keeps_the_token_out_of_a_non_json_error_body():
     assert "upstream" in str(caught.value), "причина отказа потеряна целиком"
     for rendered in (str(caught.value), repr(caught.value)):
         assert _TEST_TOKEN not in rendered
+
+
+_NOT_MODIFIED = (
+    "Bad Request: message is not modified: specified new message content and reply markup"
+    " are exactly the same as a current content and reply markup of the message"
+)
+
+
+async def test_edit_treats_an_unchanged_message_as_delivered():
+    """Четвёртый дефект той же обёртки, найденный уже ПОСЛЕ починки третьего —
+    его и обнажил показанный `description` (живая приёмка, job 1, попытка 3/3).
+
+    Попытка 2 успела перевести сообщение прогресса в «Считаю эквити…»; ретрай
+    вошёл в ту же станцию и отправил ровно тот же текст. Для Bot API это 400, для
+    нас — цель достигнута: сообщение уже говорит то, что мы хотели. Пока это
+    считалось отказом, так кончался бы КАЖДЫЙ повтор любой станции, успевшей
+    тронуть прогресс, — здоровый ретрай превращался в жёсткий `failed`.
+    """
+    requests: list[httpx.Request] = []
+    body = {"ok": False, "error_code": 400, "description": _NOT_MODIFIED}
+    sender, client = _sender_recording_into(requests, httpx.Response(400, json=body))
+    try:
+        await sender.edit(777, 4242, Msg(text="Считаю эквити…"))
+    finally:
+        await client.aclose()
+
+    assert len(requests) == 1, "запрос всё равно должен быть отправлен — молчание не лечит"
+
+
+async def test_edit_still_raises_on_any_other_bad_request():
+    """Обратная половина: 400 у Bot API — общий код на всё «запрос не принят», и
+    заглушить его целиком значило бы проглотить настоящие отказы вместе с
+    безобидным. Различает `description`, а не код ответа.
+    """
+    body = {"ok": False, "error_code": 400, "description": "Bad Request: chat not found"}
+    sender, client = _sender_recording_into([], httpx.Response(400, json=body))
+    try:
+        with pytest.raises(TelegramDeliveryError, match="chat not found"):
+            await sender.edit(777, 4242, Msg(text="Считаю эквити…"))
+    finally:
+        await client.aclose()
