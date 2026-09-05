@@ -1,0 +1,908 @@
+"""`LLM` + `PgLimiter` (спека §7) — на настоящем Postgres (`db_factory`, задача 14):
+центральное утверждение лимитера — сериализация по СОЕДИНЕНИЮ (advisory-локи
+Postgres — сессионные, не транзакционные), а значит и по процессу; внутри одной
+отменяемой транзакции (`db`) это невыразимо в принципе, ровно как у `test_queue.py`
+(задача 15). Ключ на моделях провайдера — `TestModel`/`FunctionModel` из PydanticAI:
+в этом окружении нет ключа провайдера, тесты не имеют права стучаться в сеть
+(ограничение задачи 16), а тестовые двойники дают именно то, что нужно — управляемый
+результат и управляемый провал без единого HTTP-запроса.
+
+`trace_id` — обязательный параметр `LLM.__call__` (см. докстринг `llm.py`), а
+`llm_calls.trace_id` — FK NOT NULL на `traces.id`, у которой в свою очередь NOT NULL
+`job_id`. Бриф задачи 16 показывает вызовы фасада без этого параметра — тот же
+разрыв между буквой брифа и тем, что реально требует схема БД, что был у
+`player_id=1, session_id=1` в брифе задачи 15 (см. `_make_scope` в `test_queue.py`):
+там разрешился настоящими `player`/`session` через репозитории, здесь — тем же
+приёмом, но до `job`/`trace` (`_make_trace_scope` ниже; репозитория на `jobs`/
+`traces` вне ORM пока нет — как и `test_queue.py`, довольствуемся моделями напрямую).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import time
+from contextlib import asynccontextmanager
+
+import pytest
+from pydantic import BaseModel
+from pydantic_ai import BinaryContent
+from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart, UserPromptPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.test import TestModel
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from harness.memory.models import Job, LlmCall, Trace
+from harness.memory.repos import PlayersRepo, SessionsRepo
+from harness.platform.config import Config, InvalidEnvVar, MissingEnvVar, optional_env
+from harness.platform.limiter import _ADVISORY_LOCK_CLASS, PgLimiter, PgLimiterTimeout, _engine_of
+from harness.platform.llm import LLM, LLMProviderError, LLMSchemaError, _sniff_image_media_type
+
+# Строки моделей ниже никогда не резолвятся в реального провайдера — во всех тестах
+# `model_override` подменяет модель тестовым двойником PydanticAI ДО того, как
+# `LLM` попытался бы построить `Agent` с ней; значения существуют только чтобы
+# `Config` был валиден по форме (спека §7: `"<provider>:<model>"`).
+cfg = Config(
+    llm_vision_model="anthropic:claude-sonnet-test",
+    llm_verdict_model="anthropic:claude-haiku-test",
+    llm_max_concurrency=4,
+    llm_max_per_minute=1000,
+    database_url="unused-in-tests",
+    telegram_token="unused-in-tests",
+)
+
+
+async def _make_trace_scope(session_factory, tg_user_id: int = 1) -> int:
+    """Валидный `trace_id` для FK `llm_calls.trace_id` — цепочка player -> session
+    -> job -> trace, все настоящие закоммиченные строки (лимитер и логирование
+    должны быть видны с других соединений, см. модульный докстринг). `Job`/`Trace`
+    собраны напрямую через ORM, а не через `JobsQueue`/будущий `platform/trace.py`
+    (задача 18, ещё не существует) — здесь это голая scaffolding-цепочка FK, тот же
+    приём, что `session.get(Job, ...)` в `test_queue.py`.
+    """
+    async with session_factory() as session:
+        player = await PlayersRepo(session).get_or_create(tg_user_id=tg_user_id)
+        session_row = await SessionsRepo(session).active_or_create(player.id)
+        job = Job(type="deep_dive", player_id=player.id, session_id=session_row.id, payload={})
+        session.add(job)
+        await session.flush()
+        trace = Trace(job_id=job.id)
+        session.add(trace)
+        await session.commit()
+        return trace.id
+
+
+async def fetch_all(session_factory, sql: str) -> list[tuple]:
+    async with session_factory() as session:
+        result = await session.execute(text(sql))
+        return [tuple(row) for row in result.all()]
+
+
+class Out(BaseModel):
+    text: str
+
+
+async def test_limiter_serializes_across_connections(db_factory):
+    """Advisory-локи — кросс-СОЕДИНЕНИЕ, значит и кросс-процессно (бриф задачи 16
+    дословно): два конкурентных `slot()` на одном `db_factory` (каждый вызов —
+    своё соединение из пула) обязаны выполняться по очереди, не перекрываясь.
+    """
+    lim = PgLimiter(db_factory, max_concurrency=1, max_per_minute=1000)
+    order: list[str] = []
+
+    async def hold(tag: str) -> None:
+        async with lim.slot():
+            order.append(f"{tag}-in")
+            await asyncio.sleep(0.2)
+            order.append(f"{tag}-out")
+
+    await asyncio.gather(hold("a"), hold("b"))
+    assert order in (["a-in", "a-out", "b-in", "b-out"], ["b-in", "b-out", "a-in", "a-out"])
+
+
+async def test_rate_window_blocks(db_factory, monkeypatch):
+    """`max_per_minute` строк уже в окне -> `slot()` не проходит немедленно, а ждёт
+    (спека §7: "если ≥ лимита — sleep с джиттером до входа в окно"). Чтобы не ждать
+    реальную минуту, подменяем `_sleep` — модульную косвенность `limiter.py` над
+    `asyncio.sleep` (fix round 1, small item 4: патч ИМЕННО этого атрибута, а не
+    `asyncio.sleep` глобально — см. докстринг `_sleep` в `limiter.py`). Подмена не
+    просто ускоряет паузу, а на первом вызове САМА состаривает одну из засеянных
+    строк за пределы 60-секундного окна — тест доказывает и что лимитер
+    ДЕЙСТВИТЕЛЬНО уходит в ожидание при полном окне (иначе подмена никогда не
+    вызовется и `freed` останется `False`), и что он корректно возобновляется,
+    когда окно освобождается.
+    """
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=2)
+    max_per_minute = 2
+    seed_ids: list[int] = []
+    async with db_factory() as session:
+        for _ in range(max_per_minute):
+            row = LlmCall(trace_id=trace_id, provider="anthropic", model="test", purpose="verdict_text")
+            session.add(row)
+            await session.flush()
+            seed_ids.append(row.id)
+        await session.commit()
+
+    freed = False
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal freed
+        if not freed:
+            async with db_factory() as session:
+                await session.execute(
+                    text("UPDATE llm_calls SET started_at = now() - interval '2 minutes' WHERE id = :id"),
+                    {"id": seed_ids[0]},
+                )
+                await session.commit()
+            freed = True
+        await real_sleep(0)  # отдать управление event loop, не тратя реальный джиттер
+
+    monkeypatch.setattr("harness.platform.limiter._sleep", fake_sleep)
+
+    lim = PgLimiter(db_factory, max_concurrency=1, max_per_minute=max_per_minute)
+    async with lim.slot():
+        pass
+
+    assert freed  # доказательство, что лимитер реально упёрся в полное окно и ждал
+
+
+async def test_facade_validates_and_logs(db_factory):
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=3)
+    llm = LLM(cfg, db_factory, model_override=TestModel())
+
+    out, meta = await llm("verdict_text", Out, prompt="скажи привет", trace_id=trace_id)
+
+    assert isinstance(out, Out)
+    assert meta.tokens_in > 0 and meta.tokens_out > 0
+    assert meta.latency_ms >= 0
+
+    rows = await fetch_all(db_factory, "select purpose, status from llm_calls")
+    assert rows == [("verdict_text", "ok")]
+
+
+async def test_retry_on_schema_error_then_fail(db_factory):
+    """`FunctionModel`, неизменно отдающая мусор (не проходит `output_type=Out`
+    ни разу): 1 ретрай, затем `LLMSchemaError`; в `llm_calls` — ДВЕ строки со
+    `status='schema_error'`, ни одной 'ok' (спека §7: "1 повтор, потом ошибка задачи").
+    """
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=4)
+
+    def garbage(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart(content="это не JSON и не вызов инструмента")])
+
+    llm = LLM(cfg, db_factory, model_override=FunctionModel(garbage))
+
+    with pytest.raises(LLMSchemaError):
+        await llm("verdict_text", Out, prompt="скажи привет", trace_id=trace_id)
+
+    rows = await fetch_all(db_factory, "select status from llm_calls order by id")
+    assert rows == [("schema_error",), ("schema_error",)]
+
+
+async def test_backoff_retries_on_http_error_then_succeeds(db_factory, monkeypatch):
+    """Бэкофф на 429/5xx (спека §7) — отдельный от схема-ретрая механизм: провайдер
+    падает дважды с `ModelHTTPError(503)`, третья попытка проходит. Подменяем
+    `_sleep` — модульную косвенность `llm.py` над `asyncio.sleep` (fix round 1,
+    small item 4: патч `harness.platform.llm._sleep`, а не `asyncio.sleep`
+    глобально), чтобы не ждать реальные 2^n секунд — подмена лишь ускоряет паузу,
+    самого вызова не пропускает (`real_sleep(0)` всё равно отдаёт управление event
+    loop), поэтому падение без бэкоффа (см. падение теста ниже при
+    `_MAX_HTTP_ATTEMPTS=1` в самопроверке отчёта) по-прежнему ловится.
+    """
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=5)
+    attempts = {"n": 0}
+
+    def flaky(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise ModelHTTPError(status_code=503, model_name="test", body="upstream busy")
+        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={"text": "ok"})])
+
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        await real_sleep(0)
+
+    monkeypatch.setattr("harness.platform.llm._sleep", fake_sleep)
+
+    llm = LLM(cfg, db_factory, model_override=FunctionModel(flaky))
+    out, _meta = await llm("verdict_text", Out, prompt="скажи привет", trace_id=trace_id)
+
+    assert isinstance(out, Out) and out.text == "ok"
+    assert attempts["n"] == 3
+    assert len(sleeps) == 2  # пауза между 1->2 и 2->3 попытками, не перед первой
+
+    rows = await fetch_all(db_factory, "select status from llm_calls order by id")
+    assert rows == [("error",), ("error",), ("ok",)]
+
+
+async def test_backoff_exhausted_raises_provider_error(db_factory, monkeypatch):
+    """Симметричный случай: провайдер 429 на ВСЕХ `_MAX_HTTP_ATTEMPTS` попытках ->
+    `LLMProviderError`, а не тихий провал и не бесконечный ретрай.
+    """
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=6)
+
+    def always_429(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise ModelHTTPError(status_code=429, model_name="test", body="rate limited")
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        await real_sleep(0)
+
+    monkeypatch.setattr("harness.platform.llm._sleep", fake_sleep)
+
+    llm = LLM(cfg, db_factory, model_override=FunctionModel(always_429))
+    with pytest.raises(LLMProviderError):
+        await llm("verdict_text", Out, prompt="скажи привет", trace_id=trace_id)
+
+    rows = await fetch_all(db_factory, "select status from llm_calls order by id")
+    assert rows == [("error",), ("error",), ("error",)]
+
+
+async def test_backoff_sleeps_outside_the_concurrency_slot(db_factory, monkeypatch):
+    """Round 5, Item C: бэкофф-пауза не имеет права держать слот одновременности.
+    Слот ограничивает одновременную НАГРУЗКУ на провайдера, а спящая корутина его
+    не нагружает; до этой правки `_sleep` стоял ВНУТРИ `async with slot()`, и под
+    штормом 429 — ровно там, где лимитер и нужен, — каждый ретрай на 1–4с занимал
+    один из K кросс-процессных слотов вхолостую.
+
+    Проверяется порядком событий, а не таймингом: шпион на `PgLimiter.slot`
+    пишет `enter`/`exit`, шпион на `llm._sleep` — `sleep`. Утверждение —
+    «ни одного `sleep` между `enter` и его `exit`»; на прежнем коде
+    последовательность была бы `enter sleep exit ...`.
+    """
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=13)
+
+    events: list[str] = []
+    real_slot = PgLimiter.slot
+
+    @asynccontextmanager
+    async def spying_slot(self: PgLimiter, *, deadline: float | None = None):
+        async with real_slot(self, deadline=deadline):
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+    monkeypatch.setattr(PgLimiter, "slot", spying_slot)
+
+    def always_429(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise ModelHTTPError(status_code=429, model_name="test", body="rate limited")
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        events.append("sleep")
+        await real_sleep(0)
+
+    monkeypatch.setattr("harness.platform.llm._sleep", fake_sleep)
+
+    llm = LLM(cfg, db_factory, model_override=FunctionModel(always_429))
+    with pytest.raises(LLMProviderError):
+        await llm("verdict_text", Out, prompt="скажи привет", trace_id=trace_id)
+
+    # Три попытки, две паузы между ними, и ни одной паузы внутри слота.
+    assert events == ["enter", "exit", "sleep", "enter", "exit", "sleep", "enter", "exit"]
+
+
+async def test_call_shares_one_deadline_across_retry_attempts(db_factory, monkeypatch):
+    """Fix round 3, Item 1: контроллер поймал, что round-2 дизайн (свежий
+    `_ACQUIRE_TIMEOUT_S`-бюджет на КАЖДЫЙ `slot()`) ломает саму связь с окном
+    `JobsQueue.reap()`, ради которой число вообще считалось — полная цепочка
+    ретраев `LLM.__call__` могла суммарно ждать лимитер в разы дольше 600с
+    (round-2 отчёт: ~1440с в патологическом худшем случае). Фикс структурный:
+    `__call__` считает ОДИН дедлайн до начала цикла ретраев и передаёт его в
+    каждый `slot()` неизменным.
+
+    Проверяем это напрямую и детерминированно — не через тайминг (тот тест
+    ниже, `test_limiter_budget_bounds_full_retry_chain_not_multiplied`, а
+    этот не зависит от реального времени вообще): подменяем `PgLimiter.slot`
+    шпионом, который просто записывает полученный `deadline` и делегирует
+    настоящей реализации. При retryable `ModelHTTPError` `_attempt` вызывает
+    `slot()` второй раз — оба вызова обязаны получить ОДНО И ТО ЖЕ число, не
+    два разных `time.monotonic() + бюджет`, посчитанных в разное время.
+
+    Бэкофф-пауза между попытками НЕ обнулена полностью (`real_sleep(0.05)`,
+    не `real_sleep(0)`) — намеренно: между двумя попытками должен пройти
+    измеримый реальный кусок времени, иначе "вычислен заново" и "передан тем
+    же" от вычисления `time.monotonic()` дважды подряд без задержки могут
+    случайно дать одинаковые на вид числа даже в СЛОМАННОМ коде (проверено на
+    практике при подготовке этого раунда — без задержки тест проходил и с
+    внесённым багом тоже, ничего не доказывая).
+    """
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=12)
+
+    seen_deadlines: list[float | None] = []
+    real_slot = PgLimiter.slot
+
+    @asynccontextmanager
+    async def spying_slot(self: PgLimiter, *, deadline: float | None = None):
+        seen_deadlines.append(deadline)
+        async with real_slot(self, deadline=deadline):
+            yield
+
+    monkeypatch.setattr(PgLimiter, "slot", spying_slot)
+
+    attempts = {"n": 0}
+
+    def flaky(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        attempts["n"] += 1
+        if attempts["n"] < 2:
+            raise ModelHTTPError(status_code=503, model_name="test", body="upstream busy")
+        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={"text": "ok"})])
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds: float) -> None:
+        await real_sleep(0.05)  # см. докстринг — реальный измеримый разрыв, не ноль
+
+    monkeypatch.setattr("harness.platform.llm._sleep", fake_sleep)
+
+    llm = LLM(cfg, db_factory, model_override=FunctionModel(flaky))
+    out, _meta = await llm("verdict_text", Out, prompt="скажи привет", trace_id=trace_id)
+
+    assert isinstance(out, Out)
+    assert attempts["n"] == 2  # ретрай реально случился — иначе второй slot() не вызывался бы
+    assert len(seen_deadlines) == 2
+    assert seen_deadlines[0] is not None
+    assert seen_deadlines[0] == seen_deadlines[1]  # общий дедлайн, не свежий на каждый вызов
+
+
+async def test_call_shares_one_deadline_across_schema_retry_attempts(db_factory, monkeypatch):
+    """Fix round 4, Item 3. Тест выше (`test_call_shares_one_deadline_across_
+    retry_attempts`) доказывает общий дедлайн только на уровне HTTP-ретрая
+    ВНУТРИ одного `_attempt` — ревью показало, что этого недостаточно: перенос
+    вычисления дедлайна из `LLM.__call__` внутрь ЦИКЛА СХЕМА-ретраев (т.е.
+    обратно в `_attempt`, на каждый его вызов заново) не ломает НИ ОДИН
+    существующий тест. `test_call_shares_one_deadline_across_retry_attempts`
+    видит только ОДИН вызов `_attempt` (ретраится HTTP-попытка внутри него),
+    а `test_retry_on_schema_error_then_fail` вообще не инспектирует дедлайны.
+    Именно уровень, ради которого round 3 существовал (6 `slot()` при
+    сочетании HTTP- и схема-ретраев, ~1440с) — оставался защищён только
+    чтением кода, не тестом.
+
+    `FunctionModel`, неизменно отдающая мусор (тот же приём, что `test_retry_
+    on_schema_error_then_fail`), гарантированно вызывает `_attempt` РОВНО
+    `_MAX_SCHEMA_ATTEMPTS=2` раза — `__call__` ловит `UnexpectedModelBehavior`
+    и запускает `_attempt` заново. Реальная пауза ВНУТРИ самой модельной
+    функции (а не между попытками — между схема-ретраями `__call__` вообще не
+    спит) даёт измеримый разрыв между двумя гипотетическими моментами
+    пересчёта дедлайна — тот же урок, что и в тесте выше: без него
+    `time.monotonic()`, вызванный дважды подряд без задержки, может случайно
+    совпасть даже в сломанном коде и ничего не доказать.
+    """
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=15)
+
+    seen_deadlines: list[float | None] = []
+    real_slot = PgLimiter.slot
+
+    @asynccontextmanager
+    async def spying_slot(self: PgLimiter, *, deadline: float | None = None):
+        seen_deadlines.append(deadline)
+        async with real_slot(self, deadline=deadline):
+            yield
+
+    monkeypatch.setattr(PgLimiter, "slot", spying_slot)
+
+    async def garbage(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        await asyncio.sleep(0.05)  # реальный измеримый разрыв между попытками
+        return ModelResponse(parts=[TextPart(content="это не JSON и не вызов инструмента")])
+
+    llm = LLM(cfg, db_factory, model_override=FunctionModel(garbage))
+
+    with pytest.raises(LLMSchemaError):
+        await llm("verdict_text", Out, prompt="скажи привет", trace_id=trace_id)
+
+    assert len(seen_deadlines) == 2  # оба вызова _attempt дошли до slot()
+    assert seen_deadlines[0] is not None
+    assert seen_deadlines[0] == seen_deadlines[1]  # общий дедлайн через СХЕМА-ретрай тоже
+
+
+async def test_limiter_budget_bounds_full_retry_chain_not_multiplied(db_factory, monkeypatch):
+    """Наблюдаемое поведение, не только проводка (то, что контроллер попросил
+    отдельно): если бы второй `slot()` внутри цепочки ретраев получал СВЕЖИЙ
+    `_ACQUIRE_TIMEOUT_S`, полное время до провала росло бы с числом попыток.
+    С общим дедлайном вторая попытка наследует ОСТАВШИЙСЯ бюджет первой —
+    падение приходит примерно за один бюджет, не за два.
+
+    Окно темпа (`max_per_minute=1`) занято одной засеянной строкой; управляемый
+    `_sleep`-триггер (та же техника, что `test_rate_window_blocks`) освобождает
+    её ПОСЛЕ того, как первая попытка успела съесть заметную долю бюджета
+    (не мгновенно) — так разница между «общий бюджет» и «свежий на попытку»
+    измерима, а не тонет в шуме. Собственная строка `_log_started` первой
+    попытки сразу же вновь занимает окно для второй — и на этот раз ничего его
+    не освобождает: вторая попытка обязана упасть `PgLimiterTimeout` в пределах
+    ОСТАВШЕГОСЯ, не нового, бюджета.
+    """
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=13)
+    budget = 0.5
+    monkeypatch.setattr("harness.platform.limiter._ACQUIRE_TIMEOUT_S", budget)
+    monkeypatch.setattr("harness.platform.limiter._STALL_LOG_INTERVAL_S", 0.02)
+
+    narrow_cfg = Config(
+        llm_vision_model=cfg.llm_vision_model,
+        llm_verdict_model=cfg.llm_verdict_model,
+        llm_max_concurrency=4,
+        llm_max_per_minute=1,
+        database_url=cfg.database_url,
+        telegram_token=cfg.telegram_token,
+    )
+
+    async with db_factory() as session:
+        seed = LlmCall(trace_id=trace_id, provider="anthropic", model="test", purpose="verdict_text")
+        session.add(seed)
+        await session.commit()
+        seed_id = seed.id
+
+    real_sleep = asyncio.sleep
+    freed_once = False
+    wait_started: float | None = None
+
+    async def fake_limiter_sleep(seconds: float) -> None:
+        nonlocal freed_once, wait_started
+        now = time.monotonic()
+        if wait_started is None:
+            wait_started = now
+        # Освобождаем окно только после того, как первая попытка успела
+        # прождать заметную долю бюджета — иначе разница между общим и
+        # свежим бюджетом тонет в шуме одного быстрого цикла опроса.
+        if not freed_once and now - wait_started >= budget * 0.5:
+            freed_once = True
+            async with db_factory() as session:
+                await session.execute(
+                    text("UPDATE llm_calls SET started_at = now() - interval '2 minutes' WHERE id = :id"),
+                    {"id": seed_id},
+                )
+                await session.commit()
+        await real_sleep(0.02)
+
+    monkeypatch.setattr("harness.platform.limiter._sleep", fake_limiter_sleep)
+
+    async def fake_llm_sleep(seconds: float) -> None:
+        await real_sleep(0)
+
+    monkeypatch.setattr("harness.platform.llm._sleep", fake_llm_sleep)
+
+    attempts = {"n": 0}
+
+    def flaky(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        attempts["n"] += 1
+        raise ModelHTTPError(status_code=503, model_name="test", body="upstream busy")
+
+    llm = LLM(narrow_cfg, db_factory, model_override=FunctionModel(flaky))
+    started = time.monotonic()
+    with pytest.raises(PgLimiterTimeout):
+        await llm("verdict_text", Out, prompt="скажи привет", trace_id=trace_id)
+    elapsed = time.monotonic() - started
+
+    # Модель звалась ровно один раз: первая попытка дошла до agent.run() и
+    # получила retryable ModelHTTPError, вторая не дошла даже до него — упала
+    # в самом slot(), до всякого обращения к модели.
+    assert attempts["n"] == 1
+    # Общий бюджет:~1x budget суммарно на обе попытки. Свежий бюджет на
+    # попытку дал бы ~0.5x (первая) + 1x (вторая, заново) = ~1.5x и больше.
+    assert elapsed < budget * 1.3
+    assert elapsed > budget * 0.6  # не упало мгновенно по случайной причине
+
+
+async def test_pinned_connection_survives_autocommit_statement_boundaries(db_factory):
+    """Fix round 1, Important 3 — прямое доказательство механизма пиннинга, а не
+    вывод из тайминга гонки: если `AUTOCOMMIT` (`engine.connect()` +
+    `execution_options(isolation_level="AUTOCOMMIT")`) когда-нибудь перестанет
+    держать физическое соединение закреплённым за одним `AsyncConnection` через
+    несколько операторов подряд, мы молча возвращаемся к самому багу, который был
+    найден и исправлен (см. докстринг `PgLimiter.slot()`, "Пиннинг соединения") —
+    контроллер прямо потребовал эту проверку, потому что этот же класс ошибки уже
+    случился один раз незамеченным.
+
+    `pg_backend_pid()` — физическая личность соединения; операторы между первым и
+    последним замером — включая успешный захват advisory-лока — каждый коммитится
+    сам по себе под `AUTOCOMMIT` (в отличие от `AsyncSession.commit()`, который
+    вернул бы соединение в пул). Отдельная проверка со ВТОРОГО, независимого
+    соединения — что лок и правда ещё держится, а не просто pid не поменялся.
+    """
+    engine = db_factory.kw["bind"]
+    conn = await engine.connect()
+    conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+    try:
+        pid_before = await conn.scalar(text("SELECT pg_backend_pid()"))
+        acquired = await conn.scalar(
+            text("SELECT pg_try_advisory_lock(:cls, :idx)"),
+            {"cls": _ADVISORY_LOCK_CLASS, "idx": 0},
+        )
+        assert acquired
+        await conn.execute(text("SELECT 1"))  # ещё один auto-commit-оператор во время удержания
+        pid_after = await conn.scalar(text("SELECT pg_backend_pid()"))
+        assert pid_before == pid_after
+
+        async with db_factory() as probe:
+            still_locked = not await probe.scalar(
+                text("SELECT pg_try_advisory_lock(:cls, :idx)"),
+                {"cls": _ADVISORY_LOCK_CLASS, "idx": 0},
+            )
+            assert still_locked
+    finally:
+        await conn.execute(
+            text("SELECT pg_advisory_unlock(:cls, :idx)"), {"cls": _ADVISORY_LOCK_CLASS, "idx": 0}
+        )
+        await conn.close()
+
+
+async def test_leaked_lock_self_heals_on_next_checkout(db_factory):
+    """Fix round 1, Important 1: воркер падает посреди удержания слота (`finally`
+    не успевает выполниться) — соединение возвращается в пул ЖИВЫМ, а advisory-лок
+    остаётся висеть на нём (реентерабелен на уровне сессии). Без самолечения
+    (`pg_advisory_unlock_all()` первым делом в `slot()`) следующий держатель ЭТОГО
+    ЖЕ физического соединения получил бы `pg_try_advisory_lock` `True` не потому
+    что слот свободен, а по наследству от мертвеца — то есть два логических
+    держателя на одном индексе одновременно, ровно тот класс бага, что уже был
+    найден и исправлен в этой задаче.
+
+    Пул с `pool_size=1, max_overflow=0` — не тесту "может повезёт", а гарантия:
+    следующий чекаут ОБЯЗАН получить то же самое (единственное) физическое
+    соединение.
+
+    Проверка "не зависло" одна НЕДОСТАТОЧНА: без самолечения `slot()` ТОЖЕ не
+    виснет — реентерабельность advisory-лока на уровне сессии сама даёт `True`
+    унаследованному держателю (тот же баг, другой симптом, не hang). Наблюдаемое
+    отличие — не в том, зависает ли ЭТОТ `slot()`, а в том, что после его
+    завершения остаётся: без самолечения счётчик реентерабельности так и
+    остаётся на 1 (зомби так и не разблокировал, а "исцелившийся" держатель снял
+    только СВОЙ уровень, 2->1, но не тот, что от зомби) — НЕЗАВИСИМОЕ третье
+    соединение видит лок как всё ещё занятый. С самолечением счётчик обнулён ДО
+    захвата, и после освобождения независимое соединение видит лок свободным.
+    """
+    dsn = db_factory.kw["bind"].url
+    tight_engine = create_async_engine(dsn, pool_size=1, max_overflow=0)
+    tight_factory = async_sessionmaker(tight_engine, expire_on_commit=False)
+    try:
+        zombie = await tight_engine.connect()
+        zombie = await zombie.execution_options(isolation_level="AUTOCOMMIT")
+        acquired = await zombie.scalar(
+            text("SELECT pg_try_advisory_lock(:cls, :idx)"),
+            {"cls": _ADVISORY_LOCK_CLASS, "idx": 0},
+        )
+        assert acquired
+        await zombie.close()  # "падение" воркера — без unlock
+
+        lim = PgLimiter(tight_factory, max_concurrency=1, max_per_minute=1000)
+        async with asyncio.timeout(5):  # не повиснуть на все 120с _ACQUIRE_TIMEOUT_S, если баг вернулся
+            async with lim.slot():
+                pass
+
+        # Независимое соединение (свой собственный движок, не единственное из
+        # tight_engine) — единственный способ увидеть настоящее состояние лока
+        # снаружи, не унаследовав реентерабельность той же сессии.
+        async with db_factory() as outsider:
+            freed_for_real = await outsider.scalar(
+                text("SELECT pg_try_advisory_lock(:cls, :idx)"),
+                {"cls": _ADVISORY_LOCK_CLASS, "idx": 0},
+            )
+            assert freed_for_real
+            await outsider.execute(
+                text("SELECT pg_advisory_unlock(:cls, :idx)"),
+                {"cls": _ADVISORY_LOCK_CLASS, "idx": 0},
+            )
+    finally:
+        await tight_engine.dispose()
+
+
+async def test_acquire_gives_up_with_diagnostics_when_slot_never_frees(db_factory, monkeypatch):
+    """Fix round 1, Important 2: без ограничения `_acquire_advisory_lock` ждал бы
+    вечно и молча — утечка из Important 1 (или любая другая причина затора)
+    вырождалась бы в неотличимый от нормальной работы вечный стопор. Держим
+    единственный слот (K=1) занятым С ДРУГОГО соединения, которое НИКОГДА не
+    отпускает лок за время теста, и проверяем, что `slot()` сдаётся
+    `PgLimiterTimeout`, а не виснет. Оба порога укорочены monkeypatch — иначе тест
+    честно ждал бы 120 реальных секунд.
+
+    Текст исключения (fix round 4, Item 2) проверяется отдельно: этот вызов
+    `slot()` — БЕЗ переданного `deadline`, значит бюджет свежий и полный
+    (`_ACQUIRE_TIMEOUT_S`, здесь 0.3с) — ждали ровно его целиком, "оставалось
+    в начале" тоже 0.3с (унаследовать частично исчерпанный бюджет тут неоткуда,
+    это ровно тот "честный простой с нуля", который сообщение обязано отличать
+    от унаследованного). Симметричный случай (унаследованный почти пустой
+    бюджет) — `test_limiter_budget_bounds_full_retry_chain_not_multiplied` ниже,
+    хоть там текст явно не проверяется.
+    """
+    budget = 0.3
+    monkeypatch.setattr("harness.platform.limiter._ACQUIRE_TIMEOUT_S", budget)
+    monkeypatch.setattr("harness.platform.limiter._STALL_LOG_INTERVAL_S", 0.05)
+
+    holder = await db_factory.kw["bind"].connect()
+    holder = await holder.execution_options(isolation_level="AUTOCOMMIT")
+    try:
+        acquired = await holder.scalar(
+            text("SELECT pg_try_advisory_lock(:cls, :idx)"),
+            {"cls": _ADVISORY_LOCK_CLASS, "idx": 0},
+        )
+        assert acquired
+
+        lim = PgLimiter(db_factory, max_concurrency=1, max_per_minute=1000)
+        with pytest.raises(PgLimiterTimeout) as exc_info:
+            async with lim.slot():
+                pass
+    finally:
+        await holder.execute(
+            text("SELECT pg_advisory_unlock(:cls, :idx)"), {"cls": _ADVISORY_LOCK_CLASS, "idx": 0}
+        )
+        await holder.close()
+
+    message = str(exc_info.value)
+    assert "одновременности" in message  # какой именно механизм не открылся
+    assert "ждали" in message and "оставалось" in message  # elapsed + remaining budget — Item 2
+    numbers = [float(n) for n in re.findall(r"(\d+\.\d)с", message)]
+    assert len(numbers) == 2  # "ждали Xс" и "оставалось Yс"
+    # оба числа близки к полному бюджету — унаследовать частичный тут неоткуда
+    # (без переданного deadline эта slot() сама берёт свежий полный бюджет)
+    for value in numbers:
+        assert value == pytest.approx(budget, abs=0.2)
+
+
+async def test_unlock_failure_is_logged_not_raised(db_factory, monkeypatch, caplog):
+    """Fix round 2, Item 1 — реверс round-1 рулинга: `pg_advisory_unlock`,
+    вернувший `false`, теперь только `logger.error`, не `raise`. Тело `slot()`
+    успешно — вызывающий не должен получить исключение вместо результата: то же
+    самое, что происходило бы при `raise` — вызывающий воспринял бы успешный
+    (уже оплаченный) вызов провалившимся и ретраил бы его повторно ("платим
+    дважды", см. докстринг `slot()`).
+    """
+    monkeypatch.setattr("harness.platform.limiter._UNLOCK_SQL", text("SELECT false"))
+    lim = PgLimiter(db_factory, max_concurrency=1, max_per_minute=1000)
+
+    with caplog.at_level(logging.ERROR, logger="harness.platform.limiter"):
+        async with lim.slot():
+            pass  # тело "успешно" — не должно обернуться исключением снаружи
+
+    assert any("pg_advisory_unlock" in r.message for r in caplog.records)
+
+
+async def test_unlock_exception_is_logged_not_raised(db_factory, monkeypatch, caplog):
+    """Расширение Item 1 за буквальный периметр "false" (отмечено в отчёте): если
+    сам вызов `pg_advisory_unlock` падает исключением (а не просто возвращает
+    `false` — например, соединение оборвалось), это тоже не должно подменять
+    исход тела — тот же принцип из того же обоснования. Подмена `_UNLOCK_SQL` на
+    вызов несуществующей функции даёт настоящее исключение SQLAlchemy/asyncpg,
+    не искусственный мок.
+    """
+    monkeypatch.setattr(
+        "harness.platform.limiter._UNLOCK_SQL",
+        text("SELECT pg_advisory_unlock_totally_made_up(:cls, :idx)"),
+    )
+    lim = PgLimiter(db_factory, max_concurrency=1, max_per_minute=1000)
+
+    with caplog.at_level(logging.ERROR, logger="harness.platform.limiter"):
+        async with lim.slot():
+            pass
+
+    assert any("pg_advisory_unlock" in r.message for r in caplog.records)
+
+
+async def test_body_exception_survives_unlock_failure(db_factory, monkeypatch, caplog):
+    """Главная регрессия round 2, Item 1 (то, что контроллер просил проверить
+    отдельно): исключение из ТЕЛА `slot()` обязано долететь до вызывающего БЕЗ
+    ИЗМЕНЕНИЙ, даже если юнлок при выходе тоже проваливается. `raise` в
+    `finally` вокруг `yield` заменял бы `BodyBoom` на `PgLimiterUnlockFailed`
+    (round-1 версия) — настоящая причина падения выжила бы только в
+    `__context__`, а вызывающий получил бы не тот тип исключения, который
+    реально всё объясняет.
+    """
+    monkeypatch.setattr("harness.platform.limiter._UNLOCK_SQL", text("SELECT false"))
+    lim = PgLimiter(db_factory, max_concurrency=1, max_per_minute=1000)
+
+    class BodyBoom(Exception):
+        pass
+
+    with (
+        caplog.at_level(logging.ERROR, logger="harness.platform.limiter"),
+        pytest.raises(BodyBoom),
+    ):
+        async with lim.slot():
+            raise BodyBoom("настоящая причина падения")
+
+    assert any("pg_advisory_unlock" in r.message for r in caplog.records)
+
+
+def test_sniff_image_media_type_recognizes_all_four_formats():
+    """Round 1: захардкоженный `image/png` был неверен для реального входа —
+    Telegram переотдаёт сжатые фото как JPEG. Round 2, Item 3: GIF/WebP
+    добавлены следом — пересланный стикер или нетипичный документ иначе поднял
+    бы `ValueError` до вызова модели вместо того, чтобы быть прочитанным, а оба
+    формата провайдер принимает. Магические байты, не расширение файла —
+    вызывающий передаёт голые `bytes`.
+    """
+    assert _sniff_image_media_type(b"\x89PNG\r\n\x1a\n" + b"...") == "image/png"
+    assert _sniff_image_media_type(b"\xff\xd8\xff" + b"...") == "image/jpeg"
+    assert _sniff_image_media_type(b"GIF89a" + b"...") == "image/gif"
+    assert _sniff_image_media_type(b"GIF87a" + b"...") == "image/gif"
+    assert _sniff_image_media_type(b"RIFF" + b"\x00\x00\x00\x00" + b"WEBP" + b"...") == "image/webp"
+    with pytest.raises(ValueError):
+        _sniff_image_media_type(b"not-an-image-at-all")
+
+
+async def test_call_sniffs_jpeg_media_type_for_images(db_factory):
+    """То же самое, но через публичный `LLM.__call__` end-to-end: JPEG-байты в
+    `images=` обязаны долететь до модели как `BinaryContent(media_type='image/
+    jpeg')`, не `'image/png'` — иначе задача 22 первым же реальным скрином из
+    Telegram получает 400 от провайдера на vision-пути.
+    """
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=7)
+    seen_media_types: list[str] = []
+
+    def inspect_images(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        last = messages[-1]
+        for part in last.parts:
+            if isinstance(part, UserPromptPart) and isinstance(part.content, list):
+                seen_media_types.extend(
+                    c.media_type for c in part.content if isinstance(c, BinaryContent)
+                )
+        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={"text": "ok"})])
+
+    llm = LLM(cfg, db_factory, model_override=FunctionModel(inspect_images))
+    jpeg_bytes = b"\xff\xd8\xff" + b"\x00" * 16
+    await llm("vision_extract", Out, prompt="что на фото?", images=[jpeg_bytes], trace_id=trace_id)
+
+    assert seen_media_types == ["image/jpeg"]
+
+
+async def test_unexpected_exception_finalizes_row_as_error(db_factory):
+    """Discretionary item: без третьего `except` в `_attempt` строка `llm_calls`
+    осталась бы `status='started'` навсегда для сбоя, не опознанного ни как 429/5xx,
+    ни как невалидная схема (обрыв соединения, таймаут чтения, что угодно ещё) —
+    а у `llm_calls`, в отличие от `jobs`, нет reaper'а, который бы её когда-нибудь
+    закрыл.
+    """
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=8)
+
+    def boom(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise ConnectionError("оборвалось на середине")
+
+    llm = LLM(cfg, db_factory, model_override=FunctionModel(boom))
+    with pytest.raises(ConnectionError):
+        await llm("verdict_text", Out, prompt="скажи привет", trace_id=trace_id)
+
+    rows = await fetch_all(db_factory, "select status from llm_calls")
+    assert rows == [("error",)]
+
+
+async def test_cancellation_finalizes_row_and_repropagates(db_factory):
+    """Fix round 2, Item 2: `asyncio.CancelledError` наследуется от
+    `BaseException`, не от `Exception` — третий `except Exception` (пункт выше)
+    её НЕ ловит, а в асинхронном воркере с таймаутами отмена — самый частый вид
+    незапланированного выхода, не редкий случай. Отдельный `except
+    asyncio.CancelledError` обязан и закрыть строку `llm_calls`, и
+    перевыбросить — проглоченная отмена ломает распространение отмены по
+    дереву задач, не только эту попытку.
+
+    Настоящая отмена, не имитация: задача создаётся, получает время дойти до
+    `await asyncio.sleep(10)` внутри `agent.run()`, затем `task.cancel()` —
+    ровно то, что происходит, когда внешний таймаут отменяет застрявший вызов.
+    """
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=10)
+
+    async def slow(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        await asyncio.sleep(10)
+        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={"text": "ok"})])
+
+    llm = LLM(cfg, db_factory, model_override=FunctionModel(slow))
+    task = asyncio.ensure_future(
+        llm("verdict_text", Out, prompt="скажи привет", trace_id=trace_id)
+    )
+    await asyncio.sleep(0.1)  # дать корутине дойти до agent.run() -> asyncio.sleep(10)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    rows = await fetch_all(db_factory, "select status from llm_calls")
+    assert rows == [("error",)]
+
+
+def test_engine_of_rejects_non_engine_bind():
+    """Fix round 2, Item 4: `session_factory.kw["bind"]` типизирован SQLAlchemy
+    как `Any` — конструктор `async_sessionmaker` не проверяет `bind` сам
+    (принимает что угодно молча). `_engine_of` — единственное место, где
+    `PgLimiter` действительно проверяет, что там реально `AsyncEngine`, вместо
+    того чтобы упасть тремя уровнями глубже внутри `slot()` с непонятным
+    `AttributeError`.
+    """
+    fake_factory = async_sessionmaker(bind="не движок, а строка")  # pyright: ignore[reportArgumentType]
+    with pytest.raises(TypeError, match="AsyncEngine"):
+        _engine_of(fake_factory)
+
+
+def test_config_from_env_reads_all_six_vars(monkeypatch):
+    monkeypatch.setenv("LLM_VISION_MODEL", "anthropic:claude-sonnet-x")
+    monkeypatch.setenv("LLM_VERDICT_MODEL", "anthropic:claude-haiku-x")
+    monkeypatch.setenv("LLM_MAX_CONCURRENCY", "4")
+    monkeypatch.setenv("LLM_MAX_PER_MINUTE", "60")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@h/db")
+    monkeypatch.setenv("TELEGRAM_TOKEN", "123:abc")
+
+    loaded = Config.from_env()
+
+    assert loaded.llm_vision_model == "anthropic:claude-sonnet-x"
+    assert loaded.llm_verdict_model == "anthropic:claude-haiku-x"
+    assert loaded.llm_max_concurrency == 4
+    assert loaded.llm_max_per_minute == 60
+    assert loaded.database_url == "postgresql+asyncpg://u:p@h/db"
+    assert loaded.telegram_token == "123:abc"
+
+
+def test_config_from_env_missing_var_fails_loudly(monkeypatch):
+    """Отсутствующая переменная — явный `MissingEnvVar`, а не `KeyError` без
+    контекста и не тихая подстановка дефолта (спека §7: смена лимита — дело
+    окружения, а не источник для угадывания)."""
+    monkeypatch.delenv("LLM_VISION_MODEL", raising=False)
+    monkeypatch.setenv("LLM_VERDICT_MODEL", "anthropic:claude-haiku-x")
+    monkeypatch.setenv("LLM_MAX_CONCURRENCY", "4")
+    monkeypatch.setenv("LLM_MAX_PER_MINUTE", "60")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@h/db")
+    monkeypatch.setenv("TELEGRAM_TOKEN", "123:abc")
+
+    with pytest.raises(MissingEnvVar, match="LLM_VISION_MODEL"):
+        Config.from_env()
+
+
+def test_optional_env_treats_empty_value_as_unset(monkeypatch):
+    """ПУСТАЯ строка — это незаданная переменная, а не значение.
+
+    **Это регрессионный сторож раунда 1: красный на прежней реализации.**
+    Соседний тест (`..._prefers_value_over_default`) зелёный на обеих и ловит не
+    регресс, а ПЕРЕкоррекцию — сказано явно, потому что при чтении отчёта пару
+    «сторож + страховка» легко принять за два сторожа (ревью, раунд 2).
+
+    Не теоретическая придирка, а воспроизведение живого отказа (ревью задачи
+    20): `env_file` в Docker Compose ставит строку вида `WORKER_CONCURRENCY=`
+    как пустое значение, а не как отсутствие переменной. Голый
+    `os.environ.get(name, default)` вернул бы здесь `""`, дефолт бы не
+    применился, и `int("")` уронил бы воркер трассировкой — в цикле рестартов,
+    потому что `restart: unless-stopped`. Дорога к отказу — ровно та, которую
+    предписывает README: `cp .env.example .env`, оставить необязательную строку
+    пустой, `docker compose up -d`.
+    """
+    monkeypatch.setenv("WORKER_CONCURRENCY", "")
+    assert optional_env("WORKER_CONCURRENCY", "4") == "4"
+    assert int(optional_env("WORKER_CONCURRENCY", "4")) == 4
+
+
+def test_optional_env_prefers_value_over_default(monkeypatch):
+    """Страховка от перекоррекции, а НЕ регрессионный сторож: этот тест зелёный
+    и на прежней реализации (`os.environ.get(name, default)` заданное значение
+    возвращал верно). Он держит вторую сторону инварианта — «пустое значит
+    незаданное» не имеет права выродиться в «переменная не читается вовсе».
+    """
+    monkeypatch.setenv("WORKER_CONCURRENCY", "8")
+    assert optional_env("WORKER_CONCURRENCY", "4") == "8"
+
+    monkeypatch.delenv("WORKER_CONCURRENCY", raising=False)
+    assert optional_env("WORKER_CONCURRENCY", "4") == "4"
+
+
+def test_config_from_env_rejects_non_integer_with_named_error(monkeypatch):
+    """Целочисленная переменная, заданная не числом, — `InvalidEnvVar` с именем
+    переменной, а не голый `ValueError` (ревью задачи 20, раунд 2).
+
+    Тот же симптом, что чинил раунд 1, но другой триггер: под
+    `restart: unless-stopped` оператор видит не одну честную строку, а цикл
+    рестартов с трассировкой `invalid literal for int() with base 10`, где имя
+    переменной вообще не названо. Отдельно от `MissingEnvVar`: «не задана» и
+    «задана мусором» требуют разных действий.
+    """
+    monkeypatch.setenv("LLM_VISION_MODEL", "provider:model-x")
+    monkeypatch.setenv("LLM_VERDICT_MODEL", "provider:model-y")
+    monkeypatch.setenv("LLM_MAX_CONCURRENCY", "четыре")
+    monkeypatch.setenv("LLM_MAX_PER_MINUTE", "60")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@h/db")
+    monkeypatch.setenv("TELEGRAM_TOKEN", "не-настоящий-токен")
+
+    with pytest.raises(InvalidEnvVar, match="LLM_MAX_CONCURRENCY"):
+        Config.from_env()

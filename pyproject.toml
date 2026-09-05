@@ -1,0 +1,63 @@
+[project]
+name = "poker-harness"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram>=3.31.0",
+    "alembic>=1.19.1",
+    "asyncpg>=0.31.0",
+    "eval7>=0.1.11",
+    "httpx>=0.28.1",
+    # Точный пин, а не диапазон: реплей опирается на внутреннее состояние
+    # PokerKit (`State.statuses`), и патч-релиз может увести его из-под нас.
+    "pokerkit==0.7.5",
+    "psycopg[binary]>=3.3.5",
+    "pydantic>=2.7",
+    "pydantic-ai>=2.38.0",
+    "sqlalchemy[asyncio]>=2.0.30",
+    "structlog>=26.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "pyright>=1.1.380",
+    "testcontainers[postgres]>=4.15.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/harness"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# Медленные тесты помечены И ИСКЛЮЧЕНЫ из обычного прогона по умолчанию (задача 13,
+# рулинг владельца): полный скан турнира по реальным фикстурам — это минуты, а не
+# секунды, и до этой задачи маркер существовал, но не отфильтровывал ничего, отчего
+# `pytest -q -ra` незаметно вырос до 656 секунд. Полный прогон (сверка таблицы
+# эквити, равновесия fictitious play, оба скана турнира) — `uv run pytest -q -ra -m
+# ""`, эта же команда используется в CI (workflows/ci.yml) и обязательна перед
+# мержем. Голый `-m slow` гоняет только помеченные тесты, для адресного прогона.
+markers = ["slow: считает эквити, равновесие или сканирует турнир целиком — не секунды"]
+addopts = ["-m", "not slow"]
+# Вывод тестов держим чистым, иначе наши собственные предупреждения утонут в чужих.
+# Всё, кроме известного шума eval7 (он зовёт устаревшие функции pyparsing), — ошибка.
+filterwarnings = [
+    "error",
+    "ignore::pyparsing.warnings.PyparsingDeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.12"
+strict = ["src/harness/contracts"]

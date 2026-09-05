@@ -1,7 +1,52 @@
+# macOS
 .DS_Store
-.env
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.TemporaryItems
+.AppleDouble
+.LSOverride
+Icon
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 .venv/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# секреты и локальные данные
+.env
+.claude/screens/
+
+# приватные данные игрока: реальные hand history в публичный репозиторий не едут
+fixtures/hh/
+
+# Том с файлами, которые прислал игрок (`DATA_DIR/hh/{hash}.txt`, задача 19). В
+# проде это /data внутри контейнера, но локальный запуск с DATA_DIR=./data кладёт
+# сюда настоящие hand history — те же приватные данные, что fixtures/hh/, только
+# чужие. Продублировано в .githooks/pre-push: gitignore не спасает от `git add -f`.
+# Слэш в начале обязателен: без него шаблон накрыл бы и `src/harness/analysis/
+# tools/data/`, где лежит коммитимая таблица эквити.
+/data/
+
+# eval-датасет и промпты: ров продукта, см. docs/publishing-policy.md
+evals/vision/
+evals/e2e/
+src/harness/parsers/prompts/
+
+# Кэш равновесий пуш-фолда: чистый производный артефакт, считается кодом за секунды
+# и восстанавливается при пустом кэше. В отличие от таблицы эквити (её генерация —
+# минуты, поэтому она коммитится) держать его в истории незачем.
+src/harness/analysis/tools/data/nash_hu_*.json
+
+# Дисковый кэш эквити мультивея (задача 13): тот же принцип — чистый производный
+# артефакт, восстанавливается пересчётом за секунды при пустом кэше.
+src/harness/analysis/tools/data/equity_mc_cache.json
+
+# Визуальные отчёты по фикстурам (scripts/grid_report.py): содержат реальные руки игрока.
+reports/

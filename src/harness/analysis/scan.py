@@ -1,0 +1,124 @@
+"""Префлоп-скан турнира: сводка расхождений по всем рукам файла — без LLM (задача 13).
+
+Скан прогоняет тот же расчётный инструментарий, что и `analyze_hand` (задача 12),
+циклом по всем рукам файла турнира и складывает точки решения героя в один
+ранжированный список. Ни одного обращения к LLM здесь нет и не будет — это
+чистый код, и в этом весь смысл режима (SCALING.md §3): сотня рук стоит секунды
+и ноль токенов, тогда как разбор одной руки для игрока стоит вызова модели.
+Продукту выгодно, чтобы игроки пользовались именно этим, дешёвым для нас каналом.
+
+**Честность формулировки.** Скан судит по равновесию и модельным диапазонам, а
+не по факту выигрыша раздачи, поэтому в сводке — «расхождение», а не «ошибка»:
+осознанный эксплуатирующий отход от модели может быть верным решением, и это
+показывает подробный разбор конкретной руки (не в этом модуле), а не скан.
+Только точки, по которым есть вердикт (`error_cost.is_judged`), и только те из
+них, что дороже 0.1bb, попадают в список — точка без вердикта (постфлоп, прочий
+префлоп) не идёт в сводку вовсе: «неизвестно» не выдаётся ни за «верно», ни за
+«ошибка» (тот же принцип, что в `error_cost.py`).
+
+**Пред-фильтр.** Большинство рук турнирного файла — «сфолдил в неоткрытый банк,
+отдал блайнды». `cheap_fold_verdict` (задача 13, живёт в `preflop.py` рядом с
+остальным правилом зоны) закрывает такие точки одним попаданием в равновесный
+чарт, без единого вызова `shove_ev_bb`/`equity_vs_ranges` — это и есть рычаг,
+делающий скан по файлу вычислимым за секунды, а не минуты (см. измерение в
+отчёте задачи 13). Зона точки, закрытой префильтром, переносится в `ScanItem`
+как есть: пункт сводки, помеченный `assuming`, не имеет права выглядеть как
+точный расчёт (то же правило, что стоило проекту пяти раундов правок в задаче
+12) — но такие точки в список расхождений и не попадают вовсе, поскольку
+префильтр по построению закрывает только «фолд верен» (`ev_diff_bb == 0.0`).
+
+**Политика отказа.** `table_state` (см. `classifier._cross_check`) роняет
+`ValueError`, когда стол, восстановленный анализом из строк канонической руки,
+расходится с тем, что посчитал движок реплеем, — это сигнал внутреннего
+рассогласования конвейера, а не ожидаемая форма руки. Разбор ОДНОЙ руки
+(`analyze_hand`, задача 12) обязан падать: там игрок ждёт ответ по конкретной
+раздаче, и молчаливая деградация была бы враньём о ней. У скана — другой
+контракт: игрок ждёт сводку по СОТНЯМ рук за секунды, и обвал всего файла
+из-за одной нестандартной раздачи убивает именно ту ценность, ради которой
+скан существует (загрузил файл → получил список, а не разбор одной руки на
+которой всё упало). Поэтому здесь рука, на которой расчёт бросает `ValueError`,
+пропускается — счётчик `hands_failed` делает пропуск видимым вызывающей
+стороне, а не молчаливым: это не «выдать пробел за верную игру» (запрещённый
+`error_cost.py` манёвр — там `ev_diff_bb = 0` для несчитанной точки), а прямое
+«эту раздачу разобрать не удалось» на уровне всего файла.
+
+**Типы результата живут в `contracts`, не здесь (round 5, Item L).** `ScanItem`/
+`ScanSummary` — общий словарь конвейера наравне с `AnalysisResult`/`PointVerdict`:
+их читают `memory.repos` (колонка `tournaments.scan_summary`) и
+`presentation.messages` (сводка игроку). Пока они объявлялись в этом модуле,
+импорт ТИПА тянул за собой весь счётный пакет — `pokerkit` и `eval7` — в образ
+бота, которому считать нечего. Считает по-прежнему этот модуль; описывает —
+`contracts.analysis`.
+"""
+
+from __future__ import annotations
+
+from harness.analysis.error_cost import is_judged, total_ev_loss_bb
+from harness.analysis.preflop import cheap_fold_verdict, verdict_for
+from harness.contracts import EnrichedHand, PointVerdict, ScanItem, ScanSummary
+
+__all__ = ["scan_tournament"]
+
+# Порог, дороже которого расхождение попадает в список (спека задачи 13).
+# Ниже — сумма всё равно учтена в `total_loss_bb`, но строкой сводки не
+# становится: цена в копейки не то, ради чего игрок кликает в разбор.
+_MIN_REPORTED_LOSS_BB = 0.1
+
+
+def _hand_points(en: EnrichedHand) -> list[PointVerdict]:
+    """Вердикты по всем точкам решения героя в руке — с префильтром перед каждой.
+
+    `cheap_fold_verdict` возвращает `None`, когда его условия не выполняются или
+    чарт не даёт уверенного «фолд»; тогда точку досчитывает `verdict_for`
+    целиком, тем же путём, что и `analyze_hand` (задача 12). Ложных закрытий
+    настоящих ошибок это не производит: см. докстринг `cheap_fold_verdict`.
+    """
+    points: list[PointVerdict] = []
+    for dp in en.report.decision_points:
+        point = cheap_fold_verdict(dp, en)
+        points.append(point if point is not None else verdict_for(dp, en))
+    return points
+
+
+def scan_tournament(enriched: list[EnrichedHand]) -> ScanSummary:
+    """Сводка расхождений по всем рукам турнирного файла — ранжированная по цене."""
+    items: list[ScanItem] = []
+    hands_with_decision = 0
+    hands_failed = 0
+    total_loss_bb = 0.0
+
+    for en in enriched:
+        try:
+            points = _hand_points(en)
+        except ValueError:
+            hands_failed += 1
+            continue
+
+        judged = [p for p in points if is_judged(p)]
+        if judged:
+            hands_with_decision += 1
+        total_loss_bb += total_ev_loss_bb(points)
+
+        for point in judged:
+            if point.ev_diff_bb < -_MIN_REPORTED_LOSS_BB:
+                items.append(
+                    ScanItem(
+                        hand_no=en.hand.hand_no,
+                        hand_index=en.hand.hand_index,
+                        hero_class=str(point.detail.get("hero_class", "")),
+                        spot=point.spot,
+                        action_taken=point.action_taken,
+                        best_action=point.best_action,
+                        ev_diff_bb=point.ev_diff_bb,
+                        zone=point.zone,
+                    )
+                )
+
+    items.sort(key=lambda it: it.ev_diff_bb)
+    return ScanSummary(
+        hands_total=len(enriched),
+        hands_with_decision=hands_with_decision,
+        items=items,
+        total_loss_bb=round(total_loss_bb, 6),
+        hands_failed=hands_failed,
+    )
