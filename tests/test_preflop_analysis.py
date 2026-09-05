@@ -923,6 +923,59 @@ def test_a_limped_pot_is_not_a_shove():
     assert "банк открыт лимпом" in p.detail["unjudged"]
 
 
+def test_a_limped_pot_names_the_limp_when_the_call_is_not_all_in():
+    """Лимп, колл героя, фишки за спиной остались: причина называет лимп.
+
+    `aggressor` здесь `None`, а `call_is_all_in` — False; обе величины тест
+    проверяет до вердикта. В `unpriced_reason` лимповая ветка стоит выше ветки
+    «банк открыт рейзом не в олл-ин», и порядок закрепляет именно эта ассерта:
+    при обратном порядке точку забрала бы вторая.
+    """
+    stacks = dict.fromkeys(_SIX_MAX_SEATS, 20)
+    labels, seats, posts = _six_max(stacks, "SB")
+
+    def _check(label: str, street: Street) -> RawAction:
+        return RawAction(
+            street=street, label=label, kind=ActionKind.CHECK, raw_line=f"{label}: checks"
+        )
+
+    actions = [
+        _call(labels["UTG"], _BB),  # лимп
+        _fold(labels["HJ"]),
+        _fold(labels["CO"]),
+        _fold(labels["BTN"]),
+        _call("Hero", _SB),  # доплата 1 при остатке 19 — олл-ином колл не был
+        _check(labels["BB"], Street.PREFLOP),
+    ]
+    # Рука доигрывается чеками до вскрытия: лимпленный банк всегда видит флоп,
+    # а оборванная раздача отвергается валидатором.
+    for street in (Street.FLOP, Street.TURN, Street.RIVER):
+        actions += [_check("Hero", street), _check(labels["BB"], street), _check(labels["UTG"], street)]
+    raw = _raw(
+        seats=seats,
+        button_seat=6,
+        posts=posts,
+        actions=actions,
+        dealt={"Hero": ["Tc", "Ad"]},
+        boards=_BOARD,
+        showdowns=[
+            _showdown("Hero", ["Tc", "Ad"]),
+            _showdown(labels["BB"], ["7c", "2s"]),
+            _showdown(labels["UTG"], ["9s", "9h"]),
+        ],
+    )
+    en = enrich(normalize(raw))
+    assert en.verdict.status == "pass"
+    dp = en.report.decision_points[0]
+    state = table_state(dp, en)
+    assert state.aggressor is None
+    assert state.opened_voluntarily and not state.call_is_all_in
+
+    p = analyze_hand(en).points[0]
+    assert p.spot == "preflop_other" and p.best_action == ""
+    assert "банк открыт лимпом" in p.detail["unjudged"]
+
+
 # --- Глубина шовера: только те, кто мог ему ответить ------------------------------
 
 
