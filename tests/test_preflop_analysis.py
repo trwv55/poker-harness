@@ -275,13 +275,17 @@ def test_short_shove_stays_in_pushfold_zone_with_deep_player_behind():
 
 
 def test_eff_stack_is_the_depth_the_model_indexes_by():
-    """Глубина движка и глубина модели — одна величина, посчитанная двумя путями.
+    """Глубина движка и `stack_after_ante` анализа — одна величина двумя путями.
 
     Движок считает её реплеем (`stacks + bets` в PokerKit), анализ — по строкам
-    руки (`stack_after_ante`). Расхождение означало бы, что гейт пускает к модели
-    не то, что модель считает: анте здесь не косметика, а решение о том, входит
-    ли оно в глубину (не входит — это мёртвые деньги, равновесие берёт их
-    отдельным слагаемым). Рука настоящая и с анте 750.
+    руки. Расхождение означало бы, что анте попало в глубину: оно мёртвое,
+    равновесие берёт его отдельным слагаемым, и сложить его со стеком значило бы
+    посчитать дважды. Рука настоящая и с анте 750.
+
+    Речь именно о `stack_after_ante` — той глубине, которой индексируется
+    равновесие (`equilibrium_depth`) и колл-модели живых позади. С
+    `shover_depth_bb` (глубина ШОВЕРА, вход в модель его диапазона) эта величина
+    не совпадает и совпадать не обязана — см. докстринг `_effective_stack`.
     """
     en = enrich(normalize(parse_hand(SAMPLE, source_ref="x")))
     dp = next(d for d in en.report.decision_points if d.label == "Hero")
@@ -289,8 +293,6 @@ def test_eff_stack_is_the_depth_the_model_indexes_by():
     assert state.aggressor is not None
     assert dp.eff_stack == min(state.hero.stack_after_ante, state.aggressor.stack_after_ante)
     assert dp.eff_stack == 3891 - 750  # стек Hero без анте
-
-
 
 
 def test_fixture_hand_correct_call_not_flagged():
