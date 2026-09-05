@@ -480,7 +480,8 @@ def test_scan_counts_every_decision_point_and_those_with_a_verdict():
             )
         }
     )
-    unjudged = _make_multiway_fold_hand(hero_cards=("3c", "2d"), eff_bb=8.0, players_behind=3)
+    # Точка без вердикта: живых позади больше, чем перебирает модель (8 > 7).
+    unjudged = _make_wide_field_fold_hand(hero_cards=("3c", "2d"), eff_bb=10.0)
     s = scan_tournament([judged, unjudged])
 
     assert s.hands_total == 2 and s.hands_with_decision == 1
