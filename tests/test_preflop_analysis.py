@@ -988,6 +988,87 @@ def test_a_forfeited_small_blind_does_not_open_the_heads_up_equilibrium():
     assert cheap is not None and "равновеси" not in cheap.detail["zone_reason"]
 
 
+def test_an_ante_only_forfeit_does_not_open_the_heads_up_equilibrium():
+    """Тот же гейт, но мёртвых денег сверх анте в банке нет — держит проверка героя.
+
+    Малому блайнду хватило стека ровно на анте, поэтому блайнд с него не взяли
+    (`forced_blind` = 0) и его вклад равен его анте: условие «кроме героя и
+    названного места никто не вложил больше своего анте» выполняется. Живых
+    помимо форфейта двое, позади один и он в BB — гейт открылся бы, хотя Hero
+    сидит на кнопке и вынужденной ставки не делал вовсе.
+
+    Это единственная известная форма, где `dp.live_total` и `state.live_total`
+    расходятся при открытом гейте: тем же тестом закреплена и замена одного
+    счётчика на другой.
+    """
+    stacks = {**dict.fromkeys(_SIX_MAX_SEATS, 24), "SB": 1}
+    labels, seats, posts = _six_max(stacks, "BTN", ante=1)
+    actions = [
+        _fold(labels["UTG"]),
+        _fold(labels["HJ"]),
+        _fold(labels["CO"]),
+        _shove("Hero", 23),
+        _fold(labels["SB"]),
+        _fold(labels["BB"]),
+    ]
+    raw = _raw(
+        seats=seats,
+        button_seat=6,
+        posts=posts,
+        actions=actions,
+        dealt={"Hero": ["7c", "2d"]},
+        ante=1,
+    )
+    en = enrich(normalize(raw))
+    assert en.verdict.status == "pass" and en.report.forfeits == [labels["SB"]]
+    dp = en.report.decision_points[0]
+    state = table_state(dp, en)
+    small = next(s for s in state.seats if s.position == "SB")
+    assert small.contributed == small.ante and not small.live
+    assert state.hero.contributed == state.hero.ante
+    assert dp.live_total == 3 and state.live_total == 2
+    assert [s.position for s in state.behind_hero] == ["BB"]
+
+    p = analyze_hand(en).points[0]
+    assert p.spot == "pushfold_unopened"
+    assert "равновеси" not in p.detail["zone_reason"]
+    assert p.zone == "assuming" and p.assumption is not None
+
+
+def test_a_dead_small_blind_is_not_the_heads_up_equilibrium_against_a_shove():
+    """Шов кнопки после паса малого блайнда — не та игра, что считает равновесие.
+
+    Живых двое, герой в большом блайнде, ставку поставила кнопка — гейт
+    равновесия по форме открыт. Но блайнд спасовавшего лежит в банке, а
+    `_table_dead_bb` складывает только анте, то есть мёртвые деньги переданы не
+    те. Зона обязана определяться вилкой.
+    """
+    stacks = {**dict.fromkeys(_SIX_MAX_SEATS, 60), "BTN": 20, "BB": 20}
+    labels, seats, posts = _six_max(stacks, "BB")
+    actions = [
+        _fold(labels["UTG"]),
+        _fold(labels["HJ"]),
+        _fold(labels["CO"]),
+        _shove(labels["BTN"], 20),
+        _fold(labels["SB"]),
+        _fold("Hero"),
+    ]
+    raw = _raw(
+        seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["Tc", "9d"]}
+    )
+    en = enrich(normalize(raw))
+    dp = en.report.decision_points[0]
+    state = table_state(dp, en)
+    small = next(s for s in state.seats if s.position == "SB")
+    assert small.contributed > small.ante and not small.live
+    assert state.live_total == 2 and state.hero.position == "BB"
+
+    p = analyze_hand(en).points[0]
+    assert p.spot == "pushfold_facing_shove"
+    assert "равновеси" not in p.detail["zone_reason"]
+    assert p.zone == "assuming" and p.assumption is not None
+
+
 def test_a_forfeited_seat_could_not_have_answered_the_shove():
     """Состав на момент шова тоже без форфейта: движок вычеркнул место из руки.
 

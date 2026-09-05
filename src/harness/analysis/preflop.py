@@ -595,15 +595,22 @@ def _rivals_when_shoved(
 
 
 def _nothing_dead_besides(state: TableState, opponent: SeatSnapshot) -> bool:
-    """Кроме героя и названного места, никто не вложил в банк больше своего анте.
+    """Вынужденную ставку сделал герой, и никто, кроме него и названного места.
 
-    Гейт равновесия в `_unopened_verdict` и `cheap_fold_verdict` требует ровно
-    той игры, которую считает `nash_hu`: два места и мёртвые деньги, равные
-    сумме анте (`_table_dead_bb`). Чужая вынужденная ставка в банке этой суммой
-    не учитывается, поэтому равновесие индексировалось бы не по тем деньгам.
-    Закреплено `test_a_forfeited_small_blind_does_not_open_the_heads_up_equilibrium`.
+    Проверяются два условия: вклад героя больше его анте, а вклад каждого
+    остального места, кроме названного, своему анте равен. Тогда всё, что лежит
+    в банке сверх анте стола (`_table_dead_bb`), внесли ровно эти двое.
+
+    Гейт равновесия читает результат в `_unopened_verdict`, `cheap_fold_verdict`
+    и `_facing_shove_verdict`. Закреплено тремя тестами:
+    `test_a_forfeited_small_blind_does_not_open_the_heads_up_equilibrium`
+    (чужая вынужденная ставка в банке),
+    `test_an_ante_only_forfeit_does_not_open_the_heads_up_equilibrium`
+    (вынужденной ставки не делал сам герой),
+    `test_a_dead_small_blind_is_not_the_heads_up_equilibrium_against_a_shove`
+    (то же против шова).
     """
-    return all(
+    return state.hero.contributed > state.hero.ante and all(
         seat.contributed == seat.ante
         for seat in state.seats
         if seat.label not in (state.hero.label, opponent.label)
@@ -850,6 +857,7 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         and state.hero.position == "BB"
         and shover.position in ("SB", "BTN")
         and state.voluntary_actors == (shover.label,)
+        and _nothing_dead_besides(state, shover)
     ):
         equilibrium_depth = _equilibrium_depth(
             min(state.hero.stack_after_ante, shover.stack_after_ante) / bb

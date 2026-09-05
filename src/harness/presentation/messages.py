@@ -89,8 +89,10 @@ class Msg(BaseModel):
 
 # --- Словари перевода внутренних токенов в слова игрока -------------------------
 
-# `PointVerdict.action_taken`/`best_action` — токены движка (см. `preflop.py`),
-# не то, что показывается игроку буквально.
+# `PointVerdict.action_taken`/`best_action` — токены движка (см. `preflop.py`);
+# словарь переводит их в слова игрока. Строка, которой в словаре нет,
+# показывается как есть: так сюда приходит готовая формулировка развилки из
+# `preflop._BEST_DEPENDS_ON_BEHIND`.
 _ACTION_WORD: dict[str, str] = {"fold": "фолд", "shove": "шов", "call": "колл"}
 
 _SPOT_WORD: dict[SpotKind, str] = {
