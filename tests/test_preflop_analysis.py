@@ -705,17 +705,12 @@ def test_two_all_ins_before_hero_are_not_priced():
 
 
 def test_a_player_who_already_called_the_shove_is_not_priced():
-    """Шов, ответ на него, и только потом Hero — вскрытие втроём, а модель считает пару.
+    """Шов, ответ на него, и только потом Hero: на вскрытии два диапазона, а не один.
 
-    Форма найдена прогоном по фикстурам (три точки из тридцати двух «против
-    шова»): UTG шовит, HJ его коллирует, Hero отвечает уже второму известному
-    участнику вскрытия. Заколлировавший в банке с вероятностью 1 — приписывать
-    ему модельный диапазон КОЛЛА как возможному коллеру неверно дважды: он уже
-    выбрал, и вскрытие с ним гарантировано.
-
-    Пуш-фолд-гейты этого спота не ловили: олл-ин перед героем ровно один
-    (заколлировавший покрыл шов и остался с фишками), а банк открыт тем же, кто
-    и поставил.
+    Заколлировавший — не развилка «войдёт или нет»: он уже вложился, и модельный
+    диапазон КОЛЛА ему приписывать нечему. Прежние гейты этот спот пропускали, и
+    тест это показывает: олл-ин в руке ровно один (заколлировавший покрыл шов и
+    остался с фишками), банк открыт тем же, кто и поставил.
     """
     stacks = {**dict.fromkeys(_SIX_MAX_SEATS, 60), "UTG": 20, "BB": 26}
     labels, seats, posts = _six_max(stacks, "BB")
@@ -734,27 +729,27 @@ def test_a_player_who_already_called_the_shove_is_not_priced():
     dp = en.report.decision_points[0]
     state = table_state(dp, en)
     # Оба прежних гейта пропускают эту точку — ловит её именно новый.
-    assert len(state.all_in_before_hero) == 1
+    assert len(state.all_in_besides_hero) == 1
     assert state.opened_by_aggressor
     assert {s.label for s in state.callers_before_hero} == {labels["HJ"]}
 
     p = analyze_hand(en).points[0]
     assert p.spot == "preflop_other" and p.best_action == "" and p.ev_diff_bb == 0.0
-    assert "вскрытие" in p.detail["unjudged"]
+    # Подстрока выбрана так, чтобы её не давала соседняя причина про два олл-ина.
+    assert "ответ на него" in p.detail["unjudged"]
 
 
-def test_blind_all_in_is_counted_as_an_all_in_and_is_not_modelled_as_a_caller():
-    """Олл-ин с блайнда — участник вскрытия без выбора: не коллер, но олл-ин.
+def test_a_blind_all_in_behind_hero_is_not_priced():
+    """Живой без фишек за спиной позади героя — вердикта нет, а не ярлык.
 
     BB со стеком в один блайнд уходит в олл-ин самим постом: он жив, фишек за
-    спиной нет, действия в круге у него не было. Прежний фильтр `behind` пускал
-    его в модельные коллеры и выдавал ему равновесный диапазон колла, хотя
-    коллировать ему нечем; прежний `all_in_before_hero` не считал его вовсе,
-    потому что требовал состоявшегося действия.
+    спиной нет, действия в круге у него не было. Коллером он быть не может —
+    коллировать нечем; но и посчитать точку не из чего: `call_shove_ev_bb` берёт
+    эквити против одного диапазона и весь банк записывает герою.
 
-    Открывший рейз НЕ в олл-ин выбран намеренно: только так олл-инов перед
-    героем остаётся ровно один и точка доходит до вердикта, а не отсекается
-    гейтом (это проверяет соседний тест).
+    Открывший рейз НЕ в олл-ин выбран намеренно: только так олл-ин в руке
+    остаётся один и точка доходит до `_facing_shove_verdict`, а не отсекается
+    гейтом класса (это проверяет соседний тест).
     """
     stacks = {**dict.fromkeys(_SIX_MAX_SEATS, 40), "BB": _BB, "SB": 5}
     labels, seats, posts = _six_max(stacks, "SB")
@@ -777,33 +772,33 @@ def test_blind_all_in_is_counted_as_an_all_in_and_is_not_modelled_as_a_caller():
         seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["Tc", "Ad"]}
     )
     en = enrich(normalize(raw))
+    # Рум пас за него не писал — это не форфейт, а настоящий олл-ин с блайнда.
+    assert en.report.forfeits == []
     dp = en.report.decision_points[0]
     state = table_state(dp, en)
     blind = next(s for s in state.seats if s.position == "BB")
     assert blind.live and not blind.acted and blind.behind == 0
 
-    # (1) он считается олл-ином перед героем;
-    assert {s.label for s in state.all_in_before_hero} == {blind.label}
-    # (2) и при этом не попадает в моделируемых коллеров.
+    # (1) он считается олл-ином помимо героя;
+    assert {s.label for s in state.all_in_besides_hero} == {blind.label}
+    # (2) класс спота при этом остаётся пуш-фолдным — отсекает не гейт класса,
+    #     а сам расчёт, и причина называется его словами;
+    assert state.aggressor is not None and not state.aggressor_all_in
+    assert spot_for(dp, state) == "pushfold_facing_shove"
+    # (3) вердикта нет, и он не подменён ни ярлыком зоны, ни числом.
     p = analyze_hand(en).points[0]
     assert p.spot == "pushfold_facing_shove"
-    assert p.detail["live_others"] == 0
-    # Оси «войдут ли живые позади» здесь нет: моделировать некого.
-    assert p.detail["behind_axis"] is None
-    # Но во вскрытии он будет, а эквити героя считается один на один — вывод
-    # обязан быть помечен как непроверенный по ЭТОМУ измерению, а не по какому
-    # угодно другому: поэтому проверяется названная причина, а не только зона.
-    assert p.zone == "assuming"
-    assert "олл-ине" in p.detail["zone_reason"]
-    assert p.detail["all_in_behind_ignored"] == 1
+    assert p.best_action == "" and p.ev_diff_bb == 0.0 and p.assumption is None
+    assert "без фишек за спиной" in p.detail["unjudged"]
+    assert "live_others" not in p.detail
 
 
-def test_shove_plus_blind_all_in_is_two_showdowns_and_is_not_priced():
-    """Шов и олл-ин с блайнда — два вскрывающихся и сайд-пот: гейт обязан отсечь.
+def test_shove_plus_blind_all_in_is_not_priced():
+    """Шов и олл-ин с блайнда — два олл-ина помимо героя: гейт класса обязан отсечь.
 
-    Ровно тот спот, который гейт `len(all_in_before_hero) <= 1` создан
-    исключать; он проходил его только потому, что олл-ин с блайнда за олл-ин не
-    считался. Найден прогоном по фикстурам — одна точка из тридцати двух.
+    Ровно тот спот, который гейт `len(all_in_besides_hero) <= 1` создан
+    исключать; он проходил его, пока свойство требовало состоявшегося действия,
+    а у олл-ина с блайнда действия нет.
     """
     stacks = {**dict.fromkeys(_SIX_MAX_SEATS, 60), "UTG": 20, "SB": _SB, "BB": 26}
     labels, seats, posts = _six_max(stacks, "BB")
@@ -818,13 +813,114 @@ def test_shove_plus_blind_all_in_is_two_showdowns_and_is_not_priced():
         seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["Tc", "Ad"]}
     )
     en = enrich(normalize(raw))
+    assert en.report.forfeits == []  # пас за малый блайнд рум не писал
     dp = en.report.decision_points[0]
     state = table_state(dp, en)
-    assert len({s.position for s in state.all_in_before_hero}) == 2
+    assert {s.position for s in state.all_in_besides_hero} == {"UTG", "SB"}
 
     p = analyze_hand(en).points[0]
     assert p.spot == "preflop_other" and p.best_action == ""
-    assert "2 олл-ина" in p.detail["unjudged"]
+    assert "больше одного олл-ина помимо героя (всего 2)" in p.detail["unjudged"]
+
+
+# --- Форфейт: место, которое движок вычёркивает из руки ---------------------------
+
+
+def _make_forfeit_hand(hero_position: str):
+    """Шов UTG; место с нулевым стеком в блайнде, которому рум записал `folds`.
+
+    Что это за форма и почему движок снимает такое место с руки — в докстрингах
+    `replay._is_forfeit` и `replay._forfeit`. Здесь важно только, что `enrich`
+    её распознаёт: это проверяет ассерта в конце функции.
+
+    Позиция героя выбирает, до или после его решения стоит строка `folds`
+    форфейта: при Hero в BB форфейтит SB и его пас попадает в действия ДО
+    решения героя, при Hero в HJ форфейтит BB и его пас стоит после.
+    """
+    blind = "SB" if hero_position == "BB" else "BB"
+    amount = _SB if blind == "SB" else _BB
+    stacks = {**dict.fromkeys(_SIX_MAX_SEATS, 60), "UTG": 20, blind: amount}
+    stacks[hero_position] = 26
+    labels, seats, posts = _six_max(stacks, hero_position)
+    order = ["UTG", "HJ", "CO", "BTN", "SB", "BB"]
+    actions = [_shove(labels["UTG"], 20)]
+    actions += [_fold(labels[pos]) for pos in order[1:] if pos != "UTG"]
+    raw = _raw(
+        seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["Tc", "Ad"]}
+    )
+    en = enrich(normalize(raw))
+    assert en.report.forfeits == [labels[blind]]
+    return en, labels, blind
+
+
+def test_a_forfeited_seat_behind_hero_is_not_an_all_in():
+    """Форфейт позади героя: движок снял его с руки, значит и стол его не держит.
+
+    Строка `folds` форфейтного BB стоит ПОСЛЕ решения героя, поэтому проход по
+    действиям до точки решения её не видит — место остаётся живым, если не
+    прочитать `report.forfeits`. Тогда оно идёт и в олл-ины помимо героя (спот
+    снимается с оценки с причиной, которой в руке нет), и в моделируемые
+    коллеры (равновесный диапазон колла игроку, который в руке не участвует).
+    """
+    en, labels, blind = _make_forfeit_hand("HJ")
+    dp = next(d for d in en.report.decision_points if d.label == "Hero")
+    state = table_state(dp, en)
+    seat = next(s for s in state.seats if s.label == labels[blind])
+    assert not seat.live and seat.behind == 0
+
+    assert {s.label for s in state.all_in_besides_hero} == {labels["UTG"]}
+    p = analyze_hand(en).points[0]
+    assert p.spot == "pushfold_facing_shove" and p.best_action != ""
+    # CO, BTN и SB — все живые за героем помимо шовера; форфейтного BB среди них нет.
+    assert p.detail["live_others"] == 3
+
+
+def test_a_forfeited_seat_before_hero_is_not_an_all_in():
+    """Тот же форфейт, но его пас стоит ДО решения героя — держит уже фильтр `live`.
+
+    Здесь `table_state` выводит место из живых обычным проходом по действиям, и
+    закрепляется именно `live` в `all_in_besides_hero`: без него место с нулевым
+    остатком считалось бы вторым олл-ином и спот ушёл бы без вердикта.
+    """
+    en, labels, blind = _make_forfeit_hand("BB")
+    dp = next(d for d in en.report.decision_points if d.label == "Hero")
+    state = table_state(dp, en)
+    seat = next(s for s in state.seats if s.label == labels[blind])
+    assert seat.acted and not seat.live and seat.behind == 0
+
+    assert {s.label for s in state.all_in_besides_hero} == {labels["UTG"]}
+    assert spot_for(dp, state) == "pushfold_facing_shove"
+
+
+def test_a_limped_pot_is_not_a_shove():
+    """Банк открыт лимпом: повышавшего нет, и диапазон шова приписывать некому.
+
+    Доплата съедает весь остаток героя, поэтому `call_is_all_in` истинно и точка
+    выглядела пуш-фолдной, хотя `state.aggressor` здесь `None` — обе величины
+    тест проверяет до вердикта.
+    """
+    stacks = {**dict.fromkeys(_SIX_MAX_SEATS, 60), "SB": _BB}
+    labels, seats, posts = _six_max(stacks, "SB")
+    actions = [
+        _call(labels["UTG"], _BB),  # лимп
+        _fold(labels["HJ"]),
+        _fold(labels["CO"]),
+        _fold(labels["BTN"]),
+        _fold("Hero"),
+    ]
+    raw = _raw(
+        seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["Tc", "Ad"]}
+    )
+    en = enrich(normalize(raw))
+    dp = en.report.decision_points[0]
+    state = table_state(dp, en)
+    assert state.aggressor is None
+    assert state.opened_voluntarily and state.call_is_all_in
+
+    p = analyze_hand(en).points[0]
+    assert p.spot == "preflop_other" and p.best_action == ""
+    # Подстрока целиком: слово «лимп» есть и в причине про НЕоткрытый банк.
+    assert "банк открыт лимпом" in p.detail["unjudged"]
 
 
 # --- Глубина шовера: только те, кто мог ему ответить ------------------------------

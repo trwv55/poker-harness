@@ -30,19 +30,20 @@
 живёт в `zone_for` — снаружи его переопределить негде.
 
 **Живые игроки за героем при колле шова.** `call_shove_ev_bb` считает вскрытие
-один на один. Если за героем остались живые, их возможный колл в модель не
-входит, и эквити героя завышено — смещение направлено в сторону колла. Правильно
-моделировать их — отдельная работа; до неё зона такой точки принудительно
-`assuming`, как бы ни повела себя вилка диапазонов.
+один на один, поэтому вход живых позади в модель не входит. Он считается второй
+осью вилки (`ev_call_all_behind_bb`) и попадает в `zone_for`: если вердикт от неё
+меняется, зона `assuming`, а цена берётся по самому мягкому из двух сценариев.
+Живой БЕЗ фишек за спиной так не считается — его вход не развилка, и такая точка
+остаётся без вердикта (см. границы ниже).
 
 **Границы применимости, за которыми вердикта нет.** Модель описывает ровно две
 формы: «шов или пас в неоткрытый банк» и «колл или пас против ОДНОГО открытого
 шова». Всё остальное возвращается без вердикта с названной причиной
 (`unpriced_reason`) — глубже 15bb, лимп, война повышений, ре-шов поверх чужого
-опена, два олл-ина перед героем, уже ответивший на шов перед героем. Четыре
-последние границы найдены не рассуждением, а прогоном по 318 реальным рукам: без
-них модель выдавала самые громкие цифры разбора (до -11bb) на спотах, которых она
-не описывает, и все они смещали вердикт в сторону колла.
+опена, больше одного олл-ина в руке помимо героя, уже ответивший на шов перед
+героем, живой без фишек за спиной позади героя. Каждая граница снимает вердикт
+целиком, а не поправляет число: во всех этих формах на вскрытии больше одного
+диапазона, а инструмент считает эквити против одного, — поправлять в нём нечего.
 
 **Фолд-эквити.** `shove_ev_bb` гейта не ставит (сигнатура заморожена задачей 11),
 поэтому он стоит здесь: `fold_equity_ok` считается для каждого шова и попадает в
@@ -724,6 +725,27 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
     if state.to_call <= 0 or state.hero.behind <= 0:
         return _unjudged(dp, spot, "доплаты нет либо у героя не осталось фишек")
 
+    # Живой без фишек за спиной позади героя (`behind == 0`) в модельный набор
+    # коллеров не входит: ось «войдёт или нет» для него пуста. Посчитать точку
+    # при этом нечем — `call_shove_ev_bb` берёт эквити против ОДНОГО диапазона и
+    # весь `pot_before` записывает герою, — поэтому вердикта здесь нет, как и у
+    # спота с уже ответившим на шов. Закреплено
+    # `test_a_blind_all_in_behind_hero_is_not_priced`.
+    live_behind = [
+        seat
+        for seat in state.seats
+        if seat.live and seat.label not in (state.hero.label, shover.label)
+    ]
+    behind = [seat for seat in live_behind if seat.behind > 0]
+    all_in_behind = len(live_behind) - len(behind)
+    if all_in_behind:
+        return _unjudged(
+            dp,
+            spot,
+            f"позади героя {all_in_behind} живых без фишек за спиной: во вскрытии "
+            f"больше двух участников, а эквити считается против одного диапазона",
+        )
+
     dead_bb = _table_dead_bb(state)
     rivals = _rivals_when_shoved(en.hand, dp, state, shover)
     if not rivals:
@@ -757,19 +779,6 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
     # обе поправки берутся вместе, иначе конец вилки был бы искусственно мрачным.
     # Арифметика та же самая, из замороженного инструмента: подменяется только
     # набор диапазонов на вскрытии и размер банка.
-    #
-    # Игрок без фишек за спиной (олл-ин с блайнда) в эту ось не входит: развилки
-    # «войдёт или нет» у него нет — он уже в банке, и его деньги приносит
-    # `pot_before`, а не `_extra_from_behind`. Во вскрытии он при этом будет, а
-    # эквити героя здесь считается один на один, поэтому такая точка уходит в
-    # `assuming` через `unmodelled` — так же, как в `_unopened_verdict`.
-    live_behind = [
-        seat
-        for seat in state.seats
-        if seat.live and seat.label not in (state.hero.label, shover.label)
-    ]
-    behind = [seat for seat in live_behind if seat.behind > 0]
-    all_in_behind = len(live_behind) - len(behind)
     behind_unmodelled = len(behind) > _MAX_MODELLED_CALLERS
     best_behind: list[str] = []
     ev_behind: float | None = None
@@ -822,18 +831,6 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
     # интереснее всего.
     behind_moved = bool(set(best_behind) - {best})
     behind_axis = None if not best_behind else ("unstable" if behind_moved else "stable")
-    if behind_unmodelled:
-        unmodelled = (
-            f"живых за героем {len(behind)} — больше, чем модель вскрытия способна "
-            f"перебрать, их влияние на вердикт не проверено"
-        )
-    elif all_in_behind:
-        unmodelled = (
-            f"позади героя {all_in_behind} живых уже в олл-ине: они дойдут до "
-            f"вскрытия, а эквити героя посчитано против одного диапазона"
-        )
-    else:
-        unmodelled = ""
     zone, why = zone_for(
         best_tight,
         best_wide,
@@ -842,7 +839,12 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         best_model=best,
         best_interior=by_width[1:-1],
         best_behind=best_behind,
-        unmodelled=unmodelled,
+        unmodelled=(
+            f"живых за героем {len(behind)} — больше, чем модель вскрытия способна "
+            f"перебрать, их влияние на вердикт не проверено"
+            if behind_unmodelled
+            else ""
+        ),
     )
     taken = "call" if dp.action.kind is ActionKind.CALL else "fold"
 
@@ -857,16 +859,14 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         "required_equity": round(required_equity(state.to_call, state.pot_before), 6),
         "shover_depth_bb": round(_depth_key(shover_depth_bb), 2),
         "dead_extra_bb": round(dead_bb, 4),
-        # Сколько живых за героем модель перебирает как возможных коллеров.
-        # Уже ответивший на шов сюда попасть не может: такой спот `spot_for` до
-        # этой функции не допускает (`callers_before_hero`).
+        # Сколько живых за героем модель перебирает как возможных коллеров. Уже
+        # ответивший на шов сюда попасть не может: такой спот `spot_for` до этой
+        # функции не допускает — см. `test_a_player_who_already_called_the_shove_is_not_priced`.
         "live_others": len(behind),
         "behind_axis": behind_axis,
         "ev_call_all_behind_bb": None if ev_behind is None else round(ev_behind, 4),
         "zone_reason": why,
     }
-    if all_in_behind:
-        detail["all_in_behind_ignored"] = all_in_behind
     return PointVerdict(
         dp_index=dp.index,
         street=dp.street,

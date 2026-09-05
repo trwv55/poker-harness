@@ -93,11 +93,16 @@ class TableState:
         return self.aggressor is not None and self.aggressor.behind == 0
 
     @property
-    def all_in_before_hero(self) -> tuple[SeatSnapshot, ...]:
+    def all_in_besides_hero(self) -> tuple[SeatSnapshot, ...]:
         """Живые игроки без фишек за спиной к моменту решения героя.
 
-        Состоявшееся действие не требуется: весь стек мог забрать пост блайнда.
-        Закреплено `test_blind_all_in_is_counted_as_an_all_in_and_is_not_modelled_as_a_caller`.
+        Ни состоявшегося действия, ни хода до героя не требуется: весь стек мог
+        забрать пост блайнда, а место с таким постом ходит последним. Отсюда и
+        имя: «помимо героя», а не «до героя».
+
+        Закреплено `test_a_blind_all_in_behind_hero_is_not_priced` (место позади
+        героя считается) и `test_a_forfeited_seat_before_hero_is_not_an_all_in`
+        (сброшенное место не считается).
         """
         return tuple(
             s for s in self.seats if s.live and s.behind == 0 and s.label != self.hero.label
@@ -107,7 +112,7 @@ class TableState:
     def callers_before_hero(self) -> tuple[SeatSnapshot, ...]:
         """Живые игроки, уже действовавшие в этом круге, кроме героя и агрессора.
 
-        Пусто, когда агрессора нет: без ставки отвечать не на что.
+        Без агрессора — пусто.
 
         `spot_for` читает непустой результат как «на ставку агрессора уже
         ответили» и снимает с такой точки вердикт; это чтение закреплено
@@ -166,6 +171,14 @@ def table_state(dp: DecisionPoint, en: EnrichedHand) -> TableState:
     ante = {p.label: min(hand.ante, p.stack) for p in hand.players}
     committed = {p.label: forced_blind(hand, p, ante[p.label]) for p in hand.players}
     live = dict.fromkeys(committed, True)
+    # Форфейт (`replay._forfeit`) — записанный румом пас игрока, которого
+    # вынужденная ставка оставила без фишек: движок снимает его с руки, а вклад
+    # остаётся в банке. Цикл ниже читает действия только ДО решения героя, и
+    # форфейт, записанный позже, в него не попадает — поэтому список берётся
+    # целиком. На `pot_before` и `to_call` это не влияет: обе величины считаются
+    # по всем местам, а не по живым.
+    for label in en.report.forfeits:
+        live[label] = False
     acted = dict.fromkeys(committed, False)
 
     target = action_index(hand, dp)
@@ -264,14 +277,16 @@ def unpriced_reason(dp: DecisionPoint, state: TableState) -> str:
         return "банк открыт рейзом не в олл-ин, и колл героя олл-ином не был"
     if not state.opened_by_aggressor:
         return "перед героем ре-шов поверх чужого опена: его диапазон уже открытого шова"
-    if len(state.all_in_before_hero) > 1:
+    if state.aggressor is None:
+        return "банк открыт лимпом: ставки, диапазон которой моделируется, перед героем нет"
+    if len(state.all_in_besides_hero) > 1:
         return (
-            f"перед героем {len(state.all_in_before_hero)} олл-ина: сайд-поты и вскрытие "
-            f"против нескольких диапазонов сразу"
+            f"в руке больше одного олл-ина помимо героя (всего "
+            f"{len(state.all_in_besides_hero)}): вскрытие против нескольких диапазонов сразу"
         )
     if state.callers_before_hero:
         return (
-            "перед героем шов и ответ на него: вскрытие втроём, "
+            "перед героем шов и ответ на него: во вскрытии больше двух участников, "
             "а модель считает эквити против одного диапазона"
         )
     return "перед героем олл-ин, но сыгран не колл и не пас"
@@ -318,18 +333,18 @@ def spot_for(dp: DecisionPoint, state: TableState) -> SpotKind:
         # третье действие (ре-шов), которого модель не считает.
         faces_shove = state.call_is_all_in or state.aggressor_all_in
         answered = folded or (dp.action.kind is ActionKind.CALL and state.hero_all_in_after)
-        # Три границы применимости модели, все найдены прогоном по реальным рукам.
-        # `call_shove_ev_bb` меряет эквити против ОДНОГО диапазона, а пуш-сторона
-        # `nash_hu` — это диапазон игрока, который шовит ПЕРВЫМ. Ре-шов поверх
-        # чужого опена вчетверо уже открытого шова; два уже вложившихся олл-ина
-        # означают сайд-поты и вскрытие на троих; уже ответивший на шов — то же
-        # вскрытие на троих, только без сайд-пота: он в банке с вероятностью 1, и
-        # его диапазон — не развилка «войдёт или нет», а второй известный участник
-        # вскрытия. Все три нарушения завышают эквити героя, то есть толкают
-        # вердикт в сторону колла.
+        # Модель держится на двух допущениях: `call_shove_ev_bb` берёт эквити
+        # против ОДНОГО диапазона, а `_push_model` — диапазон того, кто шовит
+        # ПЕРВЫМ. Каждое условие ниже проверяет одно из них; нарушено любое —
+        # вердикта нет, а `unpriced_reason` называет, какое именно. Все четыре
+        # закреплены: test_a_limped_pot_is_not_a_shove,
+        # test_reshove_over_an_open_is_not_priced,
+        # test_two_all_ins_before_hero_are_not_priced,
+        # test_a_player_who_already_called_the_shove_is_not_priced.
         applicable = (
-            state.opened_by_aggressor
-            and len(state.all_in_before_hero) <= 1
+            state.aggressor is not None
+            and state.opened_by_aggressor
+            and len(state.all_in_besides_hero) <= 1
             and not state.callers_before_hero
         )
         if faces_shove and answered and applicable:
