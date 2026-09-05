@@ -189,9 +189,13 @@ def _solve_cached(
         resp_risk[j] = at_risk - posted
 
     # push_term[j][h][c] — вклад «герой с h, коллер j с c» в EV шова, уже с P(c|h).
-    push_term = np.stack([conditional * (equity * contested[j] - hero_risk[j]) for j in range(seats)])
+    push_term = np.stack(
+        [conditional * (equity * contested[j] - hero_risk[j]) for j in range(seats)]
+    )
     # call_term[j][b][h] — «колл минус пас» для игрока j с b против шова руки h.
-    call_term = np.stack([conditional * (equity * contested[j] - resp_risk[j]) for j in range(seats)])
+    call_term = np.stack(
+        [conditional * (equity * contested[j] - resp_risk[j]) for j in range(seats)]
+    )
 
     avg_push = np.full(size, _INITIAL_WEIGHT)
     avg_call = np.full((seats, size), _INITIAL_WEIGHT)
