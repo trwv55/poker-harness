@@ -181,14 +181,12 @@ _SHOVER_RANGE_WIDTHS: tuple[float, ...] = (0.05, 0.20, 0.40, 0.70, 1.00)
 _MULTIWAY_ITERATIONS = 20_000
 
 # Что стоит вместо одного действия, когда две точки модели дают разный оптимум:
-# `call_shove_ev_bb` против одного диапазона и тот же расчёт с вошедшими в банк
-# живыми позади (`ev_call_all_behind_bb`). Цена такой точки — 0.0: правило
-# самого мягкого упрёка (см. `ev_diff_bb` в `_facing_shove_verdict`) берёт
-# сценарий, в котором сыгранное действие и есть лучшее. Одно название действия
-# рядом с нулём читалось бы как бесплатное расхождение, поэтому называется сама
-# развилка, а оба вердикта по отдельности лежат в `detail`
-# (`best_vs_one`, `best_all_behind`). Закреплено
-# `test_a_verdict_that_flips_with_the_players_behind_names_the_fork`.
+# `ev_call_bb` против одного диапазона и `ev_call_all_behind_bb` с вошедшими в
+# банк живыми позади. Цена такой точки — 0.0: правило самого мягкого упрёка
+# (см. `ev_diff_bb` в `_facing_shove_verdict`) берёт сценарий, в котором
+# сыгранное действие и есть лучшее. Оба вердикта по отдельности лежат в
+# `detail` (`best_vs_one`, `best_all_behind`). Развилка и нулевая цена
+# закреплены `test_a_verdict_that_flips_with_the_players_behind_names_the_fork`.
 _BEST_DEPENDS_ON_BEHIND = "зависит от того, войдут ли игроки позади"
 
 _ASSUMPTION_CALLERS = (

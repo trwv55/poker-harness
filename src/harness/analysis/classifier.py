@@ -79,12 +79,11 @@ class TableState:
 
     @property
     def live_total(self) -> int:
-        """Сколько мест ещё в руке, считая героя.
+        """Сколько мест ещё в руке, считая героя, — единственный счётчик в анализе.
 
-        Единственный счётчик живых в анализе: `dp.live_total` снят реплеем в
-        момент решения героя, а форфейт исполняется движком там, где стоит его
-        строка `folds`, — она может стоять и позже. Расхождение закреплено
-        `test_live_total_of_the_table_leaves_out_a_forfeited_seat`.
+        С `dp.live_total` совпадает не всегда:
+        `test_live_total_of_the_table_leaves_out_a_forfeited_seat` показывает
+        руку, где движок насчитал 6, а здесь выходит 5.
         """
         return sum(1 for s in self.seats if s.live)
 
