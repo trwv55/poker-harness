@@ -930,6 +930,36 @@ def test_configure_logging_renders_real_tracebacks():
         assert "приватное_содержимое_руки" not in line
 
 
+def test_configure_logging_muzzles_http_clients_that_log_urls():
+    """Живая приёмка 2026-09-05: секрет в логе воркера.
+
+    `httpx` на уровне INFO печатает URL запроса ЦЕЛИКОМ, а Bot API адресуется как
+    `https://api.telegram.org/bot<ТОКЕН>/sendMessage` — токен бота лежит в пути.
+    Строка `HTTP Request: POST ...` ушла в лог первого же реального прогона.
+    Настройка логирования обязана глушить `httpx`/`httpcore` до WARNING.
+
+    Уровни сбрасываются В НАЧАЛЕ теста: без этого он проходил бы и после отката
+    правки — уровень, выставленный `configure_logging()` в другом тесте сессии,
+    остаётся на глобальном логгере и делал бы проверку зелёной по инерции.
+    Проверяется не только уровень, но и то, что запись действительно не
+    напечаталась: уровень — механизм, пустой `buf` — само требование.
+    """
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.NOTSET)
+
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    try:
+        for name in ("httpx", "httpcore"):
+            assert logging.getLogger(name).getEffectiveLevel() >= logging.WARNING
+            logging.getLogger(name).info(
+                "HTTP Request: POST https://api.telegram.org/botНЕ-ДОЛЖЕН-БЫТЬ-В-ЛОГЕ/sendMessage"
+            )
+        assert buf.getvalue() == "", "URL с токеном напечатан"
+    finally:
+        logging.getLogger().handlers = []
+
+
 # --- round 5: строка traces под llm_calls, честная зона, отказ без утечек -----------
 
 

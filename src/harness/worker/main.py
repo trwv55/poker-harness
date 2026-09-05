@@ -49,6 +49,7 @@ from harness.presentation import Btn, Msg
 from harness.worker.pipeline import Deps, run_job
 
 __all__ = [
+    "TelegramDeliveryError",
     "TelegramSender",
     "configure_logging",
     "main",
@@ -103,6 +104,16 @@ _PROCESS_ID = f"{socket.gethostname()}-{os.getpid()}"
 
 
 def _keyboard(buttons: list[list[Btn]]) -> dict[str, object] | None:
+    """Раскладка кнопок или `None` — «ключа `reply_markup` в запросе быть не должно».
+
+    `None` здесь означает именно ОТСУТСТВИЕ ключа, а не `null` в JSON. Живая
+    приёмка 2026-09-05: значение `"reply_markup": null` Bot API отвергает —
+    `400 Bad Request: object expected as reply markup`, — и первое же сообщение
+    прогресса («Читаю стол…»), у которого кнопок нет, не доходило до игрока.
+    Ту же полезную нагрузку без ключа он принимает (проверено против живого API).
+    Разницу держит `_payload`, тесты — `test_sender_omits_reply_markup_when_
+    there_are_no_buttons` и `test_sender_sends_the_keyboard_when_there_are_buttons`.
+    """
     if not buttons:
         return None
     return {
@@ -112,39 +123,99 @@ def _keyboard(buttons: list[list[Btn]]) -> dict[str, object] | None:
     }
 
 
+def _payload(msg: Msg, **fields: object) -> dict[str, object]:
+    """Тело запроса к Bot API: обязательные поля плюс `reply_markup` — но только
+    когда кнопки действительно есть (см. `_keyboard`).
+    """
+    body: dict[str, object] = {**fields, "text": msg.text}
+    markup = _keyboard(msg.buttons)
+    if markup is not None:
+        body["reply_markup"] = markup
+    return body
+
+
+class TelegramDeliveryError(RuntimeError):
+    """Отказ Bot API, изложенный БЕЗ URL запроса — то есть без токена бота.
+
+    Почему не `response.raise_for_status()` (живая приёмка 2026-09-05). Текст
+    `httpx.HTTPStatusError` содержит полный URL запроса, а он у Bot API имеет вид
+    `https://api.telegram.org/bot<ТОКЕН>/sendMessage`. Этот текст уходил в лог
+    `job_attempt_failed_will_retry` как `error=repr(exc)` и в колонку
+    `traces.spans[].error` в базе (`platform/trace.py`) — то есть секрет
+    оказывался записан на диск в двух местах сразу. Здесь в сообщение попадают
+    только метод, код ответа и `description` из тела ответа; ни `str(exc)`, ни
+    `repr(exc)` (а в базу едет именно `repr`) URL не содержат.
+
+    Вторая половина той же истории: тело ответа с `description` не логировалось
+    нигде, поэтому причину 400 пришлось угадывать. Теперь она в тексте
+    исключения.
+
+    Закреплено `test_sender_error_names_the_status_and_description_without_the_token`
+    и `test_sender_keeps_the_token_out_of_a_non_json_error_body`.
+    """
+
+    def __init__(self, method: str, status_code: int, description: str) -> None:
+        super().__init__(f"{method} → {status_code}: {description}")
+        self.method = method
+        self.status_code = status_code
+        self.description = description
+
+
 class TelegramSender:
     """`Sender` поверх Bot API — прямые HTTP-вызовы (`sendMessage`/`editMessageText`),
     без aiogram: тот приходит вместе с ботом (задача 19), а односторонней доставке
-    результата из воркера не нужен весь SDK — только эти два эндпоинта. Не покрыт
-    тестом на реальный Телеграм (в окружении этой задачи нет токена бота — то же
-    ограничение, что у `platform/llm.py`, задача 16: тесты не имеют права стучаться
-    в сеть); оркестрация (`run_job`) тестируется против `FakeSender`, эта тонкая
-    обёртка намеренно вынесена в сторону от протестированной логики.
+    результата из воркера не нужен весь SDK — только эти два эндпоинта.
+
+    В сеть тесты не ходят (то же ограничение, что у `platform/llm.py`, задача 16),
+    но сама обёртка тестами покрыта: `httpx.MockTransport` подставляется через
+    `client=` и позволяет проверить ФАКТИЧЕСКОЕ тело запроса и разбор ответа —
+    ровно те два места, где живая приёмка 2026-09-05 нашла дефекты (`null` в
+    `reply_markup` и токен в тексте исключения). Оркестрация (`run_job`)
+    по-прежнему тестируется против `FakeSender`.
     """
 
     def __init__(self, token: str, *, client: httpx.AsyncClient | None = None) -> None:
+        self._token = token
         self._base_url = f"https://api.telegram.org/bot{token}"
         self._client = client if client is not None else httpx.AsyncClient(timeout=30.0)
 
+    async def _call(self, method: str, payload: dict[str, object]) -> httpx.Response:
+        """Один вызов Bot API. Не-2xx превращается в `TelegramDeliveryError` —
+        см. её докстринг о том, почему не `raise_for_status()`.
+        """
+        response = await self._client.post(f"{self._base_url}/{method}", json=payload)
+        if not response.is_success:
+            raise TelegramDeliveryError(method, response.status_code, self._describe(response))
+        return response
+
+    def _describe(self, response: httpx.Response) -> str:
+        """Что именно ответил Bot API, в виде, пригодном для лога и для колонки
+        `traces.spans[].error`.
+
+        Первый выбор — поле `description` из тела: это и есть внятная причина
+        отказа (`Bad Request: object expected as reply markup`), которой до этой
+        правки не было нигде. Если тело не Телеграма (например, HTML-страница от
+        промежуточного прокси на 502), берётся оно само — но с вырезанным
+        токеном: такая страница вполне может процитировать URL запроса, а в нём
+        секрет. Замена идёт ДО обрезки, иначе разорванный обрезкой токен уцелел
+        бы в остатке.
+        """
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict):
+            description = body.get("description")
+            if isinstance(description, str):
+                return description
+        return response.text.replace(self._token, "<токен>")[:200] or "<пустое тело ответа>"
+
     async def send(self, chat_id: int, msg: Msg) -> int:
-        response = await self._client.post(
-            f"{self._base_url}/sendMessage",
-            json={"chat_id": chat_id, "text": msg.text, "reply_markup": _keyboard(msg.buttons)},
-        )
-        response.raise_for_status()
+        response = await self._call("sendMessage", _payload(msg, chat_id=chat_id))
         return int(response.json()["result"]["message_id"])
 
     async def edit(self, chat_id: int, message_id: int, msg: Msg) -> None:
-        response = await self._client.post(
-            f"{self._base_url}/editMessageText",
-            json={
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": msg.text,
-                "reply_markup": _keyboard(msg.buttons),
-            },
-        )
-        response.raise_for_status()
+        await self._call("editMessageText", _payload(msg, chat_id=chat_id, message_id=message_id))
 
 
 async def _sleep_or_stop(stop: asyncio.Event | None, seconds: float) -> None:

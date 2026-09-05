@@ -73,6 +73,12 @@ limiter").warning(...)` и проверяет текст на выходе — �
 содержимым hand history игрока и путь к его файлу. Строчный трейсбек
 (`traceback.format_exception`, никаких локалей) — единственный вариант, который
 не превращает лог в новое место утечки приватных данных.
+
+**Уровень чужих логгеров — тоже часть настройки (живая приёмка 2026-09-05).**
+Соседний абзац закрывал утечку приватных данных из НАШИХ записей; в лог воркера
+при этом ушёл секрет из ЧУЖОЙ — `httpx` на INFO печатает URL запроса целиком, а
+у Bot API токен бота лежит прямо в пути. Поэтому функция не только настраивает
+рут, но и глушит `httpx`/`httpcore` до WARNING: см. `_muzzle_http_client_loggers`.
 """
 
 from __future__ import annotations
@@ -117,3 +123,26 @@ def configure_logging(*, stream: TextIO | None = None, level: int = logging.INFO
     root = logging.getLogger()
     root.handlers = [handler]
     root.setLevel(level)
+    _muzzle_http_client_loggers(level)
+
+
+# Логгеры HTTP-клиента, чьи INFO-строки содержат URL запроса целиком. У нас это
+# означает секрет в логе: Bot API адресуется как
+# `https://api.telegram.org/bot<ТОКЕН>/sendMessage`, то есть токен бота — часть
+# пути, и `httpx` печатает его строкой `HTTP Request: POST ... "HTTP/1.1 400 Bad
+# Request"`. На живой приёмке 2026-09-05 именно так он и оказался в логе воркера.
+# `httpcore` — тот же уровень абстракции ниже, с теми же URL.
+_URL_LOGGING_CLIENTS = ("httpx", "httpcore")
+
+
+def _muzzle_http_client_loggers(level: int) -> None:
+    """Поднять `httpx`/`httpcore` до WARNING — но не опустить ниже общего уровня.
+
+    `max`, а не безусловный WARNING: настройка на ERROR (когда её попросят)
+    сделала бы этих двоих РАЗГОВОРЧИВЕЕ остальных — уровень стоит на логгере, а
+    хендлер рута своего порога не имеет и напечатал бы всё, что до него дошло.
+
+    Закреплено `test_configure_logging_muzzles_http_clients_that_log_urls`.
+    """
+    for name in _URL_LOGGING_CLIENTS:
+        logging.getLogger(name).setLevel(max(level, logging.WARNING))

@@ -15,12 +15,22 @@
 2. **Структурный** — `main()` обеих точек входа не имеет права читать окружение
    напрямую. Красный, если кто-нибудь вернёт `os.environ` внутрь `main()` в
    обход вынесенной функции — дыра, которую поведенческий тест не видит.
+
+Кроме конфига здесь живёт то немногое из точек входа, что вообще проверяемо без
+сети и без живого токена: останов по сигналу (round 5, Item F) и — с живой
+приёмки 2026-09-05 — `TelegramSender`. Последний до неё считался «тонкой
+обёрткой, вынесенной в сторону от протестированной логики», и ровно в нём нашлись
+три дефекта подряд: `"reply_markup": null` вместо отсутствующего ключа (400 на
+первом же сообщении прогресса), токен бота в тексте `HTTPStatusError` (а оттуда —
+в лог и в колонку `traces.spans[].error`) и `description` из ответа Телеграма,
+не попадавший никуда. `httpx.MockTransport` покрывает всё три, не выходя в сеть.
 """
 
 from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
 import signal
 import subprocess
@@ -29,12 +39,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
+import httpx
 import pytest
 
 import harness.bot.main as bot_main
 import harness.worker.main as worker_main
 from harness.platform.config import InvalidEnvVar
 from harness.platform.queue import JobsQueue
+from harness.presentation import Btn, Msg
+from harness.worker.main import TelegramDeliveryError
 from harness.worker.pipeline import Deps
 
 
@@ -236,3 +249,139 @@ async def test_a_dying_loop_takes_the_whole_process_down_with_its_traceback():
     with pytest.raises(RuntimeError, match="цикл воркера умер"):
         await worker_main._run_until_stopped(tasks, stop)
     assert stop.is_set(), "останов объявлен всем циклам, а не только упавшему"
+
+
+# --- доставка в Телеграм: тело запроса и текст отказа (живая приёмка 2026-09-05) ----
+
+# Заметная строка вместо правдоподобного токена: если она хоть где-то просочится
+# в сообщение исключения, это видно глазами в первом же `assert`.
+_TEST_TOKEN = "SECRET-TOKEN-123"
+
+
+def _sender_recording_into(
+    requests: list[httpx.Request],
+    response: httpx.Response,
+) -> tuple[worker_main.TelegramSender, httpx.AsyncClient]:
+    """`TelegramSender` на `MockTransport`: в сеть не ходит, но проходит весь свой
+    код — сборку тела и разбор ответа. Возвращается и клиент, чтобы тест его
+    закрыл (`filterwarnings = error` в pyproject не прощает незакрытых ресурсов).
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return response
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return worker_main.TelegramSender(_TEST_TOKEN, client=client), client
+
+
+_OK = {"ok": True, "result": {"message_id": 4242}}
+
+
+async def test_sender_omits_reply_markup_when_there_are_no_buttons():
+    """Дефект №2 живой приёмки: `_keyboard` отдавал `None` при пустых кнопках, и в
+    JSON уходило `"reply_markup": null`. Bot API отвечал `400 Bad Request: object
+    expected as reply markup` — то есть «Читаю стол…», первое сообщение прогресса
+    и единственное без кнопок, не доходило до игрока НИКОГДА. Проверено против
+    живого API: та же нагрузка без ключа принимается.
+
+    Проверяются оба метода: `edit` собирал тело тем же способом и падал бы так же,
+    как только редактируемое сообщение осталось бы без кнопок.
+    """
+    requests: list[httpx.Request] = []
+    sender, client = _sender_recording_into(requests, httpx.Response(200, json=_OK))
+    try:
+        assert await sender.send(777, Msg(text="Читаю стол…")) == 4242
+        await sender.edit(777, 4242, Msg(text="Считаю…"))
+    finally:
+        await client.aclose()
+
+    assert [str(r.url).rsplit("/", 1)[-1] for r in requests] == ["sendMessage", "editMessageText"]
+    for request in requests:
+        body = json.loads(request.content)
+        assert "reply_markup" not in body, "пустые кнопки не имеют права ехать как null"
+        assert body["chat_id"] == 777
+    assert json.loads(requests[1].content)["message_id"] == 4242
+
+
+async def test_sender_sends_the_keyboard_when_there_are_buttons():
+    """Обратная половина: убрать `null` можно и выбросив `reply_markup` совсем —
+    кнопки перестали бы доезжать молча, а без них у игрока нет ни «разобрать», ни
+    ответа на вопрос. Здесь пришпилена ровно та форма, которую ждёт Bot API
+    (`inline_keyboard` — список РЯДОВ).
+    """
+    requests: list[httpx.Request] = []
+    sender, client = _sender_recording_into(requests, httpx.Response(200, json=_OK))
+    msg = Msg(
+        text="Разобрать раздачу?",
+        buttons=[
+            [Btn(text="разобрать", callback_data="deep:TM1")],
+            [Btn(text="нет", callback_data="skip")],
+        ],
+    )
+    try:
+        await sender.send(777, msg)
+        await sender.edit(777, 4242, msg)
+    finally:
+        await client.aclose()
+
+    for request in requests:
+        assert json.loads(request.content)["reply_markup"] == {
+            "inline_keyboard": [
+                [{"text": "разобрать", "callback_data": "deep:TM1"}],
+                [{"text": "нет", "callback_data": "skip"}],
+            ]
+        }
+
+
+async def test_sender_error_names_the_status_and_description_without_the_token():
+    """Дефект №1 живой приёмки, самый дорогой: `raise_for_status()` даёт
+    `HTTPStatusError`, текст которого содержит URL запроса, а URL Bot API — это
+    `https://api.telegram.org/bot<ТОКЕН>/sendMessage`. Этот текст записывался в
+    лог (`job_attempt_failed_will_retry`, `error=repr(exc)`) и в колонку
+    `traces.spans[].error` — секрет на диске в двух местах.
+
+    Проверяется и `str`, и `repr`: в базу через `platform/trace.py` едет именно
+    `repr`, и на нём одном тест бы не покраснел, если бы токен уехал в атрибут.
+    Заодно дефект №3 — `description` из тела ответа, которого раньше не было
+    нигде и из-за отсутствия которого причину 400 пришлось угадывать.
+    """
+    body = {
+        "ok": False,
+        "error_code": 400,
+        "description": "Bad Request: object expected as reply markup",
+    }
+    sender, client = _sender_recording_into([], httpx.Response(400, json=body))
+    try:
+        with pytest.raises(TelegramDeliveryError) as caught:
+            await sender.send(777, Msg(text="Читаю стол…"))
+    finally:
+        await client.aclose()
+
+    exc = caught.value
+    assert "400" in str(exc)
+    assert "object expected as reply markup" in str(exc)
+    assert "sendMessage" in str(exc)
+    for rendered in (str(exc), repr(exc)):
+        assert _TEST_TOKEN not in rendered
+        assert "api.telegram.org" not in rendered
+
+
+async def test_sender_keeps_the_token_out_of_a_non_json_error_body():
+    """Ответ не от Телеграма, а от чего-то по дороге (прокси, балансировщик): тела
+    с `description` нет, зато страница может процитировать URL запроса — вместе с
+    токеном в пути. Причина отказа при этом нужна, поэтому тело берётся, но токен
+    из него вырезается.
+    """
+    page = f"<html>502 upstream https://api.telegram.org/bot{_TEST_TOKEN}/sendMessage failed</html>"
+    sender, client = _sender_recording_into([], httpx.Response(502, text=page))
+    try:
+        with pytest.raises(TelegramDeliveryError) as caught:
+            await sender.send(777, Msg(text="Читаю стол…"))
+    finally:
+        await client.aclose()
+
+    assert "502" in str(caught.value)
+    assert "upstream" in str(caught.value), "причина отказа потеряна целиком"
+    for rendered in (str(caught.value), repr(caught.value)):
+        assert _TEST_TOKEN not in rendered
