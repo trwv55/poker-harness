@@ -85,6 +85,8 @@ def scan_tournament(enriched: list[EnrichedHand]) -> ScanSummary:
     items: list[ScanItem] = []
     hands_with_decision = 0
     hands_failed = 0
+    points_total = 0
+    points_judged = 0
     total_loss_bb = 0.0
 
     for en in enriched:
@@ -97,6 +99,11 @@ def scan_tournament(enriched: list[EnrichedHand]) -> ScanSummary:
         judged = [p for p in points if is_judged(p)]
         if judged:
             hands_with_decision += 1
+        # Покрытие в точках, а не в руках: рука с одной оценённой точкой из пяти
+        # считается «рукой с решением», и по одному этому счётчику не видно, что
+        # четыре остались без оценки.
+        points_total += len(points)
+        points_judged += len(judged)
         total_loss_bb += total_ev_loss_bb(points)
 
         for point in judged:
@@ -121,4 +128,6 @@ def scan_tournament(enriched: list[EnrichedHand]) -> ScanSummary:
         items=items,
         total_loss_bb=round(total_loss_bb, 6),
         hands_failed=hands_failed,
+        points_total=points_total,
+        points_judged=points_judged,
     )

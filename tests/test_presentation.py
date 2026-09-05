@@ -175,6 +175,56 @@ def test_scan_summary_msg_marks_assuming_rows_and_not_strict_rows():
     assert "по модели диапазонов" in assuming_line
 
 
+def test_scan_summary_msg_always_reports_how_much_was_evaluated():
+    """Покрытие печатается в обеих ветках — и со списком расхождений, и без него.
+
+    Смесь обеих веток намеренная: шаблон, печатающий строку только в одной из
+    них, тест не пройдёт (та же ловушка, что у пометки зоны и слова «ошибка»).
+    """
+    items = [_scan_item(hand_no="H1", ev_diff_bb=-2.3, zone=Zone.STRICT)]
+    with_items = ScanSummary(
+        hands_total=10,
+        hands_with_decision=8,
+        items=items,
+        total_loss_bb=-2.3,
+        points_total=40,
+        points_judged=7,
+    )
+    without_items = ScanSummary(
+        hands_total=10,
+        hands_with_decision=8,
+        items=[],
+        total_loss_bb=0.0,
+        points_total=40,
+        points_judged=7,
+    )
+
+    assert "7 из 40" in scan_summary_msg(with_items, quota_left=1, quota_total=1).text
+    assert "7 из 40" in scan_summary_msg(without_items, quota_left=1, quota_total=1).text
+
+
+def test_scan_summary_msg_does_not_pass_an_empty_list_off_as_a_clean_game():
+    """Пустой список — это «не нашли среди оценённых», а не «расхождений нет».
+
+    После правил, снимающих вердикт с точки, которую нельзя посчитать честно,
+    пустой список стал обычным исходом — и молчание о том, сколько решений
+    осталось без оценки, читалось бы игроком как «сыграно чисто». Это ровно та
+    деградация без огласки, которую сводка уже не допускает для `hands_failed`.
+    """
+    without_items = ScanSummary(
+        hands_total=10,
+        hands_with_decision=8,
+        items=[],
+        total_loss_bb=0.0,
+        points_total=40,
+        points_judged=7,
+    )
+    text = scan_summary_msg(without_items, quota_left=1, quota_total=1).text
+
+    assert "оценённых" in text  # пустота — про оценённые решения, а не про турнир
+    assert "33" in text  # сколько решений осталось без оценки — названо числом
+
+
 def test_scan_summary_msg_no_items_has_no_buttons():
     s = ScanSummary(hands_total=3, hands_with_decision=1, items=[], total_loss_bb=0.0)
     msg = scan_summary_msg(s, quota_left=50, quota_total=50)

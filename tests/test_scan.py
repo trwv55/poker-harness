@@ -461,6 +461,32 @@ def test_scan_summary_shape_and_threshold():
     assert s.total_loss_bb == pytest.approx(item.ev_diff_bb)
 
 
+def test_scan_counts_every_decision_point_and_those_with_a_verdict():
+    """Покрытие считается по точкам, а не по рукам: сводка обязана его показать.
+
+    У руки может быть точка решения, по которой вердикта нет вовсе (модель стола
+    не годится, вилка рвётся, постфлоп), — и тогда «расхождений не найдено»
+    означает «не нашли среди оценённых», а не «сыграно чисто». Чтобы сводка
+    могла сказать это честно, в ней должны быть оба числа.
+    """
+    judged = _make_hu_fold_hand(hero_cards=("3c", "2d"), eff_bb=10.0)
+    # Две точки в ОДНОЙ руке — иначе счётчик точек неотличим от счётчика рук:
+    # у синтетики этого файла по одной точке решения на раздачу.
+    judged = judged.model_copy(
+        update={
+            "report": judged.report.model_copy(
+                update={"decision_points": list(judged.report.decision_points) * 2}
+            )
+        }
+    )
+    unjudged = _make_multiway_fold_hand(hero_cards=("3c", "2d"), eff_bb=8.0, players_behind=3)
+    s = scan_tournament([judged, unjudged])
+
+    assert s.hands_total == 2 and s.hands_with_decision == 1
+    assert s.points_total == 3
+    assert s.points_judged == 2
+
+
 def test_scan_hands_with_no_hero_decision_are_not_counted():
     """Рука без единой точки решения героя не считается «рукой с решением»."""
     en = _make_hu_fold_hand(hero_cards=("3c", "2d"), eff_bb=10.0)
