@@ -39,10 +39,10 @@
 формы: «шов или пас в неоткрытый банк» и «колл или пас против ОДНОГО открытого
 шова». Всё остальное возвращается без вердикта с названной причиной
 (`unpriced_reason`) — глубже 15bb, лимп, война повышений, ре-шов поверх чужого
-опена, два олл-ина перед героем. Три последние границы найдены не рассуждением, а
-прогоном по 318 реальным рукам: без них модель выдавала самые громкие цифры
-разбора (до -11bb) на спотах, которых она не описывает, и все они смещали вердикт
-в сторону колла.
+опена, два олл-ина перед героем, уже ответивший на шов перед героем. Четыре
+последние границы найдены не рассуждением, а прогоном по 318 реальным рукам: без
+них модель выдавала самые громкие цифры разбора (до -11bb) на спотах, которых она
+не описывает, и все они смещали вердикт в сторону колла.
 
 **Фолд-эквити.** `shove_ev_bb` гейта не ставит (сигнатура заморожена задачей 11),
 поэтому он стоит здесь: `fold_equity_ok` считается для каждого шова и попадает в
@@ -757,11 +757,19 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
     # обе поправки берутся вместе, иначе конец вилки был бы искусственно мрачным.
     # Арифметика та же самая, из замороженного инструмента: подменяется только
     # набор диапазонов на вскрытии и размер банка.
-    behind = [
+    #
+    # Игрок без фишек за спиной (олл-ин с блайнда) в эту ось не входит: развилки
+    # «войдёт или нет» у него нет — он уже в банке, и его деньги приносит
+    # `pot_before`, а не `_extra_from_behind`. Во вскрытии он при этом будет, а
+    # эквити героя здесь считается один на один, поэтому такая точка уходит в
+    # `assuming` через `unmodelled` — так же, как в `_unopened_verdict`.
+    live_behind = [
         seat
         for seat in state.seats
         if seat.live and seat.label not in (state.hero.label, shover.label)
     ]
+    behind = [seat for seat in live_behind if seat.behind > 0]
+    all_in_behind = len(live_behind) - len(behind)
     behind_unmodelled = len(behind) > _MAX_MODELLED_CALLERS
     best_behind: list[str] = []
     ev_behind: float | None = None
@@ -814,6 +822,18 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
     # интереснее всего.
     behind_moved = bool(set(best_behind) - {best})
     behind_axis = None if not best_behind else ("unstable" if behind_moved else "stable")
+    if behind_unmodelled:
+        unmodelled = (
+            f"живых за героем {len(behind)} — больше, чем модель вскрытия способна "
+            f"перебрать, их влияние на вердикт не проверено"
+        )
+    elif all_in_behind:
+        unmodelled = (
+            f"позади героя {all_in_behind} живых уже в олл-ине: они дойдут до "
+            f"вскрытия, а эквити героя посчитано против одного диапазона"
+        )
+    else:
+        unmodelled = ""
     zone, why = zone_for(
         best_tight,
         best_wide,
@@ -822,12 +842,7 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         best_model=best,
         best_interior=by_width[1:-1],
         best_behind=best_behind,
-        unmodelled=(
-            f"живых за героем {len(behind)} — больше, чем модель вскрытия способна "
-            f"перебрать, их влияние на вердикт не проверено"
-            if behind_unmodelled
-            else ""
-        ),
+        unmodelled=unmodelled,
     )
     taken = "call" if dp.action.kind is ActionKind.CALL else "fold"
 
@@ -842,13 +857,16 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         "required_equity": round(required_equity(state.to_call, state.pot_before), 6),
         "shover_depth_bb": round(_depth_key(shover_depth_bb), 2),
         "dead_extra_bb": round(dead_bb, 4),
-        # Считаются все живые, кроме героя и шовера: уже походивший опенер тоже
-        # может ответить на шов, поэтому «ещё не действовавших» было бы занижением.
+        # Сколько живых за героем модель перебирает как возможных коллеров.
+        # Уже ответивший на шов сюда попасть не может: такой спот `spot_for` до
+        # этой функции не допускает (`callers_before_hero`).
         "live_others": len(behind),
         "behind_axis": behind_axis,
         "ev_call_all_behind_bb": None if ev_behind is None else round(ev_behind, 4),
         "zone_reason": why,
     }
+    if all_in_behind:
+        detail["all_in_behind_ignored"] = all_in_behind
     return PointVerdict(
         dp_index=dp.index,
         street=dp.street,

@@ -94,11 +94,31 @@ class TableState:
 
     @property
     def all_in_before_hero(self) -> tuple[SeatSnapshot, ...]:
-        """Живые игроки, уже ушедшие в олл-ин до решения героя."""
+        """Живые игроки без фишек за спиной к моменту решения героя.
+
+        Состоявшееся действие не требуется: весь стек мог забрать пост блайнда.
+        Закреплено `test_blind_all_in_is_counted_as_an_all_in_and_is_not_modelled_as_a_caller`.
+        """
+        return tuple(
+            s for s in self.seats if s.live and s.behind == 0 and s.label != self.hero.label
+        )
+
+    @property
+    def callers_before_hero(self) -> tuple[SeatSnapshot, ...]:
+        """Живые игроки, уже действовавшие в этом круге, кроме героя и агрессора.
+
+        Пусто, когда агрессора нет: без ставки отвечать не на что.
+
+        `spot_for` читает непустой результат как «на ставку агрессора уже
+        ответили» и снимает с такой точки вердикт; это чтение закреплено
+        `test_a_player_who_already_called_the_shove_is_not_priced`.
+        """
+        if self.aggressor is None:
+            return ()
         return tuple(
             s
             for s in self.seats
-            if s.live and s.acted and s.behind == 0 and s.label != self.hero.label
+            if s.live and s.acted and s.label not in (self.hero.label, self.aggressor.label)
         )
 
     @property
@@ -249,6 +269,11 @@ def unpriced_reason(dp: DecisionPoint, state: TableState) -> str:
             f"перед героем {len(state.all_in_before_hero)} олл-ина: сайд-поты и вскрытие "
             f"против нескольких диапазонов сразу"
         )
+    if state.callers_before_hero:
+        return (
+            "перед героем шов и ответ на него: вскрытие втроём, "
+            "а модель считает эквити против одного диапазона"
+        )
     return "перед героем олл-ин, но сыгран не колл и не пас"
 
 
@@ -293,13 +318,20 @@ def spot_for(dp: DecisionPoint, state: TableState) -> SpotKind:
         # третье действие (ре-шов), которого модель не считает.
         faces_shove = state.call_is_all_in or state.aggressor_all_in
         answered = folded or (dp.action.kind is ActionKind.CALL and state.hero_all_in_after)
-        # Две границы применимости модели, обе найдены прогоном по реальным рукам.
+        # Три границы применимости модели, все найдены прогоном по реальным рукам.
         # `call_shove_ev_bb` меряет эквити против ОДНОГО диапазона, а пуш-сторона
         # `nash_hu` — это диапазон игрока, который шовит ПЕРВЫМ. Ре-шов поверх
-        # чужого опена вчетверо уже открытого шова, а два уже вложившихся олл-ина
-        # означают сайд-поты и вскрытие на троих. Оба нарушения завышают эквити
-        # героя, то есть толкают вердикт в сторону колла.
-        applicable = state.opened_by_aggressor and len(state.all_in_before_hero) <= 1
+        # чужого опена вчетверо уже открытого шова; два уже вложившихся олл-ина
+        # означают сайд-поты и вскрытие на троих; уже ответивший на шов — то же
+        # вскрытие на троих, только без сайд-пота: он в банке с вероятностью 1, и
+        # его диапазон — не развилка «войдёт или нет», а второй известный участник
+        # вскрытия. Все три нарушения завышают эквити героя, то есть толкают
+        # вердикт в сторону колла.
+        applicable = (
+            state.opened_by_aggressor
+            and len(state.all_in_before_hero) <= 1
+            and not state.callers_before_hero
+        )
         if faces_shove and answered and applicable:
             return SpotKind.PUSHFOLD_FACING_SHOVE
         return SpotKind.PREFLOP_OTHER
