@@ -798,6 +798,44 @@ def test_a_blind_all_in_behind_hero_is_not_priced():
     assert "live_others" not in p.detail
 
 
+def test_a_blind_all_in_behind_the_hero_shove_is_not_priced():
+    """Живой без фишек за спиной позади шова героя — вердикта нет, а не ярлык зоны.
+
+    Банк неоткрыт, Hero на UTG, большой блайнд отдал посту весь стек: он жив,
+    фишек за спиной нет, действия в круге у него не было. В набор коллеров
+    (`callers`) он не попадает — коллировать нечем, — а его фишки остаются в
+    `pot_before`, который модель записывает выигрышем героя. Ярлык зоны этого
+    числа не меняет, поэтому точка остаётся без вердикта: та же граница, что у
+    колла шова (`test_a_blind_all_in_behind_hero_is_not_priced`).
+    """
+    stacks = {**dict.fromkeys(_SIX_MAX_SEATS, 20), "BB": _BB}
+    labels, seats, posts = _six_max(stacks, "UTG")
+    actions = [
+        _fold("Hero"),
+        _fold(labels["HJ"]),
+        _fold(labels["CO"]),
+        _fold(labels["BTN"]),
+        _fold(labels["SB"]),
+    ]
+    raw = _raw(
+        seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["7c", "2d"]}
+    )
+    en = enrich(normalize(raw))
+    # Пас за него рум не писал — это настоящий олл-ин с блайнда, не форфейт.
+    assert en.report.forfeits == []
+    dp = en.report.decision_points[0]
+    state = table_state(dp, en)
+    blind = next(s for s in state.behind_hero if s.position == "BB")
+    assert blind.live and not blind.acted and blind.behind == 0
+    assert spot_for(dp, state) == "pushfold_unopened"
+
+    p = analyze_hand(en).points[0]
+    assert p.spot == "pushfold_unopened"
+    assert p.best_action == "" and p.ev_diff_bb == 0.0 and p.assumption is None
+    assert "без фишек за спиной" in p.detail["unjudged"]
+    assert "all_in_behind_ignored" not in p.detail
+
+
 def test_shove_plus_blind_all_in_is_not_priced():
     """Шов и олл-ин с блайнда — два олл-ина помимо героя: гейт класса обязан отсечь.
 

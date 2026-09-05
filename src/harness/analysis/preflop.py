@@ -41,7 +41,8 @@
 шова». Всё остальное возвращается без вердикта с названной причиной
 (`unpriced_reason`) — глубже 15bb, лимп, война повышений, ре-шов поверх чужого
 опена, больше одного олл-ина в руке помимо героя, уже ответивший на шов перед
-героем, живой без фишек за спиной помимо героя и шовера. Каждая граница снимает
+героем, живой без фишек за спиной помимо героя — и в шове в неоткрытый банк, и
+в колле шова. Каждая граница снимает
 вердикт целиком, а не поправляет число: инструмент описывает одну форму, и вне её
 поправлять в нём нечего.
 
@@ -453,8 +454,8 @@ def zone_for(
     * `best_behind` — вердикты по оси «живые за героем тоже входят в банк».
       Ось существует там, где этих игроков в модели нет вовсе;
     * `unmodelled` — непустая строка означает, что какое-то измерение задачи в
-      модель не попало вообще (живой олл-ин позади, слишком много живых для
-      перебора). Тогда проверять нечего и `strict` заявлять не о чем.
+      модель не попало вообще (живых позади больше, чем модель способна
+      перебрать). Тогда проверять нечего и `strict` заявлять не о чем.
     """
     if unmodelled:
         return Zone.ASSUMING, unmodelled
@@ -607,6 +608,14 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
     ceiling = state.hero.stack
     behind = [s for s in state.behind_hero if s.behind > 0]
     all_in_behind = len(state.behind_hero) - len(behind)
+    if all_in_behind:
+        return _unjudged(
+            dp,
+            spot,
+            f"в руке живых без фишек за спиной помимо героя — {all_in_behind}: "
+            f"перебор подмножеств коллеров их не берёт, и цена шова посчитана "
+            f"против неполного состава",
+        )
     if not behind:
         return _unjudged(dp, spot, "позади героя некому коллировать")
     if len(behind) > _MAX_MODELLED_CALLERS:
@@ -687,12 +696,6 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
         equilibrium=equilibrium_depth is not None,
         best_model=best,
         best_interior=by_width[1:-1],
-        unmodelled=(
-            f"позади героя {all_in_behind} живых уже в олл-ине: модель шова их не "
-            f"перебирает, и их влияние на вердикт не проверено"
-            if all_in_behind
-            else ""
-        ),
     )
     taken = "shove" if state.hero_all_in_after else "fold"
     folds_possible = fold_equity_ok(callers(model_ranges))
@@ -711,8 +714,6 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
         "dead_extra_bb": round(dead_bb, 4),
         "zone_reason": why,
     }
-    if all_in_behind:
-        detail["all_in_behind_ignored"] = all_in_behind
     return PointVerdict(
         dp_index=dp.index,
         street=dp.street,
@@ -1027,10 +1028,9 @@ def cheap_fold_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | No
     behind = [s for s in behind_all if s.behind > 0]
     if len(behind) != len(behind_all):
         # Живой олл-ин позади (короткий блайнд ушёл в олл-ин постом) — вне
-        # модели шова, как и в `_unopened_verdict` (там это `all_in_behind`,
-        # принудительно ведущее к `assuming`). Дешёвый лукап такую точку не
-        # обязан разбирать — она уходит на полный расчёт, который знает, что
-        # с ней делать.
+        # модели шова: в `_unopened_verdict` такая точка остаётся без вердикта.
+        # Дешёвый лукап её не разбирает — она уходит на полный расчёт, который
+        # знает, что с ней делать.
         return None
     if not behind or state.hero.behind <= 0:
         return None
