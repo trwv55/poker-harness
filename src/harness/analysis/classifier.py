@@ -113,7 +113,7 @@ class TableState:
         return bool(self.voluntary_actors) and self.aggressor.label == self.voluntary_actors[0]
 
 
-def _action_index(hand: CanonicalHand, dp: DecisionPoint) -> int:
+def action_index(hand: CanonicalHand, dp: DecisionPoint) -> int:
     """Позиция действия точки решения в списке действий руки.
 
     `DecisionPoint.index` нумерует точки решения героя, а не действия руки, и
@@ -148,7 +148,7 @@ def table_state(dp: DecisionPoint, en: EnrichedHand) -> TableState:
     live = dict.fromkeys(committed, True)
     acted = dict.fromkeys(committed, False)
 
-    target = _action_index(hand, dp)
+    target = action_index(hand, dp)
     voluntary: list[str] = []
     aggressor: str | None = None
     for action in hand.actions[:target]:

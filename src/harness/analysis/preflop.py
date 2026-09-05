@@ -62,6 +62,7 @@ from pathlib import Path
 from harness.analysis.classifier import (
     SeatSnapshot,
     TableState,
+    action_index,
     action_name,
     spot_for,
     table_state,
@@ -534,6 +535,48 @@ def _shover(state: TableState) -> SeatSnapshot | None:
     return max(rivals, key=lambda s: (s.street_committed, s.label))
 
 
+def _rivals_when_shoved(
+    hand: CanonicalHand, dp: DecisionPoint, state: TableState, shover: SeatSnapshot
+) -> list[SeatSnapshot]:
+    """Кто мог ответить на шов: состав стола на момент ХОДА ШОВЕРА, без него самого.
+
+    `state` — снимок на момент решения ГЕРОЯ, и прочитать состав из него нельзя
+    ни одним из двух очевидных способов. Все места подряд — слишком много:
+    сбросивший карты ДО шова заколлировать его не мог, и в цену шова его стек не
+    входил (так и было, и на этом ломалось). Живые в снимке — слишком мало:
+    между шовом и ходом героя карты успевают сбросить те, кто для шовера был
+    жив, а их стеки цену его шова ограничивали. Поэтому состав восстанавливается
+    по действиям руки до хода шовера.
+
+    Стоявший в олл-ине уже на момент шова НЕ входит. Число, ради которого этот
+    состав считается, — глубина, по которой шоверу приписывается диапазон шова, а
+    диапазон шова осмыслен ровно постольку, поскольку у кого-то есть выбор
+    «коллировать или пас». У игрока без фишек за спиной выбора нет: он не даёт
+    шоверу ни фолд-эквити, ни диапазона колла, и в вопрос «на какой диапазон
+    похож этот шов» его стек не входит. На самом максимуме это исключение, как
+    правило, не сказывается — оллинщик вложил весь стек, значит его стек не
+    больше принятого им уровня ставки, — но правило пишется по смыслу, а не по
+    тому, что редко расходится.
+
+    Оба свойства закреплены: `test_shover_depth_counts_only_those_live_when_he_shoved`
+    проверяет число, `test_shover_depth_ignores_a_player_already_all_in_when_the_shove_landed`
+    — состав.
+    """
+    target = action_index(hand, dp)
+    # Последнее действие шовера до решения героя — это и есть его шов.
+    # Запасной вариант (шовер до героя не ходил вовсе) читает действия вплоть до
+    # решения героя: лучшего восстановления из этих данных не получить.
+    shove_at = next(
+        (i for i in range(target - 1, -1, -1) if hand.actions[i].label == shover.label), target
+    )
+    gone = {
+        action.label
+        for action in hand.actions[:shove_at]
+        if action.kind is ActionKind.FOLD or action.is_all_in
+    }
+    return [seat for seat in state.seats if seat.label != shover.label and seat.label not in gone]
+
+
 def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) -> PointVerdict:
     """Шов или фолд в неоткрытый банк."""
     spot = SpotKind.PUSHFOLD_UNOPENED
@@ -685,8 +728,12 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         return _unjudged(dp, spot, "доплаты нет либо у героя не осталось фишек")
 
     dead_bb = _table_dead_bb(state)
-    rivals = [seat.stack_after_ante for seat in state.seats if seat.label != shover.label]
-    shover_depth_bb = min(shover.stack_after_ante, max(rivals)) / bb
+    rivals = _rivals_when_shoved(en.hand, dp, state, shover)
+    if not rivals:
+        return _unjudged(dp, spot, "на момент шова отвечать на него было некому")
+    shover_depth_bb = (
+        min(shover.stack_after_ante, max(seat.stack_after_ante for seat in rivals)) / bb
+    )
     pot_bb = state.pot_before / bb
     to_call_bb = state.to_call / bb
     hero_bb = state.hero.behind / bb

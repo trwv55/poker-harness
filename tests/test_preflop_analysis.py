@@ -704,6 +704,93 @@ def test_two_all_ins_before_hero_are_not_priced():
     assert p.spot == "preflop_other" and p.best_action == ""
 
 
+# --- Глубина шовера: только те, кто мог ему ответить ------------------------------
+
+
+def _make_deep_folder_before_the_shove():
+    """UTG (60bb) пасует, ЗАТЕМ HJ (12bb) шовит; все живые после него мельче него.
+
+    Форма подобрана так, чтобы состав оппонентов вообще влиял на число: `min`
+    не упирается в стек шовера (он глубже всех, кто остался жив), а сброшенный
+    ДО шова UTG глубже самого шовера. Состав «все места, кроме шовера» выбрал бы
+    UTG и дал бы 12.0bb — стек самого шовера; состав «живые на момент шова» даёт
+    9.0bb по самому глубокому из тех, кто ещё мог заколлировать.
+    """
+    stacks = {"UTG": 120, "HJ": 24, "CO": 18, "BTN": 18, "SB": 18, "BB": 16}
+    labels, seats, posts = _six_max(stacks, "BB")
+    actions = [
+        _fold(labels["UTG"]),
+        _shove(labels["HJ"], 24),
+        _fold(labels["CO"]),
+        _fold(labels["BTN"]),
+        _fold(labels["SB"]),
+        _fold("Hero"),
+    ]
+    raw = _raw(
+        seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["Tc", "Ad"]}
+    )
+    return enrich(normalize(raw))
+
+
+def test_shover_depth_counts_only_those_live_when_he_shoved():
+    """Стек сбросившегося ДО шова в глубину шова не входит.
+
+    Заколлировать шов он не мог, и на диапазон, с которым шовер входил, его
+    стек не влиял. Проверяется само число глубины, а не только класс спота:
+    класс дают и другие гейты, а разъезжается здесь именно глубина — 9.0bb
+    против 12.0bb.
+    """
+    p = analyze_hand(_make_deep_folder_before_the_shove()).points[0]
+    assert p.spot == "pushfold_facing_shove"
+    assert p.detail["shover_depth_bb"] == 9.0
+
+
+def test_shover_depth_ignores_a_player_already_all_in_when_the_shove_landed():
+    """Уже стоявший в олл-ине жив, но выбора «коллировать или пас» у него нет.
+
+    Глубина здесь берётся ровно ради диапазона шова, то есть ради того, против
+    чьего выбора шовер ставил, — и такого игрока в составе быть не должно.
+
+    На самом числе исключение здесь не сказывается, и это не случайность:
+    оллинщик вложил весь стек, значит его стек не больше уровня ставки, который
+    он принял, а рейз поверх этого уровня законен только когда за столом есть
+    живой глубже уровня. Поэтому проверяется состав, а не итоговое число:
+    правило формулируется по смыслу, и в составе ошибка видна, а в максимуме — нет.
+
+    Спот при этом остаётся без вердикта — два олл-ина перед героем модель не
+    считает, — так что через `analyze_hand` состав не проверить вовсе.
+    """
+    from harness.analysis.preflop import _rivals_when_shoved, _shover
+
+    stacks = {"UTG": 22, "HJ": 24, "CO": 40, "BTN": 10, "SB": 10, "BB": 10}
+    labels, seats, posts = _six_max(stacks, "BB")
+    actions = [
+        _shove(labels["UTG"], 22),  # олл-ин ДО шова
+        _shove(labels["HJ"], 24),  # шов, на который отвечает Hero
+        _fold(labels["CO"]),
+        _fold(labels["BTN"]),
+        _fold(labels["SB"]),
+        _fold("Hero"),
+    ]
+    raw = _raw(
+        seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["Tc", "Ad"]}
+    )
+    en = enrich(normalize(raw))
+    # Реплей не отверг ре-шов: сама форма руки законна, а на нехватку карт борда
+    # (синтетика их не даёт, а два олл-ина ведут к вскрытию) префлоп не опирается.
+    assert not [x for x in en.report.illegal_actions if "raises" in x]
+    dp = en.report.decision_points[0]
+    state = table_state(dp, en)
+    shover = _shover(state)
+    assert shover is not None and shover.label == labels["HJ"]
+
+    rivals = _rivals_when_shoved(en.hand, dp, state, shover)
+    assert {seat.label for seat in rivals} == {labels["CO"], labels["BTN"], labels["SB"], "Hero"}
+    assert labels["UTG"] not in {seat.label for seat in rivals}
+
+    assert analyze_hand(en).points[0].spot == "preflop_other"
+
+
 # --- Анте стола входит в равновесие ---------------------------------------------
 
 
