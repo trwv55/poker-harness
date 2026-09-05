@@ -459,6 +459,49 @@ def test_reconstructed_pot_matches_engine(path):
     assert checked > 100
 
 
+# --- Референсный спот мультивей-равновесия ---------------------------------------
+
+
+@requires_fixtures
+@pytest.mark.slow  # решение равновесия на шестерых позади плюс мультивей-Монте-Карло
+def test_the_reference_multiway_spot_reproduces_the_solved_table():
+    """`TM6292955427` целиком через конвейер: колл-диапазоны, стол, цена шова.
+
+    8-макс, анте 1200 с восьми мест, блайнды 4000/8000, UTG спасовал, герой
+    UTG+1 с A5s и шестью игроками позади. Числа зафиксированы здесь потому, что
+    это единственная точка, где связка «решатель — восстановление стола —
+    `shove_ev_bb`» проверяется на настоящей раздаче, а не на синтетике: ошибка в
+    переносе постов или банка сдвинет их все сразу.
+
+    Разные ширины колла у мест — следствие разных постов: SB и BB платят за колл
+    меньше на свой блайнд, и коллируют шире. Порядок `call_range_fractions` —
+    порядок хода.
+    """
+    from harness.parsers.hh_parser import parse_file
+
+    raws = parse_file(FIXTURE_PKO.read_text(encoding="utf-8"), source_ref="pko")
+    target = next(raw for raw in raws if raw.hand_no == "TM6292955427")
+    point = analyze_hand(enrich(normalize(target))).points[0]
+
+    assert point.spot == "pushfold_unopened"
+    assert point.detail["hero_class"] == "A5s"
+    assert [round(w * 100, 2) for w in point.detail["call_range_fractions"]] == [
+        11.50,
+        10.54,
+        10.54,
+        10.54,
+        12.30,
+        13.86,
+    ]
+    assert round(point.detail["shove_range_fraction"] * 100, 2) == 18.82
+    assert round(point.detail["p_all_fold"] * 100, 2) == 51.44
+    assert point.detail["expected_callers"] == pytest.approx(0.629, abs=5e-4)
+    assert point.detail["ev_shove_bb"] == pytest.approx(0.0628, abs=5e-5)
+    # Эксплуатируемость профиля названа числом и уезжает в `detail` наружу —
+    # заявлять «строго» «потому что равновесие» здесь оснований нет.
+    assert point.detail["equilibrium_hand_regret_bb"] == pytest.approx(0.00421, abs=5e-6)
+
+
 # --- Фолд-эквити ----------------------------------------------------------------
 
 
@@ -539,14 +582,16 @@ def test_shove_without_fold_equity_is_marked():
 
 
 def test_a_shove_the_model_says_is_almost_always_answered_gets_no_verdict():
-    """Модель колла раздаёт КАЖДОМУ позади одну и ту же сторону равновесия.
+    """Шов, который по модели почти всегда отвечают, цены не получает.
 
-    На пятерых позади это даёт вероятность прохода шова 0.16 и полтора
-    отвечающих в среднем — стол, которого не бывает. Цена шова, посчитанная по
-    такой модели, арифметически верна и при этом описывает не эту раздачу,
-    поэтому вердикта здесь нет вовсе (решение владельца 2026-09-06).
+    На 4bb с пятерыми позади равновесные колл-диапазоны широки: шов проходит без
+    ответа в 14% случаев, а отвечают на него в среднем полтора игрока из пяти.
+    Цена такого шова арифметически верна, но проверку `_model_checksum` он не
+    проходит, и вердикта здесь нет вовсе (решение владельца 2026-09-06).
+    Порядок правил при этом важен: точка снимается контрольной суммой, а не
+    вилкой, и причина обязана называть именно её.
     """
-    en = _make_multiway_shove_hand(hero_cards=("Ad", "5d"), eff_bb=12.0, players_behind=5)
+    en = _make_multiway_shove_hand(hero_cards=("Ad", "5d"), eff_bb=4.0, players_behind=5)
     p = analyze_hand(en).points[0]
 
     assert p.spot == "pushfold_unopened"
@@ -1397,28 +1442,28 @@ def test_equilibrium_uses_table_ante_not_the_ante_free_game():
     (на 10bb пуш 58.3% против 70.7%), поэтому по нему верные шовы помечались бы
     ошибкой — для тренажёра ложное обвинение хуже пропущенной ошибки.
     """
-    dry = analyze_hand(_ante_table_shove(0)).points[0]
-    ante = analyze_hand(_ante_table_shove(5)).points[0]  # 5/40 = 0.125bb с игрока
+    dry = analyze_hand(_ante_table_shove(0, hero_cards=("9c", "9d"))).points[0]
+    # 5/40 = 0.125bb с игрока
+    ante = analyze_hand(_ante_table_shove(5, hero_cards=("9c", "9d"))).points[0]
     assert dry.detail["dead_extra_bb"] == 0.0
     assert ante.detail["dead_extra_bb"] == pytest.approx(6 * 0.125, abs=0.03)
     # больше мёртвых денег в банке -> шов прибыльнее, и это не округление
-    assert ante.detail["ev_shove_bb"] > dry.detail["ev_shove_bb"] + 0.3
+    assert ante.detail["ev_shove_bb"] > dry.detail["ev_shove_bb"] + 0.5
 
 
 def test_ante_can_flip_the_verdict_from_mistake_to_correct():
     """Ровно тот отказ, ради которого правилась игра: верный шов помечался ошибкой.
 
-    K9o, шов 10bb с CO при трёх игроках позади. Без анте модель насчитывает
-    минус («вы ошиблись»), с анте стола — плюс. Ложное обвинение учит пасовать
-    там, где надо входить, и рушит доверие при первой же сверке с солвером.
+    A4o, шов 10bb при трёх игроках позади. Без анте модель насчитывает минус
+    («вы ошиблись»), с анте стола — плюс. Ложное обвинение учит пасовать там,
+    где надо входить, и рушит доверие при первой же сверке с солвером.
 
-    Обе точки контрольная сумма снимает с оценки (трое позади по модели дают
-    больше одного отвечающего), поэтому знак читается из посчитанной EV шова, а
-    не из `best_action`: правится игра, которую решает равновесие, и она обязана
-    оставаться исправленной независимо от того, выдаётся ли по ней вердикт.
+    Знак читается из посчитанной EV шова, а не из `best_action`: у безантевой
+    точки вердикта нет вовсе (вилка рвётся), и сравнивать надо ту величину,
+    которая существует в обоих случаях.
     """
-    dry = analyze_hand(_ante_table_shove(0, hero_cards=("Kc", "9d"))).points[0]
-    ante = analyze_hand(_ante_table_shove(5, hero_cards=("Kc", "9d"))).points[0]
+    dry = analyze_hand(_ante_table_shove(0, hero_cards=("Ac", "4d"))).points[0]
+    ante = analyze_hand(_ante_table_shove(5, hero_cards=("Ac", "4d"))).points[0]
     assert dry.detail["ev_shove_bb"] < 0.0 < ante.detail["ev_shove_bb"]
 
 

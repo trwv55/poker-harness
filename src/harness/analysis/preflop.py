@@ -18,9 +18,10 @@
 
 **Правило зоны.** Точный расчёт есть только там, где колл-диапазон не угадан:
 хедз-ап SB против BB решается равновесием `nash_hu`. При трёх и более живых
-мультивей-равновесия у нас нет, колл-диапазоны игроков позади моделируются, и
-вывод обязан быть помечен как опирающийся на модель — если только он от неё не
-зависит. Последнее и проверяет bracket-тест: EV пересчитывается на СЕТКЕ ширин
+колл-диапазоны игроков позади берутся из равновесия N-игроковой подыгры
+(`analysis/tools/multiway.py`), но равновесие там не доказано, а измерено —
+вместе с профилем решатель отдаёт его эксплуатируемость. Поэтому вывод обязан
+быть помечен как опирающийся на модель — если только он от неё не зависит. Последнее и проверяет bracket-тест: EV пересчитывается на СЕТКЕ ширин
 диапазона, и зона `strict` ставится, только когда вердикт одинаков на всех её
 точках и совпадает с вердиктом самой модели. Опрашивать два конца было бы
 неверно: EV по ширине не монотонна, и вердикт умеет перевернуться внутри
@@ -86,6 +87,12 @@ from harness.analysis.classifier import (
     unpriced_reason,
 )
 from harness.analysis.tools.equity import equity_vs_ranges
+from harness.analysis.tools.multiway import (
+    DidNotConverge,
+    MultiwaySolution,
+    unopened_shove_equilibrium,
+)
+from harness.analysis.tools.multiway import Seat as MultiwaySeat
 from harness.analysis.tools.pot_odds import required_equity
 from harness.analysis.tools.pushfold import (
     BRACKET_TIGHT,
@@ -204,25 +211,29 @@ _MULTIWAY_ITERATIONS = 20_000
 _BEST_DEPENDS_ON_BEHIND = "зависит от того, войдут ли игроки позади"
 
 _ASSUMPTION_CALLERS = (
-    "колл-диапазоны игроков позади смоделированы: мультивей-равновесия в v1 нет"
+    "колл-диапазоны игроков позади посчитаны как равновесие этого стола — "
+    "допущение в том, что оппоненты его и придерживаются"
 )
 _ASSUMPTION_SHOVER = (
     "диапазон шова смоделирован равновесным пуш-диапазоном его глубины: "
     "мультивей-равновесия в v1 нет"
 )
 
-# Контрольная сумма модели стола (решение владельца 2026-09-06). `_call_model`
-# выдаёт колл-сторону ХЕДЗ-АП равновесия и раздаёт её каждому игроку позади
-# независимо, поэтому на многолюдном столе модель начинает описывать не тот
-# стол, за которым принималось решение: вероятность, что шов пройдёт без
-# ответа, падает почти до нуля, а ожидаемое число отвечающих переваливает за
-# единицу. Арифметика `shove_ev_bb` на таких входах остаётся верной — неверен
-# сам стол, который она считает, и цену шова по нему называть нельзя.
+# Контрольная сумма модели стола (решение владельца 2026-09-06). Проверяется не
+# арифметика `shove_ev_bb` — она верна на любом входе, — а то, описывает ли
+# модель коллеров тот стол, за которым принималось решение: если по ней выходит,
+# что шов почти наверняка ответят и отвечающих в среднем больше одного, цену
+# шова по такой модели называть нельзя.
 #
 # Пороги названы владельцем и обоснования «из литературы» под собой не имеют:
 # правдоподобные частоты колла — вопрос эмпирический, и ответят на него
-# популяционные данные, а не эта константа. До тех пор проверка снимает
-# вердикт, а не правит число: править колл-диапазон — отдельная задача.
+# популяционные данные, а не эта константа. Проверка снимает вердикт, а не
+# правит число.
+#
+# Двусторонняя полоса (35-70%) вместо нижнего порога здесь НЕ включена: она
+# отвергает верные ответы там, где позади сидит игрок, которому колл обходится
+# так дёшево, что он коллирует почти всем, — область применимости для неё
+# описана в спеке (§8) и является отдельной подзадачей.
 _MIN_ALL_FOLD_PROB = 0.20
 _MAX_EXPECTED_CALLERS = 1.0
 
@@ -232,6 +243,13 @@ _MAX_EXPECTED_CALLERS = 1.0
 # того, что от ширины и зависит. Исключение одно — форма, где ширину не
 # угадывают, а берут из равновесия (хедз-ап SB против BB): там вилка вердикт и
 # не держит, его держит равновесие, и `zone_for` ставит такой точке `strict`.
+# Решатель равновесия не достиг порогов остановки. Профиль, который не сошёлся,
+# — это не «примерно равновесие», а неизвестно что; цену шова по нему не считаем.
+_NO_EQUILIBRIUM = (
+    "равновесие этого стола посчитать не удалось, а называть цену шова по "
+    "недосчитанной модели мы не будем"
+)
+
 _UNSTABLE_SHOVE = (
     "цена этого решения переворачивается в зависимости от того, насколько охотно "
     "за столом отвечают на шов: одного надёжного числа здесь нет"
@@ -457,6 +475,34 @@ def _table_dead_bb(state: TableState) -> float:
 def _call_model(depth_bb: float, dead_bb: float) -> Range:
     """Модель колл-диапазона игрока такой глубины — колл-сторона равновесия."""
     return nash_hu(_depth_key(depth_bb), dead_extra_bb=dead_bb)[1]
+
+
+def _table_equilibrium(
+    state: TableState, behind: Sequence[SeatSnapshot], bb: int
+) -> MultiwaySolution:
+    """Равновесие подыгры «шов героя в неоткрытый банк» для ЭТОГО состава стола.
+
+    Деньги берутся ровно те же, что уходят в `shove_ev_bb`: банк `pot_before`,
+    посты каждого места, урезанные потолком героя, и остатки за спиной. Одна
+    точка решения стоит одного решения независимо от того, сколько раз её
+    посчитали: результат запоминает сам решатель.
+
+    Возвращается вся связка «шов + коллы»: колл-диапазон является наилучшим
+    ответом на диапазон шова того же решения, и разрывать пару нельзя.
+    """
+    ceiling = state.hero.stack
+    return unopened_shove_equilibrium(
+        MultiwaySeat(
+            posted_bb=state.hero.contributed / bb, behind_bb=state.hero.behind / bb
+        ),
+        [
+            MultiwaySeat(
+                posted_bb=min(seat.contributed, ceiling) / bb, behind_bb=seat.behind / bb
+            )
+            for seat in behind
+        ],
+        state.pot_before / bb,
+    )
 
 
 def _push_model(depth_bb: float, dead_bb: float) -> Range:
@@ -764,7 +810,11 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
             equity_fn=_model_equity,
         )
 
-    model_ranges = [_call_model(depth, dead_bb) for depth in depths]
+    try:
+        solution = _table_equilibrium(state, behind, bb)
+    except DidNotConverge as failure:
+        return _unjudged(dp, spot, _NO_EQUILIBRIUM, {"solver_error": str(failure)})
+    model_ranges = list(solution.calls)
     model_callers = callers(model_ranges)
     # Контрольная сумма модели стола. Считается здесь, на тех же `CallerModel`,
     # что уходят в `shove_ev_bb`, а решение по ней принимается перед выдачей
@@ -832,6 +882,9 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
         "depths_bb": [round(_depth_key(depth), 2) for depth in depths],
         "dead_extra_bb": round(dead_bb, 4),
         "zone_reason": why,
+        "shove_range_fraction": round(solution.push.fraction_of_hands(), 6),
+        "call_range_fractions": [round(rng.fraction_of_hands(), 6) for rng in model_ranges],
+        "equilibrium_hand_regret_bb": round(solution.hand_regret_bb, 6),
         **_checksum_detail(model_callers, hero_cls),
     }
     if broken_model:
@@ -852,13 +905,13 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
         assumption=(
             Assumption(
                 range=_average_range(model_ranges),
-                source="model:nash_hu_call",
+                source="model:multiway_pushfold",
                 note=_ASSUMPTION_CALLERS,
             )
             if zone is Zone.ASSUMING
             else None
         ),
-        tools=["nash_hu", "shove_ev_bb", "fold_equity_ok"],
+        tools=["multiway_pushfold", "shove_ev_bb", "fold_equity_ok"],
         detail=detail,
     )
 
@@ -1202,15 +1255,22 @@ def cheap_fold_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | No
         equilibrium_depth = _equilibrium_depth(min(hero_eff, behind[0].stack_after_ante) / bb)
 
     # Те же два правила, что и у полного расчёта, — иначе дешёвый лукап был бы
-    # увереннее его. Контрольную сумму он считает сам: она стоит на равновесных
-    # колл-диапазонах и эквити не требует.
+    # увереннее его. Контрольная сумма считается по ТОМУ ЖЕ равновесию стола,
+    # что и в `_unopened_verdict`: две разные модели коллеров снимали бы с точки
+    # вердикт по разным причинам, и лукап отвергал бы то, что полный расчёт
+    # судит. Решение точки считается один раз на обоих путях — его запоминает
+    # сам решатель.
+    try:
+        solution = _table_equilibrium(state, behind, bb)
+    except DidNotConverge:
+        return None  # отказ формулирует полный расчёт, а не лукап
     model_callers = [
         CallerModel(
-            call_range=_call_model(depth, dead_bb),
+            call_range=call_range,
             behind_bb=seat.behind / bb,
             posted_bb=min(seat.contributed, state.hero.stack) / bb,
         )
-        for seat, depth in zip(behind, depths, strict=True)
+        for seat, call_range in zip(behind, solution.calls, strict=True)
     ]
     broken_model = _model_checksum(model_callers, hero_cls)
     if broken_model:
