@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from harness.contracts import (
@@ -28,6 +29,7 @@ from harness.contracts import (
     Street,
 )
 from harness.engine.validation import forced_blind
+from harness.normalizer import POSITIONS_BY_COUNT
 
 # Порог пуш-фолд парадигмы (спека §5.5): глубже решение перестаёт сводиться к
 # «шов или фолд», и модель к нему неприменима.
@@ -62,6 +64,38 @@ class SeatSnapshot:
         return self.stack - self.ante
 
 
+def in_action_order_after(
+    seats: Sequence[SeatSnapshot], pivot: str
+) -> tuple[SeatSnapshot, ...]:
+    """Места, ходящие после названного, в порядке хода. Само место не входит.
+
+    Порядок мест за столом и порядок хода — разные вещи. Первый берётся из
+    `hand.players`, то есть из строк `Seat N` hand history; второй начинается со
+    следующего за `pivot` места и заворачивается по кругу. Круг восстанавливается
+    по позициям — `POSITIONS_BY_COUNT` есть тот самый список, по которому
+    нормалайзер позиции и раздавал (`normalize._positions_by_label`), — поэтому
+    номер места в `SeatSnapshot` не нужен.
+
+    Функция одна на оба входа решателя равновесия: `TableState.behind_hero`
+    крутит круг от героя, `preflop._rivals_when_shoved` — от шовера. Порядок
+    решателю не безразличен: `unopened_shove_equilibrium` документирует места
+    1..N как «живых игроков позади в порядке хода» и суммирует EV шова
+    сквозь произведение «до этого места все спасовали». Оба порядка и их
+    расхождение закреплены
+    `test_the_solver_gets_the_seats_behind_hero_in_action_order` и
+    `test_the_rivals_of_the_shover_are_in_action_order_after_him`.
+    """
+    order = POSITIONS_BY_COUNT.get(len(seats))
+    if order is None:
+        raise ValueError(f"стол на {len(seats)} мест: порядка позиций для такого нет")
+    rank = {position: i for i, position in enumerate(order)}
+    around = sorted(seats, key=lambda seat: rank[seat.position])
+    start = next((i for i, seat in enumerate(around) if seat.label == pivot), None)
+    if start is None:
+        raise ValueError(f"места {pivot} за этим столом нет")
+    return tuple(around[(start + 1 + step) % len(around)] for step in range(len(around) - 1))
+
+
 @dataclass(frozen=True)
 class TableState:
     """Стол в точке решения героя: деньги, живые игроки, форма спота."""
@@ -89,9 +123,18 @@ class TableState:
 
     @property
     def behind_hero(self) -> tuple[SeatSnapshot, ...]:
-        """Живые игроки, которые ещё не действовали в этом круге."""
+        """Живые игроки, которые ещё не действовали в этом круге, В ПОРЯДКЕ ХОДА.
+
+        Порядок — не оформление списка, а часть входа решателя равновесия:
+        `unopened_shove_equilibrium` суммирует EV шова как
+        `Σ_j (Π_{k<j}(1 − q_k)) · val_j`, то есть вес ветки «заколлировал именно
+        j» зависит от того, кто ходит до него. Отдаётся он
+        `in_action_order_after`, а не порядком `self.seats` (это порядок мест из
+        hand history); закреплено
+        `test_the_solver_gets_the_seats_behind_hero_in_action_order`.
+        """
         return tuple(
-            s for s in self.seats if s.live and not s.acted and s.label != self.hero.label
+            s for s in in_action_order_after(self.seats, self.hero.label) if s.live and not s.acted
         )
 
     @property

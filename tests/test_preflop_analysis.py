@@ -10,9 +10,11 @@ from datetime import UTC, datetime
 import pytest
 
 from harness.analysis import analyze_hand
+from harness.analysis import preflop as preflop_module
 from harness.analysis.classifier import (
     PUSHFOLD_MAX_EFF_BB,
     classify,
+    in_action_order_after,
     spot_for,
     table_state,
 )
@@ -26,6 +28,7 @@ from harness.analysis.preflop import (
     _shover_equilibrium,
     _table_dead_bb,
     cheap_fold_verdict,
+    verdict_for,
     zone_for,
 )
 from harness.analysis.tools.multiway import Seat as MultiwaySeat
@@ -1576,7 +1579,7 @@ def test_the_table_equilibrium_turns_a_heads_up_call_into_a_fold():
     """Направление сдвига: приписанный шоверу диапазон уже, и колл дешевеет.
 
     UTG шовит 12bb, позади него пятеро. Хедз-ап пуш-диапазон этой глубины —
-    53.3% комбо, равновесие его стола — 13.3%; KQo против первого коллируется,
+    53.3% комбо, равновесие его стола — 13.4%; KQo против первого коллируется,
     против второго сбрасывается. Направление названо замером, а не рассуждением:
     обе цены считает один и тот же `call_shove_ev_bb`, меняется только диапазон.
     """
@@ -1609,7 +1612,7 @@ def test_the_table_equilibrium_turns_a_heads_up_call_into_a_fold():
         )
 
     assert round(heads_up_push.fraction_of_hands(), 4) == 0.5332
-    assert round(solution.push.fraction_of_hands(), 4) == 0.1335
+    assert round(solution.push.fraction_of_hands(), 4) == 0.1337
     assert ev(heads_up_push) > 0.0 > ev(solution.push)
 
     point = analyze_hand(en).points[0]
@@ -1646,6 +1649,127 @@ def test_players_behind_hero_answer_the_same_shove_as_hero():
         round(solution.calls[rival_at[labels["BB"]]].fraction_of_hands(), 6)
     ]
     assert point.detail["rivals_when_shoved"] == len(rivals)
+
+
+# --- Порядок мест на входе решателя ---------------------------------------------
+
+
+def _order_test_table():
+    """Стол, на котором порядок мест и порядок хода РАЗНЫЕ.
+
+    Кнопка на месте 6, то есть места идут SB, BB, UTG, HJ, CO, BTN, а ход на
+    префлопе — UTG, HJ, CO, BTN, SB, BB. Герой в CO шовит в неоткрытый банк,
+    поэтому позади него BTN, SB и BB: по кругу это хвост, заворачивающийся через
+    последнее место за стол, — по номеру места те же трое идут SB, BB, BTN.
+
+    Остатки за спиной у всех троих разные (11.0, 9.5 и 12.0 bb) — по ним и
+    видно, в каком порядке места ушли в решатель.
+    """
+    stacks = {"SB": 20, "BB": 26, "UTG": 40, "HJ": 40, "CO": 24, "BTN": 22}
+    labels, seats, posts = _six_max(stacks, "CO")  # labels нужен для строк пасов
+    actions = [_fold(labels["UTG"]), _fold(labels["HJ"]), _shove("Hero", stacks["CO"])]
+    actions += [_fold(labels[pos]) for pos in ("BTN", "SB", "BB")]
+    raw = _raw(
+        seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["Ah", "Kh"]}
+    )
+    return labels, enrich(normalize(raw))
+
+
+@pytest.mark.slow  # настоящее решение равновесия на троих позади
+def test_the_solver_gets_the_seats_behind_hero_in_action_order(monkeypatch):
+    """Места позади героя уходят решателю в порядке ХОДА, а не в порядке мест.
+
+    Решатель (`multiway.unopened_shove_equilibrium`) документирует места 1..N как
+    «живых игроков позади в порядке хода» и суммирует EV шова так, что вес ветки
+    «заколлировал именно j» зависит от того, кто ходит до него. Порядок мест из
+    hand history — другой (проверяется здесь же), и подать его значило бы решать
+    не ту игру.
+
+    Фальсификация: вернуть `behind_hero` к порядку `self.seats` — записанные
+    остатки станут (9.5, 12.0, 11.0), и тест покраснеет.
+    """
+    _, en = _order_test_table()
+    dp = en.report.decision_points[0]
+    state = table_state(dp, en)
+
+    # порядок мест за столом — из строк Seat N, и он не порядок хода
+    assert [seat.position for seat in state.seats] == list(_SIX_MAX_SEATS)
+    assert [seat.position for seat in state.seats if seat.live and not seat.acted] != [
+        "BTN",
+        "SB",
+        "BB",
+    ]
+
+    recorded: list[list[tuple[float, float]]] = []
+    solve = preflop_module.unopened_shove_equilibrium
+
+    def spy(hero, behind, pot_dead_bb):
+        recorded.append([(seat.posted_bb, seat.behind_bb) for seat in behind])
+        return solve(hero, behind, pot_dead_bb)
+
+    monkeypatch.setattr(preflop_module, "unopened_shove_equilibrium", spy)
+    verdict_for(dp, en)
+
+    assert recorded, "решатель равновесия не вызывался — проверять нечего"
+    # BTN (ничего не поставил, 11bb), SB (0.5bb поста, 9.5bb), BB (1bb поста, 12bb)
+    assert recorded[0] == [(0.0, 11.0), (0.5, 9.5), (1.0, 12.0)]
+    assert [seat.position for seat in state.behind_hero] == ["BTN", "SB", "BB"]
+
+
+def test_the_rivals_of_the_shover_are_in_action_order_after_him():
+    """Состав, отвечавший на чужой шов, тоже идёт в порядке хода — от шовера.
+
+    Круг тот же самый, но крутится он от места шовера, а не от места героя:
+    поэтому порядок задаёт общая `in_action_order_after`, а не `behind_hero`.
+    Здесь шовит UTG, и позади него по ходу — HJ, CO, BTN, SB, BB, тогда как по
+    номеру места те же пятеро идут SB, BB, HJ, CO, BTN.
+    """
+    stacks = {**dict.fromkeys(_SIX_MAX_SEATS, 96), "UTG": 24, "BB": 24}
+    labels, seats, posts = _six_max(stacks, "BB")
+    actions = [_shove(labels["UTG"], 24)]
+    actions += [_fold(labels[pos]) for pos in ("HJ", "CO", "BTN", "SB")]
+    actions.append(_call("Hero", 22, all_in=True))
+    raw = _raw(
+        seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["Ah", "Ad"]}
+    )
+    en = enrich(normalize(raw))
+    dp = en.report.decision_points[0]
+    state = table_state(dp, en)
+    shover = _shover(state)
+    assert shover is not None
+
+    rivals = _rivals_when_shoved(en.hand, dp, state, shover)
+    assert [seat.position for seat in rivals] == ["HJ", "CO", "BTN", "SB", "BB"]
+    assert [seat.position for seat in state.seats if seat.label != shover.label] == [
+        "SB",
+        "BB",
+        "HJ",
+        "CO",
+        "BTN",
+    ]
+
+
+def test_the_action_order_helper_wraps_around_the_table():
+    """`in_action_order_after` заворачивает круг и само место не возвращает.
+
+    Проверяется на том же столе тремя разными опорами: от UTG (первый ход
+    префлопа), от BB (последний — круг заворачивается целиком) и от героя.
+    """
+    _, en = _order_test_table()
+    state = table_state(en.report.decision_points[0], en)
+    by_position = {seat.position: seat for seat in state.seats}
+
+    def order_after(position: str) -> list[str]:
+        return [
+            seat.position
+            for seat in in_action_order_after(state.seats, by_position[position].label)
+        ]
+
+    assert order_after("UTG") == ["HJ", "CO", "BTN", "SB", "BB"]
+    assert order_after("BB") == ["UTG", "HJ", "CO", "BTN", "SB"]
+    assert order_after("CO") == ["BTN", "SB", "BB", "UTG", "HJ"]
+    with pytest.raises(ValueError, match="места"):
+        in_action_order_after(state.seats, "нет такого места")
 
 
 # --- Анте стола входит в равновесие ---------------------------------------------

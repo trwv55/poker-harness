@@ -99,6 +99,7 @@ from harness.analysis.classifier import (
     TableState,
     action_index,
     action_name,
+    in_action_order_after,
     spot_for,
     table_state,
     unpriced_reason,
@@ -918,6 +919,12 @@ def _rivals_when_shoved(
     `test_shover_depth_counts_only_those_live_when_he_shoved` проверяет число,
     `test_shover_depth_ignores_a_player_already_all_in_when_the_shove_landed`
     — состав.
+
+    Состав отдаётся В ПОРЯДКЕ ХОДА ПОСЛЕ ШОВЕРА (`in_action_order_after`), а не
+    в порядке мест за столом: этим списком `_shover_equilibrium` заполняет места
+    1..N решателя, а тот документирует их как «живых игроков позади в порядке
+    хода». Закреплено
+    `test_the_rivals_of_the_shover_are_in_action_order_after_him`.
     """
     shove_at = _shove_action_index(hand, dp, shover)
     gone = {
@@ -926,7 +933,11 @@ def _rivals_when_shoved(
         if action.kind is ActionKind.FOLD or action.is_all_in
     }
     gone |= state.forfeits
-    return [seat for seat in state.seats if seat.label != shover.label and seat.label not in gone]
+    return [
+        seat
+        for seat in in_action_order_after(state.seats, shover.label)
+        if seat.label not in gone
+    ]
 
 
 def _posted_before_shove(hand: CanonicalHand, dp: DecisionPoint, shover: SeatSnapshot) -> int:
