@@ -44,15 +44,34 @@
 ровно то, что посчитано: у этой строки была выше EV — верно в обеих зонах,
 не спорит с маркером и не требует знания, действительно ли сыгранное было
 ошибкой.
+
+**Форма «около нуля» — вердикт, а не отказ.** У части точек интервал EV лежит
+по обе стороны нуля: при одних моделях поведения оппонентов лучше входить, при
+других пасовать. Раньше такая точка до игрока не доходила вовсе — ядро
+отказывалось называть число, — и вместе с числом пропадали три вещи, которые у
+нас на неё есть: знак и порядок величины, ширина интервала (она и есть мера
+маргинальности решения, объяснять её словами не надо) и потолок цены выбора.
+Строка такой точки не содержит «лучше»: упрекать не за что, и грамматика
+расхождения к ней не применяется. Потолок округляется ВВЕРХ
+(`_fmt_ceiling_bb`) — строка обещает «не больше столько-то», и округление вниз
+сделало бы обещание неверным.
 """
 
 from __future__ import annotations
 
+from math import ceil
 from typing import Literal
 
 from pydantic import BaseModel
 
-from harness.contracts.analysis import AnalysisResult, ScanSummary, SpotKind, Zone
+from harness.contracts.analysis import (
+    AnalysisResult,
+    EvInterval,
+    ScanItem,
+    ScanSummary,
+    SpotKind,
+    Zone,
+)
 from harness.contracts.raw import Street
 from harness.presentation.keyboards import (
     Btn,
@@ -128,6 +147,29 @@ _ASSUMING_MARKER = "по модели диапазонов"
 # турнир целиком.
 _MAX_RENDERED_SCAN_ITEMS = 20
 
+# Сколько строк «около нуля» показывается. Тот же ограничитель, что и у списка
+# расхождений выше (жёсткий лимит `sendMessage` в 4096 символов), но потолок
+# ниже: строка «около нуля» длиннее — в ней интервал и потолок цены, — а
+# ценность списка другая. Список расхождений говорит, ЧТО разобрать; список
+# «около нуля» говорит, что разбирать нечего, и десяти строк для этого хватает.
+_MAX_RENDERED_CLOSE_CALLS = 10
+
+# Что варьируется, когда мы говорим «по моделям»: в неоткрытом банке —
+# готовность стола отвечать на шов, против чужого шова — то, с какими руками
+# оппонент идёт олл-ин. Слово игрока, не внутренний термин (SESSIONS_UX).
+_MODELS_WORD: dict[SpotKind, str] = {
+    SpotKind.PUSHFOLD_UNOPENED: "по моделям колла",
+    SpotKind.PUSHFOLD_FACING_SHOVE: "по моделям шова",
+}
+
+# Действие, которое сравнивается с пасом в форме «около нуля»: в неоткрытом
+# банке это шов, против чужого шова — колл. Оба варианта называются целиком —
+# «шов или фолд», — потому что вердикт здесь и есть «оба допустимы».
+_ACTIVE_WORD: dict[SpotKind, str] = {
+    SpotKind.PUSHFOLD_UNOPENED: "шов",
+    SpotKind.PUSHFOLD_FACING_SHOVE: "колл",
+}
+
 _STATION_TEXT: dict[str, str] = {
     "parse": "Читаю стол…",
     "validate": "Проверяю руку…",
@@ -155,6 +197,48 @@ def _fmt_bb(value_bb: float) -> str:
     magnitude = round(abs(value_bb), 1)
     sign = "−" if value_bb < 0 and magnitude != 0.0 else ""
     return f"{sign}{magnitude:.1f} bb"
+
+
+def _fmt_signed_bb(value_bb: float) -> str:
+    """То же, что `_fmt_bb`, но плюс у положительного числа проговаривается.
+
+    В интервале «−0.3 … 0.8» знак верхнего конца несёт смысл: он и говорит, что
+    интервал пересекает ноль. Без явного плюса читатель видит два числа и должен
+    сам заметить, что у одного знак есть, а у другого нет.
+    """
+    magnitude = round(abs(value_bb), 1)
+    if magnitude == 0.0:
+        return "0.0 bb"
+    return f"{'−' if value_bb < 0 else '+'}{magnitude:.1f} bb"
+
+
+def _fmt_ceiling_bb(value_bb: float) -> str:
+    """Потолок цены — округлённый ВВЕРХ до той же десятой, что и остальные числа.
+
+    Вверх, а не к ближайшему: строка обещает игроку «не больше столько-то», и
+    округление вниз сделало бы обещание неверным на величину округления.
+    """
+    return f"{ceil(round(value_bb, 6) * 10) / 10:.1f} bb"
+
+
+def _interval_words(spot: SpotKind, interval: EvInterval) -> str:
+    """Интервал и потолок цены одной фразой — общая часть сводки и разбора."""
+    return (
+        f"{_MODELS_WORD.get(spot, 'по моделям')} от {_fmt_signed_bb(interval.low_bb)} "
+        f"до {_fmt_signed_bb(interval.high_bb)}, разница между вариантами — "
+        f"не больше {_fmt_ceiling_bb(interval.cost_ceiling_bb)}"
+    )
+
+
+def _close_call_line(item: ScanItem) -> str:
+    """Строка точки «около нуля» в сводке: оба варианта, интервал, потолок цены."""
+    assert item.interval is not None  # в `close_calls` попадают только точки с интервалом
+    marker = f" ({_ASSUMING_MARKER})" if item.zone is Zone.ASSUMING else ""
+    return (
+        f"№{item.hand_no} · {item.hero_class} · {_spot_word(item.spot)}: "
+        f"{_ACTIVE_WORD.get(item.spot, 'вход')} или фолд — около нуля, "
+        f"{_interval_words(item.spot, item.interval)}{marker}"
+    )
 
 
 def _quota_line(quota_left: int, quota_total: int) -> str:
@@ -231,6 +315,15 @@ def scan_summary_msg(s: ScanSummary, quota_left: int, quota_total: int) -> Msg:
             )
             buttons.append([deep_dive_button(item.hand_no)])
 
+    if s.close_calls:
+        shown_close = s.close_calls[:_MAX_RENDERED_CLOSE_CALLS]
+        lines.append("")
+        head = "Решения около нуля — расчёт не спорит ни с одним из вариантов"
+        if len(shown_close) < len(s.close_calls):
+            head += f" (показаны {len(shown_close)} из {len(s.close_calls)}, дороже — первыми)"
+        lines.append(f"{head}:")
+        lines.extend(_close_call_line(item) for item in shown_close)
+
     lines.append("")
     lines.append(f"Доступно: {_quota_line(quota_left, quota_total)}.")
     return Msg(text="\n".join(lines), buttons=buttons)
@@ -271,8 +364,24 @@ def deep_dive_msg(
         for idx in res.ranked:
             point = res.points[idx]
             marker = f" ({_ASSUMING_MARKER})" if point.zone is Zone.ASSUMING else ""
+            street = _STREET_WORD.get(point.street, point.street.value)
+            interval = point.interval
+            if interval is not None and interval.near_zero:
+                # Форма «около нуля»: ни одного «лучше» — упрёка тут нет, — зато
+                # все три числа, которых не давал прежний отказ: точка, интервал
+                # и потолок цены выбора.
+                active = _ACTIVE_WORD.get(point.spot, "вход")
+                lines.append(
+                    f"{street} · {_spot_word(point.spot)}: {active} или фолд — "
+                    f"{point.best_action}{marker}"
+                )
+                lines.append(
+                    f"    EV {active}а {_fmt_signed_bb(interval.point_bb)}, "
+                    f"{_interval_words(point.spot, interval)}."
+                )
+                continue
             lines.append(
-                f"{_STREET_WORD.get(point.street, point.street.value)} · "
+                f"{street} · "
                 f"{_spot_word(point.spot)}: {_action_word(point.action_taken)} "
                 f"(лучше: {_action_word(point.best_action)}) — {_fmt_bb(point.ev_diff_bb)}{marker}"
             )

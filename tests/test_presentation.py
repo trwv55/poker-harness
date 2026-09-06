@@ -29,6 +29,7 @@ from __future__ import annotations
 from harness.contracts import (
     AnalysisResult,
     Assumption,
+    EvInterval,
     PointVerdict,
     Range,
     ScanItem,
@@ -553,3 +554,125 @@ def test_bot_failure_msg_says_whose_side_it_is_without_the_reason():
     text = bot_failure_msg().text
     assert "нашей стороне" in text
     assert not any(word in text for word in ("Error", "Traceback", "/data", "Exception"))
+
+
+# --- Форма «около нуля»: знак, интервал и потолок цены вместо отказа -----------------
+
+
+def _close_call(
+    *, hand_no: str = "H7", low: float = -0.3, high: float = 0.8, point: float = 0.1
+) -> ScanItem:
+    return ScanItem(
+        hand_no=hand_no,
+        hand_index=3,
+        hero_class="A5s",
+        spot=SpotKind.PUSHFOLD_UNOPENED,
+        action_taken="fold",
+        best_action="около нуля, оба варианта допустимы",
+        ev_diff_bb=0.0,
+        zone=Zone.ASSUMING,
+        interval=EvInterval(point_bb=point, low_bb=low, high_bb=high, near_zero=True),
+    )
+
+
+def test_scan_summary_msg_shows_close_calls_with_interval_and_ceiling():
+    """Точка «около нуля» доходит до игрока: знак, интервал и потолок цены.
+
+    Прежде такая точка не показывалась вообще — её снимал отказ «одного
+    надёжного числа здесь нет», и вместе с числом пропадали знак, порядок
+    величины и потолок. Строка сводки обязана нести все три.
+    """
+    s = ScanSummary(
+        hands_total=10,
+        hands_with_decision=8,
+        items=[],
+        close_calls=[_close_call()],
+        total_loss_bb=0.0,
+    )
+    msg = scan_summary_msg(s, quota_left=17, quota_total=50)
+
+    line = next(line for line in msg.text.splitlines() if "H7" in line)
+    assert "около нуля" in line
+    assert "−0.3" in line and "0.8 bb" in line  # интервал целиком
+    assert "не больше 0.8 bb" in line  # потолок цены
+    assert "по модели диапазонов" in line  # зона `assuming` подписана, как и у расхождений
+
+
+def test_scan_summary_msg_close_calls_are_not_counted_as_discrepancies():
+    """Точка «около нуля» — не расхождение: в топ расхождений она не попадает.
+
+    Оба варианта допустимы, упрёка нет, цена ноль — поставить такую строку в
+    список расхождений значило бы обвинить игрока в решении, которое сам расчёт
+    считает допустимым.
+    """
+    s = ScanSummary(
+        hands_total=10,
+        hands_with_decision=8,
+        items=[_scan_item(hand_no="H1", ev_diff_bb=-2.3, zone=Zone.STRICT)],
+        close_calls=[_close_call(hand_no="H7")],
+        total_loss_bb=-2.3,
+    )
+    msg = scan_summary_msg(s, quota_left=1, quota_total=1)
+
+    lines = msg.text.splitlines()
+    top_at = next(i for i, line in enumerate(lines) if "Топ расхождений" in line)
+    close_at = next(i for i, line in enumerate(lines) if "около нуля" in line and "H7" in line)
+    assert top_at < close_at  # раздел «около нуля» идёт ПОСЛЕ расхождений
+    assert next(i for i, line in enumerate(lines) if "H1" in line) < close_at
+    # Кнопка разбора стоит только под расхождением: у точки «около нуля» разбирать нечего.
+    assert len(msg.buttons) == 1
+
+
+def test_scan_summary_msg_without_close_calls_says_nothing_about_them():
+    """Раздела нет, когда точек «около нуля» нет: сообщение о том, чего не было."""
+    s = ScanSummary(hands_total=5, hands_with_decision=5, items=[], total_loss_bb=0.0)
+    assert "около нуля" not in scan_summary_msg(s, quota_left=1, quota_total=1).text
+
+
+def test_deep_dive_msg_renders_the_close_call_form_in_full():
+    """Разбор точки «около нуля»: точка, интервал, вердикт и потолок цены.
+
+    Это та самая форма, которой отказ «одного надёжного числа здесь нет» не
+    давал: игрок видит и знак с порядком величины, и ширину интервала, и то,
+    сколько максимум стоит выбор в любую сторону.
+    """
+    point = PointVerdict(
+        dp_index=0,
+        street=Street.PREFLOP,
+        spot=SpotKind.PUSHFOLD_UNOPENED,
+        zone=Zone.ASSUMING,
+        action_taken="fold",
+        best_action="около нуля, оба варианта допустимы",
+        ev_diff_bb=0.0,
+        interval=EvInterval(point_bb=0.1, low_bb=-0.3, high_bb=0.8, near_zero=True),
+        assumption=Assumption(range=Range(weights={"AA": 1.0}), source="model:test"),
+    )
+    res = AnalysisResult(hand_no="H7", points=[point], ranked=[0], total_ev_loss_bb=0.0)
+    text = deep_dive_msg(res, elapsed_s=3, zone=Zone.ASSUMING, quota_left=1, quota_total=1).text
+
+    assert "шов или фолд" in text  # названы оба варианта, а не один «лучший»
+    assert "около нуля, оба варианта допустимы" in text
+    assert "0.1 bb" in text  # точечная оценка
+    assert "−0.3 bb" in text and "0.8 bb" in text  # интервал
+    assert "не больше 0.8 bb" in text  # потолок цены
+    assert "(лучше:" not in text  # упрёка тут нет, и грамматика расхождения не применяется
+
+
+def test_deep_dive_msg_names_the_call_side_for_a_close_call_facing_a_shove():
+    """У колла чужого шова варианты другие — «колл или фолд», и модель другая."""
+    point = PointVerdict(
+        dp_index=0,
+        street=Street.PREFLOP,
+        spot=SpotKind.PUSHFOLD_FACING_SHOVE,
+        zone=Zone.ASSUMING,
+        action_taken="call",
+        best_action="около нуля, оба варианта допустимы",
+        ev_diff_bb=0.0,
+        interval=EvInterval(point_bb=-0.2, low_bb=-1.4, high_bb=0.6, near_zero=True),
+        assumption=Assumption(range=Range(weights={"AA": 1.0}), source="model:test"),
+    )
+    res = AnalysisResult(hand_no="H8", points=[point], ranked=[0], total_ev_loss_bb=0.0)
+    text = deep_dive_msg(res, elapsed_s=3, zone=Zone.ASSUMING, quota_left=1, quota_total=1).text
+
+    assert "колл или фолд" in text
+    assert "не больше 1.4 bb" in text

@@ -62,3 +62,28 @@ def test_range_validates():
 def test_fraction_of_hands():
     assert abs(Range(weights={c: 1.0 for c in all_classes()}).fraction_of_hands() - 1.0) < 1e-9
     assert abs(Range(weights={"AA": 1.0}).fraction_of_hands() - 6 / 1326) < 1e-9
+
+
+def test_ev_interval_ceiling_bounds_the_error_in_both_directions():
+    """Потолок цены — модуль худшего конца, и он покрывает обе стороны ошибки.
+
+    Пас при верхнем конце +0.8 стоит не больше 0.8; вход при нижнем −0.3 стоит
+    не больше 0.3. Потолок обязан быть не меньше каждой из этих величин, иначе
+    строка «дороже столько-то не проиграть» была бы обещанием, которого расчёт
+    не даёт.
+    """
+    from harness.contracts import EvInterval
+
+    interval = EvInterval(point_bb=0.1, low_bb=-0.3, high_bb=0.8, near_zero=True)
+    assert interval.cost_ceiling_bb == 0.8
+    assert EvInterval(point_bb=-3.0, low_bb=-5.03, high_bb=-1.11).cost_ceiling_bb == 5.03
+
+
+def test_ev_interval_rejects_a_point_outside_its_own_interval():
+    """Точка вне собственного интервала — признак, что числа посчитаны врозь."""
+    from harness.contracts import EvInterval
+
+    with pytest.raises(ValidationError):
+        EvInterval(point_bb=1.5, low_bb=-0.3, high_bb=0.8)
+    with pytest.raises(ValidationError):
+        EvInterval(point_bb=0.1, low_bb=0.8, high_bb=-0.3)  # концы перепутаны местами

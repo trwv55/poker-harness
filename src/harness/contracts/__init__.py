@@ -10,6 +10,7 @@ from __future__ import annotations
 from harness.contracts.analysis import (
     AnalysisResult,
     Assumption,
+    EvInterval,
     PointVerdict,
     ScanItem,
     ScanSummary,
@@ -58,6 +59,7 @@ __all__ = [
     "DecisionPoint",
     "EngineReport",
     "EnrichedHand",
+    "EvInterval",
     "Identity",
     "PlayerState",
     "PointVerdict",

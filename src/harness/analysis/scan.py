@@ -16,6 +16,12 @@
 префлоп) не идёт в сводку вовсе: «неизвестно» не выдаётся ни за «верно», ни за
 «ошибка» (тот же принцип, что в `error_cost.py`).
 
+**Второй список — точки «около нуля» (`close_calls`).** Их интервал EV лежит по
+обе стороны нуля: расхождения нет, цена ноль, и в список расхождений они не
+идут. Но и молчать о них нельзя — молчание и было прежним поведением, когда
+такая точка снималась отказом целиком. У них есть, что сказать игроку: знак и
+порядок величины, ширина интервала и потолок цены выбора.
+
 **Пред-фильтр.** Большинство рук турнирного файла — «сфолдил в неоткрытый банк,
 отдал блайнды». `cheap_fold_verdict` (задача 13, живёт в `preflop.py` рядом с
 остальным правилом зоны) закрывает такие точки одним попаданием в равновесный
@@ -80,9 +86,34 @@ def _hand_points(en: EnrichedHand) -> list[PointVerdict]:
     return points
 
 
+def _item(en: EnrichedHand, point: PointVerdict) -> ScanItem:
+    """Пункт сводки из точки решения — одинаково для расхождения и для «около нуля».
+
+    Разница между двумя списками — только в том, куда пункт положен: сам пункт
+    строится одним конструктором, иначе два соседних списка расходились бы по
+    набору полей.
+    """
+    return ScanItem(
+        hand_no=en.hand.hand_no,
+        hand_index=en.hand.hand_index,
+        hero_class=str(point.detail.get("hero_class", "")),
+        spot=point.spot,
+        action_taken=point.action_taken,
+        best_action=point.best_action,
+        ev_diff_bb=point.ev_diff_bb,
+        zone=point.zone,
+        interval=point.interval,
+    )
+
+
+def _ceiling_of(item: ScanItem) -> float:
+    return 0.0 if item.interval is None else item.interval.cost_ceiling_bb
+
+
 def scan_tournament(enriched: list[EnrichedHand]) -> ScanSummary:
     """Сводка расхождений по всем рукам турнирного файла — ранжированная по цене."""
     items: list[ScanItem] = []
+    close_calls: list[ScanItem] = []
     hands_with_decision = 0
     hands_failed = 0
     points_total = 0
@@ -107,25 +138,23 @@ def scan_tournament(enriched: list[EnrichedHand]) -> ScanSummary:
         total_loss_bb += total_ev_loss_bb(points)
 
         for point in judged:
+            item = _item(en, point)
             if point.ev_diff_bb < -_MIN_REPORTED_LOSS_BB:
-                items.append(
-                    ScanItem(
-                        hand_no=en.hand.hand_no,
-                        hand_index=en.hand.hand_index,
-                        hero_class=str(point.detail.get("hero_class", "")),
-                        spot=point.spot,
-                        action_taken=point.action_taken,
-                        best_action=point.best_action,
-                        ev_diff_bb=point.ev_diff_bb,
-                        zone=point.zone,
-                    )
-                )
+                items.append(item)
+            elif point.interval is not None and point.interval.near_zero:
+                close_calls.append(item)
 
     items.sort(key=lambda it: it.ev_diff_bb)
+    # Точки «около нуля» — по потолку цены, дороже первым: расхождения там нет,
+    # и единственное, чем они отличаются друг от друга для игрока, — сколько
+    # максимум стоит выбор. Порог показа к ним не применяется: точка с потолком
+    # в копейки — тоже ответ («здесь не о чем думать»), а не пробел.
+    close_calls.sort(key=_ceiling_of, reverse=True)
     return ScanSummary(
         hands_total=len(enriched),
         hands_with_decision=hands_with_decision,
         items=items,
+        close_calls=close_calls,
         total_loss_bb=round(total_loss_bb, 6),
         hands_failed=hands_failed,
         points_total=points_total,

@@ -42,6 +42,59 @@ class Assumption(BaseModel):
     note: str = ""
 
 
+class EvInterval(BaseModel):
+    """EV решения: точка, интервал по моделям колла и потолок цены ошибки.
+
+    Отвечает на три вопроса разом, и ровно затем и заведён: какого знака и
+    порядка величина (`point_bb`), насколько вывод зависит от допущения о поле
+    (ширина `low_bb`..`high_bb` — она и есть мера маргинальности), и сколько
+    максимум стоит неверный выбор (`cost_ceiling_bb`). Отказ «одного надёжного
+    числа здесь нет» прятал все три.
+
+    `near_zero` — интервал лежит по обе стороны нуля, то есть при одних моделях
+    колла лучше входить, при других пасовать. Признак хранится, а не выводится
+    из знаков `low_bb`/`high_bb`: форма, где диапазон оппонента взят из
+    равновесия, а не угадан, получает обычный вердикт даже при интервале через
+    ноль — там вывод держит равновесие, а не интервал (`preflop.zone_for`,
+    `test_hu_equilibrium_shape_is_strict_even_when_bracket_unstable`).
+    """
+
+    point_bb: float
+    low_bb: float
+    high_bb: float
+    near_zero: bool = False
+
+    @property
+    def cost_ceiling_bb(self) -> float:
+        """Сколько максимум стоит неверный выбор — по модулю худшего конца.
+
+        Пас при `high_bb > 0` стоит не больше `high_bb`, вход при `low_bb < 0` —
+        не больше `|low_bb|`; потолок в любую сторону и есть максимум модулей.
+        Свойство, а не поле: величина полностью определена концами интервала, и
+        отдельно записанная она могла бы с ними разойтись.
+        """
+        return max(abs(self.low_bb), abs(self.high_bb))
+
+    @model_validator(mode="after")
+    def _point_lies_inside(self) -> EvInterval:
+        """Точка обязана лежать внутри интервала, а нижний конец — не выше верхнего.
+
+        Интервал строится как размах по моделям колла ВКЛЮЧАЯ саму модель, и
+        точка вне собственного интервала означала бы, что одно из двух чисел
+        посчитано не по тому набору.
+        """
+        if self.low_bb > self.high_bb:
+            raise ValueError(
+                f"нижний конец интервала {self.low_bb} выше верхнего {self.high_bb}"
+            )
+        if not self.low_bb <= self.point_bb <= self.high_bb:
+            raise ValueError(
+                f"точечная оценка {self.point_bb} лежит вне своего интервала "
+                f"[{self.low_bb}, {self.high_bb}]"
+            )
+        return self
+
+
 class PointVerdict(BaseModel):
     dp_index: int
     street: Street
@@ -50,6 +103,7 @@ class PointVerdict(BaseModel):
     action_taken: str
     best_action: str
     ev_diff_bb: float  # <0 = потеря
+    interval: EvInterval | None = None
     assumption: Assumption | None = None
     tools: list[str] = []
     detail: dict[str, Any] = {}
@@ -90,8 +144,9 @@ class ScanItem(BaseModel):
     spot: SpotKind
     action_taken: str
     best_action: str
-    ev_diff_bb: float  # < -0.1bb — иначе точка не попала бы в список
+    ev_diff_bb: float  # < -0.1bb для расхождения; 0.0 для точки «около нуля»
     zone: Zone
+    interval: EvInterval | None = None
 
 
 class ScanSummary(BaseModel):
@@ -134,6 +189,14 @@ class ScanSummary(BaseModel):
     # разбора», а не как «сумма списка ниже» — иначе игрок увидит два разных
     # числа рядом и решит, что одно из них ошибка.
     total_loss_bb: float
+    # Точки «около нуля»: интервал EV лежит по обе стороны нуля, оба варианта
+    # допустимы, цена ноль. В `items` они не входят и входить не должны — там
+    # список РАСХОЖДЕНИЙ, а тут расхождения нет, — но и молчать о них нельзя:
+    # прежде такая точка не доходила до игрока вовсе (отказ «одного надёжного
+    # числа здесь нет»), и вместе с числом пропадали знак, порядок величины и
+    # потолок цены. Умолчание `[]` — ради сводок, записанных в
+    # `tournaments.scan_summary` до появления поля.
+    close_calls: list[ScanItem] = []
     hands_failed: int = 0
     # Умолчание 0 — ради сводок, записанных в `tournaments.scan_summary` до
     # появления этих полей: они читаются тем же типом.
