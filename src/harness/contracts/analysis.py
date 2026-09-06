@@ -247,3 +247,169 @@ class PlayerStats(BaseModel):
     @property
     def fold_to_cbet_pct(self) -> float | None:
         return self._share(self.fold_to_cbet, self.cbet_faced)
+
+
+class LevelLine(BaseModel):
+    """Один уровень блайндов: сколько раздач и стек героя на входе и на выходе.
+
+    Стек в bb того уровня, к которому строка относится: bb растут по ходу
+    турнира, и один и тот же стек в фишках на разных уровнях — разная глубина.
+    """
+
+    level: int
+    hands: int
+    start_bb: float
+    end_bb: float
+
+
+class StackTrajectory(BaseModel):
+    """Траектория стека по уровням и переломная точка — максимум стека.
+
+    Переломная точка определена механически: раздача с наибольшим стеком героя
+    НА ВХОДЕ (`peak_bb`, в bb своего уровня); при равенстве — самая ранняя.
+    Всё, что после неё, — спуск с этого максимума, и `hands_after_peak` говорит,
+    за сколько раздач он пройден. Никакого суждения «до этого шло хорошо» здесь
+    нет: это арифметика максимума, а слова о ней — задача 21.
+    """
+
+    levels: list[LevelLine]
+    start_bb: float
+    final_bb: float
+    peak_level: int
+    peak_bb: float
+    peak_hand_no: str
+    hands_after_peak: int
+
+
+class AllInEvent(BaseModel):
+    """Олл-ин героя с исходом: сколько ушло в банк и чем раздача кончилась.
+
+    `invested_bb` — фишки, которых стек героя лишился к моменту, когда он
+    оказался без фишек (стартовый стек минус остаток на конец раздачи плюс
+    выигранное), поэтому исход считается одним числом `delta_bb`: изменение
+    стека за раздачу. Знак `delta_bb` и есть исход, отдельного «выиграл» в
+    контракте нет — оно вычислялось бы из того же числа и могло бы с ним
+    разойтись (то же правило, что у `EvInterval.cost_ceiling_bb`).
+    """
+
+    hand_no: str
+    hand_index: int | None
+    level: int
+    hero_class: str
+    stack_before_bb: float
+    delta_bb: float
+    showdown: bool
+
+
+class ChipMove(BaseModel):
+    """Строка «где ушли фишки»: раздача, что в ней было, цена в bb.
+
+    `cost_bb` положительно и означает «столько стек потерял». Это ФИШКИ, а не
+    EV: цена расхождения (`ScanItem.ev_diff_bb`) считается против диапазона на
+    момент решения, потеря стека — по факту раздачи, и смешивать их нельзя
+    (`EvSplit`).
+    """
+
+    hand_no: str
+    hand_index: int | None
+    level: int
+    hero_class: str
+    last_street: Street
+    all_in: bool
+    showdown: bool
+    cost_bb: float
+
+
+class Finding(BaseModel):
+    """Повторяющийся паттерн среди ОЦЕНЁННЫХ точек — с ценой и покрытием рядом.
+
+    Ключ паттерна — тройка «спот · сыгранное действие · лучшее действие»:
+    находка утверждает, что одна и та же развилка сыграна одинаково несколько
+    раз, а не что несколько разных рук чем-то похожи.
+
+    `seen_before` — сколько раз тот же ключ встречался в прошлых турнирах этого
+    игрока (`seen_before_tournaments` — в скольких именно). Это и есть «тот
+    самый паттерн, который мы разбирали»: ссылка на его собственную историю, а
+    не догадка о ней.
+    """
+
+    spot: SpotKind
+    action_taken: str
+    best_action: str
+    zone: Zone
+    count: int
+    total_cost_bb: float
+    hand_nos: list[str]
+    seen_before: int = 0
+    seen_before_tournaments: int = 0
+
+
+class EvSplit(BaseModel):
+    """Честный счёт: цена судимых расхождений ОТДЕЛЬНО от дисперсии и несудимого.
+
+    Все четыре числа — положительные величины потерь («столько ушло»), чтобы
+    рядом стоящие строки отчёта нельзя было прочитать со случайно разными
+    знаками. Знак при них ставит изложение, а не контракт.
+
+    Величины меряют РАЗНОЕ и потому не складываются между собой — ни здесь, ни
+    в изложении:
+
+    * `judged_loss_bb` — EV-цена расхождений на момент решения, по всем судимым
+      точкам турнира. Это модуль `ScanSummary.total_loss_bb`
+      (`test_judged_loss_is_the_scan_total_by_magnitude`) — единственное число
+      здесь, посчитанное против диапазона, а не по факту раздачи.
+    * `chips_in_gap_hands_bb` — фишки, потерянные в раздачах, где расхождение
+      найдено. Равняться `judged_loss_bb` оно не обязано и обычно не равняется:
+      расхождение стоит своей EV-цены, раздача — своих фишек.
+    * `chips_in_lost_allins_bb` — фишки, потерянные в проигранных олл-инах, где
+      расхождения нет: решение расчёт не оспаривает, а фишки ушли. Это
+      дисперсия, и ошибкой она не считается (CLAUDE.md: правильный вход,
+      проигравший по случайности, ошибкой не считается;
+      `test_a_lost_all_in_without_a_gap_is_variance_not_error`).
+    * `chips_elsewhere_bb` — всё остальное потерянное: блайнды, анте, постфлоп.
+      Про эти фишки расчёт не говорит ничего.
+
+    Три «фишечных» слагаемых — разбиение ВСЕХ потерянных фишек по раздачам:
+    каждая раздача попадает ровно в одно из них, поэтому их сумма равна
+    суммарной потере стека за турнир
+    (`test_chip_buckets_are_a_partition_of_every_lost_chip`).
+
+    `points_judged`/`points_total` — покрытие, перенесённое из сводки скана как
+    есть: без него любая сумма выше читается как полная цена турнира.
+    """
+
+    judged_loss_bb: float
+    points_judged: int
+    points_total: int
+    chips_in_gap_hands_bb: float
+    chips_in_lost_allins_bb: float
+    chips_elsewhere_bb: float
+
+
+class TournamentReport(BaseModel):
+    """Отчёт по турниру: факты и статистика, посчитанные кодом (задача 21 — слова).
+
+    Собирается целиком из истории рук и сводки скана; ни одного числа отсюда не
+    приходит от модели. Задача 21 получает этот объект на вход как есть.
+
+    `baseline`/`baseline_tournaments` — среднее игрока по ВСЕМ его турнирам в
+    базе, включая этот. При единственном турнире среднее совпало бы с самим
+    турниром, и сравнивать не с чем: тогда `baseline` пуст (`None`), а не равен
+    `stats` (`test_baseline_is_absent_when_the_player_has_a_single_tournament`).
+    """
+
+    schema_version: int = 1
+    hands_total: int
+    hands_failed: int
+    levels_played: int
+    first_level: int
+    last_level: int
+    duration_minutes: int
+    stats: PlayerStats
+    baseline: PlayerStats | None
+    baseline_tournaments: int
+    trajectory: StackTrajectory
+    all_ins: list[AllInEvent]
+    chip_moves: list[ChipMove]
+    findings: list[Finding]
+    ev: EvSplit
