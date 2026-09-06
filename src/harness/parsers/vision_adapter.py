@@ -67,6 +67,7 @@ from harness.contracts import (
 )
 from harness.parsers.vision_checks import (
     CHECK_BUTTON,
+    POT_TOLERANCE_BB,
     button_check,
     cards_check,
     equity_check,
@@ -666,12 +667,14 @@ def _showdowns(
 # --- контрольные суммы и каскад ---------------------------------------------
 
 
-def _contributions_bb(reading: VisionReading, raw: RawHand) -> float:
+def contributions_bb(raw: RawHand) -> float:
     """Сумма видимых вкладов в тех же ББ, в которых напечатан банк.
 
     Считается по УЖЕ построенной руке, а не по чтению: вклады там сведены к одним
     единицам, а возвращённое непоколленное вычтено — банк на экране показан после
-    возврата.
+    возврата. Публичная: по ней же проверяется ответ игрока про банк
+    (`apply_vision_answer`) — считать эту сумму двумя формулами нельзя, разойдясь,
+    они дали бы «сошлось» на одном пути и «не сошлось» на другом.
     """
     total = raw.ante * len(raw.seats)
     if raw.completeness is Completeness.STATE:
@@ -767,7 +770,7 @@ def run_checks(
         cards_check(at_seat, in_log),
         pot_check(
             (reading.pot_shown if reading.pot_unit is not Unit.CHIPS else None),
-            _contributions_bb(reading, raw),
+            contributions_bb(raw),
         ),
         equity_check(shown_pct, equity_hero, other, _board_at_all_in(raw)),
     ]
@@ -853,10 +856,21 @@ def apply_vision_answer(
             shown = float(value.replace(",", "."))
         except ValueError:
             return None
-        meta = _resolved(raw, field).model_copy(
-            update={"displayed_pot": round(shown * raw.bb)}
+        # На ПОЛНОЙ руке `displayed_pot` не читает никто: банк там считает движок
+        # по вкладам, и записать ответ игрока в это поле — значит не изменить
+        # ничего. Поэтому ответ засчитывается за разрешение спора, только если он
+        # с этими вкладами и СХОДИТСЯ; иначе поле пишется (ответ игрока не
+        # теряется), но проверка остаётся непройденной, и станция до вердикта не
+        # доходит. Иначе получалось так: модель пропустила анте, игрок подтвердил
+        # показанный банк, проверка «закрылась» — и разбор уезжал игроку по руке
+        # с анте, равным нулю (ревью раунда 2, F1).
+        agrees = abs(shown - contributions_bb(raw)) <= POT_TOLERANCE_BB
+        meta = _resolved(raw, field) if agrees or raw.completeness is Completeness.STATE else (
+            raw.vision or VisionMeta()
         )
-        return raw.model_copy(update={"vision": meta})
+        return raw.model_copy(
+            update={"vision": meta.model_copy(update={"displayed_pot": round(shown * raw.bb)})}
+        )
 
     if field == "cards":
         cards = _cards_of_answer(value)

@@ -31,6 +31,8 @@ from harness.contracts import (
     Street,
     Unit,
     ValidationStatus,
+    VisionCheck,
+    VisionMeta,
     VisionReading,
 )
 from harness.engine import enrich
@@ -679,3 +681,46 @@ def test_the_table_size_check_is_silent_when_the_header_was_not_read():
     from harness.parsers.vision_checks import CHECK_SEATS
 
     assert _named_checks(export_reading(max_seats=None))[CHECK_SEATS] is True
+
+
+def test_confirming_the_shown_pot_does_not_close_a_dispute_it_does_not_settle():
+    """На полной руке `displayed_pot` не читает никто — ответ обязан СХОДИТЬСЯ.
+
+    Иначе выходило так: модель пропустила пул анте, банк на экране разошёлся с
+    суммой вкладов, игрок подтвердил показанное число — и проверка «закрывалась»,
+    ничего в руке не изменив. Разбор уезжал игроку по руке с анте, равным нулю
+    (ревью раунда 2, F1).
+    """
+    from harness.parsers.vision_adapter import apply_vision_answer, contributions_bb
+
+    reading = export_reading(ante_pool_shown=None, winners=[])
+    raw, _ = reading_to_raw(reading, hero_nickname=HERO_NICK, source_ref="s")
+    raw.vision = (raw.vision or VisionMeta()).model_copy(
+        update={"checks": [VisionCheck(name=CHECK_POT, passed=False, options=["31.95", "30.74"])]}
+    )
+    assert raw.completeness is Completeness.HAND
+
+    confirmed = apply_vision_answer(raw, "pot", "31.95")
+    assert confirmed is not None and confirmed.vision is not None
+    assert [c.passed for c in confirmed.vision.checks] == [False]  # спор не закрыт
+    assert confirmed.vision.displayed_pot == bb(31.95)  # но ответ игрока сохранён
+
+    agreeing = apply_vision_answer(raw, "pot", f"{contributions_bb(raw):.2f}")
+    assert agreeing is not None and agreeing.vision is not None
+    assert [c.passed for c in agreeing.vision.checks] == [True]
+
+
+def test_on_a_state_the_shown_pot_is_the_answer_and_closes_the_dispute():
+    """На состоянии банк берётся именно из показанного — там ответ и есть данные."""
+    from harness.parsers.vision_adapter import apply_vision_answer
+
+    reading = export_reading(showdown_seen=False, result_seen=False, winners=[])
+    raw, _ = reading_to_raw(reading, hero_nickname=HERO_NICK, source_ref="s")
+    raw.vision = (raw.vision or VisionMeta()).model_copy(
+        update={"checks": [VisionCheck(name=CHECK_POT, passed=False, options=["31.95", "30.74"])]}
+    )
+    assert raw.completeness is Completeness.STATE
+
+    answered = apply_vision_answer(raw, "pot", "31.95")
+    assert answered is not None and answered.vision is not None
+    assert [c.passed for c in answered.vision.checks] == [True]

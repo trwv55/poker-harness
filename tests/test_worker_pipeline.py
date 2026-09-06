@@ -1885,3 +1885,90 @@ async def test_a_fabricated_showdown_never_reaches_the_player_as_a_strict_verdic
     assert shown, "разбор до игрока не дошёл"
     assert "зона: строго" not in shown[-1].text
     assert "Проверить на этом экране было нечем" in shown[-1].text
+
+
+async def test_a_confirmed_pot_that_still_does_not_add_up_never_becomes_a_verdict(
+    deps, queue, db_factory, fake_sender, tmp_path, monkeypatch
+):
+    """Опыт ревьюера целиком (раунд 2, F1): пропущенное анте, подтверждённый банк.
+
+    Модель не прочитала пул анте, строки «Победа» на экране нет, игрок нажал
+    «показанный банк». Раньше проверка закрывалась ответом, валидатор проходил
+    (сверять выплаты не с чем), и разбор уезжал игроку по руке с анте, равным
+    нулю. Теперь ответ, который с вкладами не сходится, спор не закрывает.
+    """
+    from harness.contracts import VisionCheck
+    from harness.parsers.vision_adapter import apply_vision_answer
+
+    player_id, session_id = await _make_scope(db_factory)
+    await _with_nickname(db_factory, player_id)
+
+    from tests.test_vision_adapter import HERO_NICK, export_reading
+
+    reading = export_reading(ante_pool_shown=None, winners=[])
+    raw, _checks = reading_to_raw(reading, hero_nickname=HERO_NICK, source_ref="screenshot")
+    failed = VisionCheck(name="pot", passed=False, detail="не сошлось", options=["31.95", "30.74"])
+    raw.vision = (raw.vision or VisionMeta()).model_copy(update={"checks": [failed]})
+    _stub_vision(monkeypatch, _outcome(raw=raw, checks=[failed]))
+    job_id = await _enqueue_screenshot(
+        queue, tmp_path, player_id=player_id, session_id=session_id
+    )
+
+    first = await queue.claim("w1")
+    assert first is not None
+    await run_job(first, deps)
+
+    async with db_factory() as session:
+        hand_id = (await session.get(Job, job_id)).hand_id
+    assert hand_id is not None
+    async with db_factory() as session:
+        stored = (await HandsRepo(session).get(hand_id)).raw
+    answered = apply_vision_answer(stored, "pot", "31.95")  # игрок подтвердил показанное
+    assert answered is not None
+    await _patch_raw(db_factory, hand_id, answered)
+
+    await _resume_and_run(queue, deps, monkeypatch, job_id)
+
+    async with db_factory() as session:
+        analyses = (await session.execute(text("select id from analyses"))).all()
+        status = (await session.get(Job, job_id)).status
+    assert analyses == []
+    assert status == "done"
+    assert any("не возьмусь" in msg.text for msg in fake_sender.sent)
+
+
+async def test_a_failed_check_the_player_cannot_settle_is_not_asked_about_at_all(
+    deps, queue, db_factory, fake_sender, tmp_path, monkeypatch
+):
+    """Эквити — самая частая непройденная сверка, и ответить на неё нечем (F2).
+
+    Варианты у неё — два процента под вопросом «Карты распознаны верно?», а
+    подставить процент в руку код не умеет. Вопрос был бы мёртвым: игрок
+    отвечает, рука не меняется, следующий проход упирается в то же расхождение.
+    """
+    from harness.contracts import VisionCheck
+
+    player_id, session_id = await _make_scope(db_factory)
+    await _with_nickname(db_factory, player_id)
+    failed = VisionCheck(
+        name="equity", passed=False, detail="не сошлось", options=["57.28", "53.40"]
+    )
+    raw = _screenshot_raw()
+    raw.vision = (raw.vision or VisionMeta()).model_copy(update={"checks": [failed]})
+    _stub_vision(monkeypatch, _outcome(raw=raw, checks=[failed]))
+    job_id = await _enqueue_screenshot(
+        queue, tmp_path, player_id=player_id, session_id=session_id
+    )
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    async with db_factory() as session:
+        row = await session.get(Job, job_id)
+        analyses = (await session.execute(text("select id from analyses"))).all()
+    assert row.status == "done"
+    assert "escalations" not in row.payload  # вопроса не было вовсе
+    assert analyses == []
+    assert not any(msg.buttons for msg in fake_sender.sent)
+    assert any("файл" in msg.text.casefold() for msg in fake_sender.sent)

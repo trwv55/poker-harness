@@ -938,7 +938,18 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
                 payload["hand_id"] = hand_id
                 await _fenced_update(session, job.id, worker_id, hand_id=hand_id, payload=payload)
                 if outcome.escalate:
-                    field = outcome.failed[0].name
+                    # Спрашивать можно только о том, что код умеет подставить.
+                    # Провалиться может и `stacks` (поправка на обрезку), и
+                    # `equity`, и обе сверки рассадки — вопрос по ним стоил бы
+                    # игроку внимания и всё равно кончился бы отказом после
+                    # ответа (ревью раунда 2, F2).
+                    failed = [check.name for check in outcome.failed]
+                    field = next(
+                        (name for name in failed if can_apply_vision_answer(name)), None
+                    )
+                    if field is None:
+                        await _give_up(deps, session, job, chat_id, failed)
+                        return hand_id
                     question, options, subject = _escalation_question(field, outcome.checks)
                     await _ask_player(
                         deps,
