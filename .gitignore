@@ -38,6 +38,7 @@ fixtures/hh/
 evals/vision/
 evals/e2e/
 src/harness/parsers/prompts/
+src/harness/explanation/prompts/
 
 # Кэш равновесий пуш-фолда: чистый производный артефакт, считается кодом за секунды
 # и восстанавливается при пустом кэше. В отличие от таблицы эквити (её генерация —
