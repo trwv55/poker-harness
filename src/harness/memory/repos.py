@@ -302,6 +302,48 @@ class HandsRepo:
         )
         return await self.db.scalar(stmt)
 
+    async def player_hands_by_tournament(self, player_id: int) -> list[list[CanonicalHand]]:
+        """Канонические руки игрока по всем его турнирам — списком на турнир.
+
+        Вход «среднего по всем турнирам» в отчёте (задача 23). Группировка
+        турнирами, а не одним плоским списком, — это не удобство вызывающего:
+        по числу групп отчёт решает, есть ли с чем сравнивать вообще, и
+        передать одно вместо другого он не сможет.
+
+        Читается ровно одна колонка — `canonical`: `raw` и `enriched` весят
+        кратно больше, а формулам статистики (`analysis/player_stats.py`) не
+        нужны ни отчёт движка, ни исходные строки файла. Руки без чекпоинта
+        `canonical` пропускаются: пайплайн до них не дошёл, и считать по ним
+        нечего.
+
+        Область — сессии этого игрока (JOIN по `sessions.player_id`), как и у
+        `find_session_by_hand_no`: без этого условия в среднее попали бы чужие
+        раздачи. Руки без турнира (скриншоты) не входят вовсе — сравнение
+        заявлено «по турнирам».
+
+        Стоимость растёт с историей игрока: это чтение ВСЕХ его рук на каждый
+        отчёт. На порядках величин v1 (единицы турниров по паре сотен раздач)
+        это дешевле, чем отдельная таблица агрегатов, которую пришлось бы
+        держать в согласии с руками; кэш и агрегаты — после телеметрии
+        (SCALING.md, «отложить до телеметрии»).
+        """
+        stmt = (
+            select(Hand.tournament_id, Hand.canonical)
+            .join(SessionRow, SessionRow.id == Hand.session_id)
+            .where(
+                SessionRow.player_id == player_id,
+                Hand.tournament_id.is_not(None),
+                Hand.canonical.is_not(None),
+            )
+            .order_by(Hand.tournament_id, Hand.id)
+        )
+        grouped: dict[int, list[CanonicalHand]] = {}
+        for tournament_id, canonical in await self.db.execute(stmt):
+            grouped.setdefault(tournament_id, []).append(
+                CanonicalHand.model_validate(canonical)
+            )
+        return list(grouped.values())
+
     def _to_record(self, record: Hand) -> HandRecord:
         return HandRecord(
             id=record.id,
@@ -412,6 +454,33 @@ class TournamentsRepo:
         record = await self._get_row(tournament_id)
         record.scan_summary = summary.model_dump(mode="json")
         await self.db.flush()
+
+    async def player_scan_summaries(
+        self, player_id: int, *, exclude: int
+    ) -> list[ScanSummary]:
+        """Сводки сканов ПРОШЛЫХ турниров игрока — источник «этот паттерн уже был».
+
+        `exclude` — турнир, по которому отчёт строится сейчас: его сводка к
+        этому моменту уже сохранена, и без исключения каждая находка текущего
+        турнира читалась бы как «то же самое было раньше»
+        (`test_past_scan_summaries_exclude_the_tournament_being_reported`).
+        Аргумент обязателен и именован: молчаливое умолчание «ничего не
+        исключать» — ровно та ошибка, которую он предотвращает.
+
+        Турниры без сохранённой сводки (скан не дошёл до конца) не попадают:
+        отсутствующая сводка — не пустая.
+        """
+        stmt = (
+            select(Tournament.scan_summary)
+            .join(SessionRow, SessionRow.id == Tournament.session_id)
+            .where(
+                SessionRow.player_id == player_id,
+                Tournament.id != exclude,
+                Tournament.scan_summary.is_not(None),
+            )
+            .order_by(Tournament.id)
+        )
+        return [ScanSummary.model_validate(row) for row in await self.db.scalars(stmt)]
 
     async def _get_row(self, tournament_id: int) -> Tournament:
         record = await self.db.get(Tournament, tournament_id)

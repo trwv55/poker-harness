@@ -18,7 +18,7 @@ from sqlalchemy import insert, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from harness.contracts import AnalysisResult, RawHand
+from harness.contracts import AnalysisResult, RawHand, ScanSummary
 from harness.engine import enrich
 from harness.memory.models import EvalCase, Job
 from harness.memory.repos import (
@@ -30,6 +30,7 @@ from harness.memory.repos import (
     HandsRepo,
     PlayersRepo,
     SessionsRepo,
+    TournamentsRepo,
 )
 from harness.normalizer import normalize
 from harness.parsers.hh_parser import parse_hand
@@ -322,3 +323,117 @@ async def test_calc_cache_upsert_survives_more_rows_than_one_statement_allows(db
     assert len(stored) == rows
     assert stored["k0"] == 0.0 and stored[f"k{rows - 1}"] == float(rows - 1)
     assert _UPSERT_CHUNK * 2 <= 32_767  # кусок обязан помещаться в предел протокола
+
+
+# --- история игрока для отчёта по турниру (задача 23) ------------------------------
+
+
+async def _player_with_session(db, tg_user_id: int) -> tuple[int, int]:
+    player = await PlayersRepo(db).get_or_create(tg_user_id=tg_user_id)
+    session_row = await SessionsRepo(db).active_or_create(player.id)
+    return player.id, session_row.id
+
+
+async def _save_hand_in(db, *, session_id: int, tournament_id: int, hand_no: str) -> int:
+    """Рука, доведённая до чекпоинта `canonical`, — та форма, которую читает отчёт.
+
+    Из `SAMPLE`, а не из `make_min_raw()`: у той одно место за столом, и
+    нормализатор такую руку не раскладывает по позициям вовсе.
+    """
+    raw = parse_hand(SAMPLE, source_ref="x").model_copy(update={"hand_no": hand_no})
+    hid = await HandsRepo(db).save_raw(
+        session_id=session_id, tournament_id=tournament_id, raw=raw
+    )
+    await HandsRepo(db).save_canonical(hid, normalize(raw))
+    return hid
+
+
+async def test_player_hands_come_grouped_by_tournament(db):
+    player_id, session_id = await _player_with_session(db, tg_user_id=4001)
+    first = await TournamentsRepo(db).create(session_id=session_id, source_file="a.txt")
+    second = await TournamentsRepo(db).create(session_id=session_id, source_file="b.txt")
+    await _save_hand_in(db, session_id=session_id, tournament_id=first, hand_no="A1")
+    await _save_hand_in(db, session_id=session_id, tournament_id=first, hand_no="A2")
+    await _save_hand_in(db, session_id=session_id, tournament_id=second, hand_no="B1")
+
+    grouped = await HandsRepo(db).player_hands_by_tournament(player_id)
+
+    assert [[h.hand_no for h in group] for group in grouped] == [["A1", "A2"], ["B1"]]
+
+
+async def test_player_hands_do_not_leak_between_players(db):
+    mine, my_session = await _player_with_session(db, tg_user_id=4002)
+    _theirs, their_session = await _player_with_session(db, tg_user_id=4003)
+    my_tournament = await TournamentsRepo(db).create(session_id=my_session, source_file="a.txt")
+    their_tournament = await TournamentsRepo(db).create(
+        session_id=their_session, source_file="b.txt"
+    )
+    await _save_hand_in(db, session_id=my_session, tournament_id=my_tournament, hand_no="MINE")
+    await _save_hand_in(
+        db, session_id=their_session, tournament_id=their_tournament, hand_no="THEIRS"
+    )
+
+    grouped = await HandsRepo(db).player_hands_by_tournament(mine)
+
+    assert [h.hand_no for group in grouped for h in group] == ["MINE"]
+
+
+async def test_player_hands_skip_a_hand_that_never_reached_canonical(db):
+    """Рука на чекпоинте `raw` — не отсутствие данных, но статистику по ней не считают."""
+    player_id, session_id = await _player_with_session(db, tg_user_id=4004)
+    tournament_id = await TournamentsRepo(db).create(session_id=session_id, source_file="a.txt")
+    await _save_hand_in(db, session_id=session_id, tournament_id=tournament_id, hand_no="DONE")
+    await HandsRepo(db).save_raw(
+        session_id=session_id,
+        tournament_id=tournament_id,
+        raw=parse_hand(SAMPLE, source_ref="x").model_copy(update={"hand_no": "RAW_ONLY"}),
+    )
+
+    grouped = await HandsRepo(db).player_hands_by_tournament(player_id)
+
+    assert [[h.hand_no for h in group] for group in grouped] == [["DONE"]]
+
+
+async def test_past_scan_summaries_exclude_the_tournament_being_reported(db):
+    """Сводка текущего турнира уже сохранена к моменту отчёта — и в «прошлые» не идёт.
+
+    Иначе каждая находка этого турнира выглядела бы как «то же самое было
+    раньше», хотя раньше её не было.
+    """
+    player_id, session_id = await _player_with_session(db, tg_user_id=4005)
+    old = await TournamentsRepo(db).create(session_id=session_id, source_file="old.txt")
+    current = await TournamentsRepo(db).create(session_id=session_id, source_file="now.txt")
+    old_summary = ScanSummary(
+        hands_total=9, hands_with_decision=9, items=[], total_loss_bb=-1.0
+    )
+    current_summary = ScanSummary(
+        hands_total=7, hands_with_decision=7, items=[], total_loss_bb=-2.0
+    )
+    await TournamentsRepo(db).save_scan_summary(old, old_summary)
+    await TournamentsRepo(db).save_scan_summary(current, current_summary)
+
+    past = await TournamentsRepo(db).player_scan_summaries(player_id, exclude=current)
+
+    assert past == [old_summary]
+
+
+async def test_past_scan_summaries_ignore_tournaments_without_one(db):
+    """Турнир, скан которого не дошёл до сводки, в историю не попадает."""
+    player_id, session_id = await _player_with_session(db, tg_user_id=4006)
+    await TournamentsRepo(db).create(session_id=session_id, source_file="unfinished.txt")
+
+    assert await TournamentsRepo(db).player_scan_summaries(player_id, exclude=0) == []
+
+
+async def test_past_scan_summaries_do_not_leak_between_players(db):
+    mine, _my_session = await _player_with_session(db, tg_user_id=4007)
+    _theirs, their_session = await _player_with_session(db, tg_user_id=4008)
+    their_tournament = await TournamentsRepo(db).create(
+        session_id=their_session, source_file="theirs.txt"
+    )
+    await TournamentsRepo(db).save_scan_summary(
+        their_tournament,
+        ScanSummary(hands_total=1, hands_with_decision=1, items=[], total_loss_bb=0.0),
+    )
+
+    assert await TournamentsRepo(db).player_scan_summaries(mine, exclude=0) == []
