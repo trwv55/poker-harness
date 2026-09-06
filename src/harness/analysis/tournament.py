@@ -32,6 +32,7 @@ from collections.abc import Sequence
 
 from harness.analysis.player_stats import player_stats
 from harness.contracts import (
+    ActionKind,
     AllInEvent,
     CanonicalAction,
     CanonicalHand,
@@ -56,6 +57,11 @@ __all__ = ["tournament_report"]
 # (`round(total_loss_bb, 6)`): числа сюда приходят делением фишек на bb, и
 # двоичный хвост деления не должен оседать в контракте.
 _BB_PRECISION = 6
+
+# Действия, которыми игрок кладёт фишки в банк, — те же, что в VPIP
+# (`player_stats._VOLUNTARY`): пас и чек не вкладывают ничего, а посты живут не
+# в действиях вовсе.
+_VOLUNTARY = frozenset({ActionKind.CALL, ActionKind.BET, ActionKind.RAISE})
 
 
 def _hero(hand: CanonicalHand) -> PlayerState:
@@ -89,14 +95,41 @@ def _hero_actions(hand: CanonicalHand) -> list[CanonicalAction]:
     return [a for a in hand.actions if a.label == hand.hero_label]
 
 
-def _went_all_in(hand: CanonicalHand) -> bool:
-    """Герой отправил фишки в банк целиком — по пометке источника на его действии.
+def _all_in_showdown(hand: CanonicalHand) -> bool:
+    """Раздача решилась олл-ином с участием героя — по одному правилу на оба случая.
 
-    Олл-ин с вынужденной ставки (блайнд забрал последние фишки, действия у
-    героя нет вовсе) сюда не попадает: такой раздачи нет в списке олл-инов, и
-    её потеря считается обычной потерей блайнда.
+    Правило: на какой-то улице кто-то отправил фишки ва-банк, и герой вложил на
+    ЭТОЙ улице не меньше, чем вложил ушедший ва-банк.
+
+    Оно покрывает разом собственный шов героя (его же действие и помечено
+    олл-ином, вложил он ровно столько) и уравненный им чужой шов — включая тот
+    случай, когда сам герой при этом не остался без фишек, потому что покрывал
+    оппонента (`test_calling_a_shove_with_a_bigger_stack_is_still_an_all_in`).
+    Пас в ответ на шов правилом не захватывается: вложенного героем меньше, чем
+    шов (`test_folding_to_a_shove_is_not_an_all_in`).
+
+    Различие несущее, а не косметическое: в фишечном разбиении `EvSplit`
+    проигранный олл-ин без расхождения — это дисперсия, и раздача, где герой
+    уравнял чужой шов и проиграл, обязана попасть именно туда, а не в «расчёт
+    про них не говорит ничего».
+
+    Олл-ин с вынужденной ставки (блайнд забрал последние фишки, добровольных
+    действий у героя нет вовсе) сюда не попадает: вкладывал не он.
     """
-    return any(a.is_all_in for a in _hero_actions(hand))
+    for street in Street:
+        all_in_amounts = [
+            a.committed_after for a in hand.actions if a.street is street and a.is_all_in
+        ]
+        if not all_in_amounts:
+            continue
+        hero_committed = [
+            a.committed_after
+            for a in hand.actions
+            if a.street is street and a.label == hand.hero_label and a.kind in _VOLUNTARY
+        ]
+        if hero_committed and max(hero_committed) >= min(all_in_amounts):
+            return True
+    return False
 
 
 def _last_street(hand: CanonicalHand) -> Street:
@@ -147,7 +180,14 @@ def _trajectory(enriched: Sequence[EnrichedHand]) -> StackTrajectory:
 
 
 def _all_in_events(enriched: Sequence[EnrichedHand]) -> list[AllInEvent]:
-    """Олл-ины героя, крупнейший первый — по стеку, с которым он в раздачу вошёл."""
+    """Олл-ины с участием героя, крупнейший первый — по тому, НА СКОЛЬКО сдвинулся стек.
+
+    Порядок по исходу, а не по вложенному: список отвечает на «чем кончились
+    крупные олл-ины», и сортировка по стеку на входе выносила наверх шесть
+    выигранных подряд просто потому, что выигранные раздачи оставляли стек
+    большим (замер на фикстуре daily-classic). По модулю изменения наверх
+    поднимаются и самые крупные выигрыши, и самые дорогие проигрыши.
+    """
     events = [
         AllInEvent(
             hand_no=en.hand.hand_no,
@@ -159,9 +199,9 @@ def _all_in_events(enriched: Sequence[EnrichedHand]) -> list[AllInEvent]:
             showdown=_showdown(en.hand),
         )
         for en in enriched
-        if _went_all_in(en.hand)
+        if _all_in_showdown(en.hand)
     ]
-    events.sort(key=lambda e: (-e.stack_before_bb, e.hand_no))
+    events.sort(key=lambda e: (-abs(e.delta_bb), e.hand_no))
     return events
 
 
@@ -178,7 +218,7 @@ def _chip_moves(enriched: Sequence[EnrichedHand]) -> list[ChipMove]:
             level=en.hand.level,
             hero_class=_hero_class(en.hand),
             last_street=_last_street(en.hand),
-            all_in=_went_all_in(en.hand),
+            all_in=_all_in_showdown(en.hand),
             showdown=_showdown(en.hand),
             cost_bb=-_delta_bb(en),
         )
@@ -252,7 +292,7 @@ def _ev_split(
     остальных — проигранные олл-ины (дисперсия), затем всё прочее.
     """
     gap_hands = {item.hand_no for item in summary.items}
-    all_in_hands = {en.hand.hand_no for en in enriched if _went_all_in(en.hand)}
+    all_in_hands = {en.hand.hand_no for en in enriched if _all_in_showdown(en.hand)}
 
     in_gap = 0.0
     in_lost_all_ins = 0.0
