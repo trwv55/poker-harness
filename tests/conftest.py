@@ -24,9 +24,11 @@ requires_fixtures = pytest.mark.skipif(
     reason="нет приватных HH-фикстур в fixtures/hh/ — гейт на 318 руках не выполнен",
 )
 
-PROMPTS = Path(__file__).parent.parent / "src" / "harness" / "explanation" / "prompts"
+SRC = Path(__file__).parent.parent / "src" / "harness"
+PROMPTS = SRC / "explanation" / "prompts"
 PROMPT_VERDICT = PROMPTS / "verdict.md"
 PROMPT_TOURNAMENT = PROMPTS / "tournament.md"
+PROMPT_VISION = SRC / "parsers" / "prompts" / "vision.md"
 
 # Промпты изложения закрыты политикой публикации — тем же решением владельца, что
 # и vision-промпты, и по той же причине: они копируются за вечер. В публичном
@@ -38,10 +40,16 @@ PROMPT_TOURNAMENT = PROMPTS / "tournament.md"
 # Пропускается при этом МЕНЬШИНСТВО: проверки верности, отказов и выжимки
 # промпта не читают вовсе, а `PromptUnavailable` (громкий отказ при отсутствии
 # файла) проверяется без него специально.
-PROMPTS_PRESENT = PROMPT_VERDICT.exists() and PROMPT_TOURNAMENT.exists()
+# Промпт зрения (задача 22) закрыт тем же решением и тем же путём в хуке, поэтому
+# он входит в ТОТ ЖЕ признак, а не заводит второй: маркер отвечает на вопрос «есть
+# ли в этом клоне промпты вообще», и клона с половиной промптов не бывает — они
+# лежат рядом и приезжают вместе.
+PROMPTS_PRESENT = (
+    PROMPT_VERDICT.exists() and PROMPT_TOURNAMENT.exists() and PROMPT_VISION.exists()
+)
 requires_prompts = pytest.mark.skipif(
     not PROMPTS_PRESENT,
-    reason="нет промптов изложения в src/harness/explanation/prompts/ — закрыты политикой публикации",
+    reason="нет промптов моделей (explanation/prompts, parsers/prompts) — закрыты политикой публикации",
 )
 
 

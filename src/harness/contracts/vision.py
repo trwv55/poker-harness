@@ -51,9 +51,13 @@ class SeenPlayer(BaseModel):
     8» между моделями было не ошибкой зрения, а неоговорённым заданием).
     `is_hero` при этом наблюдение модели, а не источник истины: героя определяет
     код по нику из профиля (`vision_adapter.identify_hero`).
+
+    Ключ игрока — ник: номеров мест экспорт истории не печатает вовсе. `seat`
+    заполняется только там, где места вообще упорядочиваемы глазом (живой стол),
+    и означает порядок по кругу, а не номер места в руме.
     """
 
-    seat: int
+    seat: int | None = None
     nickname: str | None = None
     is_hero: bool = False
     stack: float | None = None
@@ -81,14 +85,47 @@ class SeenAction(BaseModel):
     Суммы — как на экране: у повышения написан итог улицы (`to_amount`), у колла и
     ставки — доплата (`amount`). Это те же две формы, что пишет hand history GG,
     и `RawAction` их различает так же.
+
+    **Строки идут в том порядке, в каком напечатаны**, и на префлопе этот порядок
+    и есть порядок хода: по нему код восстанавливает рассадку (первым ходит UTG,
+    последними малый и большой блайнд). Поэтому список нельзя пересортировывать.
+
+    `nickname` пуст у строки самого героя: собственную строку экспорт печатает без
+    подписи (измерено на трёх экранах, реестр «Проверка схемы»). `position` —
+    метка, напечатанная под аватаром (`UTG`, `MP+1`, `BTN`), как есть: она даёт
+    второе, независимое прочтение рассадки, и код сверяет её с восстановленной.
     """
 
     street: Street
-    seat: int
+    nickname: str | None = None
+    position: str | None = None
     kind: ActionKind
     amount: float | None = None
     to_amount: float | None = None
     is_all_in: bool = False
+
+
+class SeenPost(BaseModel):
+    """Строка колонки блайндов: подпись, ник (если подписан) и сумма как напечатана.
+
+    Транскрипция напечатанной метки, а не разметка блайндов моделью: реестр B3
+    запрещает второе (это интерпретация), но прочитать надпись «SB 0.50 ББ» —
+    ровно то чтение, ради которого модель и зовут. Ник у одной из строк
+    отсутствует — это строка героя.
+    """
+
+    label: str  # как напечатано: "All Ante", "SB", "ББ"
+    nickname: str | None = None
+    amount: float | None = None
+    unit: Unit | None = None
+
+
+class SeenWin(BaseModel):
+    """Подпись «Победа N» у игрока — сколько он забрал, как напечатано."""
+
+    nickname: str | None = None
+    amount: float | None = None
+    unit: Unit | None = None
 
 
 class VisionReading(BaseModel):
@@ -117,8 +154,14 @@ class VisionReading(BaseModel):
 
     max_seats: int | None = None
     players: list[SeenPlayer] = []
+    blinds_block: list[SeenPost] = []
 
+    # Карты, РЕАЛЬНО открытые в этой руке. Экспорт дорисовывает борд приглушённым
+    # даже там, где рука кончилась до флопа, — такие карты идут в `board_faded` и
+    # в руку не входят. Различие видно только глазом (яркость), поэтому это
+    # наблюдение модели, а не вывод кода.
     board: list[str] = []
+    board_faded: list[str] = []
     pot_shown: float | None = None
     pot_unit: Unit | None = None
 
@@ -128,9 +171,9 @@ class VisionReading(BaseModel):
     # (`RawHand.completeness`) — тип экрана при этом не вводится, решение C1.
     showdown_seen: bool = False
     result_seen: bool = False
-    winner_seats: list[int] = []
+    winners: list[SeenWin] = []
 
     unsure_fields: list[str] = []
 
 
-__all__ = ["SeenAction", "SeenPlayer", "Unit", "VisionReading"]
+__all__ = ["SeenAction", "SeenPlayer", "SeenPost", "SeenWin", "Unit", "VisionReading"]

@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -22,6 +22,7 @@ from harness.contracts import (
     RawAction,
     RawHand,
     SeatInfo,
+    Street,
     ValidationStatus,
 )
 from harness.contracts.raw import Post, VisionMeta
@@ -62,7 +63,7 @@ def state_hand(**over) -> RawHand:
         "sb": SB,
         "bb": BB,
         "ante": ANTE,
-        "timestamp": datetime(2026, 8, 15, 0, 35),
+        "timestamp": datetime(2026, 8, 15, 0, 35, tzinfo=UTC),
         "table_name": "172",
         "max_seats": 8,
         "button_seat": 5,
@@ -79,7 +80,7 @@ def state_hand(**over) -> RawHand:
         # Пас — перевод наблюдения «перед игроком нет карт» (см. `engine.state`).
         "actions": [
             RawAction(
-                street="preflop",
+                street=Street.PREFLOP,
                 label=label,
                 kind=ActionKind.FOLD,
                 raw_line=f"нет карт у места {seat}",
@@ -148,8 +149,8 @@ def test_the_validator_names_every_check_it_could_not_run_on_a_state():
 
 def test_a_full_hand_never_carries_the_state_refusals():
     """У полной руки проверять есть чем, и пустой `not_checked` это утверждает."""
-    from tests.test_hh_parser import SAMPLE
     from harness.parsers.hh_parser import parse_hand
+    from tests.test_hh_parser import SAMPLE
 
     en = enrich(normalize(parse_hand(SAMPLE, source_ref="x")))
     assert en.verdict.not_checked == []

@@ -64,7 +64,14 @@ from harness.contracts.raw import (
     VisionHop,
     VisionMeta,
 )
-from harness.contracts.vision import SeenAction, SeenPlayer, Unit, VisionReading
+from harness.contracts.vision import (
+    SeenAction,
+    SeenPlayer,
+    SeenPost,
+    SeenWin,
+    Unit,
+    VisionReading,
+)
 
 __all__ = [
     "RANKS",
@@ -100,6 +107,8 @@ __all__ = [
     "SeatInfo",
     "SeenAction",
     "SeenPlayer",
+    "SeenPost",
+    "SeenWin",
     "ShowdownEntry",
     "SidePot",
     "SpotKind",

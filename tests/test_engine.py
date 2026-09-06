@@ -38,6 +38,7 @@ def test_decision_point_for_hero():
     dp = next(d for d in en.report.decision_points if d.label == "Hero")
     assert dp.street == "preflop"
     assert dp.to_call == 141                                  # доплата при стеке 141 за анте+SB
+    assert dp.action is not None
     assert dp.action.kind == "call" and dp.action.is_all_in
     assert (dp.live_total, dp.live_behind) == (3, 1)          # рейзер, Hero, BB; после Hero — BB
 
