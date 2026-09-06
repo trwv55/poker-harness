@@ -31,14 +31,18 @@ __all__ = [
     "CHECK_CARDS",
     "CHECK_EQUITY",
     "CHECK_HERO",
+    "CHECK_POSITIONS",
     "CHECK_POT",
+    "CHECK_SEATS",
     "EQUITY_TOLERANCE_PP",
     "POT_TOLERANCE_BB",
     "button_check",
     "cards_check",
     "equity_check",
     "match_hero",
+    "positions_check",
     "pot_check",
+    "seats_check",
 ]
 
 CHECK_POT = "pot"
@@ -46,6 +50,8 @@ CHECK_BUTTON = "button"
 CHECK_CARDS = "cards"
 CHECK_EQUITY = "equity"
 CHECK_HERO = "hero"
+CHECK_POSITIONS = "positions"
+CHECK_SEATS = "seats"
 
 # Допуск сверки банка — в больших блайндах. Экспорт печатает стеки и суммы с
 # двумя знаками и ОБРЕЗАЕТ, а не округляет (сверено с текстом рума на двух
@@ -186,6 +192,53 @@ def equity_check(
             f"расхождение {delta:.2f} п.п."
         ),
         options=[f"{shown_pct:.2f}", f"{computed_pct:.2f}"],
+    )
+
+
+def positions_check(printed: dict[str, str], derived: dict[str, str]) -> VisionCheck:
+    """Напечатанные метки позиций против рассадки, восстановленной по порядку хода.
+
+    Третий независимый сигнал о рассадке (реестр A3): экспорт подписывает
+    позиции у всех, кроме героя, и подпись эта не участвует в восстановлении
+    круга — тот строится из порядка строк лога. Расхождение означает, что круг
+    собран не из тех строк.
+
+    Измерено на живом прогоне: между строками действий попадаются служебные
+    пузырьки (банк времени), модель приняла один за девятого участника, и вся
+    рассадка уехала на место. Ни банк, ни кнопка, ни эквити этого не заметили —
+    все считались по одному и тому же неверному чтению.
+
+    Молчит, когда сверять нечего: на живом столе позиций не печатают вовсе.
+    """
+    common = sorted(set(printed) & set(derived))
+    if not common:
+        return VisionCheck(
+            name=CHECK_POSITIONS, passed=True, detail="меток позиций на экране нет"
+        )
+    wrong = [
+        f"{nick}: напечатано {printed[nick]}, по порядку хода {derived[nick]}"
+        for nick in common
+        if printed[nick] != derived[nick]
+    ]
+    return VisionCheck(
+        name=CHECK_POSITIONS,
+        passed=not wrong,
+        detail="; ".join(wrong) or f"метки позиций сошлись у {len(common)} мест",
+    )
+
+
+def seats_check(players: int, max_seats: int | None) -> VisionCheck:
+    """Игроков не больше, чем мест за столом, — если размер стола прочитан.
+
+    Однострочная арифметика, ловящая лишнего участника раньше всех денежных
+    сверок: за восьмиместным столом девятого игрока не бывает.
+    """
+    if not max_seats:
+        return VisionCheck(name=CHECK_SEATS, passed=True, detail="размер стола не прочитан")
+    return VisionCheck(
+        name=CHECK_SEATS,
+        passed=players <= max_seats,
+        detail=f"игроков {players}, мест за столом {max_seats}",
     )
 
 

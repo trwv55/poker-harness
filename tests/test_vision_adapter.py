@@ -607,3 +607,75 @@ def test_a_hand_history_payout_is_compared_without_any_tolerance():
         update={"stacks_end": {**en.report.stacks_end, "Hero": en.report.stacks_end["Hero"] + 1}}
     )
     assert _payout_mismatch(en.hand, off_by_one) is not None
+
+
+def _with_phantom_actor() -> VisionReading:
+    """Чтение, где служебный пузырёк принят за девятого участника.
+
+    Измеренный на живом прогоне класс ошибки: между строками действий стоит
+    банк времени («10s» с цифрой в кружке), модель приняла его за игрока, и вся
+    рассадка уехала на одно место.
+    """
+    reading = export_reading()
+    return export_reading(
+        players=[*reading.players, reading.players[0].model_copy(update={"nickname": "N9"})],
+        actions=[
+            reading.actions[0],
+            reading.actions[0].model_copy(update={"nickname": "N9", "position": "UTG+1"}),
+            *reading.actions[1:],
+        ],
+    )
+
+
+def _named_checks(reading: VisionReading) -> dict[str, bool]:
+    from harness.parsers.vision_adapter import run_checks
+
+    raw, extra = reading_to_raw(reading, hero_nickname=HERO_NICK, source_ref="s")
+    _hero, hero_check = match_hero(HERO_NICK, _nicknames(reading))
+    return {c.name: c.passed for c in run_checks(reading, raw, hero_check, extra)}
+
+
+def test_a_phantom_actor_is_caught_by_the_table_size_and_by_the_printed_positions():
+    """Два дешёвых чека ловят лишнего участника раньше всех денежных сверок.
+
+    Ни банк, ни кнопка, ни эквити его не замечают: все три считаются по одному и
+    тому же неверному чтению — слепой угол D4 реестра. Метки позиций и размер
+    стола — независимые от него сигналы (ревью раунда 1, E).
+    """
+    from harness.parsers.vision_checks import CHECK_POSITIONS, CHECK_SEATS
+
+    checks = _named_checks(_with_phantom_actor())
+    assert checks[CHECK_SEATS] is False
+    assert checks[CHECK_POSITIONS] is False
+
+
+def test_both_new_checks_stay_quiet_on_a_correctly_read_screen():
+    """Проверка, срабатывающая на верном чтении, — не проверка, а шум."""
+    from harness.parsers.vision_checks import CHECK_POSITIONS, CHECK_SEATS
+
+    checks = _named_checks(export_reading())
+    assert checks[CHECK_SEATS] is True
+    assert checks[CHECK_POSITIONS] is True
+
+
+def test_the_printed_positions_are_compared_and_not_merely_stored():
+    """Обещание контракта «код сверяет напечатанную метку» обязано быть правдой.
+
+    До ревью раунда 1 метка попадала только в `raw_line` и не сверялась ни с чем.
+    """
+    from harness.parsers.vision_checks import CHECK_POSITIONS
+
+    shifted = export_reading(
+        actions=[
+            a.model_copy(update={"position": "CO"}) if a.position == "UTG" else a
+            for a in export_reading().actions
+        ]
+    )
+    assert _named_checks(shifted)[CHECK_POSITIONS] is False
+
+
+def test_the_table_size_check_is_silent_when_the_header_was_not_read():
+    """Выдумывать расхождение из отсутствия данных нельзя — тот же принцип везде."""
+    from harness.parsers.vision_checks import CHECK_SEATS
+
+    assert _named_checks(export_reading(max_seats=None))[CHECK_SEATS] is True

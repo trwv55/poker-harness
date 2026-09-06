@@ -71,7 +71,9 @@ from harness.parsers.vision_checks import (
     cards_check,
     equity_check,
     match_hero,
+    positions_check,
     pot_check,
+    seats_check,
 )
 
 __all__ = [
@@ -705,6 +707,36 @@ def _showdown_pair(raw: RawHand) -> tuple[list[str], list[str]]:
     return (hands[0], hands[1]) if len(hands) >= 2 else ([], [])
 
 
+def _printed_positions(reading: VisionReading) -> dict[str, str]:
+    """Метки позиций, НАПЕЧАТАННЫЕ у строк лога, по нику — как прочитано."""
+    printed: dict[str, str] = {}
+    for action in reading.actions:
+        if action.nickname and action.position:
+            printed.setdefault(action.nickname, action.position.strip().upper())
+    return printed
+
+
+# Как GG подписывает позиции в логе против того, как их называет нормалайзер.
+# Разъезжаются они только в середине стола: `MP`/`MP+1` у рума — это `LJ`/`HJ`
+# у нас, порядок мест при этом один и тот же.
+_GG_POSITION_ALIASES: dict[str, str] = {"MP": "LJ", "MP+1": "HJ", "ББ": "BB", "БТН": "BTN"}
+
+
+def _derived_positions(raw: RawHand) -> dict[str, str]:
+    """Позиции, ВОССТАНОВЛЕННЫЕ по кругу мест, по нику — вход сверки с печатью."""
+    from harness.normalizer import POSITIONS_BY_COUNT
+
+    order = POSITIONS_BY_COUNT.get(len(raw.seats))
+    if order is None or raw.vision is None:
+        return {}
+    by_label = dict(zip([seat.label for seat in raw.seats], order, strict=True))
+    return {
+        nickname: by_label[label]
+        for label, nickname in raw.vision.nicknames.items()
+        if label in by_label
+    }
+
+
 def run_checks(
     reading: VisionReading, raw: RawHand, hero_check: VisionCheck, built: list[VisionCheck]
 ) -> list[VisionCheck]:
@@ -724,9 +756,15 @@ def run_checks(
         hero_cards,
     )
     other = villain_cards if equity_hero == hero_cards else hero_cards
+    printed = {
+        nick: _GG_POSITION_ALIASES.get(pos, pos)
+        for nick, pos in _printed_positions(reading).items()
+    }
     return [
         hero_check,
         *built,
+        seats_check(len(reading.players), reading.max_seats),
+        positions_check(printed, _derived_positions(raw)),
         cards_check(at_seat, in_log),
         pot_check(
             (reading.pot_shown if reading.pot_unit is not Unit.CHIPS else None),
