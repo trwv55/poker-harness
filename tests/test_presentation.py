@@ -1093,6 +1093,8 @@ def test_tournament_story_msg_counts_paragraphs_grammatically():
     one = tournament_story_msg(TournamentTextOut(paragraphs=["а" * 3400, "б" * 2000]))
     assert "Показан 1 абзац из 2" in one.text
 
+    # При пяти и больше подлежащее в родительном множественного, и сказуемое
+    # встаёт в средний род единственного числа.
     five = tournament_story_msg(TournamentTextOut(paragraphs=["а" * 600] * 8))
-    assert "Показано" not in five.text
-    assert "Показаны 5 абзацев из 8" in five.text
+    assert "Показаны" not in five.text
+    assert "Показано 5 абзацев из 8" in five.text

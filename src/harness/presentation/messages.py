@@ -300,25 +300,23 @@ def _prose_lines(text: str | None) -> list[str]:
     return [f"    {line.strip()}" for line in text.strip().splitlines() if line.strip()]
 
 
-def _plural_ru(count: int, one: str, few: str, many: str) -> str:
-    """Русское числительное с существительным: 1 абзац, 2 абзаца, 5 абзацев.
+def _plural_form(count: int, one: str, few: str, many: str) -> str:
+    """Форма слова по числу: 1 — `one`, 2–4 — `few`, остальное — `many`.
 
-    Правило трёх форм, а не двух: без него строка обрезки читалась как «Показаны
-    1 абзаца» и «Показаны 5 абзаца» — тест на четырёх абзацах проходил случайно,
-    потому что «4 абзаца» единственная форма, которую двухформенный шаблон
-    угадывает (`test_tournament_story_msg_counts_paragraphs_grammatically`).
+    Правило трёх форм, а не двух. Управляет и существительным, и глаголом: при
+    пяти и больше подлежащее в родительном множественного, и сказуемое встаёт в
+    средний род единственного числа — «Показано 5 абзацев», а не «Показаны»
+    (`test_tournament_story_msg_counts_paragraphs_grammatically`).
     """
     tail_100 = abs(count) % 100
     tail_10 = abs(count) % 10
     if 11 <= tail_100 <= 14:
-        word = many
-    elif tail_10 == 1:
-        word = one
-    elif 2 <= tail_10 <= 4:
-        word = few
-    else:
-        word = many
-    return f"{count} {word}"
+        return many
+    if tail_10 == 1:
+        return one
+    if 2 <= tail_10 <= 4:
+        return few
+    return many
 
 
 def _quota_line(quota_left: int, quota_total: int) -> str:
@@ -945,9 +943,8 @@ def tournament_story_msg(narrative: TournamentTextOut) -> Msg:
 
     total = len([p for p in narrative.paragraphs if p.strip()])
     if len(shown) < total:
-        shown.append(
-            f"Показан{'' if len(shown) % 10 == 1 and len(shown) % 100 != 11 else 'ы'} "
-            f"{_plural_ru(len(shown), 'абзац', 'абзаца', 'абзацев')} из {total} — "
-            f"текст не поместился целиком."
-        )
+        count = len(shown)
+        verb = _plural_form(count, "Показан", "Показаны", "Показано")
+        noun = _plural_form(count, "абзац", "абзаца", "абзацев")
+        shown.append(f"{verb} {count} {noun} из {total} — текст не поместился целиком.")
     return Msg(text="\n\n".join(shown))

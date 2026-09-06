@@ -28,7 +28,7 @@ from harness.contracts import (
     TournamentTextOut,
     Zone,
 )
-from harness.explanation.faithfulness import numbers_in
+from harness.explanation.faithfulness import error_words_in, numbers_in
 from harness.explanation.tournament_text import tournament_digest, tournament_text
 from harness.explanation.verdict_text import UnfaithfulText
 
@@ -171,6 +171,16 @@ def test_no_engine_token_reaches_the_model():
     text = tournament_digest(_report()).text
     for token in ("pushfold_unopened", "preflop", "fold", "shove", "call"):
         assert token not in text
+
+
+def test_the_tournament_digest_hands_the_model_no_forbidden_word():
+    """Выжимка не имеет права сама произнести слово, за которое потом отказывает.
+
+    Строка про рост блайндов говорила «это не ошибка данных» — и отказ прода
+    срабатывал на честном отражении нашей же формулировки. Проверяется именно
+    выжимка: в промпте запрещённые слова стоят неизбежно — он их и запрещает.
+    """
+    assert error_words_in(tournament_digest(_report()).text) == []
 
 
 def test_a_blind_jump_between_levels_is_flagged_for_the_model():

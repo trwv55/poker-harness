@@ -84,10 +84,14 @@ def test_verdict_label_thresholds_are_the_core_ones():
 
 def test_the_better_line_must_be_named_by_its_own_word_or_a_synonym():
     """Лучшая линия обязана быть названа, но не обязательно НАШИМ словом: «идти
-    ва-банк» — это тот же шов, и наказывать за живой язык проверка не должна."""
+    ва-банк» — это тот же шов, «скинули карты» и «отложили руку» — тот же фолд.
+    Обе фразы про фолд взяты из живых прогонов (Haiku и Opus соответственно)."""
     assert names_the_better_line("здесь лучше шов", "shove")
     assert names_the_better_line("правильнее было идти ва-банк", "shove")
     assert not names_the_better_line("расчёт оценивает это в 1.2 bb", "shove")
+    assert names_the_better_line("вы скинули карты, и это верная линия", "fold")
+    assert names_the_better_line("руку стоит отложить", "fold")
+    assert not names_the_better_line("расчёт даёт 0.4 bb", "fold")
 
 
 def test_a_formulation_the_checker_does_not_know_is_not_demanded():
@@ -97,7 +101,15 @@ def test_a_formulation_the_checker_does_not_know_is_not_demanded():
 
 
 def test_a_reproach_on_a_near_zero_point_is_detected():
-    assert near_zero_reproach("здесь лучше было пасовать") == ["лучше"]
+    """Ищется ОБОРОТ упрёка, а не слово «лучше»: выжимка той же точки печатает
+    `лучше: около нуля, оба варианта допустимы`, и отказ от её же формулировки
+    был бы отказом от текста, которого мы добиваемся."""
+    # «лучше бы» — подстрока «лучше было», поэтому находятся оба оборота;
+    # проверке важно, что упрёк НАЙДЕН, а не сколько форм на него откликнулось.
+    assert "лучше было" in near_zero_reproach("здесь лучше было пасовать")
+    assert near_zero_reproach("тут стоило бы пасовать") == ["стоило бы"]
+    assert near_zero_reproach("ни один вариант не лучше другого") == []
+    assert near_zero_reproach("расхождение ничего не стоило") == []
     assert near_zero_reproach("оба варианта допустимы, выбор дёшев") == []
 
 
