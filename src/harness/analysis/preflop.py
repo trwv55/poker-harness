@@ -127,6 +127,7 @@ from harness.analysis.tools.pushfold import (
     shove_ev_bb as _shove_ev_bb,
 )
 from harness.contracts import (
+    UNJUDGED_DECISION_NOT_TAKEN,
     ActionKind,
     Assumption,
     CanonicalHand,
@@ -826,6 +827,7 @@ def _unjudged(
     spot: SpotKind,
     reason: str,
     detail: Mapping[str, object] | None = None,
+    kind: str = "",
 ) -> PointVerdict:
     """Точка без вердикта: спот размечен, цена не посчитана.
 
@@ -850,7 +852,11 @@ def _unjudged(
         ev_diff_bb=0.0,
         assumption=None,
         tools=[],
-        detail={**(detail or {}), "unjudged": reason},
+        detail={
+            **(detail or {}),
+            "unjudged": reason,
+            **({"unjudged_kind": kind} if kind else {}),
+        },
     )
 
 
@@ -1631,7 +1637,12 @@ def verdict_for(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict:
     нет» значило бы выдать несделанный ход за верный.
     """
     if dp.action is None:
-        return _unjudged(dp, _spot_of_street(dp.street), _DECISION_NOT_TAKEN)
+        return _unjudged(
+            dp,
+            _spot_of_street(dp.street),
+            _DECISION_NOT_TAKEN,
+            kind=UNJUDGED_DECISION_NOT_TAKEN,
+        )
     if dp.street is not Street.PREFLOP:
         return _unjudged(dp, SpotKind.POSTFLOP, "постфлоп в v1 не оценивается")
 

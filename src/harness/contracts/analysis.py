@@ -95,6 +95,12 @@ class EvInterval(BaseModel):
         return self
 
 
+# Машинный ключ причины, по которой точка осталась без вердикта. Нужен ровно
+# затем, чтобы `presentation` мог перевести причину в слова игрока, не разбирая
+# внутренние формулировки ядра: те написаны для разбора, а не для чтения вслух.
+UNJUDGED_DECISION_NOT_TAKEN = "decision_not_taken"
+
+
 class PointVerdict(BaseModel):
     dp_index: int
     street: Street

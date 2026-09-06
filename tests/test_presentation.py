@@ -1170,3 +1170,59 @@ def test_the_refusal_repeats_what_the_model_saw_instead_of_a_generic_phrase():
     from harness.presentation import not_a_hand_msg
 
     assert "список результатов" in not_a_hand_msg("список результатов").text
+
+
+def test_what_could_not_be_checked_reaches_the_player_and_kills_the_strict_badge():
+    """«Проверить было нечем» — не то же, что «проверено и сошлось» (ревью раунда 1, C).
+
+    Скрин с фабрикованным шоудауном показывал вскрытие, которого никто не видел,
+    и подписывался «зона: строго» — ровно то, что пометка обещала не допустить.
+    Проверяются обе половины сразу: названная оговорка в тексте и отсутствие
+    самой уверенной подписи продукта.
+    """
+    res = AnalysisResult(
+        hand_no="TM1",
+        points=[_point(spot=SpotKind.PUSHFOLD_UNOPENED, ev_diff_bb=-1.0, zone=Zone.STRICT)],
+        ranked=[0],
+    )
+    plain = deep_dive_msg(res, 12, Zone.STRICT, 17, 50)
+    caveated = deep_dive_msg(
+        res, 12, Zone.ASSUMING, 17, 50, not_checked=["сверка получателей банка"]
+    )
+    assert "Проверить на этом экране было нечем: сверка получателей банка." in caveated.text
+    assert "Проверить на этом экране было нечем" not in plain.text
+    assert "зона: строго" in plain.text
+    assert "зона: строго" not in caveated.text
+
+
+def test_a_decision_not_taken_is_explained_instead_of_the_generic_line():
+    """Главный сценарий продукта не должен отвечать строкой ни о чём.
+
+    Причина у ядра названа (`detail["unjudged_kind"]`), и до сообщения она не
+    доходила: игрок, приславший стол в момент хода, получал «точек с вердиктом
+    нет».
+    """
+    from harness.contracts import UNJUDGED_DECISION_NOT_TAKEN
+
+    pending = _point(
+        spot=SpotKind.PREFLOP_OTHER, ev_diff_bb=0.0, zone=Zone.STRICT
+    ).model_copy(
+        update={"best_action": "", "detail": {"unjudged_kind": UNJUDGED_DECISION_NOT_TAKEN}}
+    )
+    msg = deep_dive_msg(
+        AnalysisResult(hand_no="TM1", points=[pending], ranked=[]), 5, None, 17, 50
+    )
+    assert "Решение по этой раздаче ещё не принято" in msg.text
+    assert "точек с вердиктом нет" not in msg.text
+
+
+def test_an_unjudged_point_without_a_known_reason_keeps_the_general_line():
+    """Пересказать игроку внутреннюю формулировку ядра хуже, чем промолчать."""
+    unpriced = _point(
+        spot=SpotKind.PREFLOP_OTHER, ev_diff_bb=0.0, zone=Zone.STRICT
+    ).model_copy(update={"best_action": "", "detail": {"unjudged": "перебор подмножеств"}})
+    msg = deep_dive_msg(
+        AnalysisResult(hand_no="TM1", points=[unpriced], ranked=[]), 5, None, 17, 50
+    )
+    assert "По этой раздаче точек с вердиктом нет." in msg.text
+    assert "перебор подмножеств" not in msg.text

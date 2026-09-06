@@ -626,9 +626,16 @@ def _board_was_dealt(reading: VisionReading) -> bool:
     Кодовое правило независимо от яркости: карты стола раздают, только если
     торговля пошла дальше префлопа ЛИБО дело дошло до вскрытия. Ни того ни
     другого — борда в руке не было, чем бы экран его ни рисовал.
+
+    Вскрытие считается и по флагу `showdown_seen`, и по прочитанному: карты
+    видны у двоих и более — значит, до вскрытия дошло, даже если флаг забыт.
+    Ошибиться этим правилом дешевле в сторону «раздан»: лишний борд ловит сверка
+    карт на дубли, а выброшенный настоящий борд не ловит ничто.
     """
-    return reading.showdown_seen or any(
-        action.street is not Street.PREFLOP for action in reading.actions
+    return (
+        reading.showdown_seen
+        or any(action.street is not Street.PREFLOP for action in reading.actions)
+        or sum(1 for player in reading.players if _cards(player)) >= 2
     )
 
 

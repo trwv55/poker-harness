@@ -691,7 +691,7 @@ def _render_ranges(data_dir: Path | None, hand_id: int, result: AnalysisResult) 
     return paths
 
 
-def _hand_zone(result: AnalysisResult) -> Zone | None:
+def _hand_zone(result: AnalysisResult, not_checked: Sequence[str] = ()) -> Zone | None:
     """Зона доверия ВСЕЙ руки — из всех судимых точек, консервативно (round 5, Item H).
 
     Два правила, оба из CLAUDE.md («`strict` — только когда вывод не опирается на
@@ -709,6 +709,11 @@ def _hand_zone(result: AnalysisResult) -> Zone | None:
     zones = {result.points[idx].zone for idx in result.ranked}
     if not zones:
         return None
+    if not_checked:
+        # Вход, часть которого проверить было нечем, не бывает «строгим»: под
+        # этой подписью продукт обещает точный расчёт, а расчёт здесь опирается
+        # на непроверенное чтение (реестр D1, ревью раунда 1, C).
+        return Zone.ASSUMING
     return Zone.STRICT if zones == {Zone.STRICT} else Zone.ASSUMING
 
 
@@ -1024,11 +1029,12 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
         msg = deep_dive_msg(
             result,
             round(deps.clock() - started_at),
-            _hand_zone(result),
+            _hand_zone(result, enriched.verdict.not_checked),
             quota_left,
             quota_total,
             replay=hand_replay(enriched),
             verdict=verdict,
+            not_checked=enriched.verdict.not_checked,
         )
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
         await session.commit()
@@ -1097,7 +1103,7 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
                 await session.commit()
 
         elapsed_s = round(deps.clock() - started_at)
-        zone = _hand_zone(result)
+        zone = _hand_zone(result, hand.enriched.verdict.not_checked)
         quota_left, quota_total = await _quota_numbers(session, job.player_id)
         msg = deep_dive_msg(
             result,
@@ -1107,6 +1113,7 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
             quota_total,
             replay=hand_replay(hand.enriched),
             verdict=verdict,
+            not_checked=hand.enriched.verdict.not_checked,
         )
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
         await session.commit()

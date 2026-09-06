@@ -66,6 +66,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from itertools import pairwise
 from math import ceil, floor
 from typing import Literal
@@ -73,6 +74,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 from harness.contracts.analysis import (
+    UNJUDGED_DECISION_NOT_TAKEN,
     AllInEvent,
     AnalysisResult,
     ChipMove,
@@ -422,6 +424,38 @@ def scan_summary_msg(s: ScanSummary, quota_left: int, quota_total: int) -> Msg:
     return Msg(text="\n".join(lines), buttons=buttons)
 
 
+# Оговорка о непроверенном. «Проверить было нечем» — не то же, что «проверено и
+# сошлось», и разница обязана быть видна игроку, а не только в трейсе.
+_NOT_CHECKED_PREFIX = "Проверить на этом экране было нечем:"
+
+# Причины, по которым точка осталась без вердикта, переведённые в слова игрока.
+# Внутренние формулировки ядра написаны для разбора, а не для чтения вслух,
+# поэтому переводятся по машинному ключу (`detail["unjudged_kind"]`), а не по
+# тексту. Ключа нет — остаётся общая строка: сказать «не знаю почему» честнее,
+# чем пересказать игроку внутреннюю причину.
+_UNJUDGED_WORD: dict[str, str] = {
+    UNJUDGED_DECISION_NOT_TAKEN: (
+        "Решение по этой раздаче ещё не принято — на экране стол в момент хода. "
+        "Разобрать можно только сыгранное."
+    ),
+}
+
+
+def _no_verdict_line(res: AnalysisResult) -> str:
+    """Почему вердикта нет — названной причиной, если она у ядра есть.
+
+    Общая строка на главном сценарии продукта («кинул скрин за столом») была бы
+    ответом ни о чём: причина у ядра названа (`detail["unjudged_kind"]`), и до
+    сообщения она не доходила.
+    """
+    kinds = {
+        str(point.detail.get("unjudged_kind", "")) for point in res.points
+    } & _UNJUDGED_WORD.keys()
+    if len(kinds) == 1:
+        return _UNJUDGED_WORD[next(iter(kinds))]
+    return "По этой раздаче точек с вердиктом нет."
+
+
 def deep_dive_msg(
     res: AnalysisResult,
     elapsed_s: int,
@@ -431,6 +465,7 @@ def deep_dive_msg(
     dev_line: str | None = None,
     replay: HandReplay | None = None,
     verdict: VerdictTextOut | None = None,
+    not_checked: Sequence[str] = (),
 ) -> Msg:
     """Полный разбор раздачи: точки решения числами (текст LLM — задача 21) +
     статус-строка (⏱ время · зона доверия · остаток квоты) + три кнопки.
@@ -450,6 +485,14 @@ def deep_dive_msg(
     Зона относится ко ВСЕЙ руке, поэтому вызывающий обязан выводить её из всех
     судимых точек, а не из первой (`worker.pipeline._hand_zone` — единственный
     такой вызывающий; там же и правило: «строго» только если строги все).
+
+    **`not_checked` — то, что на этом входе проверить было нечем** (`Verdict.
+    not_checked`), и оно обязано дойти до игрока. Скрин, где шоудаун решён на
+    доукомплектованных картах, без этой строки показывал вскрытие, которого
+    никто не видел, и подписывался «зона: строго» — то есть ровно то, что
+    пометка обещала не допустить. Понижение зоны делает вызывающий
+    (`_hand_zone`), а называет непроверенное эта строка: одно без другого
+    оставляет либо неназванную оговорку, либо неоправданную уверенность.
     """
     lines = [f"Рука {res.hand_no}", ""]
     if replay is not None:
@@ -459,7 +502,7 @@ def deep_dive_msg(
     prose = {} if verdict is None else {point.dp_index: point.text for point in verdict.points}
 
     if not res.ranked:
-        lines.append("По этой раздаче точек с вердиктом нет.")
+        lines.append(_no_verdict_line(res))
     else:
         for idx in res.ranked:
             point = res.points[idx]
@@ -491,6 +534,10 @@ def deep_dive_msg(
     if verdict is not None and verdict.summary.strip():
         lines.append("")
         lines.append(verdict.summary.strip())
+
+    if not_checked:
+        lines.append("")
+        lines.append(f"{_NOT_CHECKED_PREFIX} {', '.join(not_checked)}.")
 
     lines.append("")
     zone_segment = "" if zone is None else f"зона: {_ZONE_WORD[zone]} · "

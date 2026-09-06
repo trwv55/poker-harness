@@ -1851,3 +1851,37 @@ async def test_the_validator_asks_about_the_button_with_the_nicknames_it_read(
         for row_ in asked.buttons
         for btn in row_
     )
+
+
+async def test_a_fabricated_showdown_never_reaches_the_player_as_a_strict_verdict(
+    deps, queue, db_factory, fake_sender, tmp_path, monkeypatch
+):
+    """Пометка обязана менять то, что видит игрок, а не только лежать в вердикте.
+
+    Раньше рука с доукомплектованными картами показывала вскрытие, которого
+    никто не видел, и подписывалась «зона: строго» — самой уверенной подписью
+    продукта (ревью раунда 1, C).
+    """
+    from harness.engine.validation import _FABRICATED_SHOWDOWN
+
+    player_id, session_id = await _make_scope(db_factory)
+    await _with_nickname(db_factory, player_id)
+    raw = _screenshot_raw()
+    # Карты одного из вскрывшихся не прочитаны — движок доукомплектует их сам.
+    raw.showdowns = [entry for entry in raw.showdowns if entry.label != "S5"]
+    raw.collected = []  # без строки «Победа» сверка выплат молчит, остаётся пометка
+    _stub_vision(monkeypatch, _outcome(raw=raw))
+    await _enqueue_screenshot(queue, tmp_path, player_id=player_id, session_id=session_id)
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    async with db_factory() as session:
+        enriched = (await HandsRepo(session).get(job.hand_id or 1)).enriched
+    assert enriched is not None
+    assert _FABRICATED_SHOWDOWN in enriched.verdict.not_checked
+    shown = [msg for msg in fake_sender.sent if "Рука" in msg.text]
+    assert shown, "разбор до игрока не дошёл"
+    assert "зона: строго" not in shown[-1].text
+    assert "Проверить на этом экране было нечем" in shown[-1].text

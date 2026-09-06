@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from harness.contracts.analysis import (
+    UNJUDGED_DECISION_NOT_TAKEN,
     AllInEvent,
     AnalysisResult,
     Assumption,
@@ -75,6 +76,7 @@ from harness.contracts.vision import (
 
 __all__ = [
     "RANKS",
+    "UNJUDGED_DECISION_NOT_TAKEN",
     "ActionKind",
     "AllInEvent",
     "AnalysisResult",

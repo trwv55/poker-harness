@@ -187,3 +187,28 @@ def test_the_state_path_refuses_a_complete_hand():
 def test_the_state_path_refuses_a_board_that_cannot_be_a_street():
     with pytest.raises(StateNotReadable):
         state_report(normalize(state_hand(boards={"flop": ["Ah", "Kd"]})))
+
+
+def test_the_player_is_told_why_a_state_has_no_verdict(monkeypatch):
+    """Названная причина доходит до сообщения, а не остаётся в `detail` (ревью, C).
+
+    «Кинул скрин за столом» — главный сценарий продукта, и общая строка «точек с
+    вердиктом нет» была бы на нём ответом ни о чём.
+    """
+    from harness.presentation import deep_dive_msg
+
+    result = analyze_hand(enrich(normalize(state_hand())))
+    msg = deep_dive_msg(result, 5, None, 17, 50)
+    assert "Решение по этой раздаче ещё не принято" in msg.text
+    assert "точек с вердиктом нет" not in msg.text
+
+
+def test_the_unchecked_list_of_a_state_reaches_the_player():
+    """Проверок на состоянии нет по построению — и это обязано быть видно."""
+    from harness.presentation import deep_dive_msg
+
+    en = enrich(normalize(state_hand()))
+    result = analyze_hand(en)
+    msg = deep_dive_msg(result, 5, None, 17, 50, not_checked=en.verdict.not_checked)
+    assert "Проверить на этом экране было нечем" in msg.text
+    assert "сохранение фишек" in msg.text
