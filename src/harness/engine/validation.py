@@ -160,6 +160,37 @@ def _source_stacks_end(hand: CanonicalHand) -> dict[str, int]:
     return ends
 
 
+# Допуск сверки выплат — только для скриншота и только в размере обрезки экрана.
+# Экспорт печатает суммы с двумя знаками и ОБРЕЗАЕТ их (сверено с текстом рума),
+# поэтому «Победа 31.95» против восстановленных 31.94 — свойство отображения, а
+# не расхождение. У hand history допуск нулевой: там числа записал сам рум.
+_PAYOUT_TOLERANCE_BB = 0.1
+
+
+def _payout_mismatch(hand: CanonicalHand, report: EngineReport) -> str | None:
+    """Сверить, кому и сколько досталось, — по строкам источника, а не по движку.
+
+    Правильный по размеру банк, уехавший не тому игроку, все остальные проверки
+    проходит насквозь: фишки сохранены, банк сошёлся, недопустимых ходов нет.
+    Ловит это только пересчёт выплат, и на скрин-входе он же ловит шоудаун,
+    решённый на доукомплектованных картах (`_fabricated_showdown`).
+    """
+    if not hand.collected:
+        return None
+    expected = _source_stacks_end(hand)
+    tolerance = (
+        round(_PAYOUT_TOLERANCE_BB * hand.bb)
+        if hand.provenance is Provenance.SCREENSHOT
+        else 0
+    )
+    wrong = [
+        f"{label}: движок {report.stacks_end.get(label, 0)}, источник {amount}"
+        for label, amount in sorted(expected.items())
+        if abs(report.stacks_end.get(label, 0) - amount) > tolerance
+    ]
+    return "payout mismatch: " + "; ".join(wrong) if wrong else None
+
+
 def _question_for(field: str, hand: CanonicalHand) -> str:
     """Короткий человеческий вопрос по полю — без покерного жаргона."""
     if field == _FIELD_STACKS:
@@ -182,11 +213,13 @@ def _fabricated_showdown(hand: CanonicalHand) -> list[str]:
     history это безопасно: измерено, что 0 из 111 оспариваемых шоудаунов
     решались на фабрикованных картах — рум показывает карты всех дошедших. На
     скрине не так: карта соперника бывает не прочитана, и тогда банк может
-    «выиграть» рука, которой не было. Сверка получателей здесь не спасает — у
-    скриншота нет строк `collected`, и сравнивать выплаты не с чем.
+    «выиграть» рука, которой не было.
 
-    Поэтому такой шоудаун называется в `Verdict.not_checked`: молчание сделало
-    бы фабрикацию неотличимой от прочитанного вскрытия.
+    Сверка получателей на скрине РАБОТАЕТ и такой случай ловит: экспорт истории
+    печатает «Победа N» у победителя, и это пятое независимое чтение
+    (`SeenWin` → `hand.collected`). Пометка её не заменяет, а дополняет: строка
+    «Победа» видна не на каждом экране, а живой стол её не печатает вовсе.
+    Молчание сделало бы фабрикацию неотличимой от прочитанного вскрытия.
     """
     if hand.provenance is not Provenance.SCREENSHOT or not hand.showdowns:
         return []
@@ -288,10 +321,11 @@ def validate(hand: CanonicalHand, report: EngineReport) -> Verdict:
     if _has_duplicate_cards(hand):
         reasons.append("duplicate cards")
         fields.append(_FIELD_CARDS)
-    # Только если источник вообще пишет выплаты: у скриншота строк `collected`
-    # нет, и выдумывать по их отсутствию расхождение нельзя.
-    if hand.collected and report.stacks_end != _source_stacks_end(hand):
-        reasons.append("payout mismatch: stacks_end vs collected/uncalled")
+    # Только если источник вообще пишет выплаты: сумму, которую никто не назвал,
+    # не с чем сравнивать, и выдумывать по её отсутствию расхождение нельзя.
+    payout = _payout_mismatch(hand, report)
+    if payout is not None:
+        reasons.append(payout)
         fields.append(_FIELD_STACKS)
 
     # Реплей играет руку до рейка: PokerKit раздаёт банк целиком, ничего не

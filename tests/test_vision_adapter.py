@@ -555,3 +555,55 @@ def test_a_showdown_with_an_unread_card_is_named_as_completed_by_the_engine():
     assert _FABRICATED_SHOWDOWN in enrich(normalize(raw)).verdict.not_checked
     # У полностью прочитанного вскрытия пометки нет — иначе она ничего не значит.
     assert _FABRICATED_SHOWDOWN not in enrich(normalize(built()[0])).verdict.not_checked
+
+
+def test_the_win_banner_is_kept_as_a_fifth_independent_reading():
+    """«Победа N» читается и доезжает до руки — иначе проверка выплат слепа.
+
+    Раньше строка отбрасывалась, и валидатор проходил на любой руке. Отбросить
+    прочитанное, чтобы проверка не срабатывала, — та же подгонка, что подправить
+    число; разница только в том, что она молчаливая (ревью раунда 1, B).
+    """
+    raw, _ = built()
+    assert [(c.label, c.amount) for c in raw.collected] == [("S5", bb(31.95))]
+
+
+def test_the_payout_check_tolerates_the_truncation_the_screen_forces():
+    """31.95 на экране против 31.94 восстановленных — обрезка, а не расхождение."""
+    en = enrich(normalize(built()[0]))
+    assert en.verdict.status is ValidationStatus.PASS
+
+
+def test_the_payout_check_catches_a_showdown_decided_on_completed_cards():
+    """Пятое независимое чтение ловит фабрикацию, а не только называет её.
+
+    Карты одного из вскрывшихся не прочитаны: движок доукомплектует их из
+    колоды и может отдать банк не тому, кого назвал экран. Расхождение с
+    прочитанной строкой «Победа» — это и есть улика.
+    """
+    hidden = export_reading(
+        players=[
+            p.model_copy(update={"cards_in_log": [], "cards_at_seat": []})
+            if p.nickname == "N5"
+            else p
+            for p in export_reading().players
+        ]
+    )
+    raw, _ = reading_to_raw(hidden, hero_nickname=HERO_NICK, source_ref="s")
+    verdict = enrich(normalize(raw)).verdict
+    assert verdict.status is ValidationStatus.ESCALATE
+    assert any("payout mismatch" in reason for reason in verdict.reasons)
+
+
+def test_a_hand_history_payout_is_compared_without_any_tolerance():
+    """У рума числа точные, и допуск там был бы дырой, а не поправкой."""
+    from harness.engine.validation import _payout_mismatch
+    from harness.parsers.hh_parser import parse_hand
+    from tests.test_hh_parser import SAMPLE
+
+    en = enrich(normalize(parse_hand(SAMPLE, source_ref="x")))
+    assert _payout_mismatch(en.hand, en.report) is None
+    off_by_one = en.report.model_copy(
+        update={"stacks_end": {**en.report.stacks_end, "Hero": en.report.stacks_end["Hero"] + 1}}
+    )
+    assert _payout_mismatch(en.hand, off_by_one) is not None

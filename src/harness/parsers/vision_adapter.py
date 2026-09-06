@@ -569,7 +569,7 @@ def reading_to_raw(
         boards=_boards(reading.board if _board_was_dealt(reading) else []),
         uncalled=uncalled,
         showdowns=_showdowns(reading, labels) if complete else [],
-        collected=[] if complete else collected,
+        collected=collected,
         vision=VisionMeta(
             image_hash=image_hash,
             nicknames={
