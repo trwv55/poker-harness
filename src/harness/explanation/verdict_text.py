@@ -51,7 +51,15 @@ from harness.explanation.faithfulness import (
     verdict_label_for,
 )
 
-__all__ = ["UnfaithfulText", "VerdictLLM", "verdict_digest", "verdict_text"]
+__all__ = [
+    "Digest",
+    "UnfaithfulText",
+    "VerdictDraft",
+    "VerdictLLM",
+    "verdict_digest",
+    "verdict_draft",
+    "verdict_text",
+]
 
 _T = TypeVar("_T", bound=BaseModel)
 
@@ -74,6 +82,14 @@ _STREET_BRIEF: dict[Street, str] = {
     Street.TURN: "тёрн",
     Street.RIVER: "ривер",
 }
+
+# Токены действий движка (`fold`/`shove`/`call`) в промпт в сыром виде НЕ идут:
+# первый живой прогон показал, что модель переписывает их в текст игроку как
+# есть — вместе с `pushfold_unopened` и `preflop` она выдала «спот
+# pushfold_unopened» и «закончились на preflopе». Английский токен в тексте
+# игрока запрещён (SESSIONS_UX: никакой внутренней кухни), а надёжнее всего он
+# не появляется тогда, когда модель его не видела.
+_ACTION_BRIEF: dict[str, str] = {"fold": "фолд", "shove": "шов", "call": "колл"}
 
 _ZONE_BRIEF: dict[Zone, str] = {
     Zone.STRICT: "строго (вывод не зависит от догадки о диапазоне)",
@@ -110,15 +126,24 @@ class VerdictLLM(Protocol):
     ) -> tuple[_T, Any]: ...
 
 
-class _PointDraft(BaseModel):
+class PointDraft(BaseModel):
     """Что модели РАЗРЕШЕНО вернуть про точку: привязка и слова. Метки здесь нет."""
 
     dp_index: int
     text: str
 
 
-class _VerdictDraft(BaseModel):
-    points: list[_PointDraft]
+class VerdictDraft(BaseModel):
+    """Сырой ответ модели до проверок — то, что видит eval-прогон.
+
+    Публичный тип (в отличие от прежнего приватного) ровно потому, что у него
+    появился второй законный читатель: `evals/verdict/checks.py` проверяет
+    ИМЕННО черновик, до того как `verdict_text` его отбракует. Иначе eval мог бы
+    измерять только «прошло/не прошло», не имея возможности показать, ЧТО
+    именно модель написала.
+    """
+
+    points: list[PointDraft]
     summary: str
 
 
@@ -139,8 +164,8 @@ def _point_lines(point: PointVerdict, ordinal: int, book: NumberBook) -> list[st
             f"{_SPOT_BRIEF.get(point.spot, point.spot.value)}."
         ),
         (
-            f"  сыграно: {point.action_taken or 'не названо'}; "
-            f"лучше: {point.best_action or 'не названо'}; "
+            f"  сыграно: {_ACTION_BRIEF.get(point.action_taken, point.action_taken) or 'не названо'}; "
+            f"лучше: {_ACTION_BRIEF.get(point.best_action, point.best_action) or 'не названо'}; "
             f"цена расхождения: {book.bb(point.ev_diff_bb)} bb."
         ),
         f"  зона: {_ZONE_BRIEF[point.zone]}.",
@@ -185,7 +210,22 @@ def verdict_digest(res: AnalysisResult) -> Digest:
     return Digest(text="\n".join(lines), allowed=book.allowed)
 
 
-def _validate(draft: _VerdictDraft, res: AnalysisResult, allowed: frozenset[float]) -> None:
+async def verdict_draft(
+    llm: VerdictLLM, res: AnalysisResult, *, trace_id: int
+) -> tuple[VerdictDraft, Digest]:
+    """Один вызов модели: сырой ответ и выжимка, по которой его положено проверять.
+
+    Отдельно от `verdict_text` ради eval-прогона (`evals/verdict/checks.py`): тот
+    обязан видеть ответ ДО отбраковки, иначе измерять нечего. Прод пользуется
+    `verdict_text`, который зовёт эту функцию и сразу проверяет результат.
+    """
+    digest = verdict_digest(res)
+    prompt = _PROMPT_PATH.read_text(encoding="utf-8").replace("{digest}", digest.text)
+    draft, _meta = await llm("verdict_text", VerdictDraft, prompt=prompt, trace_id=trace_id)
+    return draft, digest
+
+
+def _validate(draft: VerdictDraft, res: AnalysisResult, allowed: frozenset[float]) -> None:
     """Три проверки разом; первая же непройденная — отказ от всего текста."""
     expected = {res.points[index].dp_index for index in res.ranked}
     got = {point.dp_index for point in draft.points}
@@ -228,9 +268,7 @@ async def verdict_text(llm: VerdictLLM, res: AnalysisResult, *, trace_id: int) -
     if not res.ranked:
         return VerdictTextOut(points=[], summary="")
 
-    digest = verdict_digest(res)
-    prompt = _PROMPT_PATH.read_text(encoding="utf-8").replace("{digest}", digest.text)
-    draft, _meta = await llm("verdict_text", _VerdictDraft, prompt=prompt, trace_id=trace_id)
+    draft, digest = await verdict_draft(llm, res, trace_id=trace_id)
     _validate(draft, res, digest.allowed)
 
     by_dp = {res.points[index].dp_index: res.points[index] for index in res.ranked}

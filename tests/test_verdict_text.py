@@ -28,7 +28,7 @@ from harness.contracts import (
 from harness.explanation.faithfulness import numbers_in
 from harness.explanation.verdict_text import (
     UnfaithfulText,
-    _VerdictDraft,
+    VerdictDraft,
     verdict_digest,
     verdict_text,
 )
@@ -43,7 +43,7 @@ class FakeLLM:
     это увидит pyright на настоящем вызывающем (`worker.pipeline`), а не тест.
     """
 
-    def __init__(self, reply: _VerdictDraft) -> None:
+    def __init__(self, reply: VerdictDraft) -> None:
         self.reply = reply
         self.prompts: list[str] = []
 
@@ -96,8 +96,8 @@ def _result(points: list[PointVerdict], ranked: list[int] | None = None) -> Anal
     )
 
 
-def _draft(*texts: tuple[int, str], summary: str = "Итог без чисел.") -> _VerdictDraft:
-    return _VerdictDraft.model_validate(
+def _draft(*texts: tuple[int, str], summary: str = "Итог без чисел.") -> VerdictDraft:
+    return VerdictDraft.model_validate(
         {"points": [{"dp_index": i, "text": t} for i, t in texts], "summary": summary}
     )
 
@@ -132,6 +132,13 @@ def test_a_point_without_a_verdict_never_reaches_the_model():
     digest = verdict_digest(_result([judged, unjudged], ranked=[0]))
     assert "dp_index 0" in digest.text
     assert "dp_index 7" not in digest.text
+
+
+def test_no_engine_token_reaches_the_model():
+    """То же, что в выжимке турнира: `fold`/`shove` переводятся до промпта."""
+    digest = verdict_digest(_result([_point(dp_index=0, ev_diff_bb=-1.2)]))
+    assert "fold" not in digest.text and "shove" not in digest.text
+    assert "фолд" in digest.text and "шов" in digest.text
 
 
 def test_the_digest_carries_the_interval_and_the_ceiling():

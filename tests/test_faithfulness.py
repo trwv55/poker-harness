@@ -34,6 +34,14 @@ def test_thousands_are_read_as_one_number_not_two():
     assert numbers_in("стек 31 250 фишек") == numbers_in("стек 31250 фишек")
 
 
+def test_a_hyphen_inside_an_identifier_is_not_a_minus_sign():
+    """«SYN-3» — номер раздачи, а не число −3. Найдено первым живым прогоном
+    evals: проверка объявляла выдумкой номер, который мы сами и дали модели."""
+    assert numbers_in("В раздаче SYN-3 расхождение") == [3.0]
+    assert numbers_in("цена −3 bb") == [-3.0]
+    assert numbers_in("от -1.9 до -0.2") == [-1.9, -0.2]
+
+
 def test_a_number_from_the_calculation_passes_and_an_invented_one_does_not():
     allowed = {-1.2, 3.4}
     assert unsupported_numbers("потеря −1.2 bb при банке 3.4 bb", allowed) == []

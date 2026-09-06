@@ -21,16 +21,21 @@ from harness.explanation.hand_replay import HandReplay, ReplaySpan, hand_replay
 from harness.explanation.range_render import range_svg, render_range_png
 from harness.explanation.tournament_text import tournament_digest, tournament_text
 from harness.explanation.verdict_text import (
+    Digest,
     UnfaithfulText,
+    VerdictDraft,
     VerdictLLM,
     verdict_digest,
+    verdict_draft,
     verdict_text,
 )
 
 __all__ = [
+    "Digest",
     "HandReplay",
     "ReplaySpan",
     "UnfaithfulText",
+    "VerdictDraft",
     "VerdictLLM",
     "hand_replay",
     "has_assumption_words",
@@ -41,6 +46,7 @@ __all__ = [
     "tournament_text",
     "unsupported_numbers",
     "verdict_digest",
+    "verdict_draft",
     "verdict_label_for",
     "verdict_text",
 ]

@@ -47,6 +47,28 @@ uv run pytest -q -ra
 uv run ruff check . && uv run pyright
 ```
 
+Картинка матрицы диапазонов (`explanation/range_render.py`) рисуется через
+`cairosvg`, а он грузит СИСТЕМНУЮ библиотеку cairo — колесо её не содержит. В
+образе стоит пакет `libcairo2` (Dockerfile), на macOS достаточно
+`brew install cairo`; путь к каталогу Homebrew модуль дописывает сам.
+
+### Evals — отдельный этаж, руками и за деньги
+
+Тесты проверяют код, evals проверяют модель ([`.claude/EVALS.md`](.claude/EVALS.md)).
+В `pytest` они не входят и в CI не гоняются; прогон верности изложения вердикта —
+обязателен при смене `LLM_VERDICT_MODEL` или промпта вердикта:
+
+```bash
+# синтетические кейсы из evals/verdict/cases (в репозитории)
+uv run python -m harness.platform.eval_runner verdict
+# те же проверки на настоящих раздачах с диска
+uv run python -m harness.platform.eval_runner verdict --hh fixtures/hh/<файл>.txt --hands 3
+```
+
+Прогон ходит к настоящей модели через тот же провайдер-слой, что и прод, поэтому ему
+нужны ключ провайдера и `DATABASE_URL` (строка `llm_calls` пишется на каждый вызов —
+из неё же берётся стоимость прогона, которую печатает раннер).
+
 ### Публикация
 
 Репозиторий открыт до выхода продукта. Что в него не попадает и почему — в

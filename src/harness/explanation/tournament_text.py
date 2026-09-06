@@ -34,7 +34,14 @@ from harness.contracts import (
 )
 from harness.explanation.digest import NumberBook
 from harness.explanation.faithfulness import unsupported_numbers
-from harness.explanation.verdict_text import Digest, UnfaithfulText, VerdictLLM
+from harness.explanation.verdict_text import (
+    _ACTION_BRIEF,
+    _SPOT_BRIEF,
+    _STREET_BRIEF,
+    Digest,
+    UnfaithfulText,
+    VerdictLLM,
+)
 
 __all__ = ["tournament_digest", "tournament_text"]
 
@@ -144,7 +151,8 @@ def _chip_move_lines(report: TournamentReport, book: NumberBook) -> list[str]:
     lines += [
         f"  раздача {book.token(move.hand_no)}, ур. {book.count(move.level)}"
         f"{f', рука {move.hero_class}' if move.hero_class else ''}: "
-        f"{move.last_street.value}{', олл-ин' if move.all_in else ''}"
+        f"{_STREET_BRIEF.get(move.last_street, move.last_street.value)}"
+        f"{', олл-ин' if move.all_in else ''}"
         f"{', вскрытие' if move.showdown else ''} — {book.bb(move.cost_bb)} bb"
         for move in report.chip_moves[:_MAX_CHIP_MOVES]
     ]
@@ -158,9 +166,11 @@ def _finding_lines(report: TournamentReport, book: NumberBook) -> list[str]:
     for finding in report.findings[:_MAX_FINDINGS]:
         zone = "предполагая" if finding.zone is Zone.ASSUMING else "строго"
         lines.append(
-            f"  спот {finding.spot.value}: сыграно «{finding.action_taken}», лучше "
-            f"«{finding.best_action}»; повторов {book.count(finding.count)}, суммарно "
-            f"{book.bb(finding.total_cost_bb)} bb; зона: {zone}."
+            f"  {_SPOT_BRIEF.get(finding.spot, finding.spot.value)}: сыграно "
+            f"«{_ACTION_BRIEF.get(finding.action_taken, finding.action_taken)}», лучше "
+            f"«{_ACTION_BRIEF.get(finding.best_action, finding.best_action)}»; повторов "
+            f"{book.count(finding.count)}, суммарно {book.bb(finding.total_cost_bb)} bb; "
+            f"зона: {zone}."
         )
         if finding.seen_before:
             lines.append(
@@ -175,7 +185,10 @@ def _ev_lines(report: TournamentReport, book: NumberBook) -> list[str]:
     ev = report.ev
     return [
         "Честный счёт (величины РАЗНЫЕ, складывать их нельзя):",
-        f"  оценено решений: {book.count(ev.points_judged)} из {book.count(ev.points_total)};",
+        (
+            f"  точек решения героя за турнир: {book.count(ev.points_total)}, из них с "
+            f"вердиктом: {book.count(ev.points_judged)} (это ТОЧКИ РЕШЕНИЯ, не раздачи);"
+        ),
         (
             f"  цена расхождений в оценённых решениях (EV на момент решения): "
             f"{book.bb(ev.judged_loss_bb)} bb;"

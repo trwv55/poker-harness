@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "hand_no": "SYN-2",
+  "points": [
+    {
+      "dp_index": 1,
+      "street": "preflop",
+      "spot": "pushfold_facing_shove",
+      "zone": "assuming",
+      "action_taken": "call",
+      "best_action": "fold",
+      "ev_diff_bb": -0.8,
+      "interval": {
+        "point_bb": -0.8,
+        "low_bb": -1.9,
+        "high_bb": -0.2,
+        "near_zero": false
+      },
+      "assumption": {
+        "range": {
+          "weights": {
+            "AA": 1.0,
+            "KK": 1.0,
+            "QQ": 1.0,
+            "JJ": 1.0,
+            "TT": 0.8,
+            "AKs": 1.0,
+            "AQs": 0.6,
+            "AKo": 0.8,
+            "AJs": 0.4,
+            "99": 0.5
+          }
+        },
+        "source": "population",
+        "note": "средний диапазон шова с 12bb с поздней позиции"
+      },
+      "tools": [
+        "equity_mc"
+      ],
+      "detail": {}
+    }
+  ],
+  "ranked": [
+    0
+  ],
+  "total_ev_loss_bb": -0.8
+}

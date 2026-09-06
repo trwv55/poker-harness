@@ -153,7 +153,21 @@ def test_the_three_chip_buckets_and_the_ev_price_stay_separate():
 
 
 def test_coverage_travels_next_to_the_price():
-    assert "оценено решений: 11 из 17" in tournament_digest(_report()).text
+    """Покрытие названо ТОЧКАМИ РЕШЕНИЯ, а не раздачами: первый живой прогон дал
+    «расчёт оценил 36 решений из 185 сыгранных раздач» — модель прочла число
+    точек как число раздач, потому что подпись это допускала."""
+    text = tournament_digest(_report()).text
+    assert "точек решения героя за турнир: 17, из них с вердиктом: 11" in text
+    assert "не раздачи" in text
+
+
+def test_no_engine_token_reaches_the_model():
+    """Английские токены движка в промпт не идут вовсе. Первый живой прогон:
+    модель переписала `pushfold_unopened` и `preflop` в текст игроку как есть —
+    надёжнее всего этого не случается, когда она их не видела."""
+    text = tournament_digest(_report()).text
+    for token in ("pushfold_unopened", "preflop", "fold", "shove", "call"):
+        assert token not in text
 
 
 def test_a_blind_jump_between_levels_is_flagged_for_the_model():

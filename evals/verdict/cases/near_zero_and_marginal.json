@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "hand_no": "SYN-3",
+  "points": [
+    {
+      "dp_index": 0,
+      "street": "preflop",
+      "spot": "pushfold_unopened",
+      "zone": "assuming",
+      "action_taken": "shove",
+      "best_action": "шов или фолд — оба допустимы",
+      "ev_diff_bb": 0.0,
+      "interval": {
+        "point_bb": 0.1,
+        "low_bb": -0.3,
+        "high_bb": 0.4,
+        "near_zero": true
+      },
+      "assumption": {
+        "range": {
+          "weights": {
+            "AA": 1.0,
+            "KK": 1.0,
+            "QQ": 0.9,
+            "AKs": 1.0,
+            "AKo": 0.7,
+            "JJ": 0.7,
+            "TT": 0.5,
+            "A9s": 0.3
+          }
+        },
+        "source": "model:field",
+        "note": "колл-диапазоны трёх игроков позади"
+      },
+      "tools": [
+        "multiway"
+      ],
+      "detail": {}
+    },
+    {
+      "dp_index": 3,
+      "street": "preflop",
+      "spot": "pushfold_facing_shove",
+      "zone": "strict",
+      "action_taken": "fold",
+      "best_action": "call",
+      "ev_diff_bb": -0.3,
+      "interval": {
+        "point_bb": 0.3,
+        "low_bb": 0.1,
+        "high_bb": 0.6,
+        "near_zero": false
+      },
+      "assumption": null,
+      "tools": [
+        "nash_hu"
+      ],
+      "detail": {}
+    }
+  ],
+  "ranked": [
+    1,
+    0
+  ],
+  "total_ev_loss_bb": -0.3
+}
