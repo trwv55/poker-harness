@@ -90,7 +90,7 @@ from harness.worker.pipeline import (
     _public_failure_reason,
     run_job,
 )
-from tests.conftest import FIXTURE_DAILY, requires_fixtures
+from tests.conftest import FIXTURE_DAILY, requires_fixtures, requires_prompts
 
 # Тестовый `Config` — те же плейсхолдеры, что в `test_llm_facade.py`: `LLM` внутри
 # `Deps` собирается по-настоящему (тип `Deps.llm` — конкретный класс, не протокол),
@@ -1238,6 +1238,30 @@ async def test_the_report_message_id_is_remembered_for_a_repeat_attempt(
 # --- станция explain: слова поверх посчитанного (задача 21) -------------------------
 
 
+async def _seed_hands_and_pick_a_judged_one(
+    db_factory, *, session_id: int, n: int
+) -> tuple[str, AnalysisResult]:
+    """Разложить `n` раздач чекпоинтами и вернуть первую, у которой ЕСТЬ вердикт.
+
+    Судимая точка есть не у каждой раздачи (постфлоп и префлоп вне пуш-фолда в
+    v1 не оцениваются), а станция explain на раздаче без вердикта модель не
+    зовёт вовсе — тест про текст модели на такой раздаче молча проверял бы
+    пустоту.
+    """
+    _tournament_id, raw_hands = await _seed_checkpointed_hands(
+        db_factory, session_id=session_id, source_file=FIXTURE_DAILY, n=n
+    )
+    async with db_factory() as session:
+        hands_repo = HandsRepo(session)
+        for raw in raw_hands:
+            hand = await hands_repo.find_by_hand_no(session_id, raw.hand_no)
+            assert hand is not None and hand.enriched is not None
+            result = analyze_hand(hand.enriched)
+            if result.ranked:
+                return raw.hand_no, result
+    raise AssertionError(f"среди первых {n} раздач фикстуры нет ни одной с вердиктом")
+
+
 def _all_texts(sender: FakeSender) -> list[str]:
     """Всё, что игрок увидел: и отправленное, и вписанное правкой сообщения."""
     return [msg.text for msg in sender.sent] + [msg.text for _msg_id, msg in sender.edits]
@@ -1257,6 +1281,7 @@ def _stub_verdict_llm(db_factory, reply: dict[str, object]) -> LLM:
 
 
 @requires_fixtures
+@requires_prompts
 async def test_deep_dive_saves_the_model_text_and_shows_it_to_the_player(
     db_factory, fake_sender, queue, deps
 ):
@@ -1267,17 +1292,22 @@ async def test_deep_dive_saves_the_model_text_and_shows_it_to_the_player(
     генератора.
     """
     player_id, session_id = await _make_scope(db_factory)
-    jid, _raw = await _seed_one_hand_deep_dive_job(
-        db_factory, queue, player_id=player_id, session_id=session_id
+    # Раздача выбирается ПО НАЛИЧИЮ судимой точки, а не первая попавшаяся:
+    # у раздачи без вердикта модель не зовётся вовсе (`verdict_text`), и тест,
+    # которому досталась такая, не проверял бы ровно то, ради чего написан.
+    # 20 раздач — с запасом: в измеренной фикстуре первая раздача с вердиктом
+    # шестнадцатая, и запас нужен, чтобы тест не сломался от сдвига на одну.
+    hand_no, result = await _seed_hands_and_pick_a_judged_one(
+        db_factory, session_id=session_id, n=20
     )
+    jid = await enqueue_deep_dive(queue, hand_no, player_id=player_id, session_id=session_id)
 
     async with db_factory() as session:
-        hand = await HandsRepo(session).find_by_hand_no(session_id, _raw.hand_no)
+        hand = await HandsRepo(session).find_by_hand_no(session_id, hand_no)
         assert hand is not None and hand.enriched is not None
 
     # Точки разбора этой руки заранее неизвестны, поэтому ответ собирается по
     # факту: dp_index обязан совпасть с судимыми точками, иначе текст отбракован.
-    result = analyze_hand(hand.enriched)
     reply = {
         "points": [
             {"dp_index": result.points[i].dp_index, "text": "Если оппонент отвечает шире, шов дешевле."}
@@ -1296,9 +1326,8 @@ async def test_deep_dive_saves_the_model_text_and_shows_it_to_the_player(
         record = await AnalysesRepo(session).get_by_hand(hand.id)
     assert record is not None
     texts = _all_texts(fake_sender)
-    if result.ranked:
-        assert record.verdict_text is not None
-        assert any("Разбор без выдуманных чисел." in text for text in texts)
+    assert record.verdict_text is not None
+    assert any("Разбор без выдуманных чисел." in text for text in texts)
     assert any("ПРЕФЛОП" in text for text in texts), "ход раздачи обязан быть в разборе"
 
 
@@ -1390,6 +1419,7 @@ async def test_a_repeat_attempt_does_not_pay_for_the_words_twice(
 
 
 @requires_fixtures
+@requires_prompts
 async def test_a_repeat_scan_does_not_pay_for_the_story_twice(
     db_factory, fake_sender, queue, deps, monkeypatch
 ):

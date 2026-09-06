@@ -24,6 +24,26 @@ requires_fixtures = pytest.mark.skipif(
     reason="нет приватных HH-фикстур в fixtures/hh/ — гейт на 318 руках не выполнен",
 )
 
+PROMPTS = Path(__file__).parent.parent / "src" / "harness" / "explanation" / "prompts"
+PROMPT_VERDICT = PROMPTS / "verdict.md"
+PROMPT_TOURNAMENT = PROMPTS / "tournament.md"
+
+# Промпты изложения закрыты политикой публикации — тем же решением владельца, что
+# и vision-промпты, и по той же причине: они копируются за вечер. В публичном
+# клоне этих файлов нет, и тесты, которым нужен НАСТОЯЩИЙ текст промпта (а не
+# только код вокруг него), пропускаются с явной причиной — ровно та же
+# дисциплина, что у HH-фикстур выше: пропуск обязан быть виден строкой
+# `skipped` в `-ra`, а не выглядеть успехом.
+#
+# Пропускается при этом МЕНЬШИНСТВО: проверки верности, отказов и выжимки
+# промпта не читают вовсе, а `PromptUnavailable` (громкий отказ при отсутствии
+# файла) проверяется без него специально.
+PROMPTS_PRESENT = PROMPT_VERDICT.exists() and PROMPT_TOURNAMENT.exists()
+requires_prompts = pytest.mark.skipif(
+    not PROMPTS_PRESENT,
+    reason="нет промптов изложения в src/harness/explanation/prompts/ — закрыты политикой публикации",
+)
+
 
 def _upgrade_head(sync_dsn: str) -> None:
     """Прогоняет `alembic upgrade head` на переданном DSN тем же путём, что и деплой

@@ -41,6 +41,7 @@ from harness.explanation.verdict_text import (
     Digest,
     UnfaithfulText,
     VerdictLLM,
+    read_prompt,
 )
 
 __all__ = ["tournament_digest", "tournament_draft", "tournament_text"]
@@ -230,7 +231,7 @@ async def tournament_draft(
     ДО отбраковки (`evals/verdict/checks.py`), иначе измерять нечего.
     """
     digest = tournament_digest(report)
-    prompt = _PROMPT_PATH.read_text(encoding="utf-8").replace("{digest}", digest.text)
+    prompt = read_prompt(_PROMPT_PATH).replace("{digest}", digest.text)
     draft, _meta = await llm("verdict_text", TournamentTextOut, prompt=prompt, trace_id=trace_id)
     return draft, digest
 

@@ -29,6 +29,7 @@ from harness.explanation.tournament_text import (
 )
 from harness.explanation.verdict_text import (
     Digest,
+    PromptUnavailable,
     UnfaithfulText,
     VerdictDraft,
     VerdictLLM,
@@ -40,6 +41,7 @@ from harness.explanation.verdict_text import (
 __all__ = [
     "Digest",
     "HandReplay",
+    "PromptUnavailable",
     "ReplaySpan",
     "UnfaithfulText",
     "VerdictDraft",

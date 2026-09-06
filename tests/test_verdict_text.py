@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import importlib
 from collections.abc import Sequence
 from typing import Literal, TypeVar, cast
 
@@ -27,11 +28,19 @@ from harness.contracts import (
 )
 from harness.explanation.faithfulness import numbers_in
 from harness.explanation.verdict_text import (
+    PromptUnavailable,
     UnfaithfulText,
     VerdictDraft,
     verdict_digest,
     verdict_text,
 )
+from tests.conftest import requires_prompts
+
+# Модуль, а не одноимённая функция: пакет `harness.explanation` реэкспортирует
+# `verdict_text` и тем самым заслоняет собой атрибут-подмодуль, поэтому
+# `import ... as` вернул бы функцию. Нужен именно модуль — тест подменяет в нём
+# путь к промпту.
+verdict_text_module = importlib.import_module("harness.explanation.verdict_text")
 
 _T = TypeVar("_T", bound=BaseModel)
 
@@ -210,6 +219,7 @@ def test_only_the_whitelisted_detail_keys_reach_the_model():
     assert "call_ev" not in digest.text
 
 
+@requires_prompts
 async def test_a_small_round_number_is_not_allowed_by_the_point_numbering():
     """«около 1 bb» на точке ценой −1.4 bb — выдумка, и нумерация точек не имеет
     права её оправдывать (ревью, раздел A: `book.count(ordinal)` разрешал 0 и 1
@@ -231,6 +241,7 @@ async def test_no_judged_points_means_no_model_call():
     assert out.points == [] and out.summary == ""
 
 
+@requires_prompts
 async def test_the_label_comes_from_the_core_not_from_the_prose():
     """Метка ставится по цене ядра, а не по тону текста: хвалебный текст на точке
     ценой −1.2 bb всё равно получает метку расхождения."""
@@ -242,6 +253,7 @@ async def test_the_label_comes_from_the_core_not_from_the_prose():
     assert [p.verdict_label for p in out.points] == ["mistake", "ok"]
 
 
+@requires_prompts
 async def test_the_prompt_contains_the_digest_and_the_rules():
     res = _result([_point(dp_index=0, ev_diff_bb=-1.2)])
     llm = FakeLLM(_draft((0, "Шов здесь дороже на 1.2 bb.")))
@@ -252,6 +264,7 @@ async def test_the_prompt_contains_the_digest_and_the_rules():
     assert "{digest}" not in prompt
 
 
+@requires_prompts
 async def test_points_are_returned_in_the_ranked_order():
     """Порядок — из `ranked` (самая дорогая первой), а не тот, в каком ответила
     модель: порядок показа принадлежит расчёту."""
@@ -264,9 +277,31 @@ async def test_points_are_returned_in_the_ranked_order():
     assert [p.dp_index for p in out.points] == [1, 0]
 
 
+# --- отсутствие промпта: громкий отказ, не пустое задание ------------------------------
+
+
+async def test_a_missing_prompt_file_fails_loudly(monkeypatch, tmp_path):
+    """Промпты закрыты политикой публикации, и в клоне без них вызов модели обязан
+    сказать об этом прямо — с путём и ссылкой на политику.
+
+    Тихая альтернатива (пустой промпт) страшнее отказа: модель получила бы
+    пустое задание, а текст без чисел прошёл бы проверки как исправный.
+
+    Самому тесту настоящий файл не нужен — он подставляет заведомо
+    отсутствующий путь, поэтому маркера `requires_prompts` здесь нет и быть не
+    должно.
+    """
+    monkeypatch.setattr(verdict_text_module, "_PROMPT_PATH", tmp_path / "нет-такого.md")
+    llm = FakeLLM(_draft((0, "Что угодно.")))
+    with pytest.raises(PromptUnavailable, match="publishing-policy"):
+        await verdict_text(llm, _result([_point(dp_index=0, ev_diff_bb=-1.2)]), trace_id=1)
+    assert llm.prompts == [], "без промпта модель не должна быть вызвана вовсе"
+
+
 # --- отказ от неверного текста --------------------------------------------------------
 
 
+@requires_prompts
 async def test_an_invented_number_rejects_the_whole_text():
     """Число, которого нет в расчёте, — отказ: игрок получит разбор без прозы,
     но не получит выдуманную цифру про свои деньги."""
@@ -276,6 +311,7 @@ async def test_an_invented_number_rejects_the_whole_text():
         await verdict_text(llm, res, trace_id=1)
 
 
+@requires_prompts
 async def test_an_invented_number_in_the_summary_is_caught_too():
     res = _result([_point(dp_index=0, ev_diff_bb=-1.2)])
     llm = FakeLLM(_draft((0, "Шов дороже."), summary="Всего за раздачу ушло 9.9 bb."))
@@ -283,6 +319,7 @@ async def test_an_invented_number_in_the_summary_is_caught_too():
         await verdict_text(llm, res, trace_id=1)
 
 
+@requires_prompts
 async def test_a_number_taken_from_the_digest_passes():
     res = _result(
         [
@@ -298,6 +335,7 @@ async def test_a_number_taken_from_the_digest_passes():
     assert out.points[0].text.startswith("Фолд стоил")
 
 
+@requires_prompts
 async def test_a_reproach_on_a_near_zero_point_is_rejected():
     """«Лучше было» на точке, где расчёт не спорит ни с одним из вариантов, —
     утверждение, которого расчёт не делал. Это верность, а не тон, поэтому отказ."""
@@ -315,6 +353,7 @@ async def test_a_reproach_on_a_near_zero_point_is_rejected():
         await verdict_text(llm, res, trace_id=1)
 
 
+@requires_prompts
 async def test_a_near_zero_point_without_a_reproach_passes():
     res = _result(
         [
@@ -330,6 +369,7 @@ async def test_a_near_zero_point_without_a_reproach_passes():
     assert out.points[0].verdict_label == "ok"
 
 
+@requires_prompts
 async def test_an_assuming_point_without_assumption_words_is_rejected():
     """Зона «предполагая» обязана быть названа словами — иначе догадка подаётся
     как факт, а это ровно то, против чего стоит вся система зон."""
@@ -339,6 +379,7 @@ async def test_an_assuming_point_without_assumption_words_is_rejected():
         await verdict_text(llm, res, trace_id=1)
 
 
+@requires_prompts
 async def test_a_strict_point_needs_no_assumption_words():
     res = _result([_point(dp_index=0, ev_diff_bb=-1.2, zone=Zone.STRICT)])
     llm = FakeLLM(_draft((0, "Шов здесь дороже фолда на 1.2 bb.")))
@@ -346,6 +387,7 @@ async def test_a_strict_point_needs_no_assumption_words():
     assert out.points[0].verdict_label == "mistake"
 
 
+@requires_prompts
 async def test_an_answer_about_the_wrong_points_is_rejected():
     """Модель ответила не про те точки — сопоставлять по порядку нельзя: текст
     уехал бы под чужие числа."""

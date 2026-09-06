@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import importlib
 from collections.abc import Sequence
 from typing import Literal, TypeVar, cast
 
@@ -30,7 +31,14 @@ from harness.contracts import (
 )
 from harness.explanation.faithfulness import error_words_in, numbers_in
 from harness.explanation.tournament_text import tournament_digest, tournament_text
-from harness.explanation.verdict_text import UnfaithfulText
+from harness.explanation.verdict_text import PromptUnavailable, UnfaithfulText
+from tests.conftest import requires_prompts
+
+# Модуль, а не одноимённая функция: пакет `harness.explanation` реэкспортирует
+# `tournament_text` и тем самым заслоняет собой атрибут-подмодуль, поэтому
+# `import ... as` вернул бы функцию. Нужен именно модуль — тест подменяет в нём
+# путь к промпту.
+tournament_text_module = importlib.import_module("harness.explanation.tournament_text")
 
 _T = TypeVar("_T", bound=BaseModel)
 
@@ -209,9 +217,20 @@ def test_the_first_tournament_says_there_is_nothing_to_compare_with():
     assert "турнир в базе первый" in tournament_digest(_report()).text
 
 
+async def test_a_missing_prompt_file_fails_loudly(monkeypatch, tmp_path):
+    """То же, что у разбора раздачи: без файла промпта — громкий отказ, а не
+    пустое задание модели. Настоящий файл тесту не нужен."""
+    monkeypatch.setattr(tournament_text_module, "_PROMPT_PATH", tmp_path / "нет-такого.md")
+    llm = FakeLLM(_answer("Что угодно."))
+    with pytest.raises(PromptUnavailable, match="publishing-policy"):
+        await tournament_text(llm, _report(), trace_id=1)
+    assert llm.prompts == [], "без промпта модель не должна быть вызвана вовсе"
+
+
 # --- вызов модели --------------------------------------------------------------------
 
 
+@requires_prompts
 async def test_the_prompt_carries_the_digest_and_the_rules():
     llm = FakeLLM(_answer("Турнир прошёл ровно."))
     await tournament_text(llm, _report(), trace_id=1)
@@ -220,18 +239,21 @@ async def test_the_prompt_carries_the_digest_and_the_rules():
     assert "{digest}" not in llm.prompts[0]
 
 
+@requires_prompts
 async def test_numbers_from_the_digest_pass():
     llm = FakeLLM(_answer("Стек дошёл до 31.0 bb, а вышли вы с 8.2 bb."))
     out = await tournament_text(llm, _report(), trace_id=1)
     assert len(out.paragraphs) == 1
 
 
+@requires_prompts
 async def test_an_invented_number_rejects_the_report_text():
     llm = FakeLLM(_answer("Вы потеряли 44.4 bb за турнир."))
     with pytest.raises(UnfaithfulText, match="44.4"):
         await tournament_text(llm, _report(), trace_id=1)
 
 
+@requires_prompts
 async def test_a_story_that_calls_something_an_error_is_refused():
     """«Без явных ошибок» — утверждение о раздачах, которых расчёт НЕ СУДИЛ.
     Подтвердить его нечем и поправить нечем, поэтому политика та же, что с
@@ -241,12 +263,14 @@ async def test_a_story_that_calls_something_an_error_is_refused():
         await tournament_text(llm, _report(), trace_id=1)
 
 
+@requires_prompts
 async def test_a_story_that_stays_within_the_words_passes():
     llm = FakeLLM(_answer("Расхождений расчёт нашёл мало; остальное — дисперсия."))
     out = await tournament_text(llm, _report(), trace_id=1)
     assert len(out.paragraphs) == 1
 
 
+@requires_prompts
 async def test_an_empty_answer_is_a_refusal_not_a_text():
     llm = FakeLLM(_answer("", "   "))
     with pytest.raises(UnfaithfulText):

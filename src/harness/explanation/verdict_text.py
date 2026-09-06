@@ -57,9 +57,11 @@ from harness.explanation.faithfulness import (
 
 __all__ = [
     "Digest",
+    "PromptUnavailable",
     "UnfaithfulText",
     "VerdictDraft",
     "VerdictLLM",
+    "read_prompt",
     "verdict_digest",
     "verdict_draft",
     "verdict_text",
@@ -68,6 +70,37 @@ __all__ = [
 _T = TypeVar("_T", bound=BaseModel)
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "verdict.md"
+
+
+class PromptUnavailable(RuntimeError):
+    """Файла промпта нет на диске — работать без него нельзя, и молчать тоже.
+
+    Промпты изложения закрыты политикой публикации (решение владельца, тот же
+    режим, что у vision-промптов): в публичном клоне репозитория этих файлов
+    НЕТ, и первый же вызов модели обязан сказать об этом прямо. Пустой промпт
+    вместо файла дал бы модели пустое задание и текст, который проверки, скорее
+    всего, пропустят как «без чисел» — то есть тихую деградацию вместо отказа.
+
+    Отдельный тип, а не `FileNotFoundError`: у него сообщение с путём и ссылкой
+    на политику, и вызывающему видно, что это конфигурация развёртывания, а не
+    сбой модели (`test_a_missing_prompt_file_fails_loudly`).
+    """
+
+
+def read_prompt(path: Path) -> str:
+    """Текст промпта с диска — ЛЕНИВО, на вызове, а не на импорте.
+
+    Лениво в том числе затем, чтобы `import harness.explanation` работал в
+    клоне без промптов: падать обязан тот, кто собрался звать модель, а не тот,
+    кто импортировал пакет ради реплея или матрицы диапазонов.
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PromptUnavailable(
+            f"нет файла промпта {path} — он закрыт политикой публикации "
+            f"(docs/publishing-policy.md); без него вызов модели невозможен"
+        ) from exc
 
 # Глоссарий промпта — НЕ словарь единого голоса (тот живёт в `presentation` и
 # принадлежит ему целиком). Здесь описания спотов для модели: она пишет прозу
@@ -266,7 +299,7 @@ async def verdict_draft(
     `verdict_text`, который зовёт эту функцию и сразу проверяет результат.
     """
     digest = verdict_digest(res)
-    prompt = _PROMPT_PATH.read_text(encoding="utf-8").replace("{digest}", digest.text)
+    prompt = read_prompt(_PROMPT_PATH).replace("{digest}", digest.text)
     draft, _meta = await llm("verdict_text", VerdictDraft, prompt=prompt, trace_id=trace_id)
     return draft, digest
 
