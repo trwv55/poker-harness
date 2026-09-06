@@ -1082,3 +1082,17 @@ def test_tournament_story_msg_says_when_it_had_to_cut():
     msg = tournament_story_msg(TournamentTextOut(paragraphs=["а" * 2000] * 4))
     assert len(msg.text) < 4096
     assert "из 4" in msg.text
+
+
+def test_tournament_story_msg_counts_paragraphs_grammatically():
+    """Числительное согласуется с существительным во всех трёх формах.
+
+    Прежний шаблон писал «Показаны N абзаца» всегда и был верен ровно при N от 2
+    до 4 — то есть тест на четырёх абзацах проходил случайно.
+    """
+    one = tournament_story_msg(TournamentTextOut(paragraphs=["а" * 3400, "б" * 2000]))
+    assert "Показан 1 абзац из 2" in one.text
+
+    five = tournament_story_msg(TournamentTextOut(paragraphs=["а" * 600] * 8))
+    assert "Показано" not in five.text
+    assert "Показаны 5 абзацев из 8" in five.text
