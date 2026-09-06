@@ -202,3 +202,48 @@ class ScanSummary(BaseModel):
     # появления этих полей: они читаются тем же типом.
     points_total: int = 0
     points_judged: int = 0
+
+
+class PlayerStats(BaseModel):
+    """Статистика игрока — только счётчики; доли выводятся из них свойствами.
+
+    Хранятся ЧИСЛИТЕЛИ И ЗНАМЕНАТЕЛИ, а не готовые проценты: две статистики с
+    разными знаменателями (VPIP считается от всех раздач, сдача на продолженную
+    ставку — от числа таких ставок против героя) складываются в среднее по
+    нескольким турнирам только через счётчики. Сложить проценты и поделить на
+    число турниров значило бы взвесить турнир из 12 раздач наравне с турниром
+    из 300.
+
+    Формулы, по которым считается каждый счётчик, записаны в докстрингах
+    `analysis/player_stats.py` — там же названы тесты, которые их пришпиливают.
+    Доля отсутствует (`None`), когда знаменатель нулевой: «0 из 0» — это не
+    ноль процентов, а отсутствие данных.
+    """
+
+    hands: int = 0
+    vpip: int = 0
+    pfr: int = 0
+    reraise: int = 0
+    reraise_chances: int = 0
+    fold_to_cbet: int = 0
+    cbet_faced: int = 0
+
+    @staticmethod
+    def _share(numerator: int, denominator: int) -> float | None:
+        return None if denominator == 0 else 100.0 * numerator / denominator
+
+    @property
+    def vpip_pct(self) -> float | None:
+        return self._share(self.vpip, self.hands)
+
+    @property
+    def pfr_pct(self) -> float | None:
+        return self._share(self.pfr, self.hands)
+
+    @property
+    def reraise_pct(self) -> float | None:
+        return self._share(self.reraise, self.reraise_chances)
+
+    @property
+    def fold_to_cbet_pct(self) -> float | None:
+        return self._share(self.fold_to_cbet, self.cbet_faced)
