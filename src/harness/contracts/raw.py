@@ -178,6 +178,10 @@ class RawHand(BaseModel):
     max_seats: int
     button_seat: int
     seats: list[SeatInfo]
+    # Фишки, стоящие перед игроками в момент снимка, — наблюдение живого стола
+    # (метка игрока -> фишки). У полной руки пусто: там ставки восстанавливает
+    # лог действий, и второй источник тех же денег только разошёлся бы с первым.
+    visible_bets: dict[str, int] = {}
     posts: list[Post]
     dealt: dict[str, list[str]] = {}  # пустой список = Dealt to без карт
     actions: list[RawAction] = []

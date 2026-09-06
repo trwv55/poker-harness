@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 from harness.contracts import (
     ActionKind,
+    CanonicalAction,
     CanonicalHand,
     DecisionPoint,
     EnrichedHand,
@@ -30,6 +31,16 @@ from harness.contracts import (
 )
 from harness.engine.validation import forced_blind
 from harness.normalizer import POSITIONS_BY_COUNT
+
+
+class DecisionNotTaken(ValueError):
+    """У точки решения нет сыгранного действия — состояние в точке решения.
+
+    Отдельный тип, а не голый `ValueError`: ядро обязано отличать «судить нечего,
+    потому что игрок ещё не сходил» от расхождения в восстановленном столе, за
+    которое `table_state` бросает тот же базовый класс.
+    """
+
 
 # Порог пуш-фолд парадигмы (спека §5.5): глубже решение перестаёт сводиться к
 # «шов или фолд», и модель к нему неприменима.
@@ -191,6 +202,22 @@ class TableState:
         return bool(self.voluntary_actors) and self.aggressor.label == self.voluntary_actors[0]
 
 
+def taken_action(dp: DecisionPoint) -> CanonicalAction:
+    """Сыгранное героем действие точки — или отказ, если его ещё не было.
+
+    `DecisionPoint.action` необязателен с задачи 22: на скриншоте живого стола
+    экран застаёт героя ДО хода, и судить там нечего (`harness.engine.state`).
+    Каждая функция этого пакета, которой нужно сыгранное действие, берёт его
+    здесь, а не разыменовывает поле напрямую: тогда отсутствие действия — один
+    названный отказ, а не пять разных `AttributeError` в глубине расчёта.
+    """
+    if dp.action is None:
+        raise DecisionNotTaken(
+            f"точка {dp.index}: решение ещё не принято — сыгранного действия нет"
+        )
+    return dp.action
+
+
 def action_index(hand: CanonicalHand, dp: DecisionPoint) -> int:
     """Позиция действия точки решения в списке действий руки.
 
@@ -199,12 +226,13 @@ def action_index(hand: CanonicalHand, dp: DecisionPoint) -> int:
     герою пас при нулевом стеке (движок исполняет такой пас без точки решения).
     Поэтому номер проверяется сверкой самого действия, а не принимается на веру.
     """
+    taken = taken_action(dp)
     hero_actions = [i for i, action in enumerate(hand.actions) if action.label == hand.hero_label]
     for i in hero_actions[dp.index :]:
-        if hand.actions[i] == dp.action:
+        if hand.actions[i] == taken:
             return i
     raise ValueError(
-        f"действие точки решения {dp.index} не найдено среди действий героя: {dp.action.raw_line}"
+        f"действие точки решения {dp.index} не найдено среди действий героя: {taken.raw_line}"
     )
 
 
@@ -270,7 +298,8 @@ def table_state(dp: DecisionPoint, en: EnrichedHand) -> TableState:
     to_call = min(
         max(s.street_committed for s in seats) - hero_seat.street_committed, hero_seat.behind
     )
-    hero_after = hero_seat.behind - (dp.action.committed_after - hero_seat.street_committed)
+    taken = taken_action(dp)
+    hero_after = hero_seat.behind - (taken.committed_after - hero_seat.street_committed)
 
     state = TableState(
         bb=hand.bb,
@@ -305,10 +334,10 @@ def _cross_check(state: TableState, dp: DecisionPoint) -> None:
 
 def action_name(dp: DecisionPoint) -> str:
     """Человекочитаемое имя сыгранного действия — то, что показывается игроку."""
-    kind = dp.action.kind
-    if kind in (ActionKind.BET, ActionKind.RAISE) and dp.action.is_all_in:
+    taken = taken_action(dp)
+    if taken.kind in (ActionKind.BET, ActionKind.RAISE) and taken.is_all_in:
         return "shove"
-    return str(kind)
+    return str(taken.kind)
 
 
 def unpriced_reason(dp: DecisionPoint, state: TableState) -> str:
@@ -376,7 +405,8 @@ def spot_for(dp: DecisionPoint, state: TableState) -> SpotKind:
     if state.hero.acted:
         return SpotKind.PREFLOP_OTHER
 
-    folded = dp.action.kind is ActionKind.FOLD
+    taken = taken_action(dp)
+    folded = taken.kind is ActionKind.FOLD
 
     if state.opened_voluntarily:
         # Колл на весь остаток — тот же олл-ин, чем бы ни была ставка перед
@@ -386,7 +416,7 @@ def spot_for(dp: DecisionPoint, state: TableState) -> SpotKind:
         # котором у героя ещё остаются фишки, — уже не пуш-фолд: там есть
         # третье действие (ре-шов), которого модель не считает.
         faces_shove = state.call_is_all_in or state.aggressor_all_in
-        answered = folded or (dp.action.kind is ActionKind.CALL and state.hero_all_in_after)
+        answered = folded or (taken.kind is ActionKind.CALL and state.hero_all_in_after)
         # Модель держится на двух допущениях: `call_shove_ev_bb` берёт эквити
         # против ОДНОГО диапазона, а равновесие подыгры шовера
         # (`preflop._shover_equilibrium`) описывает того, кто шовит ПЕРВЫМ в

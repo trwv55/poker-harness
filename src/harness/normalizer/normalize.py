@@ -128,6 +128,7 @@ def normalize(raw: RawHand) -> CanonicalHand:
 
     return CanonicalHand(
         provenance=raw.provenance,
+        completeness=raw.completeness,
         tournament_id=raw.tournament_id,
         hand_no=raw.hand_no,
         hand_index=None,  # проставляет воркер при сохранении (задача 18)
@@ -139,6 +140,7 @@ def normalize(raw: RawHand) -> CanonicalHand:
         timestamp=raw.timestamp,
         button_seat=raw.button_seat,
         players=players,
+        visible_bets=raw.visible_bets,
         dealt=raw.dealt,
         posts=raw.posts,
         actions=_canonical_actions(raw),

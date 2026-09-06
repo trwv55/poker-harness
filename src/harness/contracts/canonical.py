@@ -69,6 +69,8 @@ class CanonicalHand(BaseModel):
     button_seat: int
     hero_label: str = "Hero"
     players: list[PlayerState]
+    # Переносится из `RawHand` без изменений — см. её докстринг поля.
+    visible_bets: dict[str, int] = {}
     dealt: dict[str, list[str]] = {}
     # Посты анте и блайндов, как их записал источник. Деньги отсюда НЕ берутся:
     # блайнды уже сидят в `committed_after` первого круга, анте — в `ante`.
