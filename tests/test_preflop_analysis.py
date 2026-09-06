@@ -686,13 +686,15 @@ def test_a_realistic_calling_model_passes_the_checksum():
 
 
 def test_an_interval_across_zero_gets_the_near_zero_verdict_with_a_ceiling():
-    """Q9o на 10bb в двоих позади: интервал EV лежит по обе стороны нуля.
+    """Q2o на 10bb в двоих позади: интервал EV лежит по обе стороны нуля.
 
-    Контрольную сумму этот спот проходит (проход шова 0.40, отвечающих 0.74),
-    поэтому вердикт есть — но не точечный: при одних моделях колла шов
-    прибылен, при других убыточен.
+    Контрольную сумму этот спот проходит, поэтому вердикт есть — но не
+    точечный: против самого тесного поля полосы шов мусором прибылен за счёт
+    фолд-эквити, против равновесного — убыточен. Игроку называются знак и
+    порядок величины (`point_bb`), сам интервал и потолок цены; упрёка нет,
+    потому что оба варианта допустимы.
     """
-    en = _make_multiway_shove_hand(hero_cards=("Qc", "9d"), eff_bb=10.0, players_behind=2)
+    en = _make_multiway_shove_hand(hero_cards=("Qd", "2c"), eff_bb=10.0, players_behind=2)
     p = analyze_hand(en).points[0]
 
     assert p.spot == "pushfold_unopened"
@@ -1766,32 +1768,63 @@ def test_zone_for_takes_the_players_behind_axis():
 # --- Вилка опрашивает интервал, а не два его конца -------------------------------
 
 
-def test_interior_reversal_of_the_bracket_gets_no_point_estimate():
-    """Контрпример координатора: вердикт переворачивается ВНУТРИ интервала.
+def test_the_call_width_grid_is_built_from_the_measured_band():
+    """Сетка ширин выводится из полосы, а не набирается руками.
 
-    J8o, шов 8bb, анте стола 8 x 0.125bb, двое позади. На обоих концах вилки шов
-    плюсовой (+0.87bb против вдвое более тесного поля, чем равновесие, +0.06bb
-    против вдвое более широкого), а внутри — минусовой на равновесной ширине и на
-    полутора равновесных. Опрос двух концов объявил бы вердикт устойчивым на
-    интервале, внутри которого он дважды меняет знак: `strict` стоял бы на
-    выводе, который сам себя опровергает.
+    Полоса — единственное место, где живёт замер (докстринг `_CALL_WIDTH_BAND`);
+    сетка обязана начинаться на её нижнем конце, заканчиваться на верхнем и быть
+    равномерной по логарифму множителя. Набранная руками, она разошлась бы с
+    полосой молча — и докстринг ссылался бы на замер, которого сетка не
+    воспроизводит.
+    """
+    from harness.analysis.preflop import _CALL_WIDTH_BAND
+    from harness.analysis.preflop import _SHOVE_CALL_WIDTH_MULTIPLIERS as grid
+
+    assert len(grid) == 5
+    assert grid[0] == pytest.approx(_CALL_WIDTH_BAND[0])
+    assert grid[-1] == pytest.approx(_CALL_WIDTH_BAND[1])
+    ratios = [grid[i + 1] / grid[i] for i in range(len(grid) - 1)]
+    assert all(r == pytest.approx(ratios[0], rel=1e-3) for r in ratios)
+
+
+def test_zone_for_notices_a_reversal_inside_the_interval():
+    """Концы сетки согласны, а внутри вердикт обратный — `strict` заявлять нельзя.
+
+    Опрос двух концов объявил бы такой вывод устойчивым на интервале, внутри
+    которого он меняет знак: зона `strict` стояла бы на выводе, который сам себя
+    опровергает. Это единственное место, где правило проверяется прямо: на
+    калиброванной полосе разворота внутри интервала не встретилось ни на одной
+    из 58 точек сетки обеих фикстур (замер — в докстринге
+    `_SHOVE_CALL_WIDTH_MULTIPLIERS`), то есть на реальных руках правило сейчас
+    не срабатывает, а страховкой быть не перестаёт.
+    """
+    zone, why = zone_for(
+        "shove", "shove", live_total=5, best_model="shove", best_interior=("fold", "shove")
+    )
+    assert zone == "assuming"
+    assert "внутри" in why
+
+
+def test_the_calibrated_band_removed_the_interior_reversal_of_this_spot():
+    """Контрпример координатора J8o — на калиброванной полосе разворота больше нет.
+
+    Под прежней полосой x0.5..x2.0 этот спот (J8o, шов 8bb, анте стола
+    8 x 0.125bb, двое позади) давал +0.87 / +0.31 / -0.07 / -0.20 / +0.06 bb:
+    оба конца «шов», внутри дважды минус. Под полосой, откалиброванной по
+    наблюдаемому поведению поля, EV по сетке монотонна — концы и правда
+    ограничивают интервал, — а сам интервал по-прежнему пересекает ноль, и
+    точка остаётся в форме «около нуля». Разворот при этом не «исправлен»:
+    полоса просто больше не заходит в ту область ширин, где он происходил.
     """
     en = _ante_table_shove(5, hero_cards=("Jc", "8d"), behind=2, depth_bb=8.0, seats_count=8)
     p = analyze_hand(en).points[0]
-    widths = p.detail["ev_shove_by_width_bb"]
-    values = list(widths.values())
+    values = list(p.detail["ev_shove_by_width_bb"].values())
 
-    # то, что увидел бы опрос концов: оба говорят «шов»
-    assert values[0] > 0.0 and values[-1] > 0.0
-    # то, что видит опрос интервала: внутри вердикт обратный
-    assert min(values[1:-1]) < 0.0
+    assert values == sorted(values, reverse=True)  # монотонно: разворота внутри нет
+    assert values[0] > 0.0 > values[-1]  # но знак между концами меняется
     assert p.detail["dead_extra_bb"] == pytest.approx(1.0, abs=0.03)
-    assert "внутри" in p.detail["zone_reason"]
-    # Разворот внутри интервала — ровно тот случай, в котором точечной оценки нет,
-    # а есть форма «около нуля»: концы интервала берутся по ВСЕЙ сетке, поэтому
-    # нижний конец отрицателен, хотя оба конца сетки плюсовые.
     assert p.best_action == "около нуля, оба варианта допустимы"
-    assert p.interval is not None and p.interval.low_bb < 0.0 < p.interval.high_bb
+    assert p.interval is not None and p.interval.near_zero is True
 
 
 def test_a_tight_end_still_never_objects_to_a_junk_shove_and_that_is_honest():
