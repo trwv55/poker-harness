@@ -59,7 +59,7 @@
 
 from __future__ import annotations
 
-from math import ceil
+from math import ceil, floor
 from typing import Literal
 
 from pydantic import BaseModel
@@ -202,7 +202,7 @@ def _fmt_bb(value_bb: float) -> str:
 def _fmt_signed_bb(value_bb: float) -> str:
     """То же, что `_fmt_bb`, но плюс у положительного числа проговаривается.
 
-    В интервале «−0.3 … 0.8» знак верхнего конца несёт смысл: он и говорит, что
+    В интервале «−0.3 … +0.8» знак верхнего конца несёт смысл: он и говорит, что
     интервал пересекает ноль. Без явного плюса читатель видит два числа и должен
     сам заметить, что у одного знак есть, а у другого нет.
     """
@@ -212,20 +212,40 @@ def _fmt_signed_bb(value_bb: float) -> str:
     return f"{'−' if value_bb < 0 else '+'}{magnitude:.1f} bb"
 
 
+def _tenth_down(value_bb: float) -> float:
+    """Десятая ВНИЗ. `round(x * 10, 6)` — гвард от двоичного представления: без
+    него `floor(-0.3 * 10)` даёт −4, то есть −0.4 вместо −0.3."""
+    return floor(round(value_bb * 10, 6)) / 10
+
+
+def _tenth_up(value_bb: float) -> float:
+    """Десятая ВВЕРХ, с тем же гвардом, что и `_tenth_down`."""
+    return ceil(round(value_bb * 10, 6)) / 10
+
+
 def _fmt_ceiling_bb(value_bb: float) -> str:
     """Потолок цены — округлённый ВВЕРХ до той же десятой, что и остальные числа.
 
     Вверх, а не к ближайшему: строка обещает игроку «не больше столько-то», и
     округление вниз сделало бы обещание неверным на величину округления.
     """
-    return f"{ceil(round(value_bb, 6) * 10) / 10:.1f} bb"
+    return f"{_tenth_up(value_bb):.1f} bb"
 
 
 def _interval_words(spot: SpotKind, interval: EvInterval) -> str:
-    """Интервал и потолок цены одной фразой — общая часть сводки и разбора."""
+    """Интервал и потолок цены одной фразой — общая часть сводки и разбора.
+
+    Концы округляются НАРУЖУ (нижний вниз, верхний вверх), а не к ближайшему.
+    Иначе показанный интервал оказывается уже посчитанного, и рядом с ним
+    появляется потолок, которого в нём не видно: «от −3.3 до +2.6, разница не
+    больше 3.4» — читатель вправе счесть это опиской. При округлении наружу
+    потолок равен модулю худшего из ПОКАЗАННЫХ концов, и строка сходится сама с
+    собой (`test_the_close_call_line_agrees_with_itself_after_rounding`).
+    """
     return (
-        f"{_MODELS_WORD.get(spot, 'по моделям')} от {_fmt_signed_bb(interval.low_bb)} "
-        f"до {_fmt_signed_bb(interval.high_bb)}, разница между вариантами — "
+        f"{_MODELS_WORD.get(spot, 'по моделям')} от "
+        f"{_fmt_signed_bb(_tenth_down(interval.low_bb))} до "
+        f"{_fmt_signed_bb(_tenth_up(interval.high_bb))}, разница между вариантами — "
         f"не больше {_fmt_ceiling_bb(interval.cost_ceiling_bb)}"
     )
 

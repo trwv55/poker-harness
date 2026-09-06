@@ -676,3 +676,23 @@ def test_deep_dive_msg_names_the_call_side_for_a_close_call_facing_a_shove():
 
     assert "колл или фолд" in text
     assert "не больше 1.4 bb" in text
+
+
+def test_the_close_call_line_agrees_with_itself_after_rounding():
+    """Показанный интервал обязан содержать показанный потолок, а не спорить с ним.
+
+    При округлении концов к ближайшему интервал −3.34 … +2.61 печатался как
+    «от −3.3 до +2.6», а потолок (округляемый вверх) — как «не больше 3.4»:
+    числа рядом, и большее из них в интервале не видно. Концы округляются
+    наружу, поэтому потолок всегда равен модулю худшего из ПОКАЗАННЫХ концов.
+    """
+    s = ScanSummary(
+        hands_total=1,
+        hands_with_decision=1,
+        items=[],
+        close_calls=[_close_call(low=-3.34, high=2.61, point=-0.4)],
+        total_loss_bb=0.0,
+    )
+    line = next(line for line in scan_summary_msg(s, 1, 1).text.splitlines() if "H7" in line)
+    assert "от −3.4 bb до +2.7 bb" in line
+    assert "не больше 3.4 bb" in line
