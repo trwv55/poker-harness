@@ -68,6 +68,7 @@ from harness.analysis.preflop import (
     equity_cache_seed,
 )
 from harness.analysis.scan import scan_tournament
+from harness.analysis.tournament import tournament_report
 from harness.contracts import (
     AnalysisResult,
     EnrichedHand,
@@ -90,7 +91,14 @@ from harness.parsers import hh_parser
 from harness.platform.llm import LLM
 from harness.platform.queue import JobPreconditionFailed, JobsQueue
 from harness.platform.trace import Clock, Trace
-from harness.presentation import Msg, deep_dive_msg, failed_msg, progress_text, scan_summary_msg
+from harness.presentation import (
+    Msg,
+    deep_dive_msg,
+    failed_msg,
+    progress_text,
+    scan_summary_msg,
+    tournament_report_msg,
+)
 
 __all__ = ["Deps", "Sender", "run_job"]
 
@@ -297,7 +305,7 @@ async def _send_idempotent(
     session: AsyncSession,
     job_id: int,
     worker_id: str | None,
-    key: Literal["progress_message_id", "result_message_id"],
+    key: Literal["progress_message_id", "result_message_id", "report_message_id"],
     chat_id: int,
     msg: Msg,
 ) -> dict[str, Any]:
@@ -494,6 +502,36 @@ async def _run_hh_scan(job: JobModel, deps: Deps, trace: Trace) -> None:
 
             await tournaments_repo.save_scan_summary(tournament_id, summary)
             await session.commit()
+
+        # Отчёт по турниру (задача 23) — считается по уже готовым артефактам:
+        # руки этого турнира и его сводка на руках, история игрока — два запроса
+        # в `memory`. Ни одного расчёта эквити здесь нет, поэтому станция стоит
+        # вне процессного пула и вне спана `analyze`.
+        #
+        # Пустой файл (`enriched_hands == []`) отчёта не получает: `tournament_
+        # report` на нуле раздач отказывает, и правильно — describe там нечего.
+        # Молчания при этом не возникает: сводка ниже уходит всегда и говорит
+        # «Скан завершён: 0 рук» прямым текстом.
+        if enriched_hands:
+            report = tournament_report(
+                enriched_hands,
+                summary,
+                player_tournaments=await hands_repo.player_hands_by_tournament(job.player_id),
+                past_summaries=await tournaments_repo.player_scan_summaries(
+                    job.player_id, exclude=tournament_id
+                ),
+            )
+            # Отчёт уходит ПЕРЕД сводкой: сводка несёт кнопки «разобрать», и им
+            # место под последним сообщением, а не отлистанными вверх.
+            await _send_idempotent(
+                deps,
+                session,
+                job.id,
+                worker_id,
+                "report_message_id",
+                chat_id,
+                tournament_report_msg(report),
+            )
 
         quota_left, quota_total = await _quota_numbers(session, job.player_id)
         msg = scan_summary_msg(summary, quota_left, quota_total)

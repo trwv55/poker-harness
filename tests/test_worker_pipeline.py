@@ -1141,3 +1141,79 @@ def test_hand_zone_is_the_weakest_of_all_judged_points_not_the_first():
         hand_no="TM1", points=[strict_point, assuming_point], ranked=[0]
     )
     assert _hand_zone(unranked_assuming) is Zone.STRICT
+
+
+# --- станция отчёта по турниру (задача 23) -----------------------------------------
+
+
+@requires_fixtures
+async def test_hh_scan_sends_the_tournament_report_before_the_scan_summary(
+    db_factory, fake_sender, queue, deps
+):
+    """Отчёт уходит игроку первым, сводка с кнопками — следом.
+
+    Порядок несущий: отчёт отвечает на «что случилось за турнир», сводка — на
+    «что из этого разбирать», и кнопка «разобрать» обязана оказаться под
+    последним сообщением, а не быть отлистанной вверх. Кнопок под отчётом нет
+    вовсе — одно действие живёт в одном месте.
+
+    Руки предзаполнены чекпоинтами (`hands_saved`), поэтому скан идёт по трём
+    раздачам, а не по 146: проверяется станция, а не скорость скана.
+    """
+    player_id, session_id = await _make_scope(db_factory)
+    tournament_id, raw_hands = await _seed_checkpointed_hands(
+        db_factory, session_id=session_id, source_file=FIXTURE_DAILY, n=3
+    )
+    await queue.enqueue(
+        type="hh_scan",
+        player_id=player_id,
+        session_id=session_id,
+        payload={
+            "source_file": str(FIXTURE_DAILY),
+            "tournament_id": tournament_id,
+            "hands_saved": True,
+        },
+    )
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    report, summary = fake_sender.sent[-2:]
+    assert f"Турнир. Раздач: {len(raw_hands)}." in report.text
+    assert report.buttons == []
+    assert f"Скан завершён: {len(raw_hands)} рук" in summary.text
+
+
+@requires_fixtures
+async def test_the_report_message_id_is_remembered_for_a_repeat_attempt(
+    db_factory, fake_sender, queue, deps
+):
+    """Повторная попытка обязана редактировать отчёт, а не слать второй.
+
+    Тот же механизм, что у сводки (`_send_idempotent`), и та же цена ошибки:
+    `id` сообщения живёт в `jobs.payload`, а не в памяти воркера.
+    """
+    player_id, session_id = await _make_scope(db_factory)
+    tournament_id, _raw_hands = await _seed_checkpointed_hands(
+        db_factory, session_id=session_id, source_file=FIXTURE_DAILY, n=3
+    )
+    jid = await queue.enqueue(
+        type="hh_scan",
+        player_id=player_id,
+        session_id=session_id,
+        payload={
+            "source_file": str(FIXTURE_DAILY),
+            "tournament_id": tournament_id,
+            "hands_saved": True,
+        },
+    )
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    async with db_factory() as session:
+        row = await session.get(Job, jid)
+        assert row is not None
+        assert row.payload["report_message_id"] != row.payload["result_message_id"]
