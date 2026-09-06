@@ -724,3 +724,36 @@ def test_on_a_state_the_shown_pot_is_the_answer_and_closes_the_dispute():
     answered = apply_vision_answer(raw, "pot", "31.95")
     assert answered is not None and answered.vision is not None
     assert [c.passed for c in answered.vision.checks] == [True]
+
+
+def test_a_position_label_that_cannot_occur_in_this_ring_is_reported_not_failed():
+    """Метка, которой в круге этого стола не бывает, ничего не доказывает (F3).
+
+    Словарь позиций у рума и у нормалайзера совпадает не весь, и набор меток
+    зависит от числа мест. Роняя сверку на неопознанной метке, мы измеряли бы
+    полноту своей таблицы соответствий, а не чтение.
+    """
+    from harness.parsers.vision_checks import positions_check
+
+    check = positions_check({"N1": "MP+2"}, {"N1": "LJ", "N2": "HJ"})
+    assert check.passed
+    assert "не сопоставимо" in check.detail
+
+    both = positions_check({"N1": "MP+2", "N2": "LJ"}, {"N1": "LJ", "N2": "HJ"})
+    assert not both.passed  # сопоставимая метка всё-таки сравнивается
+    assert "не сопоставимо" in both.detail
+
+
+def test_the_room_middle_position_labels_are_only_aliased_where_measured():
+    """`MP`/`MP+1` наблюдались на 8-max; на других размерах соответствие не измерено.
+
+    На шестимаксе у нормалайзера нет `LJ` вовсе, и безусловный алиас ронял бы
+    сверку на каждом таком экспорте.
+    """
+    from harness.parsers.vision_adapter import _aliased_position
+
+    assert _aliased_position("MP", 8) == "LJ"
+    assert _aliased_position("MP", 6) == "MP"  # не опознано — и не сравнивается
+    for seats in (6, 8):
+        assert _aliased_position("ББ", seats) == "BB"
+        assert _aliased_position("МБ", seats) == "SB"

@@ -205,23 +205,32 @@ def positions_check(printed: dict[str, str], derived: dict[str, str]) -> VisionC
     эквити считаются по одному и тому же чтению и расходятся только вместе с ним
     (реестр D4). Случай, ради которого проверка написана, — в отчёте прогона.
 
+    **Сравниваются только сопоставимые метки.** Словарь позиций у рума и у
+    нормалайзера совпадает не весь: рум подписывает середину стола иначе, и
+    набор меток к тому же зависит от числа мест. Метка, которой в круге этого
+    стола не бывает вовсе, ничего не доказывает — она называется в `detail` как
+    «не сопоставимо» и проверку НЕ роняет. Иначе сверка краснела бы на каждом
+    экране непривычного размера, то есть измеряла бы полноту нашей таблицы
+    соответствий, а не чтение (ревью раунда 2, F3).
+
     Молчит, когда сверять нечего: на живом столе позиций не печатают вовсе.
     """
+    ring = set(derived.values())
     common = sorted(set(printed) & set(derived))
-    if not common:
-        return VisionCheck(
-            name=CHECK_POSITIONS, passed=True, detail="меток позиций на экране нет"
-        )
+    comparable = [nick for nick in common if printed[nick] in ring]
+    unknown = sorted({printed[nick] for nick in common if printed[nick] not in ring})
+    if not comparable:
+        note = f"не сопоставимо: {', '.join(unknown)}" if unknown else "меток позиций на экране нет"
+        return VisionCheck(name=CHECK_POSITIONS, passed=True, detail=note)
     wrong = [
         f"{nick}: напечатано {printed[nick]}, по порядку хода {derived[nick]}"
-        for nick in common
+        for nick in comparable
         if printed[nick] != derived[nick]
     ]
-    return VisionCheck(
-        name=CHECK_POSITIONS,
-        passed=not wrong,
-        detail="; ".join(wrong) or f"метки позиций сошлись у {len(common)} мест",
-    )
+    detail = "; ".join(wrong) or f"метки позиций сошлись у {len(comparable)} мест"
+    if unknown:
+        detail += f"; не сопоставимо: {', '.join(unknown)}"
+    return VisionCheck(name=CHECK_POSITIONS, passed=not wrong, detail=detail)
 
 
 def seats_check(players: int, max_seats: int | None) -> VisionCheck:

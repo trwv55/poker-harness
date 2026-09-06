@@ -631,8 +631,8 @@ def _board_was_dealt(reading: VisionReading) -> bool:
 
     Вскрытие считается и по флагу `showdown_seen`, и по прочитанному: карты
     видны у двоих и более — значит, до вскрытия дошло, даже если флаг забыт.
-    Ошибиться этим правилом дешевле в сторону «раздан»: лишний борд ловит сверка
-    карт на дубли, а выброшенный настоящий борд не ловит ничто.
+    Ошибиться этим правилом дешевле в сторону «раздан»: раздан ли борд, при
+    сомнении решает валидатор — недостающие карты стола он называет, лишние нет.
     """
     return (
         reading.showdown_seen
@@ -719,9 +719,23 @@ def _printed_positions(reading: VisionReading) -> dict[str, str]:
 
 
 # Как GG подписывает позиции в логе против того, как их называет нормалайзер.
-# Разъезжаются они только в середине стола: `MP`/`MP+1` у рума — это `LJ`/`HJ`
-# у нас, порядок мест при этом один и тот же.
-_GG_POSITION_ALIASES: dict[str, str] = {"MP": "LJ", "MP+1": "HJ", "ББ": "BB", "БТН": "BTN"}
+# Эти три соответствия от размера стола не зависят: блайнды и кнопка есть в
+# любом круге.
+_GG_POSITION_ALIASES: dict[str, str] = {"ББ": "BB", "БТН": "BTN", "МБ": "SB"}
+
+# Середина стола подписана у рума иначе, и наблюдалось это только на 8-max
+# экспорте (реестр A3): там `MP`/`MP+1` стоят на местах, которые нормалайзер
+# зовёт `LJ`/`HJ`. На других размерах соответствие не измерено, поэтому там
+# метка остаётся неопознанной — и сверка её просто не сравнивает, а не роняет
+# (`vision_checks.positions_check`).
+_GG_POSITION_ALIASES_8MAX: dict[str, str] = {"MP": "LJ", "MP+1": "HJ"}
+
+
+def _aliased_position(label: str, seats: int) -> str:
+    """Метка рума в словаре нормалайзера — насколько соответствие измерено."""
+    if seats == 8 and label in _GG_POSITION_ALIASES_8MAX:
+        return _GG_POSITION_ALIASES_8MAX[label]
+    return _GG_POSITION_ALIASES.get(label, label)
 
 
 def _derived_positions(raw: RawHand) -> dict[str, str]:
@@ -759,7 +773,7 @@ def run_checks(
     )
     other = villain_cards if equity_hero == hero_cards else hero_cards
     printed = {
-        nick: _GG_POSITION_ALIASES.get(pos, pos)
+        nick: _aliased_position(pos, len(raw.seats))
         for nick, pos in _printed_positions(reading).items()
     }
     return [
