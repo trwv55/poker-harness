@@ -925,6 +925,14 @@ def test_tournament_report_msg_links_a_finding_to_past_tournaments():
     assert "прошл" not in without_history
 
 
+def test_tournament_report_msg_omits_a_hand_class_it_does_not_know():
+    """Карт героя в источнике нет — сегмент исчезает, а не становится пустым."""
+    move = _chip_move().model_copy(update={"hero_class": ""})
+    text = tournament_report_msg(_report(chip_moves=[move], all_ins=[_all_in()])).text
+    assert "№TM1 · ур. 23" in text
+    assert " ·  · " not in text
+
+
 def test_tournament_report_msg_says_when_a_list_is_trimmed():
     moves = [_chip_move(hand_no=f"H{i}", cost_bb=50.0 - i) for i in range(30)]
     msg = tournament_report_msg(_report(chip_moves=moves))

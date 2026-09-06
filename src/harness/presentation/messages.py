@@ -585,6 +585,18 @@ _MAX_REPORT_FINDINGS = 4
 _STREET_WHERE: dict[Street, str] = {street: word.lower() for street, word in _STREET_WORD.items()}
 
 
+def _hand_head(hand_no: str, hero_class: str, level: int) -> str:
+    """«№TM123 · AKs · ур. 23» — общая шапка строк отчёта.
+
+    Класс руки пропускается, если он неизвестен (карты героя в источнике не
+    записаны): пустой сегмент оставил бы в строке две точки подряд, а выдумать
+    вместо него что-либо нельзя
+    (`test_tournament_report_msg_omits_a_hand_class_it_does_not_know`).
+    """
+    parts = [f"№{hand_no}", hero_class, f"ур. {level}"]
+    return " · ".join(part for part in parts if part)
+
+
 def _fmt_pct(value: float | None) -> str | None:
     """Доля одним знаком после запятой; `None` — доли нет, и печатать нечего.
 
@@ -697,7 +709,7 @@ def _all_in_lines(events: list[AllInEvent]) -> list[str]:
     if len(shown) < len(events):
         head = f"Олл-ины (показаны {len(shown)} самых крупных из {len(events)}):"
     return [head] + [
-        f"№{event.hand_no} · {event.hero_class} · ур. {event.level} · "
+        f"{_hand_head(event.hand_no, event.hero_class, event.level)} · "
         f"вошёл с {_fmt_bb(event.stack_before_bb)} → {_fmt_signed_bb(event.delta_bb)}"
         f"{', вскрытие' if event.showdown else ''}"
         for event in shown
@@ -720,7 +732,7 @@ def _chip_move_lines(moves: list[ChipMove]) -> list[str]:
         if move.showdown:
             what += ", вскрытие"
         lines.append(
-            f"№{move.hand_no} · {move.hero_class} · ур. {move.level} · {what} "
+            f"{_hand_head(move.hand_no, move.hero_class, move.level)} · {what} "
             f"— {_fmt_bb(move.cost_bb)}"
         )
     return lines
