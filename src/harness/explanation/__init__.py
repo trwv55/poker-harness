@@ -12,5 +12,12 @@
 from __future__ import annotations
 
 from harness.explanation.hand_replay import HandReplay, ReplaySpan, hand_replay
+from harness.explanation.range_render import range_svg, render_range_png
 
-__all__ = ["HandReplay", "ReplaySpan", "hand_replay"]
+__all__ = [
+    "HandReplay",
+    "ReplaySpan",
+    "hand_replay",
+    "range_svg",
+    "render_range_png",
+]

@@ -6,6 +6,11 @@ dependencies = [
     "aiogram>=3.31.0",
     "alembic>=1.19.1",
     "asyncpg>=0.31.0",
+    # Рендер матрицы 13x13 (`explanation/range_render.py`): SVG собираем строкой
+    # сами, cairosvg нужен только чтобы растеризовать его в PNG. Тянет за собой
+    # СИСТЕМНУЮ libcairo (в образе — пакет `libcairo2`, Dockerfile), которой нет
+    # в колесе: без неё импорт падает в рантайме, а не на сборке.
+    "cairosvg>=2.9.0",
     "eval7>=0.1.11",
     "httpx>=0.28.1",
     # Внутренний цикл решателя мультивей-равновесия (`analysis/tools/multiway.py`)
