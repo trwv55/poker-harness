@@ -76,6 +76,7 @@ from harness.memory.repos import (
 from harness.normalizer import normalize
 from harness.parsers import hh_parser as hh_parser_module
 from harness.parsers.hh_parser import parse_file
+from harness.parsers.vision_adapter import reading_to_raw
 from harness.platform.config import Config
 from harness.platform.llm import LLM, LLMProviderError
 from harness.platform.queue import JobsQueue
@@ -1512,3 +1513,194 @@ async def test_range_images_survive_a_model_that_did_not_answer(
     assert record.range_images is not None, "список картинок обязан быть записан"
     for path in record.range_images:
         assert Path(path).exists(), "нарисованная картинка обязана лежать на диске"
+
+
+# --- задача 22: станция скриншота --------------------------------------------
+
+
+def _screenshot_raw():
+    """Настоящая рука из адаптера, а не сшитая руками: то же чтение, что в его тестах."""
+    from tests.test_vision_adapter import HERO_NICK, export_reading
+
+    raw, _checks = reading_to_raw(
+        export_reading(), hero_nickname=HERO_NICK, source_ref="screenshot"
+    )
+    return raw
+
+
+def _outcome(raw=None, checks=(), refusal=None, hops=()):
+    from harness.parsers.vision_adapter import VisionOutcome
+
+    return VisionOutcome(raw=raw, checks=list(checks), hops=list(hops), refusal=refusal)
+
+
+async def _enqueue_screenshot(queue, tmp_path, *, player_id: int, session_id: int) -> int:
+    image = tmp_path / "screen.img"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n synthetic")
+    return await queue.enqueue(
+        type="screenshot_analyze",
+        player_id=player_id,
+        session_id=session_id,
+        payload={"image_file": str(image), "image_hash": "abc123"},
+    )
+
+
+async def _with_nickname(db_factory, player_id: int) -> None:
+    async with db_factory() as session:
+        await PlayersRepo(session).set_gg_nickname(player_id, "screen_nick")
+        await session.commit()
+
+
+def _stub_vision(monkeypatch, *outcomes):
+    """Подменить адаптер: станция проверяется на оркестрации, не на качестве чтения.
+
+    Качество чтения — этаж 2 EVALS.md, и меряет его `eval_runner vision` по
+    настоящим скринам; здесь важно только то, что станция делает с результатом.
+    """
+    calls: list[dict] = []
+    queued = list(outcomes)
+
+    async def fake(llm, image, **kwargs):
+        calls.append(kwargs)
+        return queued.pop(0)
+
+    monkeypatch.setattr("harness.worker.pipeline.vision_extract", fake)
+    return calls
+
+
+async def test_a_clean_screenshot_goes_all_the_way_to_a_verdict(
+    deps, queue, db_factory, fake_sender, tmp_path, monkeypatch
+):
+    player_id, session_id = await _make_scope(db_factory)
+    await _with_nickname(db_factory, player_id)
+    calls = _stub_vision(monkeypatch, _outcome(raw=_screenshot_raw()))
+    await _enqueue_screenshot(queue, tmp_path, player_id=player_id, session_id=session_id)
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    assert calls and calls[0]["gg_nickname"] == "screen_nick"
+    async with db_factory() as session:
+        status = (await session.get(Job, job.id)).status
+        hands = (await session.execute(text("select id, raw from hands"))).all()
+    assert status == "done"
+    assert len(hands) == 1
+    assert fake_sender.sent  # разбор дошёл до игрока
+
+
+async def test_a_screen_that_is_not_a_hand_is_refused_and_the_job_is_done(
+    deps, queue, db_factory, fake_sender, tmp_path, monkeypatch
+):
+    """Отказ модели — законный исход, а не сбой: задача закрывается, а не падает."""
+    player_id, session_id = await _make_scope(db_factory)
+    await _with_nickname(db_factory, player_id)
+    _stub_vision(monkeypatch, _outcome(refusal="это лобби турнира"))
+    await _enqueue_screenshot(queue, tmp_path, player_id=player_id, session_id=session_id)
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    async with db_factory() as session:
+        status = (await session.get(Job, job.id)).status
+        hands = (await session.execute(text("select id from hands"))).all()
+    assert status == "done"
+    assert hands == []
+    assert any("лобби" in msg.text for msg in fake_sender.sent)
+
+
+async def test_a_failed_checksum_asks_the_player_and_frees_the_worker(
+    deps, queue, db_factory, fake_sender, tmp_path, monkeypatch
+):
+    """Спека §8.3: вопрос кнопками, `awaiting_user`, воркер свободен.
+
+    Рука при этом уже сохранена — это чекпоинт, ради которого повторное чтение
+    не оплачивается второй раз.
+    """
+    from harness.contracts import VisionCheck
+
+    player_id, session_id = await _make_scope(db_factory)
+    await _with_nickname(db_factory, player_id)
+    failed = VisionCheck(name="pot", passed=False, detail="не сошлось", options=["31.95", "30.74"])
+    _stub_vision(monkeypatch, _outcome(raw=_screenshot_raw(), checks=[failed]))
+    await _enqueue_screenshot(queue, tmp_path, player_id=player_id, session_id=session_id)
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    async with db_factory() as session:
+        row = (
+            await session.execute(text(f"select status, payload from jobs where id = {job.id}"))
+        ).mappings().one()
+        hands = (await session.execute(text("select id from hands"))).all()
+    assert row["status"] == "awaiting_user"
+    assert row["payload"]["escalation_field"] == "pot"
+    assert row["payload"]["escalations"] == 1
+    assert len(hands) == 1
+    asked = next(msg for msg in fake_sender.sent if msg.buttons)
+    labels = [btn.text for row_ in asked.buttons for btn in row_]
+    assert labels == ["31.95", "30.74", "ввести вручную"]
+
+
+async def test_resuming_after_the_answer_never_pays_for_a_second_reading(
+    deps, queue, db_factory, fake_sender, tmp_path, monkeypatch
+):
+    """Чекпоинт `hands.raw` гасит петлю: иначе каждый ответ игрока стоил бы чтения,
+    контрольные суммы падали бы на том же месте, и вопрос повторялся бы вечно.
+    """
+    from harness.contracts import VisionCheck
+
+    player_id, session_id = await _make_scope(db_factory)
+    await _with_nickname(db_factory, player_id)
+    failed = VisionCheck(name="pot", passed=False, detail="не сошлось", options=["31.95", "30.74"])
+    _stub_vision(monkeypatch, _outcome(raw=_screenshot_raw(), checks=[failed]))
+    job_id = await _enqueue_screenshot(
+        queue, tmp_path, player_id=player_id, session_id=session_id
+    )
+
+    first = await queue.claim("w1")
+    assert first is not None
+    await run_job(first, deps)
+
+    # Второе чтение обязано не случиться вовсе — подменяем адаптер ловушкой.
+    async def never(*args, **kwargs):
+        raise AssertionError("станция позвала модель повторно после ответа игрока")
+
+    monkeypatch.setattr("harness.worker.pipeline.vision_extract", never)
+    await queue.resume(job_id)
+    second = await queue.claim("w2")
+    assert second is not None
+    await run_job(second, deps)
+
+    async with db_factory() as session:
+        status = (await session.get(Job, job_id)).status
+    assert status == "done"
+
+
+async def test_the_cascade_hops_land_in_the_trace(
+    deps, queue, db_factory, tmp_path, monkeypatch
+):
+    """Иначе в трейсе осталось бы «зрение отработало», а где расхождение — нет."""
+    from harness.contracts import VisionHop
+
+    player_id, session_id = await _make_scope(db_factory)
+    await _with_nickname(db_factory, player_id)
+    hops = [
+        VisionHop(role="primary", model="cheap", failed_checks=["pot"]),
+        VisionHop(role="fallback", model="dear", failed_checks=[]),
+    ]
+    _stub_vision(monkeypatch, _outcome(raw=_screenshot_raw(), hops=hops))
+    await _enqueue_screenshot(queue, tmp_path, player_id=player_id, session_id=session_id)
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    async with db_factory() as session:
+        spans = await session.scalar(text("select spans from traces order by id desc limit 1"))
+    names = [span["name"] for span in spans]
+    assert "vision:primary" in names and "vision:fallback" in names
+    primary = next(span for span in spans if span["name"] == "vision:primary")
+    assert primary["failed_checks"] == ["pot"]

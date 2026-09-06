@@ -60,7 +60,6 @@ from harness.presentation import (
     hh_accepted_msg,
     hh_duplicate_msg,
     new_session_msg,
-    photo_soon_msg,
     progress_text,
     quota_exceeded_msg,
     scan_summary_msg,
@@ -521,7 +520,6 @@ def test_entry_messages_are_plain_text_without_buttons():
         hh_duplicate_msg(),
         bot_failure_msg(),
         unsupported_document_msg(),
-        photo_soon_msg(),
         new_session_msg("Сессия 4 сен", previous_closed=True),
     ):
         assert msg.text.strip()
@@ -549,11 +547,6 @@ def test_new_session_msg_mentions_closing_only_when_something_was_closed():
     assert "закрыт" in later.text
     assert "Сессия 4 сен" in first.text and "Сессия 4 сен" in later.text
 
-
-def test_photo_soon_msg_names_the_working_path():
-    """Заглушка vision (задача 22) обязана давать рабочий путь, а не только отказ."""
-    text = photo_soon_msg().text
-    assert ".txt" in text and "PokerCraft" in text
 
 
 def test_hh_duplicate_msg_offers_a_way_out():
@@ -1098,3 +1091,67 @@ def test_tournament_story_msg_counts_paragraphs_grammatically():
     five = tournament_story_msg(TournamentTextOut(paragraphs=["а" * 600] * 8))
     assert "Показаны" not in five.text
     assert "Показано 5 абзацев из 8" in five.text
+
+
+# --- задача 22: тексты пути скриншота ----------------------------------------
+
+
+def test_the_vision_messages_speak_the_product_voice_and_carry_no_buttons():
+    """Те же два требования, что ко всем текстам входа: не пусто и без кнопок.
+
+    Кнопки на этом пути есть ровно у одного сообщения — вопроса эскалации, и
+    собирает их `escalation_buttons`, а не конструктор текста.
+    """
+    from harness.presentation import (
+        ask_gg_nickname_msg,
+        gg_nickname_saved_msg,
+        not_a_hand_msg,
+        send_as_file_msg,
+        vision_answer_not_a_number_msg,
+        vision_answer_saved_msg,
+        vision_gave_up_msg,
+        vision_manual_entry_msg,
+    )
+
+    for msg in (
+        ask_gg_nickname_msg(),
+        gg_nickname_saved_msg("nick"),
+        not_a_hand_msg("это лобби турнира"),
+        send_as_file_msg(),
+        vision_manual_entry_msg("Банк распознан верно?"),
+        vision_answer_saved_msg(),
+        vision_answer_not_a_number_msg(),
+        vision_gave_up_msg(),
+    ):
+        assert msg.text.strip()
+        assert msg.buttons == []
+
+
+def test_the_file_hint_appears_only_where_it_is_earned_and_explains_the_gesture():
+    """Просьба переслать файлом обязана сказать, ГДЕ в Телеграме этот выбор.
+
+    Трение вводится только после несошедшейся проверки карт (сжатие безопасно
+    для чисел и опасно для мелких значков мастей), и просьба без инструкции
+    стоила бы игроку того же тупика, что отказ без пути дальше.
+    """
+    from harness.presentation import send_as_file_msg
+
+    text = send_as_file_msg().text
+    assert "файл" in text.casefold()
+    assert "скрепк" in text.casefold() or "документ" in text.casefold()
+
+
+def test_the_escalation_message_offers_both_readings_plus_manual_entry():
+    """Варианты — два независимых прочтения одного экрана, а не выдуманные числа."""
+    from harness.presentation import escalation_msg
+
+    msg = escalation_msg("pot", "Банк распознан верно?", ["31.95", "30.74"])
+    labels = [btn.text for row in msg.buttons for btn in row]
+    assert labels == ["31.95", "30.74", "ввести вручную"]
+
+
+def test_the_refusal_repeats_what_the_model_saw_instead_of_a_generic_phrase():
+    """Модель видела экран, а мы нет: её причина — единственная подсказка игроку."""
+    from harness.presentation import not_a_hand_msg
+
+    assert "список результатов" in not_a_hand_msg("список результатов").text

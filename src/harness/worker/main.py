@@ -444,6 +444,10 @@ async def main() -> None:
             # Тот же том, что у бота (`bot.main.data_dir`): туда ложатся картинки
             # диапазонов станции `explain`, в БД едут пути (спека §6).
             data_dir=data_dir(),
+            # Флаг, а не имя модели: станции нужно одно решение — звать вторую
+            # ступень каскада зрения или сразу спрашивать игрока. Переменная
+            # необязательна (`.env.example`), и незаданная означает «каскада нет».
+            vision_fallback=bool(cfg.llm_vision_fallback_model),
         )
         stop = _install_stop_handlers()
         tasks = [

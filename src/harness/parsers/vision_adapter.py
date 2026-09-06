@@ -80,6 +80,7 @@ __all__ = [
     "PromptUnavailable",
     "VisionLLM",
     "VisionOutcome",
+    "apply_vision_answer",
     "read_prompt",
     "reading_to_raw",
     "vision_extract",
@@ -686,6 +687,83 @@ def run_checks(
         ),
         equity_check(shown_pct, equity_hero, other, _board_at_all_in(raw)),
     ]
+
+
+def _seat_of_nickname(raw: RawHand, nickname: str) -> str | None:
+    """Метка места по нику — обратный ход к `VisionMeta.nicknames`."""
+    if raw.vision is None:
+        return None
+    for label, nick in raw.vision.nicknames.items():
+        if nick == nickname:
+            return label
+    return None
+
+
+def apply_vision_answer(raw: RawHand, field: str, value: str) -> RawHand | None:
+    """Подставить ответ игрока в сырую руку — спека §8.3, шаг 2.
+
+    `None` означает «этим ответом руку не поправить»: не всякое расхождение
+    чинится одним числом (расхождение карт у места с картами в логе называет
+    ДВЕ карты, а какая из них где — вопрос второй). Ответ при этом уже записан
+    в `eval_cases` вызывающим и не теряется: он размеченный пример независимо от
+    того, помог ли он этой конкретной руке.
+
+    Патчатся ровно те поля, у которых ответ игрока однозначно ложится в контракт:
+
+    * `pot` — показанный банк (`VisionMeta.displayed_pot`), он же вход банка на
+      состоянии в точке решения;
+    * `button` — кнопка переставляется на место названного игрока;
+    * `hero` — герой переименовывается в названного игрока.
+
+    Ни одно из значений не «подгоняется, чтобы сошлось»: подставляется ровно то,
+    что сказал игрок, а сойдётся ли после этого рука, решает валидатор на
+    следующем проходе.
+    """
+    if field == "pot":
+        try:
+            shown = float(value.replace(",", "."))
+        except ValueError:
+            return None
+        meta = (raw.vision or VisionMeta()).model_copy(
+            update={"displayed_pot": round(shown * raw.bb)}
+        )
+        return raw.model_copy(update={"vision": meta})
+
+    if field == "button":
+        label = _seat_of_nickname(raw, value)
+        seat = next((s.seat for s in raw.seats if s.label == label), None)
+        return None if seat is None else raw.model_copy(update={"button_seat": seat})
+
+    if field == "hero":
+        label = _seat_of_nickname(raw, value)
+        if label is None or label == HERO_LABEL:
+            return None
+        renamed = {
+            HERO_LABEL: label,
+            label: HERO_LABEL,
+        }
+        seats = [
+            s.model_copy(update={"label": renamed.get(s.label, s.label)}) for s in raw.seats
+        ]
+        posts = [
+            p.model_copy(update={"label": renamed.get(p.label, p.label)}) for p in raw.posts
+        ]
+        actions = [
+            a.model_copy(update={"label": renamed.get(a.label, a.label)}) for a in raw.actions
+        ]
+        meta = (raw.vision or VisionMeta()).model_copy(
+            update={
+                "nicknames": {
+                    renamed.get(lbl, lbl): nick
+                    for lbl, nick in (raw.vision.nicknames if raw.vision else {}).items()
+                }
+            }
+        )
+        return raw.model_copy(
+            update={"seats": seats, "posts": posts, "actions": actions, "vision": meta}
+        )
+
+    return None
 
 
 async def vision_extract(

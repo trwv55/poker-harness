@@ -32,9 +32,12 @@ import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from harness.memory.models import Job
 from harness.memory.repos import (
+    EvalCasesRepo,
     HandsRepo,
     JobsRepo,
     PlayersRepo,
@@ -43,29 +46,52 @@ from harness.memory.repos import (
     SessionsRepo,
     TournamentsRepo,
 )
+from harness.parsers.vision_adapter import apply_vision_answer
 from harness.platform.queue import JobsQueue
 from harness.presentation import (
     Msg,
+    ask_gg_nickname_msg,
+    gg_nickname_saved_msg,
     hh_accepted_msg,
     hh_duplicate_msg,
     new_session_msg,
     quota_exceeded_msg,
     start_msg,
     unsupported_document_msg,
+    vision_answer_not_a_number_msg,
+    vision_answer_saved_msg,
+    vision_manual_entry_msg,
 )
 
 __all__ = [
+    "ESCALATION_PREFIX",
     "BotDeps",
     "QuotaCheck",
     "check_quota",
     "handle_deep_dive_callback",
     "handle_document",
+    "handle_escalation_callback",
     "handle_new_session",
+    "handle_photo",
     "handle_start",
+    "handle_text",
 ]
+
+# Префикс `callback_data` кнопок эскалации — тот же, что собирает
+# `presentation.keyboards.escalation_buttons`. Держится здесь строкой затем, что
+# разбирает его этот модуль, а не роутер: роутер по контракту не решает ничего.
+ESCALATION_PREFIX = "escalate:"
+
+# Значение, которым кнопка «ввести вручную» отличается от кнопки с числом.
+MANUAL_ANSWER = "manual"
 
 # PokerCraft отдаёт историю раздач текстом; всё остальное сканировать нечем.
 _HH_SUFFIX = ".txt"
+
+# Скрины кладутся рядом с раздачами, тем же правилом имени: содержимое решает,
+# как файл называется. Расширение условное — формат определяется по магическим
+# байтам при вызове модели (`platform/llm.py`), а не по имени.
+_SCREEN_SUFFIX = ".img"
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +128,20 @@ def _store_hh_file(data_dir: Path, file_bytes: bytes) -> Path:
     path = directory / f"{hashlib.sha256(file_bytes).hexdigest()}{_HH_SUFFIX}"
     path.write_bytes(file_bytes)
     return path
+
+
+def _store_screenshot(data_dir: Path, file_bytes: bytes) -> tuple[Path, str]:
+    """Скрин на диск под именем-хэшем содержимого — как и файл раздач.
+
+    Хэш возвращается отдельно: он же едет в `hands.image_hash`, и считать его
+    дважды значило бы завести второй источник одного значения.
+    """
+    digest = hashlib.sha256(file_bytes).hexdigest()
+    directory = data_dir / "screens"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{digest}{_SCREEN_SUFFIX}"
+    path.write_bytes(file_bytes)
+    return path, digest
 
 
 async def check_quota(deps: BotDeps, player_id: int) -> QuotaCheck:
@@ -284,3 +324,142 @@ async def handle_new_session(deps: BotDeps, tg_user_id: int) -> Msg:
         await db.commit()
         title = opened.title
     return new_session_msg(title, previous_closed=previous_closed)
+
+
+async def handle_photo(deps: BotDeps, tg_user_id: int, file_bytes: bytes) -> Msg | None:
+    """Скрин стола: файл на диск -> сессия (молча) -> задача `screenshot_analyze`.
+
+    **Сначала ник в руме.** Героя на экране определяет код, сопоставляя
+    прочитанные ники с ником из профиля; без него разбирать некого, и честнее
+    спросить сразу, чем заплатить за чтение и упереться в вопрос после него.
+
+    `None` в успешном случае — то же сознательное молчание, что у кнопки
+    «разобрать»: дальше говорит воркер одним редактируемым сообщением прогресса
+    (SESSIONS_UX), и второй текст от бота стал бы дублем.
+    """
+    async with deps.db_factory() as db:
+        player = await PlayersRepo(db).get_or_create(tg_user_id)
+        await db.commit()
+        player_id, nickname = player.id, player.gg_nickname
+
+    if not nickname:
+        return ask_gg_nickname_msg()
+
+    quota = await check_quota(deps, player_id)
+    if not quota.allowed:
+        return quota_exceeded_msg(quota.hours_to_free)
+
+    path, digest = _store_screenshot(deps.data_dir, file_bytes)
+    async with deps.db_factory() as db:
+        session_row = await SessionsRepo(db).active_or_create(player_id)
+        await db.commit()
+        session_id = session_row.id
+
+    await deps.queue.enqueue(
+        type="screenshot_analyze",
+        player_id=player_id,
+        session_id=session_id,
+        payload={"image_file": str(path), "image_hash": digest},
+    )
+    return None
+
+
+async def handle_escalation_callback(deps: BotDeps, tg_user_id: int, data: str) -> Msg | None:
+    """Ответ игрока на вопрос валидатора — спека §8.3, все четыре шага.
+
+    Ground truth в `eval_cases` пишется ПЕРВЫМ и пишется всегда, даже когда
+    подставить ответ в руку нечем: ответ игрока ценен сам по себе — это
+    размеченный пример для vision-eval, и эскалация тем самым работает
+    разметочной машиной (EVALS.md). Дальше патч `hands.raw`, сброс чекпоинтов
+    ниже (одной записью, см. `HandsRepo.replace_raw`) и возврат задачи в очередь.
+    """
+    field, _, value = data.removeprefix(ESCALATION_PREFIX).partition(":")
+    async with deps.db_factory() as db:
+        player = await PlayersRepo(db).get_or_create(tg_user_id)
+        job = await JobsRepo(db).awaiting_user(player.id)
+        if job is None:
+            await db.commit()
+            return None
+        if value == MANUAL_ANSWER:
+            payload = {**dict(job.payload), "manual_entry": field}
+            await _remember_payload(db, job.id, payload)
+            await db.commit()
+            return vision_manual_entry_msg(_question_of(job))
+        job_id = job.id
+        await _apply_answer(db, job, field, value)
+        await db.commit()
+
+    await deps.queue.resume(job_id)
+    return vision_answer_saved_msg()
+
+
+async def handle_text(deps: BotDeps, tg_user_id: int, text: str) -> Msg | None:
+    """Обычное сообщение: либо ник в руме, либо число, введённое вручную.
+
+    Состояние ввода живёт в `jobs.payload`, а не в памяти процесса бота
+    (`manual_entry`): точка возврата задачи и так зафиксирована артефактами
+    (спека §8.2), и держать половину состояния рядом с ней, а половину в памяти,
+    значило бы потерять эту половину при первом же перезапуске.
+    """
+    answer = text.strip()
+    async with deps.db_factory() as db:
+        player = await PlayersRepo(db).get_or_create(tg_user_id)
+        job = await JobsRepo(db).awaiting_user(player.id)
+        field = (job.payload or {}).get("manual_entry") if job is not None else None
+        if job is not None and field:
+            try:
+                float(answer.replace(",", "."))
+            except ValueError:
+                await db.commit()
+                return vision_answer_not_a_number_msg()
+            job_id = job.id
+            await _apply_answer(db, job, field, answer)
+            await db.commit()
+            await deps.queue.resume(job_id)
+            return vision_answer_saved_msg()
+
+        if not player.gg_nickname and answer:
+            await PlayersRepo(db).set_gg_nickname(player.id, answer)
+            await db.commit()
+            return gg_nickname_saved_msg(answer.strip())
+        await db.commit()
+    return None
+
+
+def _question_of(job) -> str:
+    """Текст вопроса, на который игрок отвечает вручную, — из payload задачи."""
+    payload = job.payload or {}
+    field = payload.get("manual_entry") or payload.get("escalation_field") or ""
+    return f"Поле «{field}»."
+
+
+async def _remember_payload(db: AsyncSession, job_id: int, payload: dict) -> None:
+    """Записать payload задачи, не трогая её статус: `awaiting_user` сохраняется.
+
+    Мимо `JobsQueue` намеренно — та не даёт менять payload без смены статуса, а
+    здесь состояние ввода дописывается к задаче, которая как ждала ответа, так и
+    ждёт (тот же приём, что `worker.pipeline._sync_payload`).
+    """
+    await db.execute(update(Job).where(Job.id == job_id).values(payload=payload))
+
+
+async def _apply_answer(db: AsyncSession, job, field: str, value: str) -> None:
+    """Ground truth в `eval_cases`, затем патч руки и сброс чекпоинтов ниже."""
+    payload = dict(job.payload)
+    hand_id = payload.get("hand_id")
+    if hand_id is not None:
+        await EvalCasesRepo(db).add(
+            kind="vision_field",
+            hand_id=hand_id,
+            field=field,
+            ground_truth={"field": field, "value": value},
+            source="escalation",
+        )
+        hands = HandsRepo(db)
+        record = await hands.get(hand_id)
+        patched = apply_vision_answer(record.raw, field, value)
+        if patched is not None:
+            await hands.replace_raw(hand_id, patched)
+    payload.pop("manual_entry", None)
+    payload["last_answer"] = {"field": field, "value": value}
+    await _remember_payload(db, job.id, payload)

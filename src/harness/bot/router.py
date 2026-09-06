@@ -34,17 +34,20 @@ from aiogram.types import (
 )
 
 from harness.bot.handlers import (
+    ESCALATION_PREFIX,
     BotDeps,
     handle_deep_dive_callback,
     handle_document,
+    handle_escalation_callback,
     handle_new_session,
+    handle_photo,
     handle_start,
+    handle_text,
 )
 from harness.presentation import (
     Msg,
     bot_failure_msg,
     button_not_ready_msg,
-    photo_soon_msg,
 )
 
 __all__ = ["DEEP_DIVE_PREFIX", "build_router"]
@@ -122,10 +125,19 @@ def build_router(deps: BotDeps) -> Router:
         await message.answer(msg.text, reply_markup=_markup(msg))
 
     @router.message(F.photo)
-    async def on_photo(message: Message) -> None:
-        # Vision — задача 22. До неё честная заглушка, а не молчание в ответ на
-        # главное действие продукта («кинул скрин»).
-        msg = photo_soon_msg()
+    async def on_photo(message: Message, bot: Bot) -> None:
+        """Фото — главный вход продукта. Берём САМЫЙ КРУПНЫЙ из присланных размеров.
+
+        Телеграм отдаёт одно фото несколькими превью, от самого мелкого к самому
+        крупному; читать надо последнее. Мелкое превью «прочиталось бы» тоже — и
+        выдало бы уверенно неверные числа, потому что цифры на нём не различимы.
+        """
+        if message.from_user is None or not message.photo:
+            return
+        file_bytes = await _download(bot, message.photo[-1].file_id)
+        msg = await handle_photo(deps, message.from_user.id, file_bytes)
+        if msg is None:
+            return
         await message.answer(msg.text, reply_markup=_markup(msg))
 
     @router.callback_query(F.data.startswith(DEEP_DIVE_PREFIX))
@@ -143,6 +155,32 @@ def build_router(deps: BotDeps) -> Router:
         # `worker/pipeline.py::_chat_id`) — не полагаемся на `callback.message`,
         # которого у старого сообщения может уже не быть.
         await bot.send_message(callback.from_user.id, msg.text, reply_markup=_markup(msg))
+
+    @router.callback_query(F.data.startswith(ESCALATION_PREFIX))
+    async def on_escalation(callback: CallbackQuery, bot: Bot) -> None:
+        # `answer()` первым делом — «часики» на кнопке гасятся до любой работы.
+        await callback.answer()
+        if callback.data is None:
+            return
+        msg = await handle_escalation_callback(deps, callback.from_user.id, callback.data)
+        if msg is None:
+            return
+        await bot.send_message(callback.from_user.id, msg.text, reply_markup=_markup(msg))
+
+    @router.message(F.text & ~F.text.startswith("/"))
+    async def on_text(message: Message) -> None:
+        """Обычный текст: ник в руме либо число, введённое вручную по эскалации.
+
+        Команды сюда не попадают — их обработчики зарегистрированы выше, а
+        фильтр отсекает всё, что начинается со слэша: иначе неизвестная команда
+        сохранялась бы как ник в руме.
+        """
+        if message.from_user is None or message.text is None:
+            return
+        msg = await handle_text(deps, message.from_user.id, message.text)
+        if msg is None:
+            return
+        await message.answer(msg.text, reply_markup=_markup(msg))
 
     @router.callback_query()
     async def on_unhandled_callback(callback: CallbackQuery) -> None:

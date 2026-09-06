@@ -99,23 +99,30 @@ from harness.presentation.keyboards import (
 
 __all__ = [
     "Msg",
+    "ask_gg_nickname_msg",
     "bot_failure_msg",
     "button_not_ready_msg",
     "deep_dive_msg",
     "escalation_msg",
     "failed_msg",
+    "gg_nickname_saved_msg",
     "hh_accepted_msg",
     "hh_duplicate_msg",
     "new_session_msg",
-    "photo_soon_msg",
+    "not_a_hand_msg",
     "progress_text",
     "quota_exceeded_msg",
     "range_image_title",
     "scan_summary_msg",
+    "send_as_file_msg",
     "start_msg",
     "tournament_report_msg",
     "tournament_story_msg",
     "unsupported_document_msg",
+    "vision_answer_not_a_number_msg",
+    "vision_answer_saved_msg",
+    "vision_gave_up_msg",
+    "vision_manual_entry_msg",
 ]
 
 
@@ -191,6 +198,7 @@ _ACTIVE_WORD: dict[SpotKind, str] = {
 }
 
 _STATION_TEXT: dict[str, str] = {
+    "read": "Читаю стол…",
     "parse": "Читаю стол…",
     "validate": "Проверяю руку…",
     "analyze": "Считаю эквити…",
@@ -323,7 +331,7 @@ def _quota_line(quota_left: int, quota_total: int) -> str:
     return f"разборов {quota_left}/{quota_total} за 24 ч"
 
 
-def progress_text(station: Literal["parse", "validate", "analyze", "explain"]) -> str:
+def progress_text(station: Literal["read", "parse", "validate", "analyze", "explain"]) -> str:
     """Строка прогресса, которой редактируется одно сообщение по станциям конвейера."""
     return _STATION_TEXT[station]
 
@@ -609,16 +617,77 @@ def unsupported_document_msg() -> Msg:
     )
 
 
-def photo_soon_msg() -> Msg:
-    """Скриншот стола — заглушка до задачи 22 (vision).
+def ask_gg_nickname_msg() -> Msg:
+    """Разовый вопрос про ник в руме — без него скрин разобрать не на кого.
 
-    Честно называет, что именно ещё не готово, и тут же даёт рабочий путь: молчание
-    в ответ на главное действие продукта («кинул скрин») было бы худшим из ответов.
+    Спрашивается ровно потому, что героя на экране определяет код, а не модель:
+    подсветку и открытые карты экран рисует и победителю раздачи, и просить
+    модель угадать «кто из них вы» значит получить уверенный неверный ответ.
     """
     return Msg(
         text=(
-            "Разбор скриншотов ещё готовится. Пока пришлите файл раздач (.txt) из "
-            "PokerCraft — по нему сделаю префлоп-скан турнира."
+            "Чтобы разбирать скриншоты, мне нужен ваш ник в руме — тот, что "
+            "написан у вашего места за столом. Пришлите его одним сообщением."
+        )
+    )
+
+
+def gg_nickname_saved_msg(nickname: str) -> Msg:
+    return Msg(text=f"Запомнил: {nickname}. Присылайте скриншот стола.")
+
+
+def not_a_hand_msg(reason: str) -> Msg:
+    """На экране не раздача — честный отказ, а не выдуманная из лобби рука.
+
+    Причина показывается словами модели: она видела экран, а мы нет, и заменять
+    её общей фразой значило бы отнять у игрока единственную подсказку, что
+    именно прислать вместо этого.
+    """
+    return Msg(text=f"Это не похоже на раздачу: {reason}. Пришлите скриншот стола или руки.")
+
+
+def send_as_file_msg() -> Msg:
+    """Просьба переслать тот же скрин файлом — только по эскалации, не заранее.
+
+    Измерено: сжатие Телеграма безопасно для чисел на любом экране и опасно для
+    мелких значков мастей на экспортах истории. Файл при этом втрое дороже в
+    токенах, поэтому трение вводится там, где оно окупается, — после
+    несошедшейся проверки карт, а не на каждой загрузке.
+    """
+    return Msg(
+        text=(
+            "Масти на этом скрине читаются плохо — Телеграм сжал картинку. "
+            "Пришлите тот же скриншот ещё раз файлом: скрепка → «Файл» "
+            "(на телефоне — «Документ»), тогда он придёт без сжатия."
+        )
+    )
+
+
+def vision_manual_entry_msg(question: str) -> Msg:
+    """Ввод числа вручную — вторая половина эскалации (спека §8.3)."""
+    return Msg(text=f"{question}\nНапишите число одним сообщением — я подставлю его в разбор.")
+
+
+def vision_answer_saved_msg() -> Msg:
+    """Ответ принят: дальше снова говорит воркер, поэтому текст короткий."""
+    return Msg(text="Принял, продолжаю разбор.")
+
+
+def vision_answer_not_a_number_msg() -> Msg:
+    return Msg(text="Это не похоже на число. Напишите только сумму, например 12.7.")
+
+
+def vision_gave_up_msg() -> Msg:
+    """Спрашивать больше нечего: расхождение не сошлось и после ответов игрока.
+
+    Молчаливо разобрать такую руку нельзя — числа в ней спорные, и разбор поверх
+    спорных чисел был бы уверенным выводом из неизвестного (CLAUDE.md).
+    """
+    return Msg(
+        text=(
+            "Не сходятся числа на этом скрине даже после уточнений — разбирать "
+            "его я не возьмусь. Если раздача есть в выгрузке PokerCraft, "
+            "пришлите файл: по тексту рума расчёт будет точным."
         )
     )
 

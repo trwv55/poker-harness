@@ -71,12 +71,14 @@ from harness.analysis.scan import scan_tournament
 from harness.analysis.tournament import tournament_report
 from harness.contracts import (
     AnalysisResult,
+    CanonicalHand,
     EnrichedHand,
     ScanSummary,
     TournamentReport,
     TournamentTextOut,
     ValidationStatus,
     VerdictTextOut,
+    VisionCheck,
     Zone,
 )
 from harness.engine import enrich
@@ -98,18 +100,23 @@ from harness.memory.repos import (
 )
 from harness.normalizer import normalize
 from harness.parsers import hh_parser
+from harness.parsers.vision_adapter import VisionOutcome, vision_extract
 from harness.platform.llm import LLM, LLMProviderError, LLMSchemaError
 from harness.platform.queue import JobPreconditionFailed, JobsQueue
 from harness.platform.trace import Clock, Trace
 from harness.presentation import (
     Msg,
     deep_dive_msg,
+    escalation_msg,
     failed_msg,
+    not_a_hand_msg,
     progress_text,
     range_image_title,
     scan_summary_msg,
+    send_as_file_msg,
     tournament_report_msg,
     tournament_story_msg,
+    vision_gave_up_msg,
 )
 
 __all__ = ["Deps", "Sender", "run_job"]
@@ -118,12 +125,17 @@ _log = structlog.get_logger(__name__)
 
 # Станции, показываемые игроку прогрессом. "explain" появилась в задаче 21: с неё
 # начинается второй (и последний) вызов модели в системе — текст вердикта.
-_Station = Literal["parse", "validate", "analyze", "explain"]
+_Station = Literal["read", "parse", "validate", "analyze", "explain"]
 
 # Бюджет попытки по типу задачи — с запасом меньше десятиминутного окна reap()
 # (см. модульный докстринг). `hh_scan` может обрабатывать сотни рук и считать эквити
 # по файлу целиком — щедрее; `deep_dive` — одна рука, дёшево даже с запасом.
-_JOB_DEADLINE_S: dict[str, float] = {"hh_scan": 480.0, "deep_dive": 120.0}
+_JOB_DEADLINE_S: dict[str, float] = {
+    "hh_scan": 480.0,
+    "deep_dive": 120.0,
+    # Скрин — два вызова модели в худшем случае (каскад) плюс расчёт одной руки.
+    "screenshot_analyze": 240.0,
+}
 _DEFAULT_JOB_DEADLINE_S = 300.0
 
 
@@ -135,6 +147,17 @@ class SourceFileUnavailable(OSError):
     тексте. Поднимается ровно в одном месте — там, где мы сами открываем
     `payload["source_file"]`, — и потому «файл раздач недоступен» под ним верно
     всегда, а не «обычно».
+    """
+
+
+class ScreenshotUnreadable(LookupError):
+    """Картинки нет на диске или игрок не назвал свой ник в руме.
+
+    Путь к картинке приходит в `jobs.payload` от бота (он же её туда и положил),
+    поэтому `data_dir` воркера этой станции не нужен: том общий, а путь абсолютный.
+
+    Свой тип по той же причине, что `SourceFileUnavailable`: причина отказа
+    игроку выбирается по ТИПУ, и «скриншот не прочитать» под ним верно всегда.
     """
 
 
@@ -170,6 +193,7 @@ class HandDataMissing(LookupError):
 _PUBLIC_FAILURE_REASON_DEFAULT = "внутренняя ошибка сервиса"
 _PUBLIC_FAILURE_REASONS: tuple[tuple[type[BaseException], str], ...] = (
     (SourceFileUnavailable, "файл раздач недоступен"),
+    (ScreenshotUnreadable, "скриншот не прочитать"),
     (HandDataMissing, "не нашли нужные данные по этой раздаче"),
     (TimeoutError, "расчёт не уложился в отведённое время"),
 )
@@ -215,6 +239,10 @@ class Deps:
     clock: Clock = time.monotonic
     process_pool: Executor | None = None
     data_dir: Path | None = None
+    # Настроена ли дорогая ступень каскада зрения (`LLM_VISION_FALLBACK_MODEL`).
+    # Флаг, а не имя модели: имя знает только `Config`, а станции нужно ровно
+    # одно решение — звать вторую ступень или сразу спрашивать игрока.
+    vision_fallback: bool = False
 
 
 def _cache_delta(cache_seed: dict[str, float]) -> dict[str, float]:
@@ -322,6 +350,7 @@ async def _send_idempotent(
         "result_message_id",
         "report_message_id",
         "story_message_id",
+        "escalation_message_id",
     ],
     chat_id: int,
     msg: Msg,
@@ -675,6 +704,249 @@ def _hand_zone(result: AnalysisResult) -> Zone | None:
     return Zone.STRICT if zones == {Zone.STRICT} else Zone.ASSUMING
 
 
+# --- станция скриншота (задача 22) -------------------------------------------
+
+# Сколько раз подряд мы вправе спросить игрока по одной руке. Второй вопрос
+# законен: первый мог уточнить банк, а следом не сойтись рассадка. Третий уже
+# означает, что чтение не спасти уточнениями, и продолжать значило бы строить
+# уверенный вывод поверх спорных чисел.
+_MAX_ESCALATIONS = 2
+
+# Проверки, чей провал лечится пересылкой того же скрина файлом: обе про карты.
+# Измерено, что сжатие Телеграма безопасно для чисел на любом экране и опасно
+# для мелких значков мастей на экспортах истории.
+_FILE_HINT_FIELDS = frozenset({"cards", "equity"})
+
+
+def _escalation_question(field: str, checks: list[VisionCheck]) -> tuple[str, list[str]]:
+    """Вопрос игроку и два варианта ответа — из самой непройденной проверки.
+
+    Варианты не выдумываются: каждая контрольная сумма сравнивает ДВА
+    независимых прочтения одного экрана, и оба и есть кнопки. Выбрать из двух
+    прочитанных чисел игроку проще, чем набрать своё, — а «ввести вручную»
+    остаётся третьей кнопкой (спека §8.3).
+    """
+    check = next((c for c in checks if c.name == field and not c.passed), None)
+    if check is None:
+        return (_VISION_QUESTIONS.get(field, f"Поле «{field}» распознано верно?"), [])
+    return (_VISION_QUESTIONS.get(field, check.detail), check.options)
+
+
+_VISION_QUESTIONS: dict[str, str] = {
+    "pot": "Банк на этом скрине распознан верно?",
+    "button": "Фишка дилера стоит на том игроке?",
+    "cards": "Карты распознаны верно?",
+    "equity": "Карты распознаны верно?",
+    "hero": "Кто из них вы?",
+    "stacks": "Стеки распознаны верно?",
+}
+
+
+async def _ask_player(
+    deps: Deps,
+    session: AsyncSession,
+    job: JobModel,
+    payload: dict[str, Any],
+    chat_id: int,
+    *,
+    field: str,
+    question: str,
+    options: list[str],
+) -> None:
+    """Задать вопрос и отпустить воркера — точка возврата уже зафиксирована.
+
+    Спека §8.3 дословно: сообщение с кнопками, `await_user`, освобождение. Ответ
+    ловит бот, он же пишет ground truth в `eval_cases`, патчит `hands.raw`,
+    сбрасывает чекпоинты ниже и возвращает задачу в очередь.
+    """
+    worker_id = job.locked_by
+    payload = await _send_idempotent(
+        deps,
+        session,
+        job.id,
+        worker_id,
+        "escalation_message_id",
+        chat_id,
+        escalation_msg(field, question, options),
+    )
+    if field in _FILE_HINT_FIELDS:
+        await deps.sender.send(chat_id, send_as_file_msg())
+    payload["escalation_field"] = field
+    payload["escalation_options"] = options
+    payload["escalations"] = payload.get("escalations", 0) + 1
+    payload.pop("escalation_message_id", None)  # следующий вопрос — новое сообщение
+    payload.pop("manual_entry", None)
+    await session.commit()
+    await deps.queue.await_user(job.id, payload, worker_id=worker_id)
+
+
+async def _read_screen(
+    job: JobModel, deps: Deps, trace: Trace, session: AsyncSession, payload: dict[str, Any]
+) -> VisionOutcome:
+    """Один вызов адаптера плюс перенос ступеней каскада в трейс.
+
+    Ступени возвращаются значением, а не пишутся адаптером: конвейерные пакеты
+    про трейс не знают (правило зависимостей CLAUDE.md). Перенести их обязана
+    станция — иначе в трейсе осталось бы «зрение отработало», а на каком
+    переходе появилось расхождение, видно бы не было.
+    """
+    player = await session.get(Player, job.player_id)
+    if player is None or not player.gg_nickname:
+        raise ScreenshotUnreadable("игрок не назвал свой ник в руме")
+    path = Path(payload["image_file"])
+    try:
+        image = path.read_bytes()
+    except OSError as exc:
+        raise ScreenshotUnreadable("файл скриншота недоступен") from exc
+
+    outcome = await vision_extract(
+        deps.llm,
+        image,
+        gg_nickname=player.gg_nickname,
+        trace_id=trace.trace_id,
+        source_ref=payload.get("image_hash", ""),
+        image_hash=payload.get("image_hash"),
+        fallback_available=deps.vision_fallback,
+    )
+    for hop in outcome.hops:
+        trace.record(
+            f"vision:{hop.role}",
+            model=hop.model,
+            failed_checks=hop.failed_checks,
+            error=hop.error,
+        )
+    return outcome
+
+
+async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: float) -> int | None:
+    """Скрин -> разбор: чтение моделью, проверки, эскалация, ядро, слова.
+
+    **Чекпоинт зрения — `hands.raw`**, и он же гасит петлю эскалаций: после
+    ответа игрока задача возвращается сюда, видит уже сохранённую руку и модель
+    больше не зовёт. Иначе каждый ответ игрока оплачивался бы новым чтением,
+    контрольные суммы падали бы на том же месте, и вопрос повторялся бы вечно.
+    """
+    worker_id = job.locked_by
+    async with deps.db_factory() as session:
+        payload: dict[str, Any] = dict(job.payload)
+        chat_id = await _chat_id(session, job.player_id)
+        hands_repo = HandsRepo(session)
+        analyses_repo = AnalysesRepo(session)
+        hand_id: int | None = payload.get("hand_id")
+
+        async with trace.span("read"):
+            payload = await _ensure_progress(deps, session, job.id, worker_id, chat_id, "read")
+            if hand_id is None:
+                outcome = await _read_screen(job, deps, trace, session, payload)
+                if outcome.raw is None:
+                    # Отказ модели — это ответ, а не сбой: экран не был раздачей.
+                    await _send_idempotent(
+                        deps,
+                        session,
+                        job.id,
+                        worker_id,
+                        "result_message_id",
+                        chat_id,
+                        not_a_hand_msg(outcome.refusal or "не похоже на раздачу"),
+                    )
+                    await session.commit()
+                    return None
+                hand_id = await hands_repo.save_raw(session_id=job.session_id, raw=outcome.raw)
+                await session.commit()
+                payload["hand_id"] = hand_id
+                await _fenced_update(session, job.id, worker_id, hand_id=hand_id, payload=payload)
+                if outcome.escalate:
+                    field = outcome.failed[0].name
+                    question, options = _escalation_question(field, outcome.checks)
+                    await _ask_player(
+                        deps,
+                        session,
+                        job,
+                        payload,
+                        chat_id,
+                        field=field,
+                        question=question,
+                        options=options,
+                    )
+                    return hand_id
+
+        record = await hands_repo.get(hand_id)
+        async with trace.span("validate"):
+            await _ensure_progress(deps, session, job.id, worker_id, chat_id, "validate")
+            canonical: CanonicalHand = record.canonical or normalize(record.raw)
+            enriched = record.enriched or enrich(canonical)
+            await hands_repo.save_canonical(hand_id, canonical)
+            await hands_repo.save_enriched(hand_id, enriched)
+            await session.commit()
+            if enriched.verdict.status is ValidationStatus.ESCALATE:
+                if payload.get("escalations", 0) >= _MAX_ESCALATIONS:
+                    await _send_idempotent(
+                        deps,
+                        session,
+                        job.id,
+                        worker_id,
+                        "result_message_id",
+                        chat_id,
+                        vision_gave_up_msg(),
+                    )
+                    await session.commit()
+                    return hand_id
+                field = enriched.verdict.fields[0]
+                await _ask_player(
+                    deps,
+                    session,
+                    job,
+                    payload,
+                    chat_id,
+                    field=field,
+                    question=enriched.verdict.questions[0],
+                    options=[],
+                )
+                return hand_id
+
+        async with trace.span("analyze"):
+            await _ensure_progress(deps, session, job.id, worker_id, chat_id, "analyze")
+            existing = await analyses_repo.get_by_hand(hand_id)
+            if existing is not None:
+                result = existing.result
+            else:
+                loop = asyncio.get_running_loop()
+                result, _exported = await loop.run_in_executor(
+                    deps.process_pool, _analyze_hand_with_cache, enriched, {}
+                )
+                await analyses_repo.save(hand_id=hand_id, result=result)
+                await session.commit()
+
+        async with trace.span("explain"):
+            await _ensure_progress(deps, session, job.id, worker_id, chat_id, "explain")
+            saved = existing.verdict_text if existing is not None else None
+            if saved is not None:
+                verdict = VerdictTextOut.model_validate_json(saved)
+            else:
+                verdict = await _verdict_prose(deps, trace, result)
+                images = _render_ranges(deps.data_dir, hand_id, result)
+                await analyses_repo.set_explanation(
+                    hand_id=hand_id,
+                    verdict_text=None if verdict is None else verdict.model_dump_json(),
+                    range_images=images,
+                )
+                await session.commit()
+
+        quota_left, quota_total = await _quota_numbers(session, job.player_id)
+        msg = deep_dive_msg(
+            result,
+            round(deps.clock() - started_at),
+            _hand_zone(result),
+            quota_left,
+            quota_total,
+            replay=hand_replay(enriched),
+            verdict=verdict,
+        )
+        await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
+        await session.commit()
+    return hand_id
+
+
 async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: float) -> int | None:
     """Возвращает `hand_id` разобранной руки — `run_job` кладёт его в `traces.hand_id`
     (не в `_run_hh_scan`: там рук много, ни одна не выделена)."""
@@ -762,6 +1034,8 @@ async def _dispatch(job: JobModel, deps: Deps, trace: Trace, started_at: float) 
         return None
     if job.type == "deep_dive":
         return await _run_deep_dive(job, deps, trace, started_at)
+    if job.type == "screenshot_analyze":
+        return await _run_screenshot(job, deps, trace, started_at)
     # `screenshot_analyze`/`eval_run` существуют в CHECK-констрейнте `jobs.type_allowed`
     # (задача 15, под будущие задачи 19+/22), но станций для них этот воркер ещё не
     # знает — явный отказ вместо молчаливого "ничего не произошло".

@@ -44,6 +44,7 @@ from harness.bot.router import build_router
 from harness.contracts import Provenance, RawHand
 from harness.memory.models import Job
 from harness.memory.repos import HandsRepo, PlayersRepo, SessionsRepo
+from harness.normalizer import normalize
 from harness.platform.queue import JobsQueue
 from harness.presentation import (
     button_not_ready_msg,
@@ -668,3 +669,191 @@ async def test_every_verdict_button_gets_an_answer_not_a_spinner(deps):
         await handlers[-1].call(_FakeCallback(f"{prefix}TM123"))
 
     assert answered == [button_not_ready_msg().text] * 3
+
+
+# --- задача 22: скрин, ник в руме, эскалация ---------------------------------
+
+_SCREEN_BYTES = b"\x89PNG\r\n\x1a\n synthetic screenshot bytes"
+
+
+async def test_a_screenshot_from_a_player_without_a_room_nickname_asks_for_it_first(deps, db_factory):
+    """Героя на экране опознаёт код по нику из профиля — без ника разбирать некого.
+
+    Спросить сразу дешевле, чем заплатить за чтение и упереться в вопрос после
+    него: модель всё равно не имеет права угадывать, кто из игроков — вы.
+    """
+    from harness.bot.handlers import handle_photo
+    from harness.presentation import ask_gg_nickname_msg
+
+    msg = await handle_photo(deps, _TG_USER_ID, _SCREEN_BYTES)
+    assert msg == ask_gg_nickname_msg()
+    assert await fetch_all(db_factory, "select id from jobs") == []
+
+
+async def test_the_first_plain_message_becomes_the_room_nickname(deps, db_factory):
+    from harness.bot.handlers import handle_text
+    from harness.presentation import gg_nickname_saved_msg
+
+    await handle_start(deps, _TG_USER_ID)
+    msg = await handle_text(deps, _TG_USER_ID, "  screen_nick  ")
+    assert msg == gg_nickname_saved_msg("screen_nick")
+    row = await fetch_one(db_factory, "select gg_nickname from players")
+    assert row["gg_nickname"] == "screen_nick"
+
+
+async def test_a_screenshot_lands_on_disk_and_becomes_a_job_the_worker_can_read(
+    deps, db_factory
+):
+    """Контракт стыка с воркером: путь к файлу и хэш картинки в `jobs.payload`."""
+    from harness.bot.handlers import handle_photo, handle_text
+
+    await handle_text(deps, _TG_USER_ID, "screen_nick")
+    assert await handle_photo(deps, _TG_USER_ID, _SCREEN_BYTES) is None
+
+    job = await fetch_one(db_factory, "select type, payload, status from jobs")
+    assert job["type"] == "screenshot_analyze"
+    assert job["status"] == "queued"
+    digest = hashlib.sha256(_SCREEN_BYTES).hexdigest()
+    assert job["payload"]["image_hash"] == digest
+    assert Path(job["payload"]["image_file"]).read_bytes() == _SCREEN_BYTES
+
+
+async def test_the_same_screenshot_twice_does_not_occupy_the_disk_twice(deps):
+    """Имя файла — хэш содержимого, поэтому вторая присылка перезаписывает ту же."""
+    from harness.bot.handlers import handle_photo, handle_text
+
+    await handle_text(deps, _TG_USER_ID, "screen_nick")
+    await handle_photo(deps, _TG_USER_ID, _SCREEN_BYTES)
+    await handle_photo(deps, _TG_USER_ID, _SCREEN_BYTES)
+    assert len(list((deps.data_dir / "screens").iterdir())) == 1
+
+
+async def _awaiting_job(db_factory, deps, *, field: str = "pot") -> tuple[int, int]:
+    """Игрок с рукой на чекпоинте `raw` и задачей, ждущей его ответа."""
+    from harness.memory.models import Job as JobModel
+
+    player_id, session_id = await _seed_player(db_factory)
+    async with db_factory() as session:
+        await PlayersRepo(session).set_gg_nickname(player_id, "screen_nick")
+        raw = RawHand.model_validate(
+            {**_raw_dict(), "provenance": Provenance.SCREENSHOT.value}
+        )
+        hand_id = await HandsRepo(session).save_raw(session_id=session_id, raw=raw)
+        job = JobModel(
+            type="screenshot_analyze",
+            status="awaiting_user",
+            payload={"hand_id": hand_id, "escalation_field": field, "escalations": 1},
+            session_id=session_id,
+            player_id=player_id,
+        )
+        session.add(job)
+        await session.commit()
+        return job.id, hand_id
+
+
+def _raw_dict() -> dict:
+    from tests.test_contracts import make_min_raw
+
+    # Два места, а не одно: нормалайзер раздаёт позиции по кругу, и стола на
+    # одного человека в его таблице позиций нет — как и в покере.
+    return make_min_raw(
+        bb=10_000,
+        button_seat=4,
+        seats=[
+            {"seat": 4, "label": "Hero", "stack": 100_000},
+            {"seat": 5, "label": "S2", "stack": 100_000},
+        ],
+        vision={"displayed_pot": 100_000, "nicknames": {"Hero": "me", "S2": "other"}},
+    )
+
+
+async def test_an_escalation_answer_is_written_to_the_eval_dataset_first(deps, db_factory):
+    """Ответ игрока — ground truth (EVALS.md): эскалация и есть разметочная машина.
+
+    Пишется он всегда, даже когда подставить его в руку нечем: размеченный
+    пример ценен сам по себе.
+    """
+    from harness.bot.handlers import handle_escalation_callback
+
+    _job_id, hand_id = await _awaiting_job(db_factory, deps)
+    msg = await handle_escalation_callback(deps, _TG_USER_ID, "escalate:pot:12.7")
+    assert msg is not None
+
+    row = await fetch_one(db_factory, "select kind, field, ground_truth, hand_id from eval_cases")
+    assert (row["kind"], row["field"], row["hand_id"]) == ("vision_field", "pot", hand_id)
+    assert row["ground_truth"] == {"field": "pot", "value": "12.7"}
+
+
+async def test_an_escalation_answer_patches_the_hand_and_resets_the_checkpoints(
+    deps, db_factory
+):
+    """Спека §8.3, шаги 2 и 3: патч `hands.raw`, сброс ниже, задача снова в очереди."""
+    from harness.bot.handlers import handle_escalation_callback
+
+    job_id, hand_id = await _awaiting_job(db_factory, deps)
+    # Чекпоинты ниже по конвейеру ставятся прямой записью: содержимое их здесь
+    # неважно, важно лишь то, что патч сырой руки их СНИМАЕТ.
+    async with db_factory() as session:
+        repo = HandsRepo(session)
+        await repo.save_canonical(hand_id, normalize((await repo.get(hand_id)).raw))
+        await session.commit()
+
+    await handle_escalation_callback(deps, _TG_USER_ID, "escalate:pot:12.7")
+
+    hand = await fetch_one(db_factory, "select raw, canonical, enriched from hands")
+    assert hand["raw"]["vision"]["displayed_pot"] == 127_000
+    assert hand["canonical"] is None and hand["enriched"] is None  # чекпоинты сняты
+    job = await fetch_one(db_factory, f"select status from jobs where id = {job_id}")
+    assert job["status"] == "queued"
+
+
+async def test_the_manual_entry_button_asks_for_a_number_and_remembers_the_field(
+    deps, db_factory
+):
+    """«Ввести вручную» — FSM, состояние которого живёт в `jobs.payload`.
+
+    В памяти процесса бота его держать нельзя: точка возврата задачи зафиксирована
+    артефактами и переживает перезапуск, а половина состояния рядом с ней — нет.
+    """
+    from harness.bot.handlers import handle_escalation_callback
+
+    job_id, _hand_id = await _awaiting_job(db_factory, deps)
+    msg = await handle_escalation_callback(deps, _TG_USER_ID, "escalate:pot:manual")
+    assert msg is not None and "число" in msg.text
+    job = await fetch_one(db_factory, f"select status, payload from jobs where id = {job_id}")
+    assert job["status"] == "awaiting_user"
+    assert job["payload"]["manual_entry"] == "pot"
+
+
+async def test_a_number_typed_by_hand_finishes_the_escalation(deps, db_factory):
+    from harness.bot.handlers import handle_escalation_callback, handle_text
+
+    job_id, _hand_id = await _awaiting_job(db_factory, deps)
+    await handle_escalation_callback(deps, _TG_USER_ID, "escalate:pot:manual")
+    msg = await handle_text(deps, _TG_USER_ID, "12,7")
+    assert msg is not None
+
+    hand = await fetch_one(db_factory, "select raw from hands")
+    assert hand["raw"]["vision"]["displayed_pot"] == 127_000
+    job = await fetch_one(db_factory, f"select status, payload from jobs where id = {job_id}")
+    assert job["status"] == "queued"
+    assert "manual_entry" not in job["payload"]
+
+
+async def test_a_non_number_typed_by_hand_asks_again_instead_of_guessing(deps, db_factory):
+    from harness.bot.handlers import handle_escalation_callback, handle_text
+    from harness.presentation import vision_answer_not_a_number_msg
+
+    job_id, _hand_id = await _awaiting_job(db_factory, deps)
+    await handle_escalation_callback(deps, _TG_USER_ID, "escalate:pot:manual")
+    assert await handle_text(deps, _TG_USER_ID, "не помню") == vision_answer_not_a_number_msg()
+    job = await fetch_one(db_factory, f"select status from jobs where id = {job_id}")
+    assert job["status"] == "awaiting_user"
+
+
+async def test_an_answer_without_a_waiting_job_changes_nothing(deps, db_factory):
+    from harness.bot.handlers import handle_escalation_callback
+
+    await _seed_player(db_factory)
+    assert await handle_escalation_callback(deps, _TG_USER_ID, "escalate:pot:12.7") is None
+    assert await fetch_all(db_factory, "select id from eval_cases") == []

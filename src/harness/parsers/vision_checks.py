@@ -24,7 +24,6 @@
 
 from __future__ import annotations
 
-from harness.analysis.tools.equity import equity_hand_vs_hand
 from harness.contracts import VisionCheck
 
 __all__ = [
@@ -154,7 +153,17 @@ def equity_check(
 
     Молчит, когда сверять нечего: процент напечатан только на экспортах с
     олл-ином, и не на каждом.
+
+    **Импорт эквити — внутри функции, и это не стиль.** Через
+    `harness.analysis` в процесс затягивается весь расчётный стек (`eval7`,
+    `pokerkit`), а `harness.parsers.vision_adapter` импортирует процесс БОТА
+    ради подстановки ответа игрока в руку. Модульный импорт вернул бы в образ
+    бота ровно ту зависимость, которую из него уже однажды выносили
+    (`test_bot_image_does_not_import_calculation_stack`). Считает эквити воркер,
+    и грузит его тоже он.
     """
+    from harness.analysis.tools.equity import equity_hand_vs_hand
+
     if shown_pct is None or len(hero) != 2 or len(villain) != 2:
         return VisionCheck(
             name=CHECK_EQUITY, passed=True, detail="эквити на экране не напечатано"
