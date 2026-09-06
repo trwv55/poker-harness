@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,6 +74,7 @@ from harness.contracts import (
     AnalysisResult,
     CanonicalHand,
     EnrichedHand,
+    RawHand,
     ScanSummary,
     TournamentReport,
     TournamentTextOut,
@@ -100,7 +102,12 @@ from harness.memory.repos import (
 )
 from harness.normalizer import normalize
 from harness.parsers import hh_parser
-from harness.parsers.vision_adapter import VisionOutcome, VisionReadFailed, vision_extract
+from harness.parsers.vision_adapter import (
+    VisionOutcome,
+    VisionReadFailed,
+    can_apply_vision_answer,
+    vision_extract,
+)
 from harness.platform.llm import LLM, LLMProviderError, LLMSchemaError
 from harness.platform.queue import JobPreconditionFailed, JobsQueue
 from harness.platform.trace import Clock, Trace
@@ -719,19 +726,40 @@ _MAX_ESCALATIONS = 2
 _FILE_HINT_FIELDS = frozenset({"cards", "equity"})
 
 
-def _escalation_question(field: str, checks: list[VisionCheck]) -> tuple[str, list[str]]:
-    """Вопрос игроку и два варианта ответа — из самой непройденной проверки.
+def _unresolved_checks(raw: RawHand) -> list[VisionCheck]:
+    """Контрольные суммы, которые всё ещё не сошлись, — включая после ответа игрока.
+
+    Ответ, который код УМЕЛ подставить, закрывает свою проверку
+    (`vision_adapter.apply_vision_answer`); ответ, который подставить не вышло,
+    не закрывает ничего. Разница видна только здесь, и она решающая: без неё
+    возобновлённая задача пропускает чтение, идёт в валидатор — а тот про
+    неверную масть ничего не знает, дубля нет, деньги сходятся — и игрок
+    получает вердикт «зона: строго» по спорному чтению (ревью раунда 1, R1).
+    """
+    return [check for check in (raw.vision.checks if raw.vision else []) if not check.passed]
+
+
+def _escalation_question(field: str, checks: list[VisionCheck]) -> tuple[str, list[str], str]:
+    """Вопрос, два варианта ответа и субъект — из самой непройденной проверки.
 
     Варианты не выдумываются: каждая контрольная сумма сравнивает ДВА
     независимых прочтения одного экрана, и оба и есть кнопки. Выбрать из двух
     прочитанных чисел игроку проще, чем набрать своё, — а «ввести вручную»
     остаётся третьей кнопкой (спека §8.3).
+
+    Субъект нужен там, где спор про конкретного игрока: два варианта карт без
+    ответа на «чьих» подставить некуда.
     """
     check = next((c for c in checks if c.name == field and not c.passed), None)
     if check is None:
-        return (_VISION_QUESTIONS.get(field, f"Поле «{field}» распознано верно?"), [])
-    return (_VISION_QUESTIONS.get(field, check.detail), check.options)
+        return (_VISION_QUESTIONS.get(field, f"Поле «{field}» распознано верно?"), [], "")
+    return (_VISION_QUESTIONS.get(field, check.detail), check.options, check.subject)
 
+
+# Имя поля кнопки в вердикте валидатора (`engine.validation`). Продублировано
+# строкой, а не импортом приватного имени чужого модуля: разойдутся — увидит
+# тест `test_the_validator_asks_about_the_button_with_the_nicknames_it_read`.
+_VALIDATOR_FIELD_BUTTON = "button"
 
 _VISION_QUESTIONS: dict[str, str] = {
     "pot": "Банк на этом скрине распознан верно?",
@@ -753,6 +781,7 @@ async def _ask_player(
     field: str,
     question: str,
     options: list[str],
+    subject: str = "",
 ) -> None:
     """Задать вопрос и отпустить воркера — точка возврата уже зафиксирована.
 
@@ -768,17 +797,64 @@ async def _ask_player(
         worker_id,
         "escalation_message_id",
         chat_id,
-        escalation_msg(field, question, options),
+        escalation_msg(job.id, field, question, options),
     )
     if field in _FILE_HINT_FIELDS:
         await deps.sender.send(chat_id, send_as_file_msg())
     payload["escalation_field"] = field
     payload["escalation_options"] = options
+    payload["escalation_subject"] = subject
     payload["escalations"] = payload.get("escalations", 0) + 1
-    payload.pop("escalation_message_id", None)  # следующий вопрос — новое сообщение
     payload.pop("manual_entry", None)
     await session.commit()
+    # `escalation_message_id` СНИМАЕТСЯ вместе с переходом в `awaiting_user`, а
+    # не раньше: между отправкой и `await_user` попытка может умереть, и тогда
+    # повтор обязан увидеть уже отправленный вопрос, а не задать его второй раз
+    # (ревью раунда 1, F). Ключ нужен ровно до этой границы и не дальше — иначе
+    # следующий вопрос отредактировал бы предыдущий вместо нового сообщения.
+    payload.pop("escalation_message_id", None)
     await deps.queue.await_user(job.id, payload, worker_id=worker_id)
+
+
+def _validator_options(field: str, raw: RawHand) -> list[str]:
+    """Варианты ответа на вопрос ВАЛИДАТОРА — их у него, в отличие от сверок, нет.
+
+    Контрольная сумма адаптера сравнивает два прочтения и обоими и отвечает;
+    валидатор сравнивает прочтение с правилами покера, и второго прочтения у
+    него не бывает. Кнопки поэтому берутся из того, что уже прочитано с экрана:
+    для кнопки дилера это список ников — игроку остаётся показать, у кого она
+    стояла на самом деле.
+    """
+    if field != _VALIDATOR_FIELD_BUTTON or raw.vision is None:
+        return []
+    return list(raw.vision.hero_candidates)
+
+
+async def _give_up(
+    deps: Deps,
+    session: AsyncSession,
+    job: JobModel,
+    chat_id: int,
+    fields: Sequence[str],
+) -> None:
+    """Прекратить разбор с честным текстом — и назвать путь дальше, если он есть.
+
+    Молча разобрать руку со спорными числами нельзя: вывод поверх неизвестного
+    хуже отсутствия вывода (CLAUDE.md). Если спор про карты, у игрока есть
+    рабочий следующий шаг — прислать тот же экран файлом, без сжатия.
+    """
+    await _send_idempotent(
+        deps,
+        session,
+        job.id,
+        job.locked_by,
+        "result_message_id",
+        chat_id,
+        vision_gave_up_msg(),
+    )
+    if any(field in _FILE_HINT_FIELDS for field in fields):
+        await deps.sender.send(chat_id, send_as_file_msg())
+    await session.commit()
 
 
 async def _read_screen(
@@ -858,7 +934,7 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
                 await _fenced_update(session, job.id, worker_id, hand_id=hand_id, payload=payload)
                 if outcome.escalate:
                     field = outcome.failed[0].name
-                    question, options = _escalation_question(field, outcome.checks)
+                    question, options, subject = _escalation_question(field, outcome.checks)
                     await _ask_player(
                         deps,
                         session,
@@ -868,10 +944,19 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
                         field=field,
                         question=question,
                         options=options,
+                        subject=subject,
                     )
                     return hand_id
 
         record = await hands_repo.get(hand_id)
+        unresolved = _unresolved_checks(record.raw)
+        if unresolved:
+            # Сюда попадает только возобновлённая задача: на первом проходе
+            # непройденная проверка уходит вопросом игроку и возвращается выше.
+            # Значит, ответ расхождение не закрыл — и разбирать эту руку нельзя.
+            await _give_up(deps, session, job, chat_id, [c.name for c in unresolved])
+            return hand_id
+
         async with trace.span("validate"):
             await _ensure_progress(deps, session, job.id, worker_id, chat_id, "validate")
             canonical: CanonicalHand = record.canonical or normalize(record.raw)
@@ -880,19 +965,21 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
             await hands_repo.save_enriched(hand_id, enriched)
             await session.commit()
             if enriched.verdict.status is ValidationStatus.ESCALATE:
-                if payload.get("escalations", 0) >= _MAX_ESCALATIONS:
-                    await _send_idempotent(
-                        deps,
-                        session,
-                        job.id,
-                        worker_id,
-                        "result_message_id",
-                        chat_id,
-                        vision_gave_up_msg(),
+                answerable = [
+                    (field, question)
+                    for field, question in zip(
+                        enriched.verdict.fields, enriched.verdict.questions, strict=True
                     )
-                    await session.commit()
+                    if can_apply_vision_answer(field)
+                ]
+                # Вопрос по полю, ответ на которое подставить некуда, — мёртвый:
+                # игрок отвечает, ответ ложится в eval-датасет, рука остаётся
+                # прежней, и следующий проход упирается в то же расхождение
+                # (ревью раунда 1, R3). Такие поля не спрашиваем вовсе.
+                if not answerable or payload.get("escalations", 0) >= _MAX_ESCALATIONS:
+                    await _give_up(deps, session, job, chat_id, enriched.verdict.fields)
                     return hand_id
-                field = enriched.verdict.fields[0]
+                field, question = answerable[0]
                 await _ask_player(
                     deps,
                     session,
@@ -900,8 +987,8 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
                     payload,
                     chat_id,
                     field=field,
-                    question=enriched.verdict.questions[0],
-                    options=[],
+                    question=question,
+                    options=_validator_options(field, record.raw),
                 )
                 return hand_id
 

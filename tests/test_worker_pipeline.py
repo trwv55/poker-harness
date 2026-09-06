@@ -61,6 +61,7 @@ from harness.contracts import (
     SpotKind,
     Street,
     VerdictTextOut,
+    VisionMeta,
     Zone,
 )
 from harness.engine import enrich
@@ -1644,18 +1645,86 @@ async def test_a_failed_checksum_asks_the_player_and_frees_the_worker(
     assert labels == ["31.95", "30.74", "ввести вручную"]
 
 
-async def test_resuming_after_the_answer_never_pays_for_a_second_reading(
+async def _resume_and_run(queue, deps, monkeypatch, job_id: int) -> None:
+    """Продолжить задачу после ответа игрока — с ловушкой на повторное чтение.
+
+    Второе чтение обязано не случиться вовсе: чекпоинт `hands.raw` для того и
+    существует, иначе каждый ответ игрока оплачивался бы новым вызовом модели.
+    """
+
+    async def never(*args, **kwargs):
+        raise AssertionError("станция позвала модель повторно после ответа игрока")
+
+    monkeypatch.setattr("harness.worker.pipeline.vision_extract", never)
+    await queue.resume(job_id)
+    job = await queue.claim("w2")
+    assert job is not None
+    await run_job(job, deps)
+
+
+async def _patch_raw(db_factory, hand_id: int, raw) -> None:
+    async with db_factory() as session:
+        await HandsRepo(session).replace_raw(hand_id, raw)
+        await session.commit()
+
+
+async def test_an_unresolved_checksum_never_reaches_a_verdict_after_the_answer(
     deps, queue, db_factory, fake_sender, tmp_path, monkeypatch
 ):
-    """Чекпоинт `hands.raw` гасит петлю: иначе каждый ответ игрока стоил бы чтения,
-    контрольные суммы падали бы на том же месте, и вопрос повторялся бы вечно.
+    """Ответ, который подставить было некуда, не превращается в вердикт (R1).
+
+    Возобновлённая задача пропускает чтение и идёт в валидатор — а тот про
+    неверную масть ничего не знает: дубля нет, деньги сходятся. Без этой
+    проверки игрок получил бы разбор «зона: строго» по спорному чтению, то есть
+    тихую ошибку ПОСЛЕ того, как его о ней спросили.
     """
     from harness.contracts import VisionCheck
 
     player_id, session_id = await _make_scope(db_factory)
     await _with_nickname(db_factory, player_id)
-    failed = VisionCheck(name="pot", passed=False, detail="не сошлось", options=["31.95", "30.74"])
-    _stub_vision(monkeypatch, _outcome(raw=_screenshot_raw(), checks=[failed]))
+    failed = VisionCheck(
+        name="cards", passed=False, detail="не сошлось", options=["Ks Ad", "Kh Ad"], subject="N5"
+    )
+    raw = _screenshot_raw()
+    raw.vision = (raw.vision or VisionMeta()).model_copy(update={"checks": [failed]})
+    _stub_vision(monkeypatch, _outcome(raw=raw, checks=[failed]))
+    job_id = await _enqueue_screenshot(
+        queue, tmp_path, player_id=player_id, session_id=session_id
+    )
+
+    first = await queue.claim("w1")
+    assert first is not None
+    await run_job(first, deps)
+    await _resume_and_run(queue, deps, monkeypatch, job_id)
+
+    async with db_factory() as session:
+        status = (await session.get(Job, job_id)).status
+        analyses = (await session.execute(text("select id from analyses"))).all()
+    assert status == "done"
+    assert analyses == []  # разбора не было
+    assert any("не возьмусь" in msg.text for msg in fake_sender.sent)
+    assert any("файл" in msg.text.casefold() for msg in fake_sender.sent)
+
+
+async def test_a_resolved_checksum_lets_the_verdict_through_without_a_second_reading(
+    deps, queue, db_factory, fake_sender, tmp_path, monkeypatch
+):
+    """Ответ, который код подставил, закрывает проверку — и разбор идёт дальше (R1).
+
+    Обратная половина того же инварианта: гейт обязан пропускать, иначе он не
+    предохранитель, а глухая стена.
+    """
+    from harness.contracts import VisionCheck
+    from harness.parsers.vision_adapter import apply_vision_answer
+
+    player_id, session_id = await _make_scope(db_factory)
+    await _with_nickname(db_factory, player_id)
+    failed = VisionCheck(
+        name="cards", passed=False, detail="не сошлось", options=["Tc Th", "Td Th"], subject="N3"
+    )
+    raw = _screenshot_raw()
+    raw.vision = (raw.vision or VisionMeta()).model_copy(update={"checks": [failed]})
+    _stub_vision(monkeypatch, _outcome(raw=raw, checks=[failed]))
     job_id = await _enqueue_screenshot(
         queue, tmp_path, player_id=player_id, session_id=session_id
     )
@@ -1664,19 +1733,22 @@ async def test_resuming_after_the_answer_never_pays_for_a_second_reading(
     assert first is not None
     await run_job(first, deps)
 
-    # Второе чтение обязано не случиться вовсе — подменяем адаптер ловушкой.
-    async def never(*args, **kwargs):
-        raise AssertionError("станция позвала модель повторно после ответа игрока")
+    async with db_factory() as session:
+        hand_id = (await session.get(Job, job_id)).hand_id
+    assert hand_id is not None
+    async with db_factory() as session:
+        stored = (await HandsRepo(session).get(hand_id)).raw
+    answered = apply_vision_answer(stored, "cards", "Tc Th", subject="N3")
+    assert answered is not None
+    await _patch_raw(db_factory, hand_id, answered)
 
-    monkeypatch.setattr("harness.worker.pipeline.vision_extract", never)
-    await queue.resume(job_id)
-    second = await queue.claim("w2")
-    assert second is not None
-    await run_job(second, deps)
+    await _resume_and_run(queue, deps, monkeypatch, job_id)
 
     async with db_factory() as session:
         status = (await session.get(Job, job_id)).status
+        analyses = (await session.execute(text("select id from analyses"))).all()
     assert status == "done"
+    assert len(analyses) == 1  # разбор состоялся
 
 
 async def test_the_cascade_hops_land_in_the_trace(
@@ -1704,3 +1776,78 @@ async def test_the_cascade_hops_land_in_the_trace(
     assert "vision:primary" in names and "vision:fallback" in names
     primary = next(span for span in spans if span["name"] == "vision:primary")
     assert primary["failed_checks"] == ["pot"]
+
+
+async def test_the_validator_never_asks_a_question_whose_answer_goes_nowhere(
+    deps, queue, db_factory, fake_sender, tmp_path, monkeypatch
+):
+    """Вопрос про поле, которое код подставить не умеет, — мёртвый (R3).
+
+    Игрок отвечает, ответ ложится в eval-датасет, рука остаётся прежней, и
+    следующий проход упирается в то же расхождение. Два таких круга кончались
+    отказом после двух «Принял, продолжаю» — то есть трата внимания игрока
+    впустую. Такие поля не спрашиваются вовсе.
+    """
+    player_id, session_id = await _make_scope(db_factory)
+    await _with_nickname(db_factory, player_id)
+    # Рука с невозможным ходом: валидатор спросит про действия, а подставить
+    # ответ по этому полю код не умеет — значит, спрашивать нечего.
+    raw = _screenshot_raw()
+    raw.actions[0].to_amount = 10 * max(seat.stack for seat in raw.seats)
+    _stub_vision(monkeypatch, _outcome(raw=raw))
+    job_id = await _enqueue_screenshot(
+        queue, tmp_path, player_id=player_id, session_id=session_id
+    )
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    async with db_factory() as session:
+        row = (await session.get(Job, job_id))
+        analyses = (await session.execute(text("select id from analyses"))).all()
+    assert row.status == "done"
+    assert row.payload.get("escalations") is None  # вопроса не было вовсе
+    assert analyses == []
+    assert any("не возьмусь" in msg.text for msg in fake_sender.sent)
+    assert not any(msg.buttons for msg in fake_sender.sent)
+
+
+async def test_the_validator_asks_about_the_button_with_the_nicknames_it_read(
+    deps, queue, db_factory, fake_sender, tmp_path, monkeypatch
+):
+    """У вопроса валидатора вариантов нет — их берут из прочитанного (R3).
+
+    Контрольная сумма адаптера сравнивает два прочтения и обоими и отвечает;
+    валидатор сравнивает прочтение с правилами покера, и второго прочтения у
+    него не бывает. Для кнопки дилера варианты — прочитанные с экрана ники.
+    """
+    player_id, session_id = await _make_scope(db_factory)
+    await _with_nickname(db_factory, player_id)
+    raw = _screenshot_raw()
+    raw.button_seat = 4  # кнопка не на том месте: блайнды перестают сходиться
+    _stub_vision(monkeypatch, _outcome(raw=raw))
+    job_id = await _enqueue_screenshot(
+        queue, tmp_path, player_id=player_id, session_id=session_id
+    )
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    async with db_factory() as session:
+        row = await session.get(Job, job_id)
+    assert row.status == "awaiting_user"
+    assert row.payload["escalation_field"] == "button"
+    assert row.payload["escalation_options"] == (raw.vision.hero_candidates if raw.vision else [])
+    assert row.payload["escalation_options"]
+    asked = next(msg for msg in fake_sender.sent if msg.buttons)
+    labels = [btn.text for row_ in asked.buttons for btn in row_]
+    assert labels[-1] == "ввести вручную"
+    assert len(labels) == len(row.payload["escalation_options"]) + 1
+    # Номер задачи в кнопке обязателен — иначе ответ уйдёт в чужую руку (R2).
+    assert all(
+        btn.callback_data.startswith(f"escalate:{job_id}:button:")
+        for row_ in asked.buttons
+        for btn in row_
+    )

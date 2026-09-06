@@ -739,21 +739,66 @@ def _seat_of_nickname(raw: RawHand, nickname: str) -> str | None:
     return None
 
 
-def apply_vision_answer(raw: RawHand, field: str, value: str) -> RawHand | None:
+# Поля эскалации, ответ на которые код умеет подставить в руку. Вопрос по полю
+# вне этого списка — мёртвый: игрок отвечает, ответ ложится в eval-датасет, а
+# рука остаётся прежней, и следующий проход упирается в то же расхождение. Такие
+# поля спрашивать нельзя вовсе (ревью раунда 1, R3).
+ANSWERABLE_FIELDS = frozenset({"pot", "button", "hero", "cards"})
+
+
+def can_apply_vision_answer(field: str) -> bool:
+    """Умеет ли код подставить ответ игрока по этому полю в сырую руку."""
+    return field in ANSWERABLE_FIELDS
+
+
+def _resolved(raw: RawHand, field: str) -> VisionMeta:
+    """Пометить проверку `field` закрытой ответом игрока.
+
+    Ответ игрока и есть разрешение спора для своего поля: он видел экран, а мы
+    нет. Пометка нужна не для красоты — по ней станция отличает «расхождение
+    закрыто» от «спросили и не помогло», и второе больше не доходит до вердикта
+    (ревью раунда 1, R1).
+    """
+    meta = raw.vision or VisionMeta()
+    return meta.model_copy(
+        update={
+            "checks": [
+                check.model_copy(update={"passed": True, "detail": "закрыто ответом игрока"})
+                if check.name == field and not check.passed
+                else check
+                for check in meta.checks
+            ]
+        }
+    )
+
+
+def _cards_of_answer(value: str) -> list[str]:
+    """Две карты из строки варианта («Ks Ad»). Иначе пусто — подставлять нечего."""
+    cards = value.split()
+    return cards if len(cards) == 2 else []
+
+
+def apply_vision_answer(
+    raw: RawHand, field: str, value: str, *, subject: str = ""
+) -> RawHand | None:
     """Подставить ответ игрока в сырую руку — спека §8.3, шаг 2.
 
-    `None` означает «этим ответом руку не поправить»: не всякое расхождение
-    чинится одним числом (расхождение карт у места с картами в логе называет
-    ДВЕ карты, а какая из них где — вопрос второй). Ответ при этом уже записан
+    `None` означает «этим ответом руку не поправить». Ответ при этом уже записан
     в `eval_cases` вызывающим и не теряется: он размеченный пример независимо от
-    того, помог ли он этой конкретной руке.
+    того, помог ли он этой конкретной руке. Но до вердикта такая рука не
+    доходит — станция видит непройденную проверку и отказывается (см.
+    `worker.pipeline._unresolved_checks`).
 
-    Патчатся ровно те поля, у которых ответ игрока однозначно ложится в контракт:
+    Патчатся ровно те поля, у которых ответ игрока однозначно ложится в контракт
+    (`ANSWERABLE_FIELDS`):
 
     * `pot` — показанный банк (`VisionMeta.displayed_pot`), он же вход банка на
       состоянии в точке решения;
     * `button` — кнопка переставляется на место названного игрока;
-    * `hero` — герой переименовывается в названного игрока.
+    * `hero` — герой переименовывается в названного игрока;
+    * `cards` — карты названного игрока (`subject` — его ник) ставятся и в
+      раздачу, и во вскрытие: расхождение было между двумя прочтениями ОДНИХ
+      карт, и разводить их после ответа не во что.
 
     Ни одно из значений не «подгоняется, чтобы сошлось»: подставляется ровно то,
     что сказал игрок, а сойдётся ли после этого рука, решает валидатор на
@@ -764,15 +809,35 @@ def apply_vision_answer(raw: RawHand, field: str, value: str) -> RawHand | None:
             shown = float(value.replace(",", "."))
         except ValueError:
             return None
-        meta = (raw.vision or VisionMeta()).model_copy(
+        meta = _resolved(raw, field).model_copy(
             update={"displayed_pot": round(shown * raw.bb)}
         )
         return raw.model_copy(update={"vision": meta})
 
+    if field == "cards":
+        cards = _cards_of_answer(value)
+        label = _seat_of_nickname(raw, subject) if subject else None
+        if not cards or label is None:
+            return None
+        showdowns = [
+            entry.model_copy(update={"cards": cards}) if entry.label == label else entry
+            for entry in raw.showdowns
+        ]
+        if all(entry.label != label for entry in raw.showdowns):
+            showdowns = [*showdowns, ShowdownEntry(label=label, cards=cards)]
+        dealt = {**raw.dealt}
+        if label in dealt or label == HERO_LABEL:
+            dealt[label] = cards
+        return raw.model_copy(
+            update={"dealt": dealt, "showdowns": showdowns, "vision": _resolved(raw, field)}
+        )
+
     if field == "button":
         label = _seat_of_nickname(raw, value)
         seat = next((s.seat for s in raw.seats if s.label == label), None)
-        return None if seat is None else raw.model_copy(update={"button_seat": seat})
+        if seat is None:
+            return None
+        return raw.model_copy(update={"button_seat": seat, "vision": _resolved(raw, field)})
 
     if field == "hero":
         label = _seat_of_nickname(raw, value)
@@ -791,7 +856,7 @@ def apply_vision_answer(raw: RawHand, field: str, value: str) -> RawHand | None:
         actions = [
             a.model_copy(update={"label": renamed.get(a.label, a.label)}) for a in raw.actions
         ]
-        meta = (raw.vision or VisionMeta()).model_copy(
+        meta = _resolved(raw, field).model_copy(
             update={
                 "nicknames": {
                     renamed.get(lbl, lbl): nick

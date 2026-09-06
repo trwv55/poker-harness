@@ -477,18 +477,33 @@ def test_deep_dive_msg_with_no_ranked_points_does_not_crash():
 
 
 def test_escalation_msg_has_option_buttons_plus_manual_entry():
+    """Кнопка несёт НОМЕР задачи и ИНДЕКС варианта, а не сам вариант.
+
+    Номер задачи — потому что ждущих задач у игрока бывает несколько сразу, и
+    ответ без него уходил бы в чужую руку. Индекс — потому что в `callback_data`
+    Телеграма 64 байта, а вариантом бывает ник игрока.
+    """
     msg = escalation_msg(
-        field="hero_stack_bb", question="Стек героя: 12.7bb?", options=["12.7", "12.1"]
+        77, field="hero_stack_bb", question="Стек героя: 12.7bb?", options=["12.7", "12.1"]
     )
     assert msg.text == "Стек героя: 12.7bb?"
     assert len(msg.buttons) == 1
     row = msg.buttons[0]
     assert [b.text for b in row] == ["12.7", "12.1", "ввести вручную"]
     assert [b.callback_data for b in row] == [
-        "escalate:hero_stack_bb:12.7",
-        "escalate:hero_stack_bb:12.1",
-        "escalate:hero_stack_bb:manual",
+        "escalate:77:hero_stack_bb:0",
+        "escalate:77:hero_stack_bb:1",
+        "escalate:77:hero_stack_bb:manual",
     ]
+
+
+def test_every_escalation_button_fits_the_telegram_callback_limit():
+    """64 байта — жёсткий предел Телеграма, и ник в варианте его пробивал бы."""
+    long_nicks = [f"игрок_с_очень_длинным_ником_{i}" for i in range(4)]
+    msg = escalation_msg(9_999_999, field="button", question="Кто?", options=long_nicks)
+    assert all(
+        len(btn.callback_data.encode("utf-8")) <= 64 for row in msg.buttons for btn in row
+    )
 
 
 # --- failed_msg / quota_exceeded_msg --------------------------------------------------
@@ -1145,7 +1160,7 @@ def test_the_escalation_message_offers_both_readings_plus_manual_entry():
     """Варианты — два независимых прочтения одного экрана, а не выдуманные числа."""
     from harness.presentation import escalation_msg
 
-    msg = escalation_msg("pot", "Банк распознан верно?", ["31.95", "30.74"])
+    msg = escalation_msg(1, "pot", "Банк распознан верно?", ["31.95", "30.74"])
     labels = [btn.text for row in msg.buttons for btn in row]
     assert labels == ["31.95", "30.74", "ввести вручную"]
 

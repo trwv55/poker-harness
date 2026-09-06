@@ -523,9 +523,9 @@ def range_image_title(point: PointVerdict) -> str:
     )
 
 
-def escalation_msg(field: str, question: str, options: list[str]) -> Msg:
+def escalation_msg(job_id: int, field: str, question: str, options: list[str]) -> Msg:
     """Эскалация валидатора — вопрос кнопками, не текстом (SESSIONS_UX): один тап."""
-    return Msg(text=question, buttons=[escalation_buttons(field, options)])
+    return Msg(text=question, buttons=[escalation_buttons(job_id, field, options)])
 
 
 def failed_msg(reason_public: str) -> Msg:

@@ -44,14 +44,24 @@ def verdict_buttons(hand_no: str) -> list[Btn]:
     ]
 
 
-def escalation_buttons(field: str, options: list[str]) -> list[Btn]:
+def escalation_buttons(job_id: int, field: str, options: list[str]) -> list[Btn]:
     """Варианты эскалации плюс постоянная кнопка ручного ввода — одним рядом.
 
-    `field` в `callback_data` — так хендлер бота узнаёт, какое поле дозаполняет
-    ответ игрока, не заглядывая в текст вопроса.
+    **`job_id` в `callback_data` обязателен.** У игрока может ждать ответа
+    больше одной задачи разом (спека §8.1: `awaiting_user` не считается
+    активной и следующий скрин разбирается независимо), и ответ без номера
+    задачи применялся бы к свежайшей — то есть к чужой руке, да ещё и писался бы
+    ground truth с чужим `hand_id` (ревью раунда 1, R2).
+
+    **Значение — ИНДЕКС варианта, а не сам вариант.** `callback_data` Телеграма
+    ограничен 64 байтами, а вариантом бывает ник игрока; сам список лежит в
+    `jobs.payload["escalation_options"]`, откуда бот его и берёт.
     """
-    buttons = [Btn(text=option, callback_data=f"escalate:{field}:{option}") for option in options]
-    buttons.append(Btn(text="ввести вручную", callback_data=f"escalate:{field}:manual"))
+    buttons = [
+        Btn(text=option, callback_data=f"escalate:{job_id}:{field}:{index}")
+        for index, option in enumerate(options)
+    ]
+    buttons.append(Btn(text="ввести вручную", callback_data=f"escalate:{job_id}:{field}:manual"))
     return buttons
 
 

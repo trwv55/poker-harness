@@ -728,21 +728,36 @@ async def test_the_same_screenshot_twice_does_not_occupy_the_disk_twice(deps):
     assert len(list((deps.data_dir / "screens").iterdir())) == 1
 
 
-async def _awaiting_job(db_factory, deps, *, field: str = "pot") -> tuple[int, int]:
+async def _awaiting_job(
+    db_factory,
+    deps,
+    *,
+    field: str = "pot",
+    options: list[str] | None = None,
+    tg_user_id: int = _TG_USER_ID,
+    escalation_subject: str = "",
+    **raw_over,
+) -> tuple[int, int]:
     """Игрок с рукой на чекпоинте `raw` и задачей, ждущей его ответа."""
     from harness.memory.models import Job as JobModel
 
-    player_id, session_id = await _seed_player(db_factory)
+    player_id, session_id = await _seed_player(db_factory, tg_user_id=tg_user_id)
     async with db_factory() as session:
         await PlayersRepo(session).set_gg_nickname(player_id, "screen_nick")
         raw = RawHand.model_validate(
-            {**_raw_dict(), "provenance": Provenance.SCREENSHOT.value}
+            {**_raw_dict(**raw_over), "provenance": Provenance.SCREENSHOT.value}
         )
         hand_id = await HandsRepo(session).save_raw(session_id=session_id, raw=raw)
         job = JobModel(
             type="screenshot_analyze",
             status="awaiting_user",
-            payload={"hand_id": hand_id, "escalation_field": field, "escalations": 1},
+            payload={
+                "hand_id": hand_id,
+                "escalation_field": field,
+                "escalation_options": options if options is not None else ["12.7", "12.1"],
+                "escalation_subject": escalation_subject,
+                "escalations": 1,
+            },
             session_id=session_id,
             player_id=player_id,
         )
@@ -751,20 +766,22 @@ async def _awaiting_job(db_factory, deps, *, field: str = "pot") -> tuple[int, i
         return job.id, hand_id
 
 
-def _raw_dict() -> dict:
+def _raw_dict(**over) -> dict:
     from tests.test_contracts import make_min_raw
 
     # Два места, а не одно: нормалайзер раздаёт позиции по кругу, и стола на
     # одного человека в его таблице позиций нет — как и в покере.
-    return make_min_raw(
-        bb=10_000,
-        button_seat=4,
-        seats=[
+    base = {
+        "bb": 10_000,
+        "button_seat": 4,
+        "seats": [
             {"seat": 4, "label": "Hero", "stack": 100_000},
             {"seat": 5, "label": "S2", "stack": 100_000},
         ],
-        vision={"displayed_pot": 100_000, "nicknames": {"Hero": "me", "S2": "other"}},
-    )
+        "vision": {"displayed_pot": 100_000, "nicknames": {"Hero": "me", "S2": "other"}},
+    }
+    base.update(over)
+    return make_min_raw(**base)
 
 
 async def test_an_escalation_answer_is_written_to_the_eval_dataset_first(deps, db_factory):
@@ -775,8 +792,8 @@ async def test_an_escalation_answer_is_written_to_the_eval_dataset_first(deps, d
     """
     from harness.bot.handlers import handle_escalation_callback
 
-    _job_id, hand_id = await _awaiting_job(db_factory, deps)
-    msg = await handle_escalation_callback(deps, _TG_USER_ID, "escalate:pot:12.7")
+    job_id, hand_id = await _awaiting_job(db_factory, deps)
+    msg = await handle_escalation_callback(deps, _TG_USER_ID, f"escalate:{job_id}:pot:0")
     assert msg is not None
 
     row = await fetch_one(db_factory, "select kind, field, ground_truth, hand_id from eval_cases")
@@ -798,7 +815,7 @@ async def test_an_escalation_answer_patches_the_hand_and_resets_the_checkpoints(
         await repo.save_canonical(hand_id, normalize((await repo.get(hand_id)).raw))
         await session.commit()
 
-    await handle_escalation_callback(deps, _TG_USER_ID, "escalate:pot:12.7")
+    await handle_escalation_callback(deps, _TG_USER_ID, f"escalate:{job_id}:pot:0")
 
     hand = await fetch_one(db_factory, "select raw, canonical, enriched from hands")
     assert hand["raw"]["vision"]["displayed_pot"] == 127_000
@@ -818,7 +835,7 @@ async def test_the_manual_entry_button_asks_for_a_number_and_remembers_the_field
     from harness.bot.handlers import handle_escalation_callback
 
     job_id, _hand_id = await _awaiting_job(db_factory, deps)
-    msg = await handle_escalation_callback(deps, _TG_USER_ID, "escalate:pot:manual")
+    msg = await handle_escalation_callback(deps, _TG_USER_ID, f"escalate:{job_id}:pot:manual")
     assert msg is not None and "число" in msg.text
     job = await fetch_one(db_factory, f"select status, payload from jobs where id = {job_id}")
     assert job["status"] == "awaiting_user"
@@ -829,7 +846,7 @@ async def test_a_number_typed_by_hand_finishes_the_escalation(deps, db_factory):
     from harness.bot.handlers import handle_escalation_callback, handle_text
 
     job_id, _hand_id = await _awaiting_job(db_factory, deps)
-    await handle_escalation_callback(deps, _TG_USER_ID, "escalate:pot:manual")
+    await handle_escalation_callback(deps, _TG_USER_ID, f"escalate:{job_id}:pot:manual")
     msg = await handle_text(deps, _TG_USER_ID, "12,7")
     assert msg is not None
 
@@ -845,7 +862,7 @@ async def test_a_non_number_typed_by_hand_asks_again_instead_of_guessing(deps, d
     from harness.presentation import vision_answer_not_a_number_msg
 
     job_id, _hand_id = await _awaiting_job(db_factory, deps)
-    await handle_escalation_callback(deps, _TG_USER_ID, "escalate:pot:manual")
+    await handle_escalation_callback(deps, _TG_USER_ID, f"escalate:{job_id}:pot:manual")
     assert await handle_text(deps, _TG_USER_ID, "не помню") == vision_answer_not_a_number_msg()
     job = await fetch_one(db_factory, f"select status from jobs where id = {job_id}")
     assert job["status"] == "awaiting_user"
@@ -855,5 +872,104 @@ async def test_an_answer_without_a_waiting_job_changes_nothing(deps, db_factory)
     from harness.bot.handlers import handle_escalation_callback
 
     await _seed_player(db_factory)
-    assert await handle_escalation_callback(deps, _TG_USER_ID, "escalate:pot:12.7") is None
+    assert await handle_escalation_callback(deps, _TG_USER_ID, "escalate:1:pot:0") is None
     assert await fetch_all(db_factory, "select id from eval_cases") == []
+
+
+async def test_an_answer_lands_on_the_hand_whose_button_was_pressed(deps, db_factory):
+    """Двум ждущим задачам одного игрока отвечают порознь (ревью раунда 1, R2).
+
+    Спека §8.1: `awaiting_user` активной не считается, и второй скрин
+    разбирается независимо — то есть две задачи ждут ответа одновременно
+    штатно. Ответ без номера задачи применялся бы к свежайшей: чужая рука
+    получила бы патч, а eval-датасет — ground truth с чужим `hand_id`.
+    """
+    from harness.bot.handlers import handle_escalation_callback
+
+    first_job, first_hand = await _awaiting_job(db_factory, deps)
+    second_job, second_hand = await _awaiting_job(db_factory, deps)
+    assert (first_job, first_hand) != (second_job, second_hand)
+
+    await handle_escalation_callback(deps, _TG_USER_ID, f"escalate:{first_job}:pot:1")
+
+    case = await fetch_one(db_factory, "select hand_id, ground_truth from eval_cases")
+    assert case["hand_id"] == first_hand
+    assert case["ground_truth"]["value"] == "12.1"
+    patched = await fetch_one(
+        db_factory, f"select raw from hands where id = {first_hand}"
+    )
+    untouched = await fetch_one(
+        db_factory, f"select raw from hands where id = {second_hand}"
+    )
+    assert patched["raw"]["vision"]["displayed_pot"] == 121_000
+    assert untouched["raw"]["vision"]["displayed_pot"] == 100_000
+    statuses = await fetch_all(db_factory, "select id, status from jobs order by id")
+    assert {row["id"]: row["status"] for row in statuses} == {
+        first_job: "queued",
+        second_job: "awaiting_user",
+    }
+
+
+async def test_a_button_press_on_someone_elses_job_changes_nothing(deps, db_factory):
+    """`callback_data` приходит из внешнего мира: номер задачи сам по себе не пропуск."""
+    from harness.bot.handlers import handle_escalation_callback
+
+    job_id, _hand_id = await _awaiting_job(db_factory, deps)
+    assert await handle_escalation_callback(deps, 999_001, f"escalate:{job_id}:pot:0") is None
+    assert await fetch_all(db_factory, "select id from eval_cases") == []
+
+
+async def test_a_manual_number_lands_on_the_job_where_the_input_was_started(deps, db_factory):
+    """Обычное сообщение номера задачи не несёт — адресат ищется по начатому вводу."""
+    from harness.bot.handlers import handle_escalation_callback, handle_text
+
+    first_job, first_hand = await _awaiting_job(db_factory, deps)
+    _second_job, second_hand = await _awaiting_job(db_factory, deps)
+    await handle_escalation_callback(deps, _TG_USER_ID, f"escalate:{first_job}:pot:manual")
+
+    await handle_text(deps, _TG_USER_ID, "12.1")
+
+    case = await fetch_one(db_factory, "select hand_id from eval_cases")
+    assert case["hand_id"] == first_hand
+    untouched = await fetch_one(db_factory, f"select raw from hands where id = {second_hand}")
+    assert untouched["raw"]["vision"]["displayed_pot"] == 100_000
+
+
+async def test_an_option_index_outside_the_stored_list_is_ignored(deps, db_factory):
+    """Индекс варианта — тоже вход из внешнего мира, и он проверяется."""
+    from harness.bot.handlers import handle_escalation_callback
+
+    job_id, _hand_id = await _awaiting_job(db_factory, deps)
+    assert await handle_escalation_callback(deps, _TG_USER_ID, f"escalate:{job_id}:pot:9") is None
+    assert await fetch_all(db_factory, "select id from eval_cases") == []
+
+
+async def test_an_answer_about_cards_is_applied_to_the_named_player(deps, db_factory):
+    """Ответ «карты такие» подставляется и в раздачу, и во вскрытие (R1).
+
+    Расхождение было между двумя прочтениями ОДНИХ карт; после ответа разводить
+    их не во что, и оба места обязаны получить названное игроком.
+    """
+    from harness.bot.handlers import handle_escalation_callback
+
+    job_id, hand_id = await _awaiting_job(
+        db_factory,
+        deps,
+        field="cards",
+        options=["Ks Ad", "Kh Ad"],
+        showdowns=[{"label": "S2", "cards": ["Ks", "Ad"]}],
+        vision={
+            "displayed_pot": 100_000,
+            "nicknames": {"Hero": "me", "S2": "other"},
+            "checks": [
+                {"name": "cards", "passed": False, "options": ["Ks Ad", "Kh Ad"], "subject": "other"}
+            ],
+        },
+        escalation_subject="other",
+    )
+    await handle_escalation_callback(deps, _TG_USER_ID, f"escalate:{job_id}:cards:1")
+
+    hand = await fetch_one(db_factory, f"select raw from hands where id = {hand_id}")
+    assert hand["raw"]["showdowns"] == [{"label": "S2", "cards": ["Kh", "Ad"]}]
+    # Проверка закрыта ответом игрока — станция больше не считает её спорной.
+    assert [c["passed"] for c in hand["raw"]["vision"]["checks"]] == [True]

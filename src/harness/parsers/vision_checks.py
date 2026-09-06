@@ -137,6 +137,7 @@ def cards_check(at_seat: dict[str, list[str]], in_log: dict[str, list[str]]) -> 
         passed=False,
         detail="; ".join(disagreements),
         options=[" ".join(at_seat[first]), " ".join(in_log[first])],
+        subject=first,
     )
 
 
@@ -189,8 +190,12 @@ def equity_check(
 
 
 def _normalized(nickname: str) -> str:
-    """Ник без хвоста обрезки и регистра: экран режет длинные ники многоточием."""
-    trimmed = nickname.strip().rstrip(".").strip()
+    """Ник без хвоста обрезки и регистра: экран режет длинные ники многоточием.
+
+    Многоточие бывает и одним символом `…`, и тремя точками — модель пишет как
+    видит, а обрезаются оба вида одинаково.
+    """
+    trimmed = nickname.strip().rstrip(".…").strip()
     return trimmed.casefold()
 
 

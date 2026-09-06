@@ -522,23 +522,54 @@ async def test_patching_the_raw_hand_resets_the_checkpoints_below_it(db):
     assert got.canonical is None and got.enriched is None
 
 
-async def test_the_job_waiting_for_the_player_is_found_by_the_player(db):
+async def _awaiting(db, player_id: int, session_id: int, **payload) -> int:
+    row = await db.execute(
+        insert(Job)
+        .values(
+            type="screenshot_analyze",
+            status="awaiting_user",
+            payload=payload,
+            session_id=session_id,
+            player_id=player_id,
+        )
+        .returning(Job.id)
+    )
+    return row.scalar_one()
+
+
+async def test_the_job_waiting_for_the_player_is_found_by_its_own_number(db):
     """Состояние ожидания живёт в `jobs`, а не в памяти бота: оно переживает перезапуск."""
     session_id = await _make_session(db)
     player = await PlayersRepo(db).get_or_create(tg_user_id=777)
-    await db.execute(
-        insert(Job).values(
-            type="screenshot_analyze",
-            status="awaiting_user",
-            payload={"escalation_field": "pot"},
-            session_id=session_id,
-            player_id=player.id,
-        )
-    )
-    found = await JobsRepo(db).awaiting_user(player.id)
+    job_id = await _awaiting(db, player.id, session_id, escalation_field="pot")
+    found = await JobsRepo(db).get_awaiting(job_id, player.id)
     assert found is not None and found.payload["escalation_field"] == "pot"
+
+
+async def test_a_waiting_job_of_another_player_is_not_reachable_by_its_number(db):
+    """Номер задачи приходит из внешнего мира, и одной его мало."""
+    session_id = await _make_session(db)
+    mine = await PlayersRepo(db).get_or_create(tg_user_id=777)
+    stranger = await PlayersRepo(db).get_or_create(tg_user_id=779)
+    job_id = await _awaiting(db, mine.id, session_id, escalation_field="pot")
+    assert await JobsRepo(db).get_awaiting(job_id, stranger.id) is None
 
 
 async def test_no_waiting_job_is_not_an_error(db):
     player = await PlayersRepo(db).get_or_create(tg_user_id=778)
-    assert await JobsRepo(db).awaiting_user(player.id) is None
+    assert await JobsRepo(db).get_awaiting(1, player.id) is None
+    assert await JobsRepo(db).awaiting_manual_entry(player.id) is None
+
+
+async def test_manual_entry_is_looked_up_by_the_started_input_not_by_the_status(db):
+    """Обычное сообщение номера задачи не несёт — адресат ищется по начатому вводу.
+
+    У соседней ждущей задачи ввод не начинали, и подставлять число в неё нельзя
+    (спека §8.1: ждущих задач у игрока бывает несколько сразу).
+    """
+    session_id = await _make_session(db)
+    player = await PlayersRepo(db).get_or_create(tg_user_id=777)
+    started = await _awaiting(db, player.id, session_id, escalation_field="pot", manual_entry="pot")
+    await _awaiting(db, player.id, session_id, escalation_field="cards")
+    found = await JobsRepo(db).awaiting_manual_entry(player.id)
+    assert found is not None and found.id == started

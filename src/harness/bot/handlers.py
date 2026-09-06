@@ -364,6 +364,32 @@ async def handle_photo(deps: BotDeps, tg_user_id: int, file_bytes: bytes) -> Msg
     return None
 
 
+def _parse_escalation(data: str) -> tuple[int, str, str] | None:
+    """`escalate:{job_id}:{field}:{value}` — номер задачи, поле и выбор игрока.
+
+    Номер задачи в кнопке обязателен: у игрока может ждать ответа больше одной
+    задачи разом, и ответ без номера применялся бы к свежайшей — то есть к
+    чужой руке (ревью раунда 1, R2).
+    """
+    parts = data.removeprefix(ESCALATION_PREFIX).split(":")
+    if len(parts) != 3 or not parts[0].isdigit():
+        return None
+    return int(parts[0]), parts[1], parts[2]
+
+
+def _chosen_option(job: Job, raw_value: str) -> str | None:
+    """Вариант ответа по его ИНДЕКСУ в кнопке — сам список лежит в задаче.
+
+    В `callback_data` Телеграма 64 байта, а вариантом бывает ник игрока; поэтому
+    кнопка несёт номер, а не текст (`presentation.keyboards.escalation_buttons`).
+    """
+    options = list((job.payload or {}).get("escalation_options") or [])
+    if not raw_value.isdigit():
+        return None
+    index = int(raw_value)
+    return options[index] if 0 <= index < len(options) else None
+
+
 async def handle_escalation_callback(deps: BotDeps, tg_user_id: int, data: str) -> Msg | None:
     """Ответ игрока на вопрос валидатора — спека §8.3, все четыре шага.
 
@@ -372,20 +398,29 @@ async def handle_escalation_callback(deps: BotDeps, tg_user_id: int, data: str) 
     размеченный пример для vision-eval, и эскалация тем самым работает
     разметочной машиной (EVALS.md). Дальше патч `hands.raw`, сброс чекпоинтов
     ниже (одной записью, см. `HandsRepo.replace_raw`) и возврат задачи в очередь.
+
+    Задача берётся ПО НОМЕРУ ИЗ КНОПКИ и сверяется с игроком: чужую задачу
+    нажатием не тронуть, а свою — не перепутать с соседней.
     """
-    field, _, value = data.removeprefix(ESCALATION_PREFIX).partition(":")
+    parsed = _parse_escalation(data)
+    if parsed is None:
+        return None
+    job_id, field, raw_value = parsed
     async with deps.db_factory() as db:
         player = await PlayersRepo(db).get_or_create(tg_user_id)
-        job = await JobsRepo(db).awaiting_user(player.id)
+        job = await JobsRepo(db).get_awaiting(job_id, player.id)
         if job is None:
             await db.commit()
             return None
-        if value == MANUAL_ANSWER:
+        if raw_value == MANUAL_ANSWER:
             payload = {**dict(job.payload), "manual_entry": field}
             await _remember_payload(db, job.id, payload)
             await db.commit()
             return vision_manual_entry_msg(_question_of(job))
-        job_id = job.id
+        value = _chosen_option(job, raw_value)
+        if value is None:
+            await db.commit()
+            return None
         await _apply_answer(db, job, field, value)
         await db.commit()
 
@@ -404,7 +439,10 @@ async def handle_text(deps: BotDeps, tg_user_id: int, text: str) -> Msg | None:
     answer = text.strip()
     async with deps.db_factory() as db:
         player = await PlayersRepo(db).get_or_create(tg_user_id)
-        job = await JobsRepo(db).awaiting_user(player.id)
+        # Ждущих задач у игрока может быть несколько, а ручного ввода ждёт та, у
+        # которой он и был начат: искать «свежайшую ждущую» значило бы подставить
+        # число в чужую руку (ревью раунда 1, R2).
+        job = await JobsRepo(db).awaiting_manual_entry(player.id)
         field = (job.payload or {}).get("manual_entry") if job is not None else None
         if job is not None and field:
             try:
@@ -426,7 +464,7 @@ async def handle_text(deps: BotDeps, tg_user_id: int, text: str) -> Msg | None:
     return None
 
 
-def _question_of(job) -> str:
+def _question_of(job: Job) -> str:
     """Текст вопроса, на который игрок отвечает вручную, — из payload задачи."""
     payload = job.payload or {}
     field = payload.get("manual_entry") or payload.get("escalation_field") or ""
@@ -443,7 +481,7 @@ async def _remember_payload(db: AsyncSession, job_id: int, payload: dict) -> Non
     await db.execute(update(Job).where(Job.id == job_id).values(payload=payload))
 
 
-async def _apply_answer(db: AsyncSession, job, field: str, value: str) -> None:
+async def _apply_answer(db: AsyncSession, job: Job, field: str, value: str) -> None:
     """Ground truth в `eval_cases`, затем патч руки и сброс чекпоинтов ниже."""
     payload = dict(job.payload)
     hand_id = payload.get("hand_id")
@@ -457,7 +495,9 @@ async def _apply_answer(db: AsyncSession, job, field: str, value: str) -> None:
         )
         hands = HandsRepo(db)
         record = await hands.get(hand_id)
-        patched = apply_vision_answer(record.raw, field, value)
+        patched = apply_vision_answer(
+            record.raw, field, value, subject=payload.get("escalation_subject", "")
+        )
         if patched is not None:
             await hands.replace_raw(hand_id, patched)
     payload.pop("manual_entry", None)
