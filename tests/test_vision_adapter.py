@@ -530,3 +530,28 @@ async def test_empty_readings_everywhere_fail_loudly_instead_of_inventing_a_refu
         "vision_extract_fallback",
         "vision_extract_fallback",
     ]
+
+
+def test_a_showdown_with_an_unread_card_is_named_as_completed_by_the_engine():
+    """Движок доукомплектовывает неизвестные карты — на скрине это опасно.
+
+    В hand history безопасно (измерено: 0 из 111 оспариваемых шоудаунов решались
+    на фабрикованных картах — рум показывает карты всех дошедших), на скрине
+    карта соперника бывает не прочитана, и тогда банк может «выиграть» рука,
+    которой не было. Сверка получателей не спасает: строк `collected` у скрина
+    нет. Значит, такой шоудаун обязан быть назван.
+    """
+    from harness.engine.validation import _FABRICATED_SHOWDOWN
+
+    hidden = export_reading(
+        players=[
+            p.model_copy(update={"cards_in_log": [], "cards_at_seat": []})
+            if p.nickname == "N5"
+            else p
+            for p in export_reading().players
+        ]
+    )
+    raw, _ = reading_to_raw(hidden, hero_nickname=HERO_NICK, source_ref="s")
+    assert _FABRICATED_SHOWDOWN in enrich(normalize(raw)).verdict.not_checked
+    # У полностью прочитанного вскрытия пометки нет — иначе она ничего не значит.
+    assert _FABRICATED_SHOWDOWN not in enrich(normalize(built()[0])).verdict.not_checked

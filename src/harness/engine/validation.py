@@ -14,6 +14,7 @@ Hand history — это факт, записанный самим румом: р
 from __future__ import annotations
 
 from harness.contracts import (
+    ActionKind,
     CanonicalHand,
     Completeness,
     EngineReport,
@@ -169,6 +170,34 @@ def _question_for(field: str, hand: CanonicalHand) -> str:
     return _QUESTIONS.get(field, f"Поле «{field}» распознано верно?")
 
 
+_FABRICATED_SHOWDOWN = (
+    "шоудаун решён на доукомплектованных картах — спот не подаётся как точный расчёт"
+)
+
+
+def _fabricated_showdown(hand: CanonicalHand) -> list[str]:
+    """Дошёл ли до вскрытия игрок, чьих карт источник не назвал.
+
+    Движок доукомплектовывает неизвестные карты из остатка колоды, и на hand
+    history это безопасно: измерено, что 0 из 111 оспариваемых шоудаунов
+    решались на фабрикованных картах — рум показывает карты всех дошедших. На
+    скрине не так: карта соперника бывает не прочитана, и тогда банк может
+    «выиграть» рука, которой не было. Сверка получателей здесь не спасает — у
+    скриншота нет строк `collected`, и сравнивать выплаты не с чем.
+
+    Поэтому такой шоудаун называется в `Verdict.not_checked`: молчание сделало
+    бы фабрикацию неотличимой от прочитанного вскрытия.
+    """
+    if hand.provenance is not Provenance.SCREENSHOT or not hand.showdowns:
+        return []
+    folded = {a.label for a in hand.actions if a.kind is ActionKind.FOLD}
+    known = {entry.label for entry in hand.showdowns} | {
+        label for label, cards in hand.dealt.items() if len(cards) == 2
+    }
+    unknown = [p.label for p in hand.players if p.label not in folded and p.label not in known]
+    return [_FABRICATED_SHOWDOWN] if unknown else []
+
+
 def _verdict_from(
     hand: CanonicalHand, reasons: list[str], fields: list[str], not_checked: list[str]
 ) -> Verdict:
@@ -240,6 +269,7 @@ def validate(hand: CanonicalHand, report: EngineReport) -> Verdict:
 
     reasons: list[str] = []
     fields: list[str] = []
+    not_checked = _fabricated_showdown(hand)
 
     # Первой: неверная кнопка проявляется каскадом денежных расхождений ниже,
     # но причина у него одна, и назвать её должна отдельная проверка.
@@ -275,4 +305,4 @@ def validate(hand: CanonicalHand, report: EngineReport) -> Verdict:
         )
         fields.append(_FIELD_STACKS)
 
-    return _verdict_from(hand, reasons, fields, [])
+    return _verdict_from(hand, reasons, fields, not_checked)
