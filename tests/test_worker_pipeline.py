@@ -64,6 +64,7 @@ from harness.contracts import (
     Zone,
 )
 from harness.engine import enrich
+from harness.explanation import UnfaithfulText
 from harness.memory.models import Job
 from harness.memory.repos import (
     AnalysesRepo,
@@ -1302,18 +1303,28 @@ async def test_deep_dive_saves_the_model_text_and_shows_it_to_the_player(
 
 
 @requires_fixtures
+@pytest.mark.parametrize(
+    "failure",
+    [LLMProviderError("провайдер недоступен"), UnfaithfulText("числа не из расчёта")],
+    ids=["провайдер недоступен", "текст не прошёл проверку верности"],
+)
 async def test_a_broken_model_does_not_take_the_analysis_away_from_the_player(
-    db_factory, fake_sender, queue, deps, monkeypatch
+    db_factory, fake_sender, queue, deps, monkeypatch, failure
 ):
     """Слова необязательны, числа обязательны: провал изложения оставляет разбор
-    целым, а задачу — успешной."""
+    целым, а задачу — успешной.
+
+    Оба отказа проверяются, а не один: `UnfaithfulText` — наш собственный и самый
+    вероятный (модель ответила, но не тем), и раньше он этим тестом не покрывался
+    вовсе (ревью, раздел A).
+    """
     player_id, session_id = await _make_scope(db_factory)
     jid, _raw = await _seed_one_hand_deep_dive_job(
         db_factory, queue, player_id=player_id, session_id=session_id
     )
 
     async def _boom(*args, **kwargs):
-        raise LLMProviderError("провайдер недоступен")
+        raise failure
 
     monkeypatch.setattr(pipeline_module, "verdict_text", _boom)
 

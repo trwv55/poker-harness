@@ -135,7 +135,7 @@ def _all_in_lines(report: TournamentReport, book: NumberBook) -> list[str]:
     lines = [f"Олл-ины (всего {book.count(len(report.all_ins))}, крупнейшие первыми):"]
     lines += [
         f"  раздача {book.token(event.hand_no)}, ур. {book.count(event.level)}"
-        f"{f', рука {event.hero_class}' if event.hero_class else ''}: "
+        f"{f', рука {book.token(event.hero_class)}' if event.hero_class else ''}: "
         f"вошёл с {book.bb(event.stack_before_bb)} bb, изменение "
         f"{book.bb(event.delta_bb)} bb"
         f"{', со вскрытием' if event.showdown else ''}"
@@ -150,7 +150,7 @@ def _chip_move_lines(report: TournamentReport, book: NumberBook) -> list[str]:
     lines = ["Где ушли фишки (дороже первой):"]
     lines += [
         f"  раздача {book.token(move.hand_no)}, ур. {book.count(move.level)}"
-        f"{f', рука {move.hero_class}' if move.hero_class else ''}: "
+        f"{f', рука {book.token(move.hero_class)}' if move.hero_class else ''}: "
         f"{_STREET_BRIEF.get(move.last_street, move.last_street.value)}"
         f"{', олл-ин' if move.all_in else ''}"
         f"{', вскрытие' if move.showdown else ''} — {book.bb(move.cost_bb)} bb"

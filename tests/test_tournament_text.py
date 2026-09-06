@@ -87,7 +87,10 @@ def _report(
                 hand_no="TM19",
                 hand_index=19,
                 level=11,
-                hero_class="KK",
+                # Класс руки с цифрой — намеренно: «A9s» несёт 9, и прежняя
+                # фикстура «KK» не могла поймать незарегистрированное число
+                # (ревью, раздел A).
+                hero_class="A9s",
                 stack_before_bb=18.4,
                 delta_bb=-18.4,
                 showdown=True,
@@ -98,7 +101,7 @@ def _report(
                 hand_no="TM19",
                 hand_index=19,
                 level=11,
-                hero_class="KK",
+                hero_class="A9s",
                 last_street=Street.PREFLOP,
                 all_in=True,
                 showdown=True,

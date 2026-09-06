@@ -69,6 +69,7 @@ def _point(
     spot: SpotKind = SpotKind.PUSHFOLD_UNOPENED,
     best_action: str = "shove",
     interval: EvInterval | None = None,
+    detail: dict[str, object] | None = None,
 ) -> PointVerdict:
     return PointVerdict(
         dp_index=dp_index,
@@ -80,10 +81,18 @@ def _point(
         ev_diff_bb=ev_diff_bb,
         interval=interval,
         assumption=(
-            Assumption(range=Range(weights={"AA": 1.0, "KK": 0.5}), source="population")
+            Assumption(
+                range=Range(weights={"AA": 1.0, "KK": 0.5}),
+                source="model:multiway_pushfold",
+                # Цифра в пояснении — намеренно: `preflop` пишет туда и глубину,
+                # и число живых позади, а первый живой прогон отбраковал текст
+                # ровно за такое число, показанное модели и не зарегистрированное.
+                note="колл-диапазон на 12bb, 2 живых позади",
+            )
             if zone is Zone.ASSUMING
             else None
         ),
+        detail=detail or {},
     )
 
 
@@ -116,12 +125,18 @@ def test_the_digest_registers_every_number_it_prints():
                 ev_diff_bb=-1.23,
                 zone=Zone.ASSUMING,
                 interval=EvInterval(point_bb=-1.23, low_bb=-3.0, high_bb=0.4),
+                detail={"shover_depth_bb": 12.25, "live_others": 2},
             ),
-            _point(dp_index=1, ev_diff_bb=-0.4),
+            _point(dp_index=1, ev_diff_bb=-0.4, detail={"lookup_depth_bb": 9.5}),
         ]
     )
     digest = verdict_digest(res)
-    unregistered = [n for n in numbers_in(digest.text) if round(n, 1) not in digest.allowed]
+    # Заголовок точки («Точка 1 (dp_index 3)») несёт ИДЕНТИФИКАТОРЫ, а не
+    # величины, и в реестр не идёт сознательно — см. `_point_lines`.
+    body = [line for line in digest.text.splitlines() if not line.startswith("Точка ")]
+    unregistered = [
+        n for n in numbers_in("\n".join(body)) if round(n, 1) not in digest.allowed
+    ]
     assert unregistered == []
 
 
@@ -157,6 +172,42 @@ def test_the_digest_carries_the_interval_and_the_ceiling():
     )
     assert "-0.3" in digest.text and "0.8" in digest.text
     assert "около нуля: да" in digest.text
+
+
+def test_only_the_whitelisted_detail_keys_reach_the_model():
+    """Из `detail` в промпт идут три величины и ни одной больше: остальное —
+    внутренняя кухня расчёта, и показать её значит разрешить её назвать."""
+    digest = verdict_digest(
+        _result(
+            [
+                _point(
+                    dp_index=0,
+                    ev_diff_bb=-1.2,
+                    detail={
+                        "shover_depth_bb": 12.25,
+                        "lookup_depth_bb": 9.5,
+                        "live_others": 2,
+                        "equilibrium_hand_regret_bb": 0.004,
+                        "shove_range_fraction": 0.317,
+                        "method": "call_ev",
+                    },
+                )
+            ]
+        )
+    )
+    assert "12.2" in digest.text and "9.5" in digest.text and "позади: 2" in digest.text
+    assert "0.004" not in digest.text and "0.317" not in digest.text
+    assert "call_ev" not in digest.text
+
+
+async def test_a_small_round_number_is_not_allowed_by_the_point_numbering():
+    """«около 1 bb» на точке ценой −1.4 bb — выдумка, и нумерация точек не имеет
+    права её оправдывать (ревью, раздел A: `book.count(ordinal)` разрешал 0 и 1
+    в любом разборе)."""
+    res = _result([_point(dp_index=0, ev_diff_bb=-1.4), _point(dp_index=1, ev_diff_bb=-2.3)])
+    llm = FakeLLM(_draft((0, "Фолд стоил около 1 bb."), (1, "Дорогое расхождение.")))
+    with pytest.raises(UnfaithfulText, match="1.0"):
+        await verdict_text(llm, res, trace_id=1)
 
 
 # --- вызов модели --------------------------------------------------------------------

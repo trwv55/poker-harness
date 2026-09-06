@@ -91,6 +91,13 @@ _STREET_BRIEF: dict[Street, str] = {
 # не появляется тогда, когда модель его не видела.
 _ACTION_BRIEF: dict[str, str] = {"fold": "фолд", "shove": "шов", "call": "колл"}
 
+# Единственные величины из `PointVerdict.detail`, которые модель видит, — с их
+# подписями (см. `_detail_lines`). Ключи ставит `analysis/preflop.py`.
+_DETAIL_BB: dict[str, str] = {
+    "shover_depth_bb": "глубина стека того, кто поставил",
+    "lookup_depth_bb": "глубина, по которой взят чарт",
+}
+
 _ZONE_BRIEF: dict[Zone, str] = {
     Zone.STRICT: "строго (вывод не зависит от догадки о диапазоне)",
     Zone.ASSUMING: "предполагая (вывод опирается на допущение о диапазоне)",
@@ -154,12 +161,42 @@ class Digest(BaseModel):
     allowed: frozenset[float]
 
 
+def _detail_lines(point: PointVerdict, book: NumberBook) -> list[str]:
+    """Разрешённая часть `PointVerdict.detail` — по белому списку, через реестр.
+
+    Белый список, а не весь `detail`: там лежат и внутренние величины расчёта
+    (веса диапазонов, EV по ширинам, регрет равновесия), которым в тексте игроку
+    делать нечего, и их появление в промпте разрешило бы модели их назвать.
+    Пропущены сюда три величины, без которых объяснение спота беднее: глубина
+    того, кто поставил, глубина лукапа чарта и число живых позади.
+
+    Глубины САМОГО героя, банка и позиции здесь нет намеренно: в
+    `AnalysisResult` их нет, а игрок видит их в реплее — числом их называть
+    незачем (то же сказано промпту дословно).
+    """
+    lines: list[str] = []
+    for key, label in _DETAIL_BB.items():
+        value = point.detail.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            lines.append(f"  {label}: {book.bb(float(value))} bb.")
+    live_others = point.detail.get("live_others")
+    if isinstance(live_others, int) and not isinstance(live_others, bool):
+        lines.append(f"  живых игроков позади: {book.count(live_others)}.")
+    return lines
+
+
 def _point_lines(point: PointVerdict, ordinal: int, book: NumberBook) -> list[str]:
-    """Одна точка выжимки. Каждое число — через `book`, иначе оно окажется
-    запрещённым в ответе модели, хотя мы сами его и показали."""
+    """Одна точка выжимки. Каждая ВЕЛИЧИНА — через `book`, иначе она окажется
+    запрещённой в ответе модели, хотя мы сами её и показали.
+
+    Порядковый номер точки и `dp_index` через реестр НЕ идут (ревью, раздел A):
+    это идентификаторы, а не величины, и регистрация делала бы разрешёнными 0 и
+    1 в любом разборе — то есть «около 1 bb» на точке ценой −1.4 bb прошло бы
+    проверку (`test_a_small_round_number_is_not_allowed_by_the_point_numbering`).
+    """
     lines = [
         (
-            f"Точка {book.count(ordinal)} (dp_index {book.count(point.dp_index)}): "
+            f"Точка {ordinal} (dp_index {point.dp_index}): "
             f"{_STREET_BRIEF.get(point.street, point.street.value)}, "
             f"{_SPOT_BRIEF.get(point.spot, point.spot.value)}."
         ),
@@ -179,14 +216,15 @@ def _point_lines(point: PointVerdict, ordinal: int, book: NumberBook) -> list[st
             f"потолок цены выбора {book.bb(interval.cost_ceiling_bb)} bb; "
             f"около нуля: {near}."
         )
+    lines.extend(_detail_lines(point, book))
     assumption = point.assumption
     if assumption is not None:
         share = book.pct(100.0 * assumption.range.fraction_of_hands())
-        note = f", {assumption.note}" if assumption.note else ""
-        lines.append(
-            f"  допущение: диапазон оппонента взят из источника «{assumption.source}»"
-            f"{note}; в нём {share}% всех рук."
-        )
+        # Пояснение к допущению несёт цифры (`preflop` пишет туда и глубину, и
+        # число живых позади), поэтому идёт через реестр: живой прогон отбраковал
+        # текст за «12bb», которые мы сами модели и показали в этой строке.
+        note = f", {book.token(assumption.note)}" if assumption.note else ""
+        lines.append(f"  допущение о диапазоне оппонента{note}; в нём {share}% всех рук.")
     return lines
 
 
