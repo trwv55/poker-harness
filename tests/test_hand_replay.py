@@ -332,11 +332,24 @@ def test_raise_over_a_raise_is_called_a_3bet_preflop():
 
 
 def test_street_pot_is_the_engine_number_not_the_summary():
-    """Банк улицы берётся из отчёта движка — единственного источника истины о деньгах."""
+    """Банк улицы берётся из отчёта движка — единственного источника истины о деньгах.
+
+    Раздача кончилась на префлопе, банк вырос вчетверо — значит итоговый банк
+    улицы печатается отдельной строкой (спека §5.6: «только если улица изменила
+    его существенно»).
+    """
     en = _preflop_shove_hand()
     pot = en.report.pot_by_street[Street.PREFLOP]
+    assert f"банк {pot:,}".replace(",", "\u00a0") in hand_replay(en).plain
+
+
+def test_the_final_pot_is_printed_once_not_twice():
+    """Итоговый банк улицы, за которой идёт ДРУГАЯ улица с действиями, отдельной
+    строкой не печатается: он уже стоит в заголовке следующей."""
+    en = _postflop_hand()
+    pot = en.report.pot_by_street[Street.PREFLOP]
     text = hand_replay(en).plain
-    assert f"{pot:,}".replace(",", " ") in text
+    assert text.count(f"банк {pot:,}".replace(",", "\u00a0")) == 1
 
 
 def test_the_replay_prints_no_number_the_hand_does_not_contain():
