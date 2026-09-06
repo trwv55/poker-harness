@@ -322,8 +322,8 @@ def test_the_hero_is_found_by_the_profile_nickname_not_by_the_model():
 
 def test_a_truncated_nickname_on_screen_still_matches_the_profile():
     """Экран режет длинные ники многоточием — отсюда сопоставление по префиксу."""
-    hero, check = match_hero("FictionalNick46..", ["FictionalNick46..", "someone"])
-    assert (hero, check.passed) == ("FictionalNick46..", True)
+    hero, check = match_hero("длинный_ник_игрока", ["длинный_ник_иг..", "кто-то"])
+    assert (hero, check.passed) == ("длинный_ник_иг..", True)
 
 
 def test_no_match_and_several_matches_both_escalate_instead_of_guessing():
