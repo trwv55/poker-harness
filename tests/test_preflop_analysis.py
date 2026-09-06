@@ -715,8 +715,14 @@ def test_an_interval_across_zero_gets_the_near_zero_verdict_with_a_ceiling():
 
 
 def test_an_interval_across_zero_facing_a_shove_gets_the_near_zero_verdict():
-    """То же правило на другом споте: колл против шова, модели диапазона шовера."""
-    en = _make_facing_shove_hand(hero_cards=("Kd", "Ts"), eff_bb=12.0, shover_bb=12.0)
+    """То же правило на другом споте: колл против шова, модели диапазона шовера.
+
+    Глубина здесь 5bb, а не 12: на калиброванной полосе диапазона шовера KTs
+    против шова на 12bb стал обычным вердиктом «фолд» — интервал перестал
+    пересекать ноль. Форма «около нуля» на этом споте никуда не делась, она
+    просто переехала туда, где решение и правда пограничное.
+    """
+    en = _make_facing_shove_hand(hero_cards=("Kd", "Ts"), eff_bb=5.0, shover_bb=5.0)
     p = analyze_hand(en).points[0]
 
     assert p.spot == "pushfold_facing_shove"
@@ -725,6 +731,35 @@ def test_an_interval_across_zero_facing_a_shove_gets_the_near_zero_verdict():
     assert p.ev_diff_bb == 0.0
     assert p.interval is not None and p.interval.near_zero is True
     assert p.interval.low_bb < 0.0 < p.interval.high_bb
+
+
+def test_the_near_zero_form_is_refused_to_an_interval_that_is_too_wide():
+    """Широкий интервал через ноль — не «около нуля», а отсутствие ответа.
+
+    Форма «около нуля» обещает игроку, что выбор дёшев («не больше столько-то»).
+    88 против шова на 12bb даёт интервал шире 3bb: знак не установлен, порядок
+    величины не установлен, и то же обещание здесь было бы неверным. Такая точка
+    возвращается без вердикта — числа остаются в `detail`, игроку не показывается
+    ничего. Порог взят из разрыва в замеренном распределении ширин
+    (`_NEAR_ZERO_MAX_WIDTH_BB`), а узкий интервал того же спота форму сохраняет
+    (тест выше).
+    """
+    from harness.analysis.preflop import _NEAR_ZERO_MAX_WIDTH_BB
+
+    en = _make_facing_shove_hand(hero_cards=("8d", "8c"), eff_bb=12.0, shover_bb=12.0)
+    p = analyze_hand(en).points[0]
+
+    assert p.best_action == ""  # вердикта нет
+    assert p.ev_diff_bb == 0.0
+    reason = str(p.detail["unjudged"])
+    assert "расчёт не говорит ничего" in reason
+    # Причина называет саму величину расхождения моделей, а не только факт.
+    # Размах берётся по тем же числам, что и интервал: сетка ширин плюс сама
+    # модель (`_interval_of`) — у снятой точки `interval` уже нет.
+    values = [*p.detail["ev_call_by_width_bb"].values(), p.detail["ev_call_bb"]]
+    width = max(values) - min(values)
+    assert width > _NEAR_ZERO_MAX_WIDTH_BB
+    assert f"{width:.1f} bb" in reason
 
 
 def test_a_wide_interval_on_one_side_of_zero_keeps_its_point_verdict():
@@ -1263,11 +1298,15 @@ def test_a_dead_small_blind_is_not_the_heads_up_equilibrium_against_a_shove():
 
     p = analyze_hand(en).points[0]
     assert p.spot == "pushfold_facing_shove"
+    # Проверяемое здесь — ЧЕМ поставлена зона, а не какая она вышла: гейт
+    # равновесия закрыт, и причина обязана прийти от вилки ширин.
     assert "равновеси" not in p.detail["zone_reason"]
-    # Тот же вывод, что и у шова в неоткрытый банк: гейт закрыт, интервал не
-    # держит, точечной оценки нет — вердикт «около нуля».
-    assert p.detail["bracket"] == "unstable"
-    assert p.best_action == "около нуля, оба варианта допустимы"
+    assert "ни на одной ширине" in p.detail["zone_reason"]
+    # На калиброванной полосе диапазона шовера вердикт этой точки перестал
+    # зависеть от ширины: прежде вилка была неустойчива (полоса доходила до
+    # диапазона «любые две карты»), теперь «фолд» стоит на всех пяти точках.
+    assert p.detail["bracket"] == "stable"
+    assert p.best_action == "fold"
 
 
 def test_a_forfeited_seat_could_not_have_answered_the_shove():
@@ -1734,10 +1773,11 @@ def test_players_behind_axis_is_computed_and_can_disagree():
     блайнд тоже войдёт — минусовой (−1.19bb). Ось помечена `unstable`.
 
     Изолированного случая, где вторая ось двигает вердикт, а первая нет, найти
-    не удалось (перебор по глубинам шовера 5–20bb, стекам героя, анте и 21 классу
-    рук — ноль попаданий): узкий конец вилки диапазона шовера настолько тесен,
-    что везде срабатывает раньше. Поэтому саму развилку проверяет модульный тест
-    на `zone_for`, а здесь — что ось действительно считается по руке.
+    не удалось — ни на прежней вилке, ни на калиброванной полосе (повторный
+    перебор по глубинам шова 8–20bb, стекам героя, глубине стола и 21 классу рук
+    — ноль попаданий): узкий конец полосы диапазона шовера настолько тесен, что
+    везде срабатывает раньше. Поэтому саму развилку проверяет модульный тест на
+    `zone_for`, а здесь — что ось действительно считается по руке.
     """
     stacks = {**dict.fromkeys(_SIX_MAX_SEATS, 96), "SB": 24, "UTG": 24}
     labels, seats, posts = _six_max(stacks, "SB")
@@ -1751,9 +1791,11 @@ def test_players_behind_axis_is_computed_and_can_disagree():
     p = analyze_hand(enrich(normalize(raw))).points[0]
     assert p.detail["ev_call_bb"] > 0.0 > p.detail["ev_call_all_behind_bb"]
     assert p.detail["behind_axis"] == "unstable"
-    # Интервал по моделям шова на этой руке тоже лежит по обе стороны нуля, поэтому
-    # точечной оценки у точки нет; ось при этом посчитана и видна в `detail`.
-    assert p.best_action == "около нуля, оба варианта допустимы"
+    # Интервал по моделям шова на этой руке лежит по обе стороны нуля И шире
+    # порога, поэтому вердикта у точки нет вовсе. Ось при этом посчитана и видна
+    # в `detail` — тем и проверяется, что она считается независимо от того, чем
+    # кончилась первая.
+    assert p.best_action == ""
     assert p.detail["bracket"] == "unstable"
 
 
@@ -1785,6 +1827,54 @@ def test_the_call_width_grid_is_built_from_the_measured_band():
     assert grid[-1] == pytest.approx(_CALL_WIDTH_BAND[1])
     ratios = [grid[i + 1] / grid[i] for i in range(len(grid) - 1)]
     assert all(r == pytest.approx(ratios[0], rel=1e-3) for r in ratios)
+
+
+def test_the_shover_width_grid_is_built_from_the_measured_band():
+    """То же требование к сетке ширин диапазона ШОВЕРА: она выводится из полосы.
+
+    Прежде здесь стояли абсолютные доли комбо, ни к какому замеру не привязанные;
+    теперь замер живёт в `_SHOVE_WIDTH_BAND`, и сетка обязана его воспроизводить,
+    а не соседствовать с ним.
+    """
+    from harness.analysis.preflop import _SHOVE_WIDTH_BAND
+    from harness.analysis.preflop import _SHOVER_WIDTH_MULTIPLIERS as grid
+
+    assert len(grid) == 5
+    assert grid[0] == pytest.approx(_SHOVE_WIDTH_BAND[0])
+    assert grid[-1] == pytest.approx(_SHOVE_WIDTH_BAND[1])
+    ratios = [grid[i + 1] / grid[i] for i in range(len(grid) - 1)]
+    assert all(r == pytest.approx(ratios[0], rel=1e-3) for r in ratios)
+
+
+def test_the_shover_width_family_reproduces_the_equilibrium_at_one():
+    """На множителе x1 семейство ширин обязано быть самим равновесным шовом.
+
+    Множитель осмыслен только как отклонение ОТ МОДЕЛИ: если на единице
+    построенный диапазон — уже не модель, то и «x0.14», и «x1.46» отсчитываются
+    не от неё, и полоса перестаёт значить то, что замерено.
+
+    Порог 0.97 отделяет нынешнее построение от заменённого: на этой подыгре
+    порядок из самого решения даёт 0.993, а ранжирование по эквити против
+    равновесного шова той же глубины — то, что делал прежний `range_of_width`, —
+    0.891. Замер по 29 точкам «колл шова» обеих фикстур (в докстринге
+    `_shover_range_models`) даёт те же две величины медианами 0.995 и 0.906.
+    """
+    from harness.analysis.preflop import _WIDTH_KEY, _shover_range_models
+    from harness.analysis.tools.equity import combos_of_class
+    from harness.analysis.tools.multiway import Seat, unopened_shove_equilibrium
+
+    solution = unopened_shove_equilibrium(
+        Seat(posted_bb=0.0, behind_bb=11.0),
+        [Seat(posted_bb=0.5, behind_bb=10.5), Seat(posted_bb=1.0, behind_bb=10.0)],
+        2.375,
+    )
+    push = solution.push
+    assert 0.0 < push.fraction_of_hands() < 1.0  # иначе на x1 сравнивать нечего
+
+    at_one = _shover_range_models(solution, multipliers=(1.0,))[_WIDTH_KEY(1.0)]
+    weight = {cls: push.weight(cls) * len(combos_of_class(cls)) for cls in push.weights}
+    inside = sum(w for cls, w in weight.items() if cls in at_one.weights)
+    assert inside / sum(weight.values()) >= 0.97
 
 
 def test_zone_for_notices_a_reversal_inside_the_interval():
@@ -1903,9 +1993,10 @@ def test_a_verdict_that_flips_with_the_players_behind_names_the_fork():
     assert split.detail["ev_call_bb"] > 0.0 > split.detail["ev_call_all_behind_bb"]
     assert split.detail["best_vs_one"] == "call"
     assert split.detail["best_all_behind"] == "fold"
-    # Интервал по моделям шова на этой руке лежит по обе стороны нуля, поэтому
-    # точечной оценки у точки нет — развилка остаётся в `detail` двумя вердиктами.
-    assert split.best_action == "около нуля, оба варианта допустимы"
+    # Интервал по моделям шова на этой руке лежит по обе стороны нуля и шире
+    # порога — вердикта у точки нет, и развилку игрок здесь не увидит. Оба
+    # вердикта по отдельности при этом остаются в `detail`.
+    assert split.best_action == ""
     assert split.ev_diff_bb == 0.0
 
     agreed = hand(["Ah", "Ad"], hero_calls=True)
