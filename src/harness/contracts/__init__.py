@@ -1,7 +1,7 @@
 """Контракты данных: модели, которыми обмениваются сервисы конвейера.
 
 Публичный API пакета — реэкспорт из всех подмодулей (`raw`, `canonical`,
-`enriched`, `ranges`, `analysis`), чтобы последующие задачи импортировали
+`enriched`, `ranges`, `analysis`, `explanation`), чтобы последующие задачи импортировали
 из `harness.contracts`, а не из отдельных модулей.
 """
 
@@ -38,6 +38,12 @@ from harness.contracts.enriched import (
     SidePot,
     ValidationStatus,
     Verdict,
+)
+from harness.contracts.explanation import (
+    PointText,
+    TournamentTextOut,
+    VerdictLabel,
+    VerdictTextOut,
 )
 from harness.contracts.ranges import RANKS, Range, all_classes, class_of
 from harness.contracts.raw import (
@@ -76,6 +82,7 @@ __all__ = [
     "LevelLine",
     "PlayerState",
     "PlayerStats",
+    "PointText",
     "PointVerdict",
     "Post",
     "PostKind",
@@ -93,9 +100,12 @@ __all__ = [
     "Street",
     "SummaryInfo",
     "TournamentReport",
+    "TournamentTextOut",
     "Uncalled",
     "ValidationStatus",
     "Verdict",
+    "VerdictLabel",
+    "VerdictTextOut",
     "VisionMeta",
     "Zone",
     "all_classes",

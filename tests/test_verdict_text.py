@@ -1,0 +1,255 @@
+"""Текст вердикта (задача 21): выжимка, структурная метка, отказ от выдумки.
+
+**В сеть тесты не ходят** — то же ограничение, что у задачи 16: модель
+подменяется двойником `FakeLLM`, который возвращает заранее заданный ответ и
+запоминает промпт. Здесь проверяется КОД вокруг модели (что уходит в промпт,
+что принимается обратно), а не качество текста: качество — этаж 3, eval-прогон
+`evals/verdict/`, и он в набор тестов не входит.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import Literal, TypeVar, cast
+
+import pytest
+from pydantic import BaseModel
+
+from harness.contracts import (
+    AnalysisResult,
+    Assumption,
+    EvInterval,
+    PointVerdict,
+    Range,
+    SpotKind,
+    Street,
+    Zone,
+)
+from harness.explanation.faithfulness import numbers_in
+from harness.explanation.verdict_text import (
+    UnfaithfulText,
+    _VerdictDraft,
+    verdict_digest,
+    verdict_text,
+)
+
+_T = TypeVar("_T", bound=BaseModel)
+
+
+class FakeLLM:
+    """Двойник фасада: отдаёт заданный черновик и запоминает, что его просили.
+
+    Реализует ровно протокол `VerdictLLM` — если протокол разойдётся с фасадом,
+    это увидит pyright на настоящем вызывающем (`worker.pipeline`), а не тест.
+    """
+
+    def __init__(self, reply: _VerdictDraft) -> None:
+        self.reply = reply
+        self.prompts: list[str] = []
+
+    async def __call__(
+        self,
+        purpose: Literal["verdict_text"],
+        schema: type[_T],
+        *,
+        prompt: str,
+        images: Sequence[bytes] = (),
+        trace_id: int,
+    ) -> tuple[_T, None]:
+        assert purpose == "verdict_text"
+        self.prompts.append(prompt)
+        return cast("_T", self.reply), None
+
+
+def _point(
+    *,
+    dp_index: int,
+    ev_diff_bb: float,
+    zone: Zone = Zone.STRICT,
+    spot: SpotKind = SpotKind.PUSHFOLD_UNOPENED,
+    best_action: str = "shove",
+    interval: EvInterval | None = None,
+) -> PointVerdict:
+    return PointVerdict(
+        dp_index=dp_index,
+        street=Street.PREFLOP,
+        spot=spot,
+        zone=zone,
+        action_taken="fold",
+        best_action=best_action,
+        ev_diff_bb=ev_diff_bb,
+        interval=interval,
+        assumption=(
+            Assumption(range=Range(weights={"AA": 1.0, "KK": 0.5}), source="population")
+            if zone is Zone.ASSUMING
+            else None
+        ),
+    )
+
+
+def _result(points: list[PointVerdict], ranked: list[int] | None = None) -> AnalysisResult:
+    return AnalysisResult(
+        hand_no="TM99",
+        points=points,
+        ranked=list(range(len(points))) if ranked is None else ranked,
+        total_ev_loss_bb=sum(p.ev_diff_bb for p in points if p.ev_diff_bb < 0),
+    )
+
+
+def _draft(*texts: tuple[int, str], summary: str = "Итог без чисел.") -> _VerdictDraft:
+    return _VerdictDraft.model_validate(
+        {"points": [{"dp_index": i, "text": t} for i, t in texts], "summary": summary}
+    )
+
+
+# --- выжимка -------------------------------------------------------------------------
+
+
+def test_the_digest_registers_every_number_it_prints():
+    """Каждое число промпта разрешено в ответе — иначе модель наказана за то, что
+    процитировала нас же. Инвариант механический: числа промпта минус
+    разрешённые обязаны дать пустоту."""
+    res = _result(
+        [
+            _point(
+                dp_index=0,
+                ev_diff_bb=-1.23,
+                zone=Zone.ASSUMING,
+                interval=EvInterval(point_bb=-1.23, low_bb=-3.0, high_bb=0.4),
+            ),
+            _point(dp_index=1, ev_diff_bb=-0.4),
+        ]
+    )
+    digest = verdict_digest(res)
+    unregistered = [n for n in numbers_in(digest.text) if round(n, 1) not in digest.allowed]
+    assert unregistered == []
+
+
+def test_a_point_without_a_verdict_never_reaches_the_model():
+    """В выжимку идут только точки из `ranked` — то есть только судимые."""
+    judged = _point(dp_index=0, ev_diff_bb=-1.2)
+    unjudged = _point(dp_index=7, ev_diff_bb=0.0, spot=SpotKind.POSTFLOP, best_action="")
+    digest = verdict_digest(_result([judged, unjudged], ranked=[0]))
+    assert "dp_index 0" in digest.text
+    assert "dp_index 7" not in digest.text
+
+
+def test_the_digest_carries_the_interval_and_the_ceiling():
+    """Интервал и потолок цены обязаны доехать до модели: без них она не сможет
+    сказать про устойчивость вывода ничего, кроме выдуманного."""
+    digest = verdict_digest(
+        _result(
+            [
+                _point(
+                    dp_index=0,
+                    ev_diff_bb=0.0,
+                    interval=EvInterval(point_bb=0.0, low_bb=-0.3, high_bb=0.8, near_zero=True),
+                )
+            ]
+        )
+    )
+    assert "-0.3" in digest.text and "0.8" in digest.text
+    assert "около нуля: да" in digest.text
+
+
+# --- вызов модели --------------------------------------------------------------------
+
+
+async def test_no_judged_points_means_no_model_call():
+    """Судить нечего — модель не зовётся вовсе: ни токенов, ни риска выдумки."""
+    llm = FakeLLM(_draft())
+    out = await verdict_text(llm, _result([], ranked=[]), trace_id=1)
+    assert llm.prompts == []
+    assert out.points == [] and out.summary == ""
+
+
+async def test_the_label_comes_from_the_core_not_from_the_prose():
+    """Метка ставится по цене ядра, а не по тону текста: хвалебный текст на точке
+    ценой −1.2 bb всё равно получает метку расхождения."""
+    res = _result([_point(dp_index=0, ev_diff_bb=-1.2), _point(dp_index=1, ev_diff_bb=0.0)])
+    llm = FakeLLM(
+        _draft((0, "Отличный фолд, всё сделано правильно."), (1, "Здесь всё в порядке."))
+    )
+    out = await verdict_text(llm, res, trace_id=1)
+    assert [p.verdict_label for p in out.points] == ["mistake", "ok"]
+
+
+async def test_the_prompt_contains_the_digest_and_the_rules():
+    res = _result([_point(dp_index=0, ev_diff_bb=-1.2)])
+    llm = FakeLLM(_draft((0, "Шов здесь дороже на 1.2 bb.")))
+    await verdict_text(llm, res, trace_id=1)
+    prompt = llm.prompts[0]
+    assert "Раздача TM99" in prompt
+    assert "Не выдумывай числа" in prompt
+    assert "{digest}" not in prompt
+
+
+async def test_points_are_returned_in_the_ranked_order():
+    """Порядок — из `ranked` (самая дорогая первой), а не тот, в каком ответила
+    модель: порядок показа принадлежит расчёту."""
+    res = _result(
+        [_point(dp_index=0, ev_diff_bb=-0.3), _point(dp_index=1, ev_diff_bb=-2.0)],
+        ranked=[1, 0],
+    )
+    llm = FakeLLM(_draft((0, "Мелкое расхождение."), (1, "Дорогое расхождение.")))
+    out = await verdict_text(llm, res, trace_id=1)
+    assert [p.dp_index for p in out.points] == [1, 0]
+
+
+# --- отказ от неверного текста --------------------------------------------------------
+
+
+async def test_an_invented_number_rejects_the_whole_text():
+    """Число, которого нет в расчёте, — отказ: игрок получит разбор без прозы,
+    но не получит выдуманную цифру про свои деньги."""
+    res = _result([_point(dp_index=0, ev_diff_bb=-1.2)])
+    llm = FakeLLM(_draft((0, "Шов дороже фолда примерно на 3.7 bb.")))
+    with pytest.raises(UnfaithfulText, match="3.7"):
+        await verdict_text(llm, res, trace_id=1)
+
+
+async def test_an_invented_number_in_the_summary_is_caught_too():
+    res = _result([_point(dp_index=0, ev_diff_bb=-1.2)])
+    llm = FakeLLM(_draft((0, "Шов дороже."), summary="Всего за раздачу ушло 9.9 bb."))
+    with pytest.raises(UnfaithfulText, match="9.9"):
+        await verdict_text(llm, res, trace_id=1)
+
+
+async def test_a_number_taken_from_the_digest_passes():
+    res = _result(
+        [
+            _point(
+                dp_index=0,
+                ev_diff_bb=-1.2,
+                interval=EvInterval(point_bb=-1.2, low_bb=-2.4, high_bb=0.5),
+            )
+        ]
+    )
+    llm = FakeLLM(_draft((0, "Фолд стоил 1.2 bb, в худшем случае 2.4 bb.")))
+    out = await verdict_text(llm, res, trace_id=1)
+    assert out.points[0].text.startswith("Фолд стоил")
+
+
+async def test_an_assuming_point_without_assumption_words_is_rejected():
+    """Зона «предполагая» обязана быть названа словами — иначе догадка подаётся
+    как факт, а это ровно то, против чего стоит вся система зон."""
+    res = _result([_point(dp_index=0, ev_diff_bb=-1.2, zone=Zone.ASSUMING)])
+    llm = FakeLLM(_draft((0, "Шов здесь дороже фолда на 1.2 bb.")))
+    with pytest.raises(UnfaithfulText, match="допущение"):
+        await verdict_text(llm, res, trace_id=1)
+
+
+async def test_a_strict_point_needs_no_assumption_words():
+    res = _result([_point(dp_index=0, ev_diff_bb=-1.2, zone=Zone.STRICT)])
+    llm = FakeLLM(_draft((0, "Шов здесь дороже фолда на 1.2 bb.")))
+    out = await verdict_text(llm, res, trace_id=1)
+    assert out.points[0].verdict_label == "mistake"
+
+
+async def test_an_answer_about_the_wrong_points_is_rejected():
+    """Модель ответила не про те точки — сопоставлять по порядку нельзя: текст
+    уехал бы под чужие числа."""
+    res = _result([_point(dp_index=0, ev_diff_bb=-1.2)])
+    llm = FakeLLM(_draft((5, "Про какую-то другую точку.")))
+    with pytest.raises(UnfaithfulText, match="точкам"):
+        await verdict_text(llm, res, trace_id=1)
