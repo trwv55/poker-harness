@@ -40,6 +40,7 @@ from contextlib import suppress
 import httpx
 import structlog
 
+from harness.bot.main import data_dir
 from harness.memory.models import async_session_factory
 from harness.platform.config import Config, EnvVarError, optional_int
 from harness.platform.llm import LLM
@@ -440,6 +441,9 @@ async def main() -> None:
             sender=sender,
             llm=llm,
             process_pool=process_pool,
+            # Тот же том, что у бота (`bot.main.data_dir`): туда ложатся картинки
+            # диапазонов станции `explain`, в БД едут пути (спека §6).
+            data_dir=data_dir(),
         )
         stop = _install_stop_handlers()
         tasks = [

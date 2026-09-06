@@ -45,27 +45,38 @@ from typing import cast
 import pytest
 import structlog
 from pydantic import BaseModel
+from pydantic_ai.messages import ModelResponse, ToolCallPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from harness.analysis import analyze_hand
 from harness.contracts import (
     AnalysisResult,
     Assumption,
     PointVerdict,
     Range,
+    RawHand,
     SpotKind,
     Street,
+    VerdictTextOut,
     Zone,
 )
 from harness.engine import enrich
 from harness.memory.models import Job
-from harness.memory.repos import HandsRepo, PlayersRepo, SessionsRepo, TournamentsRepo
+from harness.memory.repos import (
+    AnalysesRepo,
+    HandsRepo,
+    PlayersRepo,
+    SessionsRepo,
+    TournamentsRepo,
+)
 from harness.normalizer import normalize
 from harness.parsers import hh_parser as hh_parser_module
 from harness.parsers.hh_parser import parse_file
 from harness.platform.config import Config
-from harness.platform.llm import LLM
+from harness.platform.llm import LLM, LLMProviderError
 from harness.platform.queue import JobsQueue
 from harness.presentation import Msg, deep_dive_msg
 from harness.worker import pipeline as pipeline_module
@@ -150,7 +161,11 @@ def queue(db_factory) -> JobsQueue:
 
 @pytest.fixture
 def deps(db_factory, queue, fake_sender, process_pool) -> Deps:
-    llm = LLM(_TEST_CFG, db_factory)
+    # `model_override=TestModel()` — станция `explain` (задача 21) зовёт модель на
+    # обоих путях, а тесты в сеть не ходят (ограничение задачи 16). `TestModel`
+    # PydanticAI сам собирает валидный ответ по схеме, то есть проверяет ровно то,
+    # что нужно здесь: что оркестрация умеет вызвать модель и разложить её ответ.
+    llm = LLM(_TEST_CFG, db_factory, model_override=TestModel())
     return Deps(
         db_factory=db_factory,
         queue=queue,
@@ -448,7 +463,7 @@ async def test_send_idempotent(db_factory, fake_sender, queue, deps):
 
 async def _seed_one_hand_deep_dive_job(
     db_factory, queue: JobsQueue, *, player_id: int, session_id: int
-) -> tuple[int, Job]:
+) -> tuple[int, RawHand]:
     _tournament_id, raw_hands = await _seed_checkpointed_hands(
         db_factory, session_id=session_id, source_file=FIXTURE_DAILY, n=1
     )
@@ -808,9 +823,9 @@ async def test_hh_scan_closes_transaction_before_executor_call(
         queue=spy_queue,
         sender=fake_sender,
         # `LLM`/`PgLimiter` требуют настоящий `async_sessionmaker` (читают
-        # `.kw["bind"]` в конструкторе) — станции этой задачи `deps.llm` не
-        # вызывают вовсе, поэтому здесь достаточно настоящей фабрики без шпиона.
-        llm=LLM(_TEST_CFG, db_factory),
+        # `.kw["bind"]` в конструкторе); шпион тут не нужен — за транзакцией
+        # следит сам тест, а модель подменена двойником.
+        llm=LLM(_TEST_CFG, db_factory, model_override=TestModel()),
         process_pool=spy_executor,  # type: ignore[arg-type]
     )
 
@@ -1217,3 +1232,147 @@ async def test_the_report_message_id_is_remembered_for_a_repeat_attempt(
         row = await session.get(Job, jid)
         assert row is not None
         assert row.payload["report_message_id"] != row.payload["result_message_id"]
+
+
+# --- станция explain: слова поверх посчитанного (задача 21) -------------------------
+
+
+def _all_texts(sender: FakeSender) -> list[str]:
+    """Всё, что игрок увидел: и отправленное, и вписанное правкой сообщения."""
+    return [msg.text for msg in sender.sent] + [msg.text for _msg_id, msg in sender.edits]
+
+
+def _stub_verdict_llm(db_factory, reply: dict[str, object]) -> LLM:
+    """Фасад с фиксированным ответом модели — тот же приём, что `TestModel` выше,
+    но ответ задаёт тест, а не генератор PydanticAI."""
+
+    def _reply(messages, info: AgentInfo) -> ModelResponse:
+        assert info.output_tools
+        return ModelResponse(
+            parts=[ToolCallPart(info.output_tools[0].name, reply)]
+        )
+
+    return LLM(_TEST_CFG, db_factory, model_override=FunctionModel(_reply))
+
+
+@requires_fixtures
+async def test_deep_dive_saves_the_model_text_and_shows_it_to_the_player(
+    db_factory, fake_sender, queue, deps
+):
+    """Станция explain: текст модели уходит игроку и ложится в `analyses.verdict_text`.
+
+    Ответ модели фиксирован тестом и намеренно не содержит чисел — так проверка
+    верности гарантированно проходит, и тест меряет оркестрацию, а не удачу
+    генератора.
+    """
+    player_id, session_id = await _make_scope(db_factory)
+    jid, _raw = await _seed_one_hand_deep_dive_job(
+        db_factory, queue, player_id=player_id, session_id=session_id
+    )
+
+    async with db_factory() as session:
+        hand = await HandsRepo(session).find_by_hand_no(session_id, _raw.hand_no)
+        assert hand is not None and hand.enriched is not None
+
+    # Точки разбора этой руки заранее неизвестны, поэтому ответ собирается по
+    # факту: dp_index обязан совпасть с судимыми точками, иначе текст отбракован.
+    result = analyze_hand(hand.enriched)
+    reply = {
+        "points": [
+            {"dp_index": result.points[i].dp_index, "text": "Если оппонент отвечает шире, шов дешевле."}
+            for i in result.ranked
+        ],
+        "summary": "Разбор без выдуманных чисел.",
+    }
+    llm_deps = replace(deps, llm=_stub_verdict_llm(db_factory, reply))
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, llm_deps)
+
+    assert (await job_status(db_factory, jid)) == "done"
+    async with db_factory() as session:
+        record = await AnalysesRepo(session).get_by_hand(hand.id)
+    assert record is not None
+    texts = _all_texts(fake_sender)
+    if result.ranked:
+        assert record.verdict_text is not None
+        assert any("Разбор без выдуманных чисел." in text for text in texts)
+    assert any("ПРЕФЛОП" in text for text in texts), "ход раздачи обязан быть в разборе"
+
+
+@requires_fixtures
+async def test_a_broken_model_does_not_take_the_analysis_away_from_the_player(
+    db_factory, fake_sender, queue, deps, monkeypatch
+):
+    """Слова необязательны, числа обязательны: провал изложения оставляет разбор
+    целым, а задачу — успешной."""
+    player_id, session_id = await _make_scope(db_factory)
+    jid, _raw = await _seed_one_hand_deep_dive_job(
+        db_factory, queue, player_id=player_id, session_id=session_id
+    )
+
+    async def _boom(*args, **kwargs):
+        raise LLMProviderError("провайдер недоступен")
+
+    monkeypatch.setattr(pipeline_module, "verdict_text", _boom)
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    assert (await job_status(db_factory, jid)) == "done"
+    assert any(f"Рука {_raw.hand_no}" in shown for shown in _all_texts(fake_sender))
+    async with db_factory() as session:
+        hand = await HandsRepo(session).find_by_hand_no(session_id, _raw.hand_no)
+        assert hand is not None
+        record = await AnalysesRepo(session).get_by_hand(hand.id)
+    assert record is not None and record.verdict_text is None
+
+
+@requires_fixtures
+async def test_a_repeat_attempt_does_not_pay_for_the_words_twice(
+    db_factory, fake_sender, queue, deps, monkeypatch
+):
+    """Чекпоинт станции: если текст уже сохранён, модель не зовётся снова."""
+    player_id, session_id = await _make_scope(db_factory)
+    jid, _raw = await _seed_one_hand_deep_dive_job(
+        db_factory, queue, player_id=player_id, session_id=session_id
+    )
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+    assert (await job_status(db_factory, jid)) == "done"
+
+    async with db_factory() as session:
+        hand = await HandsRepo(session).find_by_hand_no(session_id, _raw.hand_no)
+        assert hand is not None
+        await AnalysesRepo(session).set_explanation(
+            hand_id=hand.id,
+            verdict_text=VerdictTextOut(points=[], summary="Уже сказано.").model_dump_json(),
+            range_images=[],
+        )
+        await session.commit()
+
+    called = False
+
+    async def _should_not_be_called(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("модель позвана повторно за уже сохранённым текстом")
+
+    monkeypatch.setattr(pipeline_module, "verdict_text", _should_not_be_called)
+
+    async with db_factory() as session:
+        await session.execute(
+            text("UPDATE jobs SET status = 'queued', locked_by = NULL WHERE id = :id"),
+            {"id": jid},
+        )
+        await session.commit()
+    repeat = await queue.claim("w2")
+    assert repeat is not None
+    await run_job(repeat, deps)
+
+    assert called is False
+    assert any("Уже сказано." in shown for shown in _all_texts(fake_sender))

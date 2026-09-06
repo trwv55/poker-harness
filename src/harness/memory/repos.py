@@ -405,6 +405,22 @@ class AnalysesRepo:
         await self.db.flush()
         return record.id
 
+    async def set_explanation(
+        self, *, hand_id: int, verdict_text: str, range_images: list[str]
+    ) -> None:
+        """Дописать изложение к УЖЕ сохранённому разбору — чекпоинт станции explain.
+
+        Отдельным методом, а не вторым `save()`: разбор (`result`) и текст к нему
+        считаются разными станциями конвейера и переживают разные падения (задача
+        18, чекпоинты). Повторная попытка, у которой числа уже посчитаны, обязана
+        дописать к ним слова, а не завести вторую строку на ту же руку.
+        """
+        await self.db.execute(
+            update(Analysis)
+            .where(Analysis.hand_id == hand_id)
+            .values(verdict_text=verdict_text, range_images=range_images)
+        )
+
     async def get_by_hand(self, hand_id: int) -> AnalysisRecord | None:
         record = await self.db.scalar(select(Analysis).where(Analysis.hand_id == hand_id))
         if record is None:

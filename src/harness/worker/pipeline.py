@@ -23,9 +23,9 @@
 типу задачи, с запасом меньше 10 минут: `asyncio.wait_for` вокруг работы станций (не
 вокруг трейса/`complete`/`fail` — тем всегда дают дожить до конца). Задача 16 сознательно
 не ограничила длительность самого вызова модели (только ожидание лимитера) и оставила
-общий бюджет здесь — сейчас `llm` станциями v1-HH не вызывается вовсе (интерфейсы этой
-задачи, дословно), но дедлайн станции уже покрывает и будущий вызов модели внутри неё
-транзитивно, не дожидаясь отдельной задачи на таймаут конкретно LLM-запроса.
+общий бюджет здесь. С задачи 21 модель вызывается на станции `explain` (текст вердикта
+и рассказ по турниру), и покрывает её тот же дедлайн станции — отдельного таймаута на
+LLM-запрос по-прежнему нет.
 
 **Фенсинг (контроллерский рулинг задачи 18, п.2).** `job.locked_by`, который вернул
 `claim()`, передаётся В КАЖДЫЙ вызов `complete()`/`fail()`/`await_user()` как `worker_id`
@@ -73,10 +73,20 @@ from harness.contracts import (
     AnalysisResult,
     EnrichedHand,
     ScanSummary,
+    TournamentReport,
+    TournamentTextOut,
     ValidationStatus,
+    VerdictTextOut,
     Zone,
 )
 from harness.engine import enrich
+from harness.explanation import (
+    UnfaithfulText,
+    hand_replay,
+    render_range_png,
+    tournament_text,
+    verdict_text,
+)
 from harness.memory.models import Job as JobModel
 from harness.memory.models import Player
 from harness.memory.repos import (
@@ -88,7 +98,7 @@ from harness.memory.repos import (
 )
 from harness.normalizer import normalize
 from harness.parsers import hh_parser
-from harness.platform.llm import LLM
+from harness.platform.llm import LLM, LLMProviderError, LLMSchemaError
 from harness.platform.queue import JobPreconditionFailed, JobsQueue
 from harness.platform.trace import Clock, Trace
 from harness.presentation import (
@@ -96,18 +106,19 @@ from harness.presentation import (
     deep_dive_msg,
     failed_msg,
     progress_text,
+    range_image_title,
     scan_summary_msg,
     tournament_report_msg,
+    tournament_story_msg,
 )
 
 __all__ = ["Deps", "Sender", "run_job"]
 
 _log = structlog.get_logger(__name__)
 
-# Станции v1-HH, показываемые игроку прогрессом (спека — `progress_text` знает четыре
-# ярлыка, "explain" сюда не входит: текст вердикта LLM формулирует задача 21, здесь его
-# ещё не пишем, см. модульный докстринг presentation/messages.py).
-_Station = Literal["parse", "validate", "analyze"]
+# Станции, показываемые игроку прогрессом. "explain" появилась в задаче 21: с неё
+# начинается второй (и последний) вызов модели в системе — текст вердикта.
+_Station = Literal["parse", "validate", "analyze", "explain"]
 
 # Бюджет попытки по типу задачи — с запасом меньше десятиминутного окна reap()
 # (см. модульный докстринг). `hh_scan` может обрабатывать сотни рук и считать эквити
@@ -203,6 +214,7 @@ class Deps:
     llm: LLM
     clock: Clock = time.monotonic
     process_pool: Executor | None = None
+    data_dir: Path | None = None
 
 
 def _cache_delta(cache_seed: dict[str, float]) -> dict[str, float]:
@@ -305,7 +317,12 @@ async def _send_idempotent(
     session: AsyncSession,
     job_id: int,
     worker_id: str | None,
-    key: Literal["progress_message_id", "result_message_id", "report_message_id"],
+    key: Literal[
+        "progress_message_id",
+        "result_message_id",
+        "report_message_id",
+        "story_message_id",
+    ],
     chat_id: int,
     msg: Msg,
 ) -> dict[str, Any]:
@@ -521,8 +538,24 @@ async def _run_hh_scan(job: JobModel, deps: Deps, trace: Trace) -> None:
                     job.player_id, exclude=tournament_id
                 ),
             )
-            # Отчёт уходит ПЕРЕД сводкой: сводка несёт кнопки «разобрать», и им
-            # место под последним сообщением, а не отлистанными вверх.
+            # Рассказ словами — перед отчётом с числами, отчёт — перед сводкой:
+            # сводка несёт кнопки «разобрать», и им место под последним
+            # сообщением, а не отлистанными вверх. Рассказа может не быть вовсе
+            # (модель недоступна либо её текст не прошёл проверку) — тогда игрок
+            # получает те же два сообщения с числами, и это полноценный ответ.
+            async with trace.span("explain"):
+                await _ensure_progress(deps, session, job.id, worker_id, chat_id, "explain")
+                story = await _tournament_story(deps, trace, report)
+            if story is not None:
+                await _send_idempotent(
+                    deps,
+                    session,
+                    job.id,
+                    worker_id,
+                    "story_message_id",
+                    chat_id,
+                    tournament_story_msg(story),
+                )
             await _send_idempotent(
                 deps,
                 session,
@@ -537,6 +570,75 @@ async def _run_hh_scan(job: JobModel, deps: Deps, trace: Trace) -> None:
         msg = scan_summary_msg(summary, quota_left, quota_total)
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
         await session.commit()
+
+
+# --- станция explain: слова поверх посчитанного (задача 21) -------------------------
+
+# Отказы, после которых разбор ВСЁ РАВНО уходит игроку — без прозы, но с числами.
+# Ни один из них не означает, что расчёт неверен: модель недоступна, ответила не по
+# схеме или сказала то, чего расчёт не говорил. Числа, вердикты и зоны посчитаны
+# кодом и от модели не зависят — прятать их из-за её ответа было бы хуже, чем
+# показать разбор молча. Причина при этом не теряется: она в логе.
+_EXPLANATION_FAILURES = (UnfaithfulText, LLMSchemaError, LLMProviderError)
+
+
+async def _verdict_prose(deps: Deps, trace: Trace, result: AnalysisResult) -> VerdictTextOut | None:
+    """Текст модели к разбору или `None`, если его не удалось получить честно."""
+    try:
+        return await verdict_text(deps.llm, result, trace_id=trace.trace_id)
+    except _EXPLANATION_FAILURES as exc:
+        _log.warning("verdict_text_unavailable", hand_no=result.hand_no, error=repr(exc))
+        return None
+    except Exception:  # noqa: BLE001 — см. `_EXPLANATION_FAILURES`: слова
+        # необязательны, числа обязательны. Любой сбой слоя изложения (сюда
+        # попадает и неверная конфигурация провайдера — `UserError` PydanticAI,
+        # который не наследует наши типы) не имеет права отменить разбор, уже
+        # посчитанный кодом. Причина уходит в лог целиком, с трейсбеком.
+        _log.exception("verdict_text_crashed", hand_no=result.hand_no)
+        return None
+
+
+async def _tournament_story(
+    deps: Deps, trace: Trace, report: TournamentReport
+) -> TournamentTextOut | None:
+    """Рассказ по турниру или `None` — по тем же правилам, что и текст разбора."""
+    try:
+        return await tournament_text(deps.llm, report, trace_id=trace.trace_id)
+    except _EXPLANATION_FAILURES as exc:
+        _log.warning("tournament_text_unavailable", error=repr(exc))
+        return None
+    except Exception:  # noqa: BLE001 — та же граница, что у `_verdict_prose`.
+        _log.exception("tournament_text_crashed")
+        return None
+
+
+def _render_ranges(data_dir: Path | None, hand_id: int, result: AnalysisResult) -> list[str]:
+    """Картинки диапазонов на диск; возвращает пути для `analyses.range_images`.
+
+    Рисуются ТОЛЬКО допущения (`PointVerdict.assumption`) — то есть ровно те
+    диапазоны, на которые опирается вывод в зоне «предполагая». У строгой точки
+    показывать нечего: её вывод не зависит от догадки о поле, и картинка
+    подразумевала бы обратное.
+
+    Сбой записи не роняет разбор: картинка — дополнение к числам, а не они сами.
+    """
+    if data_dir is None:
+        return []
+    paths: list[str] = []
+    directory = data_dir / "ranges"
+    for index in result.ranked:
+        point = result.points[index]
+        if point.assumption is None:
+            continue
+        path = directory / f"{hand_id}-{point.dp_index}.png"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(render_range_png(point.assumption.range, range_image_title(point)))
+        except OSError as exc:
+            _log.warning("range_image_failed", hand_id=hand_id, error=repr(exc))
+            continue
+        paths.append(str(path))
+    return paths
 
 
 def _hand_zone(result: AnalysisResult) -> Zone | None:
@@ -601,10 +703,36 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
                 await analyses_repo.save(hand_id=hand.id, result=result)
                 await session.commit()
 
+        async with trace.span("explain"):
+            await _ensure_progress(deps, session, job.id, worker_id, chat_id, "explain")
+            saved = existing.verdict_text if existing is not None else None
+            if saved is not None:
+                # Чекпоинт станции: слова уже сказаны прошлой попыткой — второй раз
+                # за них не платим (спека §8.2, тот же принцип, что у `hands.*`).
+                verdict = VerdictTextOut.model_validate_json(saved)
+            else:
+                verdict = await _verdict_prose(deps, trace, result)
+                images = _render_ranges(deps.data_dir, hand.id, result)
+                if verdict is not None:
+                    await analyses_repo.set_explanation(
+                        hand_id=hand.id,
+                        verdict_text=verdict.model_dump_json(),
+                        range_images=images,
+                    )
+                    await session.commit()
+
         elapsed_s = round(deps.clock() - started_at)
         zone = _hand_zone(result)
         quota_left, quota_total = await _quota_numbers(session, job.player_id)
-        msg = deep_dive_msg(result, elapsed_s, zone, quota_left, quota_total)
+        msg = deep_dive_msg(
+            result,
+            elapsed_s,
+            zone,
+            quota_left,
+            quota_total,
+            replay=hand_replay(hand.enriched),
+            verdict=verdict,
+        )
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
         await session.commit()
 

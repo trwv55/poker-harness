@@ -79,6 +79,7 @@ from harness.contracts.analysis import (
     EvInterval,
     EvSplit,
     Finding,
+    PointVerdict,
     ScanItem,
     ScanSummary,
     SpotKind,
@@ -109,6 +110,7 @@ __all__ = [
     "photo_soon_msg",
     "progress_text",
     "quota_exceeded_msg",
+    "range_image_title",
     "scan_summary_msg",
     "start_msg",
     "tournament_report_msg",
@@ -467,6 +469,27 @@ def deep_dive_msg(
         lines.append(dev_line)
 
     return Msg(text="\n".join(lines), buttons=[verdict_buttons(res.hand_no)])
+
+
+def range_image_title(point: PointVerdict) -> str:
+    """Подпись НА картинке диапазона — тоже голос продукта, а не подпись из воркера.
+
+    Называет ровно то, что нарисовано: чей это диапазон, к какому споту относится
+    и какую долю всех рук занимает. Долю считает контракт (`Range.
+    fraction_of_hands`), здесь она только печатается — второй формулы доли в
+    продукте нет.
+
+    Точка без допущения сюда не приходит: рисовать нечего (`worker.pipeline.
+    _render_ranges`). Если всё же пришла, подпись честно говорит, что диапазон
+    неизвестен, — вместо выдуманной доли.
+    """
+    if point.assumption is None:
+        return f"{_spot_word(point.spot)}: диапазон оппонента не задан"
+    share = 100.0 * point.assumption.range.fraction_of_hands()
+    return (
+        f"{_spot_word(point.spot)}: допущение о диапазоне оппонента — "
+        f"{share:.1f}% всех рук"
+    )
 
 
 def escalation_msg(field: str, question: str, options: list[str]) -> Msg:
