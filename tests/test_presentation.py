@@ -629,6 +629,28 @@ def test_scan_summary_msg_without_close_calls_says_nothing_about_them():
     assert "около нуля" not in scan_summary_msg(s, quota_left=1, quota_total=1).text
 
 
+def test_scan_summary_msg_says_which_end_of_the_close_calls_it_kept():
+    """Обрезанный список «около нуля» называет, по какому краю он обрезан.
+
+    Строка обещает игроку, что выбор дёшев, и список идёт от самого дешёвого
+    выбора к самому дорогому (`scan.scan_tournament`). Подпись обязана говорить
+    то же самое: прежняя («дороже — первыми») описывала порядок, которого больше
+    нет, и обещала игроку ровно обратное тому, что он увидит.
+    """
+    s = ScanSummary(
+        hands_total=30,
+        hands_with_decision=30,
+        items=[],
+        close_calls=[_close_call(hand_no=f"H{i}") for i in range(26)],
+        total_loss_bb=0.0,
+    )
+    head = next(
+        line for line in scan_summary_msg(s, 1, 1).text.splitlines() if "около нуля" in line
+    )
+    assert "показаны 10 из 26" in head
+    assert "самые дешёвые — первыми" in head
+
+
 def test_deep_dive_msg_renders_the_close_call_form_in_full():
     """Разбор точки «около нуля»: точка, интервал, вердикт и потолок цены.
 

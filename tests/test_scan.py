@@ -529,3 +529,46 @@ def test_scan_skips_a_hand_that_fails_reconciliation_and_counts_it(monkeypatch):
     assert s.hands_failed == 1
     assert s.hands_with_decision == 1  # только «good» дошла до вердикта
     assert s.items == []  # good — верный фолд, bad пропущена целиком
+
+
+def test_close_calls_are_ordered_by_the_promise_they_make(monkeypatch):
+    """Список «около нуля» идёт от самого дешёвого выбора к самому дорогому.
+
+    Каждая строка такого списка обещает игроку одно: «выбор стоит не больше
+    столько-то». Обещание тем сильнее, чем потолок меньше, а список для того и
+    существует, чтобы освободить внимание, — поэтому сверху стоит самое сильное
+    из них. Прежний порядок (дороже первым) ставил наверх самые слабые.
+    """
+    import harness.analysis.scan as scan_mod
+    from harness.contracts import EvInterval, PointVerdict, SpotKind, Street
+
+    hands = [
+        _make_hu_fold_hand(hero_cards=("3c", "2d"), eff_bb=10.0),
+        _make_hu_fold_hand(hero_cards=("4c", "2d"), eff_bb=10.0),
+        _make_hu_fold_hand(hero_cards=("5c", "2d"), eff_bb=10.0),
+    ]
+    ceilings = {id(hands[0]): 1.5, id(hands[1]): 0.4, id(hands[2]): 0.9}
+
+    def near_zero(dp, en):
+        top = ceilings[id(en)]
+        return PointVerdict(
+            dp_index=dp.index,
+            street=Street.PREFLOP,
+            spot=SpotKind.PUSHFOLD_UNOPENED,
+            zone=Zone.STRICT,  # без допущения — иначе контракт требует `assumption`
+            action_taken="fold",
+            best_action="около нуля, оба варианта допустимы",
+            ev_diff_bb=0.0,
+            interval=EvInterval(point_bb=0.0, low_bb=-0.1, high_bb=top, near_zero=True),
+            detail={"hero_class": "32o"},
+        )
+
+    monkeypatch.setattr(scan_mod, "verdict_for", near_zero)
+    monkeypatch.setattr(scan_mod, "cheap_fold_verdict", lambda dp, en: None)
+
+    s = scan_tournament(hands)
+    assert [round(it.interval.cost_ceiling_bb, 1) for it in s.close_calls if it.interval] == [
+        0.4,
+        0.9,
+        1.5,
+    ]
