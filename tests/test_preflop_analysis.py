@@ -624,47 +624,69 @@ def test_hu_equilibrium_shape_is_strict_even_when_bracket_unstable():
 
 
 def test_shove_without_fold_equity_is_marked():
-    """На 2bb равновесный колл — любые две карты: фолд-эквити структурно нет."""
+    """На 2bb равновесный колл — любые две карты: фолд-эквити структурно нет.
+
+    Пометка стоит у СУДИМОЙ точки: `p_all_fold` здесь ноль по построению, и
+    вердикт всё равно выносится — «на этот шов всегда отвечают» есть свойство
+    раздачи на 2bb, а не повод не называть её цену.
+    """
     en = _make_multiway_shove_hand(hero_cards=("Ac", "Ts"), eff_bb=2.0, players_behind=2)
     p = analyze_hand(en).points[0]
     assert p.spot == "pushfold_unopened"
     assert p.detail["fold_equity_ok"] is False
+    assert p.detail["p_all_fold"] == 0.0
+    assert "unjudged" not in p.detail and p.best_action == "shove"
 
 
-# --- Контрольная сумма модели стола и неустойчивая вилка -------------------------
+# --- Равновесие как эталон и неустойчивая вилка ----------------------------------
 
 
-def test_a_shove_the_model_says_is_almost_always_answered_gets_no_verdict():
-    """Шов, который по модели почти всегда отвечают, цены не получает.
+def test_a_shove_the_field_would_rarely_let_through_is_still_judged():
+    """Широкий равновесный ответ вердикта не снимает: равновесие — эталон, а не гипотеза.
 
     На 4bb с пятерыми позади равновесные колл-диапазоны широки: шов проходит без
-    ответа в 14% случаев, а отвечают на него в среднем полтора игрока из пяти.
-    Цена такого шова арифметически верна, но проверку `_model_checksum` он не
-    проходит, и вердикта здесь нет вовсе (решение владельца 2026-09-06).
-    Порядок правил при этом важен: точка снимается контрольной суммой, а не
-    вилкой, и причина обязана называть именно её.
+    ответа в 16% случаев, а отвечают на него в среднем полтора игрока из пяти
+    (`p_all_fold` 0.1596, `expected_callers` 1.4777). Это не признак сломанной
+    модели, а верный ответ на 4bb, и вердикт здесь есть.
+
+    Больше того, вердикт от ширины колла вообще не зависит: интервал по всей
+    калиброванной полосе лежит выше нуля, зона `strict`. То, насколько охотно
+    отвечает настоящее поле, — замер, и живёт он в полосе ширин
+    (`_CALL_WIDTH_BAND`), а не в гейте на существование вердикта.
     """
     en = _make_multiway_shove_hand(hero_cards=("Ad", "5d"), eff_bb=4.0, players_behind=5)
     p = analyze_hand(en).points[0]
 
     assert p.spot == "pushfold_unopened"
-    assert p.best_action == ""  # вердикта нет
-    assert p.ev_diff_bb == 0.0 and p.assumption is None
-    reason = p.detail["unjudged"]
-    assert "цену шова" in reason and "модель" in reason
-    # Язык игрока (SESSIONS_UX): без внутренней кухни.
-    assert not any(word in reason for word in ("колл-диапазон", "равновеси", "хедз-ап"))
+    assert "unjudged" not in p.detail
+    assert p.best_action == "shove"
+    assert p.zone == "strict" and p.assumption is None
+    # Ровно те числа, по которым точка прежде снималась целиком.
+    assert p.detail["p_all_fold"] == pytest.approx(0.1596, abs=5e-5)
+    assert p.detail["expected_callers"] == pytest.approx(1.4777, abs=5e-5)
+    # Вердикт не опирается на угаданную ширину: он одинаков на всей полосе.
+    assert p.interval is not None and p.interval.low_bb > 0.0
+    assert min(p.detail["ev_shove_by_width_bb"].values()) > 0.0
 
 
-def test_a_realistic_calling_model_passes_the_checksum():
-    """Защита от того, чтобы правка сняла вообще всё: тесная модель проходит.
+def test_the_table_equilibrium_never_hands_the_heads_up_range_to_everyone():
+    """Хедз-ап колл-диапазон, розданный всем позади, `_table_equilibrium` не производит.
 
-    Тот же спот (пятеро позади, 12bb), но колл-диапазоны реалистичной ширины
-    10% вместо равновесных 33%: `p_all_fold` 0.63 против порога 0.20 и 0.44
-    отвечающих против порога 1.0 — контрольная сумма молчит, и точка судится.
+    Это тот самый дефект, ради которого когда-то считалась контрольная сумма
+    модели: одна и та же ширина у каждого места независимо от того, сколько их.
+    Решатель подыгры так не умеет — он решает места совместно, и на 12bb с
+    пятерыми позади даёт им 6.6...7.9% комбо против 33.1% хедз-ап на той же
+    глубине. Сводные числа модели расходятся соответственно: равновесие —
+    `p_all_fold` 0.7156 при 0.3237 отвечающих, хедз-ап-раздача — 0.1554 при
+    1.5544.
     """
-    from harness.analysis.preflop import _depth_key, _model_checksum, _table_dead_bb
-    from harness.analysis.tools.pushfold import CallerModel, nash_hu, range_of_width
+    from harness.analysis.preflop import (
+        _call_model_detail,
+        _depth_key,
+        _table_dead_bb,
+        _table_equilibrium,
+    )
+    from harness.analysis.tools.pushfold import CallerModel, nash_hu
 
     en = _make_multiway_shove_hand(hero_cards=("Ad", "5d"), eff_bb=12.0, players_behind=5)
     dp = en.report.decision_points[0]
@@ -673,27 +695,39 @@ def test_a_realistic_calling_model_passes_the_checksum():
     dead_bb = _table_dead_bb(state)
     depths = [min(state.hero.stack_after_ante, s.stack_after_ante) / en.hand.bb for s in behind]
 
+    solved = list(_table_equilibrium(state, behind, en.hand.bb).calls)
+    heads_up = [nash_hu(_depth_key(d), dead_extra_bb=dead_bb)[1] for d in depths]
+
+    solved_widths = [rng.fraction_of_hands() for rng in solved]
+    hu_widths = [rng.fraction_of_hands() for rng in heads_up]
+    # Хедз-ап-раздача даёт всем одно число; решённое равновесие — разные, и все
+    # они уже потому вне подозрения, что вдвое с лишним теснее.
+    assert len({round(w, 4) for w in hu_widths}) == 1
+    assert len({round(w, 4) for w in solved_widths}) > 1
+    assert all(s < h / 2 for s, h in zip(solved_widths, hu_widths, strict=True))
+
     def callers(ranges):
         return [
             CallerModel(call_range=rng, behind_bb=s.behind / en.hand.bb, posted_bb=0.0)
             for s, rng in zip(behind, ranges, strict=True)
         ]
 
-    equilibrium = callers(
-        [nash_hu(_depth_key(d), dead_extra_bb=dead_bb)[1] for d in depths]
-    )
-    realistic = callers([range_of_width(d, 0.10, dead_extra_bb=dead_bb) for d in depths])
-
-    assert _model_checksum(equilibrium, "A5s") != ""
-    assert _model_checksum(realistic, "A5s") == ""
+    assert _call_model_detail(callers(solved), "A5s") == {
+        "p_all_fold": pytest.approx(0.7156, abs=5e-5),
+        "expected_callers": pytest.approx(0.3237, abs=5e-5),
+    }
+    assert _call_model_detail(callers(heads_up), "A5s") == {
+        "p_all_fold": pytest.approx(0.1554, abs=5e-5),
+        "expected_callers": pytest.approx(1.5544, abs=5e-5),
+    }
 
 
 def test_an_interval_across_zero_gets_the_near_zero_verdict_with_a_ceiling():
     """Q2o на 10bb в двоих позади: интервал EV лежит по обе стороны нуля.
 
-    Контрольную сумму этот спот проходит, поэтому вердикт есть — но не
-    точечный: против самого тесного поля полосы шов мусором прибылен за счёт
-    фолд-эквити, против равновесного — убыточен. Игроку называются знак и
+    Вердикт здесь есть, но не точечный: против самого тесного поля полосы шов
+    мусором прибылен за счёт фолд-эквити, против равновесного — убыточен.
+    Игроку называются знак и
     порядок величины (`point_bb`), сам интервал и потолок цены; упрёка нет,
     потому что оба варианта допустимы.
     """

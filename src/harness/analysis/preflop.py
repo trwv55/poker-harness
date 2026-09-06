@@ -53,16 +53,15 @@
 героем, живой без фишек за спиной помимо героя — и в шове в неоткрытый банк, и
 в колле шова. Каждая граница снимает
 вердикт целиком, а не поправляет число: инструмент описывает одну форму, и вне её
-поправлять в нём нечего.
+поправлять в нём нечего. Все границы — про ФОРМУ раздачи; ни одна не смотрит на
+то, насколько широко решатель ответил на шов. Широкий равновесный ответ вердикта
+не снимает: равновесие здесь — эталон, против которого судят, а не гипотеза о
+поле, и насколько тесно играет настоящее поле, сказано полосами ширин
+(`_CALL_WIDTH_BAND`, `_SHOVE_WIDTH_BAND`), которые двигают зону доверия.
+Закреплено `test_a_shove_the_field_would_rarely_let_through_is_still_judged`.
 
-**Что снимает вердикт с уже посчитанной точки, а что меняет его форму.**
-Снимает одно — контрольная сумма модели стола (`_model_checksum`): когда по
-модели коллеров выходит, что шов почти наверняка ответят, модель описывает не
-этот стол, и цену шова по ней не называем. Посчитанные числа остаются в
-`detail` снятой точки, игроку не показывается ничего: `best_action` пуст, и
-`error_cost.is_judged` такую точку не берёт.
-
-Форму меняет ЗНАК интервала EV по моделям диапазона (`EvInterval`). Пока обе
+**Что меняет форму уже посчитанного вердикта.** ЗНАК интервала EV по моделям
+диапазона (`EvInterval`). Пока обе
 границы по одну сторону нуля, вердикт обычный, и ширина интервала на него не
 влияет. Когда интервал лежит по обе стороны нуля, точечной оценки нет — но и
 отказа нет: точка получает вердикт `_BOTH_ACCEPTABLE` («около нуля»), интервал
@@ -347,24 +346,6 @@ _ASSUMPTION_SHOVER = (
     "диапазон шова посчитан как равновесие того стола, за которым шовер принимал "
     "решение — допущение в том, что он его и придерживается"
 )
-
-# Контрольная сумма модели стола (решение владельца 2026-09-06). Проверяется не
-# арифметика `shove_ev_bb` — она верна на любом входе, — а то, описывает ли
-# модель коллеров тот стол, за которым принималось решение: если по ней выходит,
-# что шов почти наверняка ответят и отвечающих в среднем больше одного, цену
-# шова по такой модели называть нельзя.
-#
-# Пороги названы владельцем и обоснования «из литературы» под собой не имеют:
-# правдоподобные частоты колла — вопрос эмпирический, и ответят на него
-# популяционные данные, а не эта константа. Проверка снимает вердикт, а не
-# правит число.
-#
-# Двусторонняя полоса (35-70%) вместо нижнего порога здесь НЕ включена: она
-# отвергает верные ответы там, где позади сидит игрок, которому колл обходится
-# так дёшево, что он коллирует почти всем, — область применимости для неё
-# описана в спеке (§8) и является отдельной подзадачей.
-_MIN_ALL_FOLD_PROB = 0.20
-_MAX_EXPECTED_CALLERS = 1.0
 
 # Вердикт точки, у которой интервал EV лежит по обе стороны нуля (решение
 # владельца 2026-09-06, правка предыдущего его же решения). Прежде такая точка
@@ -657,44 +638,21 @@ def _push_model(depth_bb: float, dead_bb: float) -> Range:
     return nash_hu(_depth_key(depth_bb), dead_extra_bb=dead_bb)[0]
 
 
-def _checksum_detail(callers: Sequence[CallerModel], hero_cls: str) -> dict[str, object]:
-    """Числа контрольной суммы — в `detail` каждой точки о шове в неоткрытый банк.
+def _call_model_detail(callers: Sequence[CallerModel], hero_cls: str) -> dict[str, object]:
+    """Две сводные величины модели коллеров — в `detail` точки о шове в неоткрытый банк.
 
-    Стоят и у судимой точки, и у снятой: по ним видно, насколько модель стола
-    разошлась с проверкой и чем именно точка снята. Игроку не показываются
-    ничем (см. `_unjudged`).
+    Считаются по тем же `CallerModel`, что уходят в `shove_ev_bb`, и той же
+    вероятностью колла (`default_call_prob`), которой считается сама EV:
+    `p_all_fold = Π(1 − p_i)`, `expected_callers = Σ p_i`. Вердикта они не
+    решают и игроку не показываются ничем — это описание решённого равновесия,
+    по которому видно, каким его увидел расчёт. Числа закреплены на настоящей
+    раздаче `test_the_reference_multiway_spot_reproduces_the_solved_table`.
     """
     probs = [default_call_prob(caller, hero_cls) for caller in callers]
     return {
         "p_all_fold": round(prod(1.0 - p for p in probs), 6),
         "expected_callers": round(sum(probs), 4),
     }
-
-
-def _model_checksum(callers: Sequence[CallerModel], hero_cls: str) -> str:
-    """Причина снять вердикт о шове, если модель колла описывает не этот стол.
-
-    Пустая строка означает, что проверка пройдена. Считается по тем же
-    `CallerModel`, что уходят в `shove_ev_bb`, и той же вероятностью колла
-    (`default_call_prob`), которой считается сама EV: `p_all_fold = Π(1 − p_i)`,
-    `expected_callers = Σ p_i`. Пороги — `_MIN_ALL_FOLD_PROB` и
-    `_MAX_EXPECTED_CALLERS`.
-
-    Причина написана для игрока (SESSIONS_UX): что именно не так с моделью и
-    почему цены не будет, без внутренних терминов. Закреплено
-    `test_a_shove_the_model_says_is_almost_always_answered_gets_no_verdict` и
-    `test_a_realistic_calling_model_passes_the_checksum`.
-    """
-    probs = [default_call_prob(caller, hero_cls) for caller in callers]
-    p_all_fold = prod(1.0 - p for p in probs)
-    expected_callers = sum(probs)
-    if p_all_fold >= _MIN_ALL_FOLD_PROB and expected_callers <= _MAX_EXPECTED_CALLERS:
-        return ""
-    return (
-        f"по нашей модели такой шов проходит без ответа лишь в {p_all_fold:.0%} случаев, "
-        f"а отвечают на него в среднем {expected_callers:.1f} из {len(probs)} — для этого "
-        f"стола модель не годится, и цену шова по ней мы не считаем"
-    )
 
 
 def _average_range(ranges: Sequence[Range]) -> Range:
@@ -1093,12 +1051,6 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
         return _unjudged(dp, spot, _NO_EQUILIBRIUM, {"solver_error": str(failure)})
     model_ranges = list(solution.calls)
     model_callers = callers(model_ranges)
-    # Контрольная сумма модели стола. Считается здесь, на тех же `CallerModel`,
-    # что уходят в `shove_ev_bb`, а решение по ней принимается перед выдачей
-    # вердикта — вместе с проверкой вилки и в этом порядке (сначала модель,
-    # потом устойчивость): числа расчёта остаются в `detail` снятой точки, по
-    # ним видно, чем именно она снята.
-    broken_model = _model_checksum(model_callers, hero_cls)
     ev_model = ev(model_ranges)
     # Опрашивается вся сетка множителей, а не два конца полосы: EV по ширине не
     # монотонна, и вердикт умеет перевернуться внутри интервала. Множитель
@@ -1165,10 +1117,8 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
         "shove_range_fraction": round(solution.push.fraction_of_hands(), 6),
         "call_range_fractions": [round(rng.fraction_of_hands(), 6) for rng in model_ranges],
         "equilibrium_hand_regret_bb": round(solution.hand_regret_bb, 6),
-        **_checksum_detail(model_callers, hero_cls),
+        **_call_model_detail(model_callers, hero_cls),
     }
-    if broken_model:
-        return _unjudged(dp, spot, broken_model, detail)
     # Интервал по обе стороны нуля точечной оценки не даёт, но и отказом больше
     # не является: точка получает вердикт «около нуля» (`_BOTH_ACCEPTABLE`) с
     # интервалом и потолком цены. Форма, где колл-диапазон взят из равновесия, а
@@ -1558,15 +1508,13 @@ def cheap_fold_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | No
     дёшево. Это гарантирует отсутствие ложных «расхождения нет» на настоящих
     промахах: см. `_PREFILTER_PUSH_WEIGHT_MAX`.
 
-    Дешёвый лукап не имеет права быть увереннее полного расчёта, поэтому оба
-    его правила действуют и здесь. Контрольную сумму модели (`_model_checksum`)
-    он считает сам — она не требует эквити и снимает точку прямо тут, без
-    дорогого перебора. Интервал EV по ширинам колл-диапазона он не считает
-    вовсе, а именно знак этого интервала решает, будет ли у точки точечная
-    оценка или форма «около нуля»: поэтому мультивей уходит на полный расчёт, а
-    лукап закрывает только форму, где колл-диапазон взят из равновесия (SB
-    против BB один на один) — там вердикт держит равновесие. Отсюда зона
-    `strict` без допущения: вывода на догадке эта функция больше не производит.
+    Дешёвый лукап не имеет права быть увереннее полного расчёта. Интервал EV по
+    ширинам колл-диапазона он не считает вовсе, а именно знак этого интервала
+    решает, будет ли у точки точечная оценка или форма «около нуля»: поэтому
+    мультивей уходит на полный расчёт, а лукап закрывает только форму, где
+    колл-диапазон взят из равновесия (SB против BB один на один) — там вердикт
+    держит равновесие. Отсюда зона `strict` без допущения: вывода на догадке эта
+    функция не производит.
     """
     if dp.street is not Street.PREFLOP or dp.action.kind is not ActionKind.FOLD:
         return None
@@ -1613,38 +1561,6 @@ def cheap_fold_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | No
     ):
         equilibrium_depth = _equilibrium_depth(min(hero_eff, behind[0].stack_after_ante) / bb)
 
-    # Те же два правила, что и у полного расчёта, — иначе дешёвый лукап был бы
-    # увереннее его. Контрольная сумма считается по ТОМУ ЖЕ равновесию стола,
-    # что и в `_unopened_verdict`: две разные модели коллеров снимали бы с точки
-    # вердикт по разным причинам, и лукап отвергал бы то, что полный расчёт
-    # судит. Решение точки считается один раз на обоих путях — его запоминает
-    # сам решатель.
-    try:
-        solution = _table_equilibrium(state, behind, bb)
-    except DidNotConverge:
-        return None  # отказ формулирует полный расчёт, а не лукап
-    model_callers = [
-        CallerModel(
-            call_range=call_range,
-            behind_bb=seat.behind / bb,
-            posted_bb=min(seat.contributed, state.hero.stack) / bb,
-        )
-        for seat, call_range in zip(behind, solution.calls, strict=True)
-    ]
-    broken_model = _model_checksum(model_callers, hero_cls)
-    if broken_model:
-        return _unjudged(
-            dp,
-            SpotKind.PUSHFOLD_UNOPENED,
-            broken_model,
-            {
-                "method": "prefilter_chart_lookup",
-                "hero_class": hero_cls,
-                "depths_bb": [round(_depth_key(depth), 2) for depth in depths],
-                "dead_extra_bb": round(dead_bb, 4),
-                **_checksum_detail(model_callers, hero_cls),
-            },
-        )
     # Интервал EV по ширинам колл-диапазона лукап не считает вовсе, а именно его
     # знак решает, получит точка точечную оценку или форму «около нуля».
     # Заявить его здесь нечем, поэтому мультивей уходит на полный расчёт: он
@@ -1652,6 +1568,14 @@ def cheap_fold_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | No
     # — там вердикт держит равновесие.
     if equilibrium_depth is None:
         return None
+    # На этой же форме полный расчёт решает равновесие стола и на несошедшемся
+    # решении вердикта не даёт (`_NO_EQUILIBRIUM`). Лукап обязан отступить там
+    # же, иначе окажется увереннее его. Само решение здесь не нужно — вердикт
+    # держит `nash_hu`, — и второй раз оно не считается: решатель его запоминает.
+    try:
+        _table_equilibrium(state, behind, bb)
+    except DidNotConverge:
+        return None  # отказ формулирует полный расчёт, а не лукап
 
     detail: dict[str, object] = {
         "method": "prefilter_chart_lookup",
