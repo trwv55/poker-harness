@@ -36,6 +36,7 @@ from harness.contracts import (
     Finding,
     LevelLine,
     PlayerStats,
+    PointText,
     PointVerdict,
     Range,
     ScanItem,
@@ -44,8 +45,11 @@ from harness.contracts import (
     StackTrajectory,
     Street,
     TournamentReport,
+    TournamentTextOut,
+    VerdictTextOut,
     Zone,
 )
+from harness.explanation import HandReplay, ReplaySpan
 from harness.presentation import (
     Btn,
     Msg,
@@ -62,6 +66,7 @@ from harness.presentation import (
     scan_summary_msg,
     start_msg,
     tournament_report_msg,
+    tournament_story_msg,
     unsupported_document_msg,
 )
 
@@ -956,3 +961,124 @@ def test_tournament_report_msg_surfaces_hands_it_could_not_analyse():
     """Пропуск виден строкой, а не только отсутствующей цифрой где-то в тексте."""
     assert "Раздач не разобрано: 3" in tournament_report_msg(_report(hands_failed=3)).text
     assert "не разобрано" not in tournament_report_msg(_report(hands_failed=0)).text
+
+
+# --- задача 21: реплей, текст модели, рассказ по турниру -----------------------------
+
+
+def _prose_result() -> AnalysisResult:
+    """Две точки с РАЗНЫМИ `dp_index`: проза привязывается по индексу точки."""
+    strict_point = _point(spot=SpotKind.PUSHFOLD_UNOPENED, ev_diff_bb=-2.3, zone=Zone.STRICT)
+    assuming_point = _point(
+        spot=SpotKind.PUSHFOLD_FACING_SHOVE,
+        ev_diff_bb=-1.1,
+        zone=Zone.ASSUMING,
+        assumption=Assumption(range=Range(weights={"AA": 1.0}), source="model:test"),
+    ).model_copy(update={"dp_index": 3})
+    return AnalysisResult(
+        hand_no="H42",
+        points=[strict_point, assuming_point],
+        ranked=[0, 1],
+        total_ev_loss_bb=-3.4,
+    )
+
+
+def _verdict_text() -> VerdictTextOut:
+    return VerdictTextOut(
+        points=[
+            PointText(dp_index=0, verdict_label="mistake", text="Шов здесь дороже фолда."),
+            PointText(
+                dp_index=3,
+                verdict_label="mistake",
+                text="Если оппонент шовит широко, колл дешевле.",
+            ),
+        ],
+        summary="За раздачу расчёт нашёл два расхождения.",
+    )
+
+
+def _replay() -> HandReplay:
+    return HandReplay(
+        spans=[
+            ReplaySpan(text="T1 · ур. 12 · 50/100\nHero SB J♥️9♥️ · 1 000 (10.0bb)\n\n"),
+            ReplaySpan(text="ПРЕФЛОП · банк 210\nUTG фолд → "),
+            ReplaySpan(text="Hero олл-ин 990 (9.9bb)", emphasis=True),
+        ]
+    )
+
+
+def test_deep_dive_msg_puts_the_prose_under_the_point_it_explains():
+    """Текст модели стоит под строкой СВОЕЙ точки — привязка по `dp_index`, а не
+    по порядку: иначе пояснение уезжает под чужие числа."""
+    msg = deep_dive_msg(
+        _prose_result(), 12, Zone.ASSUMING, 17, 50, verdict=_verdict_text()
+    )
+    lines = msg.text.splitlines()
+    first = next(i for i, line in enumerate(lines) if "пуш-фолд" in line)
+    second = next(i for i, line in enumerate(lines) if "колл шова" in line)
+    assert "Шов здесь дороже фолда." in lines[first + 1]
+    assert "Если оппонент шовит широко" in lines[second + 1]
+
+
+def test_deep_dive_msg_shows_the_summary_of_the_model():
+    msg = deep_dive_msg(_prose_result(), 12, Zone.STRICT, 17, 50, verdict=_verdict_text())
+    assert "За раздачу расчёт нашёл два расхождения." in msg.text
+
+
+def test_deep_dive_msg_without_prose_has_no_holes_in_it():
+    """Разбор без текста модели (её не позвали или текст не прошёл проверку) —
+    цельное сообщение с числами, а не то же самое с пустыми местами."""
+    msg = deep_dive_msg(_prose_result(), 12, Zone.STRICT, 17, 50)
+    assert "\n\n\n" not in msg.text
+    assert "−2.3 bb" in msg.text
+
+
+def test_deep_dive_msg_shows_the_replay_above_the_verdicts():
+    """Ход раздачи — до вердиктов: разбор без хода руки нечитаем (спека §5.6)."""
+    msg = deep_dive_msg(_prose_result(), 12, Zone.STRICT, 17, 50, replay=_replay())
+    assert "Hero олл-ин 990" in msg.text
+    assert msg.text.index("ПРЕФЛОП") < msg.text.index("пуш-фолд")
+
+
+def test_deep_dive_msg_with_replay_and_prose_fits_one_telegram_message():
+    msg = deep_dive_msg(
+        _prose_result(), 12, Zone.ASSUMING, 17, 50, replay=_replay(), verdict=_verdict_text()
+    )
+    assert len(msg.text) < 4096
+
+
+def test_tournament_report_msg_explains_the_bb_jump_between_levels():
+    """Стек на входе уровня меньше, чем на выходе предыдущего, — строка выглядит
+    ошибкой в счёте, и объяснение печатает КОД, а не модель."""
+    jumped = StackTrajectory(
+        levels=[
+            LevelLine(level=20, hands=12, start_bb=34.0, end_bb=33.0),
+            LevelLine(level=21, hands=12, start_bb=22.0, end_bb=21.0),
+        ],
+        start_bb=34.0,
+        final_bb=21.0,
+        peak_level=20,
+        peak_bb=34.0,
+        peak_hand_no="TM1",
+        hands_after_peak=12,
+    )
+    assert "выросли блайнды" in tournament_report_msg(_report(trajectory=jumped)).text
+
+
+def test_tournament_report_msg_stays_silent_about_a_jump_that_did_not_happen():
+    assert "выросли блайнды" not in tournament_report_msg(_report()).text
+
+
+def test_tournament_story_msg_keeps_paragraphs_apart():
+    msg = tournament_story_msg(
+        TournamentTextOut(paragraphs=["Первый абзац.", "Второй абзац."])
+    )
+    assert msg.text == "Первый абзац.\n\nВторой абзац."
+    assert msg.buttons == []
+
+
+def test_tournament_story_msg_says_when_it_had_to_cut():
+    """Обрезка не бывает молчаливой — это то же правило, что у списков отчёта."""
+    msg = tournament_story_msg(TournamentTextOut(paragraphs=["а" * 2000] * 4))
+    assert len(msg.text) < 4096
+    assert "из 4" in msg.text

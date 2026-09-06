@@ -29,6 +29,7 @@ from harness.presentation.messages import (
     scan_summary_msg,
     start_msg,
     tournament_report_msg,
+    tournament_story_msg,
     unsupported_document_msg,
 )
 
@@ -51,6 +52,7 @@ __all__ = [
     "scan_summary_msg",
     "start_msg",
     "tournament_report_msg",
+    "tournament_story_msg",
     "unsupported_document_msg",
     "verdict_buttons",
 ]

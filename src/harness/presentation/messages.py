@@ -66,6 +66,7 @@
 
 from __future__ import annotations
 
+from itertools import pairwise
 from math import ceil, floor
 from typing import Literal
 
@@ -85,7 +86,9 @@ from harness.contracts.analysis import (
     TournamentReport,
     Zone,
 )
+from harness.contracts.explanation import TournamentTextOut, VerdictTextOut
 from harness.contracts.raw import Street
+from harness.explanation.hand_replay import HandReplay
 from harness.presentation.keyboards import (
     Btn,
     deep_dive_button,
@@ -109,6 +112,7 @@ __all__ = [
     "scan_summary_msg",
     "start_msg",
     "tournament_report_msg",
+    "tournament_story_msg",
     "unsupported_document_msg",
 ]
 
@@ -282,6 +286,18 @@ def _close_call_line(item: ScanItem) -> str:
     )
 
 
+def _prose_lines(text: str | None) -> list[str]:
+    """Абзац модели под строкой точки — с отступом, чтобы было видно, где чья речь.
+
+    Пустой текст не даёт пустой строки: разбор без прозы (модель недоступна либо
+    её текст не прошёл проверку верности) обязан выглядеть цельным, а не
+    дырявым (`test_deep_dive_msg_without_prose_has_no_holes_in_it`).
+    """
+    if text is None or not text.strip():
+        return []
+    return [f"    {line.strip()}" for line in text.strip().splitlines() if line.strip()]
+
+
 def _quota_line(quota_left: int, quota_total: int) -> str:
     return f"разборов {quota_left}/{quota_total} за 24 ч"
 
@@ -380,6 +396,8 @@ def deep_dive_msg(
     quota_left: int,
     quota_total: int,
     dev_line: str | None = None,
+    replay: HandReplay | None = None,
+    verdict: VerdictTextOut | None = None,
 ) -> Msg:
     """Полный разбор раздачи: точки решения числами (текст LLM — задача 21) +
     статус-строка (⏱ время · зона доверия · остаток квоты) + три кнопки.
@@ -401,6 +419,11 @@ def deep_dive_msg(
     такой вызывающий; там же и правило: «строго» только если строги все).
     """
     lines = [f"Рука {res.hand_no}", ""]
+    if replay is not None:
+        lines.append(replay.plain)
+        lines.append("")
+
+    prose = {} if verdict is None else {point.dp_index: point.text for point in verdict.points}
 
     if not res.ranked:
         lines.append("По этой раздаче точек с вердиктом нет.")
@@ -423,12 +446,18 @@ def deep_dive_msg(
                     f"    EV {active}а {_fmt_signed_bb(interval.point_bb)}, "
                     f"{_interval_words(point.spot, interval)}."
                 )
+                lines.extend(_prose_lines(prose.get(point.dp_index)))
                 continue
             lines.append(
                 f"{street} · "
                 f"{_spot_word(point.spot)}: {_action_word(point.action_taken)} "
                 f"(лучше: {_action_word(point.best_action)}) — {_fmt_bb(point.ev_diff_bb)}{marker}"
             )
+            lines.extend(_prose_lines(prose.get(point.dp_index)))
+
+    if verdict is not None and verdict.summary.strip():
+        lines.append("")
+        lines.append(verdict.summary.strip())
 
     lines.append("")
     zone_segment = "" if zone is None else f"зона: {_ZONE_WORD[zone]} · "
@@ -580,6 +609,20 @@ _MAX_REPORT_ALL_INS = 6
 _MAX_REPORT_CHIP_MOVES = 8
 _MAX_REPORT_FINDINGS = 4
 
+# Строка, без которой таблица уровней читается как ошибка в счёте: стек на входе
+# уровня МЕНЬШЕ, чем на выходе предыдущего, при тех же фишках. Объяснение
+# кодовое, а не модельное — это факт («блайнды выросли»), а не суждение, и
+# показывать его должен тот же голос, что печатает саму таблицу.
+_BLIND_JUMP_LINE = (
+    "Стек на входе уровня бывает меньше, чем на выходе предыдущего: фишки те же, "
+    "выросли блайнды — в новых bb та же гора стоит меньше."
+)
+
+# Потолок текста рассказа по турниру: тот же предел `sendMessage` в 4096
+# символов. Абзацы, которые в него не влезли, не выбрасываются молча — строка
+# ниже говорит, сколько показано из скольких.
+_MAX_STORY_CHARS = 3500
+
 # Улица последнего действия героя — строчной буквой: она стоит внутри фразы
 # («префлоп, олл-ин»), а не заголовком строки, как в разборе одной раздачи.
 _STREET_WHERE: dict[Street, str] = {street: word.lower() for street, word in _STREET_WORD.items()}
@@ -697,6 +740,8 @@ def _trajectory_lines(trajectory: StackTrajectory) -> list[str]:
         f"(раздача №{trajectory.peak_hand_no}). После неё раздач: "
         f"{trajectory.hands_after_peak}, к концу турнира: {_fmt_bb(trajectory.final_bb)}."
     )
+    if any(nxt.start_bb < prev.end_bb for prev, nxt in pairwise(shown)):
+        lines.append(_BLIND_JUMP_LINE)
     return lines
 
 
@@ -828,3 +873,33 @@ def tournament_report_msg(report: TournamentReport) -> Msg:
     lines.append("")
     lines += _ev_lines(report.ev)
     return Msg(text="\n".join(lines))
+
+
+def tournament_story_msg(narrative: TournamentTextOut) -> Msg:
+    """Рассказ по турниру словами — отдельным сообщением ПЕРЕД отчётом с числами.
+
+    Отдельным, а не абзацем внутри отчёта, по одной причине: вместе они не
+    помещаются в `sendMessage` (4096 символов), и урезать пришлось бы либо
+    числа, либо текст. Порядок «сначала рассказ, потом числа» — тот же, что у
+    пары «отчёт → сводка со сводными кнопками»: кнопки должны остаться под
+    последним сообщением.
+
+    Абзацы, не влезшие в потолок, не пропадают молча — сообщение говорит,
+    сколько абзацев показано из скольких
+    (`test_tournament_story_msg_says_when_it_had_to_cut`).
+    """
+    shown: list[str] = []
+    length = 0
+    for paragraph in narrative.paragraphs:
+        cleaned = paragraph.strip()
+        if not cleaned:
+            continue
+        if length + len(cleaned) + 2 > _MAX_STORY_CHARS and shown:
+            break
+        shown.append(cleaned)
+        length += len(cleaned) + 2
+
+    total = len([p for p in narrative.paragraphs if p.strip()])
+    if len(shown) < total:
+        shown.append(f"Показаны {len(shown)} абзаца из {total} — текст не поместился целиком.")
+    return Msg(text="\n\n".join(shown))
