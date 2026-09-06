@@ -27,15 +27,23 @@
 from __future__ import annotations
 
 from harness.contracts import (
+    AllInEvent,
     AnalysisResult,
     Assumption,
+    ChipMove,
     EvInterval,
+    EvSplit,
+    Finding,
+    LevelLine,
+    PlayerStats,
     PointVerdict,
     Range,
     ScanItem,
     ScanSummary,
     SpotKind,
+    StackTrajectory,
     Street,
+    TournamentReport,
     Zone,
 )
 from harness.presentation import (
@@ -53,6 +61,7 @@ from harness.presentation import (
     quota_exceeded_msg,
     scan_summary_msg,
     start_msg,
+    tournament_report_msg,
     unsupported_document_msg,
 )
 
@@ -718,3 +727,224 @@ def test_the_close_call_line_agrees_with_itself_after_rounding():
     line = next(line for line in scan_summary_msg(s, 1, 1).text.splitlines() if "H7" in line)
     assert "от −3.4 bb до +2.7 bb" in line
     assert "не больше 3.4 bb" in line
+
+
+# --- отчёт по турниру (задача 23) --------------------------------------------------
+
+
+def _stats(**kw) -> PlayerStats:
+    base = {
+        "hands": 100,
+        "vpip": 24,
+        "pfr": 18,
+        "reraise": 2,
+        "reraise_chances": 24,
+        "fold_to_cbet": 11,
+        "cbet_faced": 20,
+    }
+    return PlayerStats(**{**base, **kw})
+
+
+def _trajectory(levels: int = 2) -> StackTrajectory:
+    return StackTrajectory(
+        levels=[
+            LevelLine(level=20 + i, hands=12, start_bb=34.0 - i, end_bb=33.0 - i)
+            for i in range(levels)
+        ],
+        start_bb=34.0,
+        final_bb=0.0,
+        peak_level=23,
+        peak_bb=41.2,
+        peak_hand_no="TM777",
+        hands_after_peak=50,
+    )
+
+
+def _finding(zone: Zone = Zone.STRICT, seen_before: int = 0, cost: float = 4.2) -> Finding:
+    return Finding(
+        spot=SpotKind.PUSHFOLD_FACING_SHOVE,
+        action_taken="call",
+        best_action="fold",
+        zone=zone,
+        count=3,
+        total_cost_bb=cost,
+        hand_nos=["H1", "H2", "H3"],
+        seen_before=seen_before,
+        seen_before_tournaments=2 if seen_before else 0,
+    )
+
+
+def _report(
+    *,
+    stats: PlayerStats | None = None,
+    baseline: PlayerStats | None = None,
+    baseline_tournaments: int = 1,
+    trajectory: StackTrajectory | None = None,
+    all_ins: list[AllInEvent] | None = None,
+    chip_moves: list[ChipMove] | None = None,
+    findings: list[Finding] | None = None,
+    ev: EvSplit | None = None,
+    hands_total: int = 146,
+    hands_failed: int = 0,
+) -> TournamentReport:
+    return TournamentReport(
+        hands_total=hands_total,
+        hands_failed=hands_failed,
+        levels_played=7,
+        first_level=20,
+        last_level=26,
+        duration_minutes=72,
+        stats=stats or _stats(),
+        baseline=baseline,
+        baseline_tournaments=baseline_tournaments,
+        trajectory=trajectory or _trajectory(),
+        all_ins=all_ins or [],
+        chip_moves=chip_moves or [],
+        findings=findings or [],
+        ev=ev
+        or EvSplit(
+            judged_loss_bb=12.3,
+            points_judged=67,
+            points_total=402,
+            chips_in_gap_hands_bb=45.0,
+            chips_in_lost_allins_bb=68.0,
+            chips_elsewhere_bb=22.5,
+        ),
+    )
+
+
+def _all_in(hand_no: str = "TM1") -> AllInEvent:
+    return AllInEvent(
+        hand_no=hand_no,
+        hand_index=3,
+        level=23,
+        hero_class="AKs",
+        stack_before_bb=23.0,
+        delta_bb=23.0,
+        showdown=True,
+    )
+
+
+def _chip_move(hand_no: str = "TM1", cost_bb: float = 34.0) -> ChipMove:
+    return ChipMove(
+        hand_no=hand_no,
+        hand_index=3,
+        level=23,
+        hero_class="K3s",
+        last_street=Street.PREFLOP,
+        all_in=True,
+        showdown=True,
+        cost_bb=cost_bb,
+    )
+
+
+def test_tournament_report_msg_states_hands_levels_and_duration():
+    msg = tournament_report_msg(_report())
+    assert "146" in msg.text
+    assert "20" in msg.text and "26" in msg.text
+    assert "1 ч 12 мин" in msg.text
+    assert msg.buttons == []  # кнопки живут под сводкой скана, не здесь
+
+
+def test_tournament_report_msg_says_plainly_there_is_nothing_to_compare_against():
+    """Один турнир в базе — среднее совпало бы с самим турниром (бриф, дословно)."""
+    msg = tournament_report_msg(_report(baseline=None, baseline_tournaments=1))
+    assert "не с чем" in msg.text
+    assert "24.0%" in msg.text  # сама статистика турнира при этом показана
+
+
+def test_tournament_report_msg_shows_the_average_over_every_tournament():
+    msg = tournament_report_msg(
+        _report(
+            baseline=_stats(hands=300, vpip=63, pfr=48),
+            baseline_tournaments=3,
+        )
+    )
+    assert "24.0%" in msg.text and "21.0%" in msg.text  # турнир и среднее рядом
+    assert "не с чем" not in msg.text
+    assert "3" in msg.text
+
+
+def test_tournament_report_msg_does_not_print_a_missing_share_as_zero():
+    """«0 из 0» — не ноль процентов, и печатать «0.0%» здесь значило бы соврать."""
+    msg = tournament_report_msg(_report(stats=_stats(reraise=0, reraise_chances=0)))
+    assert "Ре-рейз" in msg.text
+    assert "0.0%" not in msg.text.split("Сдача")[0].split("Ре-рейз")[1]
+
+
+def test_tournament_report_msg_names_the_turning_point_with_its_hand():
+    msg = tournament_report_msg(_report())
+    assert "41.2 bb" in msg.text
+    assert "TM777" in msg.text
+    assert "50" in msg.text  # раздач после максимума
+
+
+def test_tournament_report_msg_always_prints_coverage():
+    """Покрытие печатается всегда — и когда находки есть, и когда их нет."""
+    with_findings = tournament_report_msg(_report(findings=[_finding()])).text
+    without = tournament_report_msg(_report(findings=[])).text
+    for text in (with_findings, without):
+        assert "67" in text and "402" in text
+
+
+def test_tournament_report_msg_never_calls_variance_a_mistake():
+    """Дисперсия названа тем, что она есть: решение, которое расчёт не оспаривает.
+
+    Слово «ошиб» не имеет права появиться ни в одной ветке (CLAUDE.md), а строка
+    про проигранные олл-ины обязана прямо сказать, что расчёт эти решения не
+    оспаривает — иначе число рядом с ценой расхождений читается как вторая цена
+    ошибок.
+    """
+    with_findings = tournament_report_msg(
+        _report(findings=[_finding()], all_ins=[_all_in()])
+    ).text
+    without = tournament_report_msg(_report()).text
+    for text in (with_findings, without):
+        assert "ошиб" not in text
+        assert "не оспаривает" in text
+    assert "расхожд" in with_findings
+
+
+def test_tournament_report_msg_marks_assuming_findings_and_not_strict_ones():
+    strict = tournament_report_msg(_report(findings=[_finding(zone=Zone.STRICT)])).text
+    assuming = tournament_report_msg(_report(findings=[_finding(zone=Zone.ASSUMING)])).text
+    assert "по модели диапазонов" not in strict
+    assert "по модели диапазонов" in assuming
+
+
+def test_tournament_report_msg_links_a_finding_to_past_tournaments():
+    """«Тот самый паттерн, который мы разбирали» — со счётом, а не намёком.
+
+    Голые цифры проверять нельзя: «5» и «2» встречаются в отчёте и сами по себе
+    (покрытие, цены), и тест на них прошёл бы даже с вырезанной строкой —
+    найдено фальсификацией.
+    """
+    msg = tournament_report_msg(_report(findings=[_finding(seen_before=5)]))
+    assert "та же развилка в прошлых турнирах — точек: 5, турниров: 2" in msg.text
+    without_history = tournament_report_msg(_report(findings=[_finding(seen_before=0)])).text
+    assert "прошл" not in without_history
+
+
+def test_tournament_report_msg_says_when_a_list_is_trimmed():
+    moves = [_chip_move(hand_no=f"H{i}", cost_bb=50.0 - i) for i in range(30)]
+    msg = tournament_report_msg(_report(chip_moves=moves))
+    shown = [line for line in msg.text.splitlines() if line.startswith("№H")]
+    assert len(shown) < 30
+    assert str(len(shown)) in msg.text and "30" in msg.text
+
+
+def test_tournament_report_msg_of_a_long_tournament_fits_one_telegram_message():
+    """Предел `sendMessage` — 4096 символов, и отказ на нём стоит игроку ретраев."""
+    report = _report(
+        trajectory=_trajectory(levels=30),
+        all_ins=[_all_in(hand_no=f"TM{i}") for i in range(40)],
+        chip_moves=[_chip_move(hand_no=f"H{i}", cost_bb=50.0 - i) for i in range(200)],
+        findings=[_finding(seen_before=3, cost=9.0 - i) for i in range(12)],
+    )
+    assert len(tournament_report_msg(report).text) < 4096
+
+
+def test_tournament_report_msg_surfaces_hands_it_could_not_analyse():
+    """Пропуск виден строкой, а не только отсутствующей цифрой где-то в тексте."""
+    assert "Раздач не разобрано: 3" in tournament_report_msg(_report(hands_failed=3)).text
+    assert "не разобрано" not in tournament_report_msg(_report(hands_failed=0)).text

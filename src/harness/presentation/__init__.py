@@ -28,6 +28,7 @@ from harness.presentation.messages import (
     quota_exceeded_msg,
     scan_summary_msg,
     start_msg,
+    tournament_report_msg,
     unsupported_document_msg,
 )
 
@@ -49,6 +50,7 @@ __all__ = [
     "quota_exceeded_msg",
     "scan_summary_msg",
     "start_msg",
+    "tournament_report_msg",
     "unsupported_document_msg",
     "verdict_buttons",
 ]

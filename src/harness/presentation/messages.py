@@ -72,11 +72,17 @@ from typing import Literal
 from pydantic import BaseModel
 
 from harness.contracts.analysis import (
+    AllInEvent,
     AnalysisResult,
+    ChipMove,
     EvInterval,
+    EvSplit,
+    Finding,
     ScanItem,
     ScanSummary,
     SpotKind,
+    StackTrajectory,
+    TournamentReport,
     Zone,
 )
 from harness.contracts.raw import Street
@@ -102,6 +108,7 @@ __all__ = [
     "quota_exceeded_msg",
     "scan_summary_msg",
     "start_msg",
+    "tournament_report_msg",
     "unsupported_document_msg",
 ]
 
@@ -193,17 +200,24 @@ def _spot_word(spot: SpotKind) -> str:
     return _SPOT_WORD.get(spot, spot.value)
 
 
-def _fmt_bb(value_bb: float) -> str:
-    """Знак минуса типографский (U+2212 «−»), не дефис — так задан бриф.
+def _bb_number(value_bb: float) -> str:
+    """Число в bb без единицы — для пар вида «34.0 → 12.5 bb».
 
-    Знак берётся ПОСЛЕ округления до 0.1, а не до: `-0.03` меньше нуля, но
-    после округления до одного знака превращается в `0.0`, и если решать знак
-    раньше округления, на экране игрока возникает «−0.0 bb» — читается как
-    отдельная (мнимая) отрицательная величина вместо честного нуля (fix round 1).
+    Знак минуса типографский (U+2212 «−»), не дефис — так задан бриф. Знак
+    берётся ПОСЛЕ округления до 0.1, а не до: `-0.03` меньше нуля, но после
+    округления до одного знака превращается в `0.0`, и если решать знак раньше
+    округления, на экране игрока возникает «−0.0» — читается как отдельная
+    (мнимая) отрицательная величина вместо честного нуля (fix round 1).
     """
     magnitude = round(abs(value_bb), 1)
     sign = "−" if value_bb < 0 and magnitude != 0.0 else ""
-    return f"{sign}{magnitude:.1f} bb"
+    return f"{sign}{magnitude:.1f}"
+
+
+def _fmt_bb(value_bb: float) -> str:
+    """То же число с единицей. Округление и знак — общие с `_bb_number`, а не
+    вторая их копия: две формы одной величины обязаны округляться одинаково."""
+    return f"{_bb_number(value_bb)} bb"
 
 
 def _fmt_signed_bb(value_bb: float) -> str:
@@ -551,3 +565,254 @@ def new_session_msg(title: str, previous_closed: bool) -> Msg:
     else:
         lines.append("Всё, что пришлёте дальше, попадёт в неё.")
     return Msg(text=" ".join(lines))
+
+
+# --- отчёт по турниру (задача 23) --------------------------------------------------
+
+# Потолки показа — тот же предел `sendMessage` в 4096 символов, что режет список
+# расхождений выше, и та же цена отказа: `raise_for_status()` в отправителе,
+# ретрай задачи, три пересчёта турнира вместо одного сообщения. Отчёт длиннее
+# сводки (пять разделов вместо одного), поэтому потолки ниже; сумма всех
+# разделов на максимуме проверена тестом
+# (`test_tournament_report_msg_of_a_long_tournament_fits_one_telegram_message`).
+_MAX_REPORT_LEVELS = 12
+_MAX_REPORT_ALL_INS = 6
+_MAX_REPORT_CHIP_MOVES = 8
+_MAX_REPORT_FINDINGS = 4
+
+# Улица последнего действия героя — строчной буквой: она стоит внутри фразы
+# («префлоп, олл-ин»), а не заголовком строки, как в разборе одной раздачи.
+_STREET_WHERE: dict[Street, str] = {street: word.lower() for street, word in _STREET_WORD.items()}
+
+
+def _fmt_pct(value: float | None) -> str | None:
+    """Доля одним знаком после запятой; `None` — доли нет, и печатать нечего.
+
+    Возвращается `None`, а не «0.0%»: доля отсутствует ровно тогда, когда
+    знаменатель нулевой (`PlayerStats`), и ноль процентов на этом месте был бы
+    утверждением о том, чего не измеряли
+    (`test_tournament_report_msg_does_not_print_a_missing_share_as_zero`).
+    """
+    return None if value is None else f"{value:.1f}%"
+
+
+def _fmt_duration(minutes: int) -> str:
+    """«1 ч 12 мин» для часа и дольше, «45 мин» — короче часа."""
+    if minutes < 60:
+        return f"{minutes} мин"
+    return f"{minutes // 60} ч {minutes % 60:02d} мин"
+
+
+def _levels_word(first: int, last: int) -> str:
+    return f"{first}" if first == last else f"{first}–{last}"
+
+
+def _share_line(title: str, share_pct: float | None, taken: int, chances: int) -> str:
+    """Строка доли со счётчиками в скобках; при нулевом знаменателе — прямо об этом.
+
+    Долю считает `PlayerStats` и передаёт сюда готовой — второй такой формулы в
+    изложении нет и быть не должно. Счётчики показываются рядом с процентом
+    намеренно: «8.3%» на двух десятках возможностей и на двух сотнях — разной
+    силы утверждения, и отличить их можно только по знаменателю.
+    """
+    share = _fmt_pct(share_pct)
+    if share is None:
+        return f"{title}: таких развилок не было."
+    return f"{title}: {share} ({taken} из {chances})."
+
+
+def _stats_lines(report: TournamentReport) -> list[str]:
+    """Статистика турнира и среднее игрока по всем его турнирам — или отказ сравнивать.
+
+    При единственном турнире в базе среднее совпало бы с самим турниром, и
+    сравнение было бы пустым: строка говорит об этом прямо, а не показывает два
+    одинаковых числа (`TournamentReport.baseline`, бриф задачи).
+    """
+    stats = report.stats
+    lines = [
+        (
+            f"Добровольный вход в банк: {_fmt_pct(stats.vpip_pct)}. "
+            f"Повышение до флопа: {_fmt_pct(stats.pfr_pct)}."
+        )
+    ]
+    baseline = report.baseline
+    if baseline is None:
+        lines.append("Сравнить не с чем: это первый турнир в базе.")
+    else:
+        lines.append(
+            f"В среднем по всем турнирам (их {report.baseline_tournaments}): "
+            f"вход {_fmt_pct(baseline.vpip_pct)}, повышение {_fmt_pct(baseline.pfr_pct)}."
+        )
+    lines.append(
+        _share_line(
+            "Ре-рейз до флопа", stats.reraise_pct, stats.reraise, stats.reraise_chances
+        )
+    )
+    lines.append(
+        _share_line(
+            "Сдача на продолженную ставку",
+            stats.fold_to_cbet_pct,
+            stats.fold_to_cbet,
+            stats.cbet_faced,
+        )
+    )
+    return lines
+
+
+def _trajectory_lines(trajectory: StackTrajectory) -> list[str]:
+    """Стек по уровням и переломная точка.
+
+    Обрезается по ПОСЛЕДНИМ уровням, а не по первым: обрезка нужна только очень
+    длинному турниру, и в нём ближе к концу то, чем он кончился. Строка перелома
+    печатается всегда — она и есть ответ на вопрос «где всё повернуло», и её
+    уровень мог остаться за обрезкой.
+    """
+    shown = trajectory.levels[-_MAX_REPORT_LEVELS:]
+    head = "Стек по уровням:"
+    if len(shown) < len(trajectory.levels):
+        head = (
+            f"Стек по уровням (показаны последние {len(shown)} "
+            f"из {len(trajectory.levels)}):"
+        )
+    lines = [head]
+    lines += [
+        f"Ур. {level.level}: {_bb_number(level.start_bb)} → {_fmt_bb(level.end_bb)}, "
+        f"раздач: {level.hands}"
+        for level in shown
+    ]
+    lines.append(
+        f"Максимум: {_fmt_bb(trajectory.peak_bb)} на уровне {trajectory.peak_level} "
+        f"(раздача №{trajectory.peak_hand_no}). После неё раздач: "
+        f"{trajectory.hands_after_peak}, к концу турнира: {_fmt_bb(trajectory.final_bb)}."
+    )
+    return lines
+
+
+def _all_in_lines(events: list[AllInEvent]) -> list[str]:
+    """Олл-ины с исходом. Пустой список проговаривается, а не пропускается молча."""
+    if not events:
+        return ["Олл-инов в этом турнире не было."]
+    shown = events[:_MAX_REPORT_ALL_INS]
+    head = "Олл-ины:"
+    if len(shown) < len(events):
+        head = f"Олл-ины (показаны {len(shown)} самых крупных из {len(events)}):"
+    return [head] + [
+        f"№{event.hand_no} · {event.hero_class} · ур. {event.level} · "
+        f"вошёл с {_fmt_bb(event.stack_before_bb)} → {_fmt_signed_bb(event.delta_bb)}"
+        f"{', вскрытие' if event.showdown else ''}"
+        for event in shown
+    ]
+
+
+def _chip_move_lines(moves: list[ChipMove]) -> list[str]:
+    """«Где ушли фишки»: раздача · что было · цена, дороже первой."""
+    if not moves:
+        return ["Раздач, в которых стек уменьшился, нет."]
+    shown = moves[:_MAX_REPORT_CHIP_MOVES]
+    head = "Где ушли фишки:"
+    if len(shown) < len(moves):
+        head = f"Где ушли фишки (показаны {len(shown)} самых дорогих из {len(moves)}):"
+    lines = [head]
+    for move in shown:
+        what = _STREET_WHERE.get(move.last_street, move.last_street.value)
+        if move.all_in:
+            what += ", олл-ин"
+        if move.showdown:
+            what += ", вскрытие"
+        lines.append(
+            f"№{move.hand_no} · {move.hero_class} · ур. {move.level} · {what} "
+            f"— {_fmt_bb(move.cost_bb)}"
+        )
+    return lines
+
+
+def _finding_lines(findings: list[Finding]) -> list[str]:
+    """Находки — только по оценённым решениям, с ценой и историей игрока.
+
+    Слово то же, что во всём модуле: «расхождение», не «ошибка», и «лучше», не
+    «верно» — находка утверждает лишь, что у другой ветки была выше EV
+    (`test_tournament_report_msg_never_calls_variance_a_mistake`).
+    """
+    if not findings:
+        return ["Повторяющихся развилок среди оценённых решений не нашлось."]
+    shown = findings[:_MAX_REPORT_FINDINGS]
+    head = "Находки — только среди оценённых решений:"
+    if len(shown) < len(findings):
+        head = (
+            f"Находки — только среди оценённых решений (показаны {len(shown)} "
+            f"самых дорогих из {len(findings)}):"
+        )
+    lines = [head]
+    for finding in shown:
+        marker = f" ({_ASSUMING_MARKER})" if finding.zone is Zone.ASSUMING else ""
+        lines.append(
+            f"{_spot_word(finding.spot)}: {_action_word(finding.action_taken)} "
+            f"(лучше: {_action_word(finding.best_action)}) — повторов: {finding.count}, "
+            f"суммарно {_fmt_bb(finding.total_cost_bb)}{marker}"
+        )
+        if finding.seen_before:
+            lines.append(
+                f"    та же развилка в прошлых турнирах — точек: {finding.seen_before}, "
+                f"турниров: {finding.seen_before_tournaments}"
+            )
+    return lines
+
+
+def _ev_lines(ev: EvSplit) -> list[str]:
+    """Честный счёт: цена расхождений, дисперсия и несудимое — тремя разными строками.
+
+    Ни одно из чисел не подписано как «цена ошибок», и ни одно не складывается с
+    соседним: EV расхождения посчитан против диапазона на момент решения, фишки
+    — по факту раздачи. Последняя строка говорит это прямо, чтобы читатель не
+    сложил их сам.
+    """
+    return [
+        "Сколько это стоило:",
+        f"Оценено решений: {ev.points_judged} из {ev.points_total}.",
+        f"Цена расхождений в оценённых решениях: {_fmt_bb(ev.judged_loss_bb)}.",
+        f"Фишки в раздачах с расхождением: {_fmt_bb(ev.chips_in_gap_hands_bb)}.",
+        (
+            f"Фишки в проигранных олл-инах без расхождения: "
+            f"{_fmt_bb(ev.chips_in_lost_allins_bb)} — эти решения расчёт не оспаривает."
+        ),
+        (
+            f"Фишки в остальных раздачах: {_fmt_bb(ev.chips_elsewhere_bb)} — про них "
+            f"расчёт не говорит ничего."
+        ),
+        "Цена расхождений и потерянные фишки — разные величины: складывать их нельзя.",
+    ]
+
+
+def tournament_report_msg(report: TournamentReport) -> Msg:
+    """Отчёт по турниру целиком: что случилось, где ушли фишки, находки, сколько стоило.
+
+    Кнопок нет намеренно: «разобрать» стоит под пунктами сводки скана
+    (`scan_summary_msg`), которая приходит следующим сообщением, и вторая копия
+    тех же кнопок раздвоила бы одно действие на два места.
+
+    Каждый список обрезан своим потолком и, если обрезан, говорит об этом
+    прямо — молча показать восемь строк из ста было бы той же деградацией без
+    огласки, что и умолчанный `hands_failed`.
+    """
+    lines = [
+        (
+            f"Турнир. Раздач: {report.hands_total}. "
+            f"Уровни: {_levels_word(report.first_level, report.last_level)}. "
+            f"Время: {_fmt_duration(report.duration_minutes)}."
+        )
+    ]
+    if report.hands_failed:
+        lines.append(f"Раздач не разобрано: {report.hands_failed} — они не вошли в оценку.")
+    lines.append("")
+    lines += _stats_lines(report)
+    lines.append("")
+    lines += _trajectory_lines(report.trajectory)
+    lines.append("")
+    lines += _all_in_lines(report.all_ins)
+    lines.append("")
+    lines += _chip_move_lines(report.chip_moves)
+    lines.append("")
+    lines += _finding_lines(report.findings)
+    lines.append("")
+    lines += _ev_lines(report.ev)
+    return Msg(text="\n".join(lines))
