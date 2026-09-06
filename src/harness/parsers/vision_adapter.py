@@ -116,6 +116,9 @@ _NO_TIMESTAMP = datetime(1, 1, 1, tzinfo=UTC)
 _TRUNCATION_LIMIT_BB = 0.05
 CHECK_TRUNCATION = "stacks"
 
+# Метка ступени каскада, вернувшей пустую схему (см. `VisionReadFailed`).
+_EMPTY_READING = "пустое чтение"
+
 _SB_LABELS = {"sb", "мб", "мблайнд", "small blind"}
 _BB_LABELS = {"bb", "бб", "ббл", "big blind"}
 
@@ -141,10 +144,19 @@ class PromptUnavailable(RuntimeError):
 
 
 class VisionReadFailed(RuntimeError):
-    """Экран прочитать не удалось: модель отказалась или чтение не складывается.
+    """Экран прочитать не удалось: модель вернула пустую схему на всех ступенях.
 
-    Не то же, что провал контрольной суммы: там прочитанное есть и его можно
-    предъявить игроку кнопками, здесь предъявлять нечего.
+    Не то же, что `not_a_hand`, и разница существенна. Отказ — это ОТВЕТ: модель
+    посмотрела и говорит, что раздачи здесь нет, с причиной. Пустая схема — сбой:
+    все поля `VisionReading` необязательны (иначе модель дописывала бы то, чего
+    не видит), поэтому пустой объект проходит валидацию и от честного отказа
+    неотличим ничем, кроме отсутствия причины.
+
+    Измерено на живом прогоне датасета: одна и та же картинка на одном и том же
+    промпте отдаётся то полным чтением, то пустой схемой. Поэтому пустое чтение
+    повторяется — сначала на той же модели, потом на дорогой; и только когда
+    пусто везде, поднимается это исключение. Показать игроку «это не раздача» на
+    таком чтении было бы утверждением, которого никто не делал.
     """
 
 
@@ -188,6 +200,16 @@ class VisionOutcome:
     @property
     def failed(self) -> list[VisionCheck]:
         return [check for check in self.checks if not check.passed]
+
+
+def _is_empty(reading: VisionReading) -> bool:
+    """Модель не прочитала ничего: ни игроков, ни отказа с причиной.
+
+    Все поля схемы необязательны намеренно (пустое поле честнее выдуманного), и
+    цена этого решения ровно здесь: пустой объект валиден. Отличить его от
+    ответа можно только по содержимому — см. `VisionReadFailed`.
+    """
+    return not reading.players and not reading.not_a_hand
 
 
 def read_prompt(path: Path = _PROMPT_PATH) -> str:
@@ -544,7 +566,7 @@ def reading_to_raw(
             else {}
         ),
         actions=actions if complete else _folds_of_absent_cards(reading, labels),
-        boards=_boards(reading.board),
+        boards=_boards(reading.board if _board_was_dealt(reading) else []),
         uncalled=uncalled,
         showdowns=_showdowns(reading, labels) if complete else [],
         collected=[] if complete else collected,
@@ -590,6 +612,24 @@ def _folds_of_absent_cards(
         for p in reading.players
         if p.has_hole_cards is False and p.nickname in labels
     ]
+
+
+def _board_was_dealt(reading: VisionReading) -> bool:
+    """Дошла ли рука до карт стола вообще — по правилам покера, а не по яркости.
+
+    Экспорт дорисовывает борд приглушённым даже там, где рука кончилась до
+    флопа: последний рейз никто не заколлировал, банк ушёл сразу. Отличить такие
+    карты глазом модель может (`board_faded`), но полагаться на это одно нельзя —
+    измерено на живом прогоне: Sonnet принял приглушённый борд за настоящий, и
+    рука разошлась с текстом рума по банку втрое.
+
+    Кодовое правило независимо от яркости: карты стола раздают, только если
+    торговля пошла дальше префлопа ЛИБО дело дошло до вскрытия. Ни того ни
+    другого — борда в руке не было, чем бы экран его ни рисовал.
+    """
+    return reading.showdown_seen or any(
+        action.street is not Street.PREFLOP for action in reading.actions
+    )
 
 
 def _boards(board: list[str]) -> dict[Street, list[str]]:
@@ -797,8 +837,20 @@ async def vision_extract(
 
     outcome: VisionOutcome | None = None
     for role, purpose in roles:
-        reading, meta = await llm(purpose, VisionReading, prompt=prompt, images=[image], trace_id=trace_id)
+        reading, meta = await llm(
+            purpose, VisionReading, prompt=prompt, images=[image], trace_id=trace_id
+        )
         model = getattr(meta, "model", purpose)
+        if _is_empty(reading):
+            # Пустое чтение — сбой, а не ответ, и лечится оно повтором.
+            hops.append(VisionHop(role=role, model=model, error=_EMPTY_READING))
+            reading, meta = await llm(
+                purpose, VisionReading, prompt=prompt, images=[image], trace_id=trace_id
+            )
+            model = getattr(meta, "model", purpose)
+            if _is_empty(reading):
+                hops.append(VisionHop(role=role, model=model, error=_EMPTY_READING))
+                continue
         if reading.not_a_hand:
             hops.append(VisionHop(role=role, model=model, error="not_a_hand"))
             return VisionOutcome(
@@ -824,6 +876,8 @@ async def vision_extract(
         outcome = VisionOutcome(raw=raw, checks=checks, hops=list(hops))
         if not failed:
             return outcome
-    if outcome is None:  # pragma: no cover — список ступеней непуст по построению
-        raise VisionReadFailed("ни одна ступень каскада не выполнилась")
+    if outcome is None:
+        raise VisionReadFailed(
+            "модель вернула пустое чтение на каждой ступени каскада — экран не прочитан"
+        )
     return outcome

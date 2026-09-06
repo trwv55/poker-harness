@@ -498,3 +498,35 @@ def test_the_real_prompt_never_asks_the_model_to_compute_or_to_name_the_hero():
     assert "не дели" in text or "делить" in text
     assert "герой" in text
     assert "unsure_fields" in text
+
+
+async def test_an_empty_reading_is_retried_and_not_called_a_refusal(prompt_file):
+    """Пустая схема — сбой, а не ответ: повторяем, а не объявляем «это не раздача».
+
+    Все поля `VisionReading` необязательны намеренно, поэтому пустой объект
+    валиден и от честного отказа отличается только отсутствием причины.
+    Измерено на живом прогоне датасета: одна и та же картинка на одном промпте
+    отдаётся то полным чтением, то пустой схемой.
+    """
+    llm = FakeLLM(VisionReading(), export_reading())
+    outcome = await _extract(llm, prompt_file)
+    assert llm.purposes == ["vision_extract", "vision_extract"]
+    assert outcome.raw is not None
+    assert outcome.hops[0].error == "пустое чтение"
+
+
+async def test_empty_readings_everywhere_fail_loudly_instead_of_inventing_a_refusal(
+    prompt_file,
+):
+    """Пусто на всех ступенях — отказ станции, а не «это не раздача» игроку."""
+    from harness.parsers.vision_adapter import VisionReadFailed
+
+    llm = FakeLLM(*[VisionReading() for _ in range(4)])
+    with pytest.raises(VisionReadFailed):
+        await _extract(llm, prompt_file)
+    assert llm.purposes == [
+        "vision_extract",
+        "vision_extract",
+        "vision_extract_fallback",
+        "vision_extract_fallback",
+    ]
