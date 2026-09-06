@@ -18,11 +18,19 @@ from harness.analysis.classifier import (
 )
 from harness.analysis.error_cost import rank_points, total_ev_loss_bb
 from harness.analysis.preflop import (
+    _depth_key,
+    _model_equity,
+    _posted_before_shove,
     _rivals_when_shoved,
     _shover,
+    _shover_equilibrium,
+    _table_dead_bb,
     cheap_fold_verdict,
     zone_for,
 )
+from harness.analysis.tools.multiway import Seat as MultiwaySeat
+from harness.analysis.tools.multiway import unopened_shove_equilibrium
+from harness.analysis.tools.pushfold import call_shove_ev_bb, nash_hu
 from harness.contracts import (
     ActionKind,
     Assumption,
@@ -33,6 +41,7 @@ from harness.contracts import (
     RawHand,
     SeatInfo,
     Street,
+    all_classes,
 )
 from harness.engine import enrich
 from harness.normalizer import normalize
@@ -43,6 +52,11 @@ from tests.test_hh_parser import SAMPLE
 _BB = 2
 _SB = 1
 _BOARD = {Street.FLOP: ["Kd", "8h", "3s"], Street.TURN: ["4c"], Street.RIVER: ["9d"]}
+
+
+def _max_weight_gap(left, right) -> float:
+    """Худшее расхождение двух диапазонов по весу класса — мера опоры N = 1."""
+    return max(abs(left.weight(cls) - right.weight(cls)) for cls in all_classes())
 
 
 def _raw(
@@ -151,6 +165,42 @@ def _make_hu_shove_hand(hero_cards: tuple[str, str], eff_bb: float, *, called: b
         dealt={"Hero": list(hero_cards), "V": villain_cards if called else []},
         boards=boards,
         showdowns=showdowns,
+    )
+    return enrich(normalize(raw))
+
+
+def _make_hu_facing_shove_hand(stack: int, ante: int = 0):
+    """Хедз-ап: оппонент на кнопке (= малый блайнд) шовит, Hero в большом блайнде.
+
+    Зеркало `_make_hu_shove_hand`. Позади шовера ровно одно место — герой, — и
+    это та единственная конфигурация, в которой равновесие его стола обязано
+    совпасть с `nash_hu`. Стек задаётся в фишках: глубина равновесия считается
+    уже за вычетом анте, и дробить её здесь было бы лишним звеном.
+    """
+    seats = [
+        SeatInfo(seat=1, label="V", stack=stack),
+        SeatInfo(seat=2, label="Hero", stack=stack),
+    ]
+    posts = (
+        [Post(label=label, kind=PostKind.ANTE, amount=ante) for label in ("V", "Hero")]
+        if ante
+        else []
+    )
+    posts += [
+        Post(label="V", kind=PostKind.SMALL_BLIND, amount=_SB),
+        Post(label="Hero", kind=PostKind.BIG_BLIND, amount=_BB),
+    ]
+    actions = [
+        _shove("V", stack - ante, already=_SB),
+        _call("Hero", stack - ante - _BB, all_in=True),
+    ]
+    raw = _raw(
+        seats=seats,
+        button_seat=1,
+        posts=posts,
+        actions=actions,
+        dealt={"Hero": ["Ah", "Ad"]},
+        ante=ante,
     )
     return enrich(normalize(raw))
 
@@ -610,8 +660,8 @@ def test_a_realistic_calling_model_passes_the_checksum():
     10% вместо равновесных 33%: `p_all_fold` 0.63 против порога 0.20 и 0.44
     отвечающих против порога 1.0 — контрольная сумма молчит, и точка судится.
     """
-    from harness.analysis.preflop import _call_model, _model_checksum, _table_dead_bb
-    from harness.analysis.tools.pushfold import CallerModel, range_of_width
+    from harness.analysis.preflop import _depth_key, _model_checksum, _table_dead_bb
+    from harness.analysis.tools.pushfold import CallerModel, nash_hu, range_of_width
 
     en = _make_multiway_shove_hand(hero_cards=("Ad", "5d"), eff_bb=12.0, players_behind=5)
     dp = en.report.decision_points[0]
@@ -626,7 +676,9 @@ def test_a_realistic_calling_model_passes_the_checksum():
             for s, rng in zip(behind, ranges, strict=True)
         ]
 
-    equilibrium = callers([_call_model(d, dead_bb) for d in depths])
+    equilibrium = callers(
+        [nash_hu(_depth_key(d), dead_extra_bb=dead_bb)[1] for d in depths]
+    )
     realistic = callers([range_of_width(d, 0.10, dead_extra_bb=dead_bb) for d in depths])
 
     assert _model_checksum(equilibrium, "A5s") != ""
@@ -1374,6 +1426,159 @@ def test_shover_depth_ignores_a_player_already_all_in_when_the_shove_landed():
     assert analyze_hand(en).points[0].spot == "preflop_other"
 
 
+# --- Диапазон шовера: равновесие ЕГО стола, а не хедз-ап -------------------------
+
+
+def _shover_solution(en):
+    """Решение подыгры шовера по руке — тем же путём, которым его берёт вердикт."""
+    dp = en.report.decision_points[0]
+    state = table_state(dp, en)
+    shover = _shover(state)
+    assert shover is not None
+    rivals = _rivals_when_shoved(en.hand, dp, state, shover)
+    posted = _posted_before_shove(en.hand, dp, shover)
+    return state, shover, rivals, _shover_equilibrium(state, shover, posted, rivals, en.hand.bb)
+
+
+@pytest.mark.parametrize("stack,ante", [(24, 0), (20, 0), (10, 0), (24, 1), (30, 1)])
+def test_the_shover_range_with_one_player_behind_is_the_nash_push_range(stack, ante):
+    """Опора: при ОДНОМ игроке позади шовера обе стороны обязаны совпасть с `nash_hu`.
+
+    `nash_hu` — единственное место в системе, где ответ подтверждён независимо
+    (якорные тесты против опубликованных чартов). Хедз-ап SB против BB — ровно
+    та игра, в которую играл шовер, когда позади него сидел один герой, поэтому
+    допуск здесь ноль по весу КАЖДОГО из 169 классов, а не «близко».
+    """
+    en = _make_hu_facing_shove_hand(stack, ante)
+    state, shover, rivals, solution = _shover_solution(en)
+    assert [seat.label for seat in rivals] == ["Hero"]
+
+    eff_bb = min(shover.stack_after_ante, rivals[0].stack_after_ante) / en.hand.bb
+    reference_push, reference_call = nash_hu(eff_bb, dead_extra_bb=_table_dead_bb(state))
+
+    assert _max_weight_gap(solution.push, reference_push) == 0.0
+    assert _max_weight_gap(solution.calls[0], reference_call) == 0.0
+
+
+def test_the_shover_subgame_starts_before_his_own_shove():
+    """Деньги подыгры берутся на ходе ШОВЕРА: без его шова ни в банке, ни в его посте.
+
+    На решении героя шов уже лежит в банке, и взять `pot_before` с постами из
+    того же снимка значило бы решать игру, в которой шовер платит второй раз.
+    """
+    en = _make_hu_facing_shove_hand(24)
+    dp = en.report.decision_points[0]
+    state = table_state(dp, en)
+    shover = _shover(state)
+    assert shover is not None
+
+    posted = _posted_before_shove(en.hand, dp, shover)
+    assert posted == _SB  # только малый блайнд: анте нет, до шова он не ходил
+    assert shover.contributed == 24  # а в снимке героя он уже весь в банке
+    assert state.pot_before == 24 + _BB  # банк на решении героя содержит шов
+
+
+def test_the_shover_anchor_notices_the_pot_taken_after_the_shove():
+    """Фальсификация опоры: с банком, взятым на решении героя, совпадения нет.
+
+    Опора обязана ловить именно восстановление момента шова. Если бы она
+    проходила и с банком, который шов уже содержит, она не проверяла бы ничего.
+    """
+    en = _make_hu_facing_shove_hand(24)
+    state, shover, rivals, solution = _shover_solution(en)
+    reference_push, _ = nash_hu(12.0)
+    assert _max_weight_gap(solution.push, reference_push) == 0.0
+
+    bb = en.hand.bb
+    posted = _posted_before_shove(en.hand, en.report.decision_points[0], shover)
+    spoiled = unopened_shove_equilibrium(
+        MultiwaySeat(posted_bb=posted / bb, behind_bb=(shover.stack - posted) / bb),
+        [
+            MultiwaySeat(
+                posted_bb=rivals[0].contributed / bb, behind_bb=rivals[0].behind / bb
+            )
+        ],
+        state.pot_before / bb,
+    )
+    assert _max_weight_gap(spoiled.push, reference_push) > 0.0
+
+
+def test_the_table_equilibrium_turns_a_heads_up_call_into_a_fold():
+    """Направление сдвига: приписанный шоверу диапазон уже, и колл дешевеет.
+
+    UTG шовит 12bb, позади него пятеро. Хедз-ап пуш-диапазон этой глубины —
+    53.3% комбо, равновесие его стола — 13.3%; KQo против первого коллируется,
+    против второго сбрасывается. Направление названо замером, а не рассуждением:
+    обе цены считает один и тот же `call_shove_ev_bb`, меняется только диапазон.
+    """
+    stacks = {**dict.fromkeys(_SIX_MAX_SEATS, 96), "SB": 24, "UTG": 24}
+    labels, seats, posts = _six_max(stacks, "SB")
+    actions = [_shove(labels["UTG"], 24)]
+    actions += [_fold(labels[pos]) for pos in ("HJ", "CO", "BTN")]
+    actions += [_fold("Hero"), _fold(labels["BB"])]
+    raw = _raw(
+        seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["Kd", "Qc"]}
+    )
+    en = enrich(normalize(raw))
+    state, shover, rivals, solution = _shover_solution(en)
+    assert len(rivals) == 5
+
+    bb = en.hand.bb
+    heads_up_push = nash_hu(
+        _depth_key(min(shover.stack_after_ante, max(s.stack_after_ante for s in rivals)) / bb),
+        dead_extra_bb=_table_dead_bb(state),
+    )[0]
+
+    def ev(rng):
+        return call_shove_ev_bb(
+            "KQo",
+            state.hero.behind / bb,
+            rng,
+            state.pot_before / bb,
+            state.to_call / bb,
+            equity_fn=_model_equity,
+        )
+
+    assert round(heads_up_push.fraction_of_hands(), 4) == 0.5332
+    assert round(solution.push.fraction_of_hands(), 4) == 0.1335
+    assert ev(heads_up_push) > 0.0 > ev(solution.push)
+
+    point = analyze_hand(en).points[0]
+    assert point.detail["best_vs_one"] == "fold"
+    assert point.detail["shove_range_fraction"] == round(solution.push.fraction_of_hands(), 6)
+    assert point.detail["equilibrium_hand_regret_bb"] == round(solution.hand_regret_bb, 6)
+
+
+def test_players_behind_hero_answer_the_same_shove_as_hero():
+    """Колл-диапазоны живых за героем берутся из ТОГО ЖЕ решения, что и диапазон шова.
+
+    Разрывать пару нельзя: колл-сторона является наилучшим ответом на шов того
+    же решения. Проверяется поимённо — каждое место позади героя есть среди тех,
+    кто отвечал на шов, и его ширина в `detail` совпадает с решением.
+    """
+    stacks = {**dict.fromkeys(_SIX_MAX_SEATS, 96), "SB": 24, "UTG": 24}
+    labels, seats, posts = _six_max(stacks, "SB")
+    actions = [_shove(labels["UTG"], 24)]
+    actions += [_fold(labels[pos]) for pos in ("HJ", "CO", "BTN")]
+    actions += [_call("Hero", 23, all_in=True), _fold(labels["BB"])]
+    raw = _raw(
+        seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["Ah", "Ad"]}
+    )
+    en = enrich(normalize(raw))
+    state, _, rivals, solution = _shover_solution(en)
+
+    behind = [s for s in state.seats if s.live and s.label not in ("Hero", labels["UTG"])]
+    assert [s.label for s in behind] == [labels["BB"]]
+    rival_at = {seat.label: index for index, seat in enumerate(rivals)}
+    assert set(rival_at) >= {seat.label for seat in behind}
+
+    point = analyze_hand(en).points[0]
+    assert point.detail["call_range_fractions"] == [
+        round(solution.calls[rival_at[labels["BB"]]].fraction_of_hands(), 6)
+    ]
+    assert point.detail["rivals_when_shoved"] == len(rivals)
+
+
 # --- Анте стола входит в равновесие ---------------------------------------------
 
 
@@ -1495,15 +1700,14 @@ def test_live_players_behind_do_not_force_assuming_when_verdict_is_unmoved():
 def test_players_behind_axis_is_computed_and_can_disagree():
     """Вторая ось считается и умеет расходиться с первой.
 
-    A2o против шова 12bb: один на один колл плюсовой (+0.72bb), а если малый
-    блайнд тоже войдёт — минусовой (−2.00bb). Ось помечена `unstable`, зона
-    `assuming`.
+    AQo против шова 12bb: один на один колл плюсовой (+1.55bb), а если малый
+    блайнд тоже войдёт — минусовой (−1.19bb). Ось помечена `unstable`.
 
     Изолированного случая, где вторая ось двигает вердикт, а первая нет, найти
     не удалось (перебор по глубинам шовера 5–20bb, стекам героя, анте и 21 классу
-    рук — ноль попаданий): узкий конец `BRACKET_TIGHT` настолько тесен, что везде
-    срабатывает раньше. Поэтому саму развилку проверяет модульный тест на
-    `zone_for`, а здесь — что ось действительно считается по руке.
+    рук — ноль попаданий): узкий конец вилки диапазона шовера настолько тесен,
+    что везде срабатывает раньше. Поэтому саму развилку проверяет модульный тест
+    на `zone_for`, а здесь — что ось действительно считается по руке.
     """
     stacks = {**dict.fromkeys(_SIX_MAX_SEATS, 96), "SB": 24, "UTG": 24}
     labels, seats, posts = _six_max(stacks, "SB")
@@ -1512,7 +1716,7 @@ def test_players_behind_axis_is_computed_and_can_disagree():
     actions.append(_call("Hero", 23, all_in=True))
     actions.append(_fold(labels["BB"]))
     raw = _raw(
-        seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["Ah", "2c"]}
+        seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["Ah", "Qc"]}
     )
     p = analyze_hand(enrich(normalize(raw))).points[0]
     assert p.detail["ev_call_bb"] > 0.0 > p.detail["ev_call_all_behind_bb"]
@@ -1583,10 +1787,10 @@ def test_a_tight_end_still_never_objects_to_a_junk_shove_and_that_is_honest():
 
 
 def test_price_does_not_charge_for_a_reproach_the_second_axis_refutes():
-    """A2o: колл плюсовой один на один и минусовой, если малый блайнд тоже войдёт.
+    """AQo: колл плюсовой один на один и минусовой, если малый блайнд тоже войдёт.
 
-    Упрекать игрока за пас на 0.72bb, когда мы сами посчитали, что при входе
-    игрока позади колл теряет 2bb, нельзя: это число ведёт и ранжирование, и
+    Упрекать игрока за пас на 1.55bb, когда мы сами посчитали, что при входе
+    игрока позади колл теряет 1.19bb, нельзя: это число ведёт и ранжирование, и
     сумму потерь руки.
     """
     stacks = {**dict.fromkeys(_SIX_MAX_SEATS, 96), "SB": 24, "UTG": 24}
@@ -1596,7 +1800,7 @@ def test_price_does_not_charge_for_a_reproach_the_second_axis_refutes():
     actions.append(_fold("Hero"))
     actions.append(_fold(labels["BB"]))
     raw = _raw(
-        seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["Ah", "2c"]}
+        seats=seats, button_seat=6, posts=posts, actions=actions, dealt={"Hero": ["Ah", "Qc"]}
     )
     res = analyze_hand(enrich(normalize(raw)))
     p = res.points[0]
@@ -1608,7 +1812,7 @@ def test_price_does_not_charge_for_a_reproach_the_second_axis_refutes():
 def test_a_verdict_that_flips_with_the_players_behind_names_the_fork():
     """Две точки модели дают разный оптимум — вместо одного действия названа развилка.
 
-    Тот же A2o против шова, что и в тесте выше: `ev_call_bb` плюсовой,
+    Тот же AQo против шова, что и в тесте выше: `ev_call_bb` плюсовой,
     `ev_call_all_behind_bb` минусовой. Цена по правилу самого мягкого упрёка
     равна 0.0, и одно названное действие рядом с нулём выглядело бы бесплатным
     расхождением. Оба вердикта при этом остаются в `detail` по отдельности.
@@ -1630,7 +1834,7 @@ def test_a_verdict_that_flips_with_the_players_behind_names_the_fork():
         )
         return analyze_hand(enrich(normalize(raw))).points[0]
 
-    split = hand(["Ah", "2c"], hero_calls=False)
+    split = hand(["Ah", "Qc"], hero_calls=False)
     assert split.detail["ev_call_bb"] > 0.0 > split.detail["ev_call_all_behind_bb"]
     assert split.detail["best_vs_one"] == "call"
     assert split.detail["best_all_behind"] == "fold"

@@ -16,11 +16,13 @@
 пропущенной ошибки: оно учит пасовать там, где надо входить. Поэтому `nash_hu`
 получает `dead_extra_bb` (сумма анте стола), а глубину — уже за вычетом анте.
 
-**Правило зоны.** Точный расчёт есть только там, где колл-диапазон не угадан:
+**Правило зоны.** Точный расчёт есть только там, где диапазон не угадан:
 хедз-ап SB против BB решается равновесием `nash_hu`. При трёх и более живых
-колл-диапазоны игроков позади берутся из равновесия N-игроковой подыгры
-(`analysis/tools/multiway.py`), но равновесие там не доказано, а измерено —
-вместе с профилем решатель отдаёт его эксплуатируемость. Поэтому вывод обязан
+диапазоны берутся из равновесия N-игроковой подыгры
+(`analysis/tools/multiway.py`) — в неоткрытом банке это колл-диапазоны игроков
+позади героя, против чужого шова это диапазон самого шовера и коллы тех, кто
+сидел позади него, — но равновесие там не доказано, а измерено: вместе с
+профилем решатель отдаёт его эксплуатируемость. Поэтому вывод обязан
 быть помечен как опирающийся на модель — если только он от неё не зависит.
 Последнее и проверяет bracket-тест: EV пересчитывается на СЕТКЕ ширин диапазона,
 и зона `strict` ставится, только когда вердикт одинаков на всех её точках и
@@ -123,6 +125,7 @@ from harness.contracts import (
     Zone,
     class_of,
 )
+from harness.engine.validation import forced_blind
 
 # Шаг сетки глубин, на которой берутся равновесные диапазоны. Квантование нужно
 # ради кэша: без него каждая рука с произвольной глубиной заводила бы собственный
@@ -219,8 +222,8 @@ _ASSUMPTION_CALLERS = (
     "допущение в том, что оппоненты его и придерживаются"
 )
 _ASSUMPTION_SHOVER = (
-    "диапазон шова смоделирован равновесным пуш-диапазоном его глубины: "
-    "мультивей-равновесия в v1 нет"
+    "диапазон шова посчитан как равновесие того стола, за которым шовер принимал "
+    "решение — допущение в том, что он его и придерживается"
 )
 
 # Контрольная сумма модели стола (решение владельца 2026-09-06). Проверяется не
@@ -477,11 +480,6 @@ def _table_dead_bb(state: TableState) -> float:
     return _dead_key(sum(seat.ante for seat in state.seats) / state.bb)
 
 
-def _call_model(depth_bb: float, dead_bb: float) -> Range:
-    """Модель колл-диапазона игрока такой глубины — колл-сторона равновесия."""
-    return nash_hu(_depth_key(depth_bb), dead_extra_bb=dead_bb)[1]
-
-
 def _table_equilibrium(
     state: TableState, behind: Sequence[SeatSnapshot], bb: int
 ) -> MultiwaySolution:
@@ -695,6 +693,18 @@ def _shover(state: TableState) -> SeatSnapshot | None:
     return max(rivals, key=lambda s: (s.street_committed, s.label))
 
 
+def _shove_action_index(hand: CanonicalHand, dp: DecisionPoint, shover: SeatSnapshot) -> int:
+    """Номер последнего действия шовера в руке до решения героя.
+
+    Запасной вариант (шовер до решения героя не ходил вовсе) — номер самого
+    решения героя: лучшего восстановления из этих данных не получить.
+    """
+    target = action_index(hand, dp)
+    return next(
+        (i for i in range(target - 1, -1, -1) if hand.actions[i].label == shover.label), target
+    )
+
+
 def _rivals_when_shoved(
     hand: CanonicalHand, dp: DecisionPoint, state: TableState, shover: SeatSnapshot
 ) -> list[SeatSnapshot]:
@@ -723,13 +733,7 @@ def _rivals_when_shoved(
     `test_shover_depth_ignores_a_player_already_all_in_when_the_shove_landed`
     — состав.
     """
-    target = action_index(hand, dp)
-    # Отсечка — последнее действие шовера до решения героя. Запасной вариант
-    # (шовер до героя не ходил вовсе) читает действия вплоть до решения героя:
-    # лучшего восстановления из этих данных не получить.
-    shove_at = next(
-        (i for i in range(target - 1, -1, -1) if hand.actions[i].label == shover.label), target
-    )
+    shove_at = _shove_action_index(hand, dp, shover)
     gone = {
         action.label
         for action in hand.actions[:shove_at]
@@ -737,6 +741,65 @@ def _rivals_when_shoved(
     }
     gone |= state.forfeits
     return [seat for seat in state.seats if seat.label != shover.label and seat.label not in gone]
+
+
+def _posted_before_shove(hand: CanonicalHand, dp: DecisionPoint, shover: SeatSnapshot) -> int:
+    """Сколько шовер вложил в банк ДО собственного шова, в фишках.
+
+    `SeatSnapshot.contributed` снят на решении героя и сам шов уже содержит, а
+    подыгра, которую решает `_shover_equilibrium`, начинается перед ним. Если до
+    шова шовер уже действовал, берётся накопленное тем действием; иначе —
+    вынужденная ставка его позиции, той же формулой `forced_blind`, которой
+    считает посты движок. Закреплено
+    `test_the_shover_subgame_starts_before_his_own_shove`.
+    """
+    shove_at = _shove_action_index(hand, dp, shover)
+    earlier = [a.committed_after for a in hand.actions[:shove_at] if a.label == shover.label]
+    if earlier:
+        return shover.ante + earlier[-1]
+    player = next(p for p in hand.players if p.label == shover.label)
+    return shover.ante + forced_blind(hand, player, shover.ante)
+
+
+def _shover_equilibrium(
+    state: TableState,
+    shover: SeatSnapshot,
+    shover_posted: int,
+    rivals: Sequence[SeatSnapshot],
+    bb: int,
+) -> MultiwaySolution:
+    """Равновесие подыгры, в которую играл ШОВЕР: его шов против всех, кто был позади.
+
+    Деньги берутся на момент его хода: банк без самого шова и вклад шовера без
+    него же. Вклады и остатки остальных мест берутся из снимка на решении героя
+    — состав `rivals` восстановлен `_rivals_when_shoved`.
+
+    Потолок вкладов — стек ШОВЕРА: больше, чем покрыл он сам, из чужих стеков в
+    его банк не входит. Это тот же потолок, по которому `_unopened_verdict`
+    считает банк своему герою.
+
+    Возвращается связка целиком: пуш-сторона — диапазон, который приписывается
+    шоверу, колл-стороны — диапазоны тех, кто на этот шов отвечал (герой в их
+    числе). Разрывать пару нельзя: колл-сторона является наилучшим ответом на
+    шов ТОГО ЖЕ решения — закреплено
+    `test_the_call_range_answers_the_shove_range_of_the_same_solution`.
+
+    При одном игроке позади шовера пуш-сторона обязана совпасть с `nash_hu`
+    поклассно: `test_the_shover_range_with_one_player_behind_is_the_nash_push_range`.
+    """
+    ceiling = shover.stack
+    pot_dead = sum(
+        min(shover_posted if seat.label == shover.label else seat.contributed, ceiling)
+        for seat in state.seats
+    )
+    return unopened_shove_equilibrium(
+        MultiwaySeat(posted_bb=shover_posted / bb, behind_bb=(shover.stack - shover_posted) / bb),
+        [
+            MultiwaySeat(posted_bb=min(seat.contributed, ceiling) / bb, behind_bb=seat.behind / bb)
+            for seat in rivals
+        ],
+        pot_dead / bb,
+    )
 
 
 def _nothing_dead_besides(state: TableState, opponent: SeatSnapshot) -> bool:
@@ -965,6 +1028,29 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
     rivals = _rivals_when_shoved(en.hand, dp, state, shover)
     if not rivals:
         return _unjudged(dp, spot, "на момент шова отвечать на него было некому")
+    if len(rivals) > _MAX_MODELLED_CALLERS:
+        return _unjudged(
+            dp,
+            spot,
+            f"на момент шова позади шовера было {len(rivals)} игроков — больше, чем "
+            f"решатель равновесия берёт, и приписать шоверу диапазон не из чего",
+        )
+    if any(seat.behind <= 0 for seat in rivals):
+        return _unjudged(
+            dp,
+            spot,
+            "на момент шова позади шовера было место без фишек за спиной: выбора "
+            "«коллировать или пас» у него не было, а равновесие решается для стола, "
+            "где он есть у каждого",
+        )
+    shover_posted = _posted_before_shove(en.hand, dp, shover)
+    if shover.stack <= shover_posted:
+        return _unjudged(dp, spot, "у шовера не было фишек за спиной — шовить ему было нечем")
+    try:
+        solution = _shover_equilibrium(state, shover, shover_posted, rivals, bb)
+    except DidNotConverge as failure:
+        return _unjudged(dp, spot, _NO_EQUILIBRIUM, {"solver_error": str(failure)})
+
     shover_depth_bb = (
         min(shover.stack_after_ante, max(seat.stack_after_ante for seat in rivals)) / bb
     )
@@ -977,7 +1063,10 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
             hero_cls, hero_bb, rng, pot_bb, to_call_bb, equity_fn=_model_equity
         )
 
-    model_range = _push_model(shover_depth_bb, dead_bb)
+    # Диапазон шова — пуш-сторона равновесия ЕГО стола, а не хедз-ап равновесия
+    # его глубины: у шовера была своя позиция и своё число игроков позади, и
+    # хедз-ап пуш-диапазон отвечает на другую игру.
+    model_range = solution.push
     ev_model = ev(model_range)
     width_ranges = {
         width: range_of_width(_depth_key(shover_depth_bb), width, dead_extra_bb=dead_bb)
@@ -997,11 +1086,14 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
     behind_unmodelled = len(behind) > _MAX_MODELLED_CALLERS
     best_behind: list[str] = []
     ev_behind: float | None = None
+    behind_ranges: list[Range] = []
     if behind and not behind_unmodelled:
-        behind_ranges = [
-            _call_model(min(seat.stack_after_ante, state.hero.stack_after_ante) / bb, dead_bb)
-            for seat in behind
-        ]
+        # Колл-диапазоны берутся из ТОГО ЖЕ решения, что и диапазон шова: эти
+        # игроки отвечали на этот самый шов. Каждый из них есть среди `rivals`
+        # (живой на решении героя не выбыл до шова) — закреплено
+        # `test_players_behind_hero_answer_the_same_shove_as_hero`.
+        rival_at = {seat.label: index for index, seat in enumerate(rivals)}
+        behind_ranges = [solution.calls[rival_at[seat.label]] for seat in behind]
         pot_with_behind_bb = (state.pot_before + _extra_from_behind(state, behind)) / bb
 
         def ev_all(rng: Range) -> float:
@@ -1082,6 +1174,10 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         # функции не допускает — см. `test_a_player_who_already_called_the_shove_is_not_priced`.
         "live_others": len(behind),
         "behind_axis": behind_axis,
+        "rivals_when_shoved": len(rivals),
+        "shove_range_fraction": round(model_range.fraction_of_hands(), 6),
+        "call_range_fractions": [round(rng.fraction_of_hands(), 6) for rng in behind_ranges],
+        "equilibrium_hand_regret_bb": round(solution.hand_regret_bb, 6),
         # Обе точки модели по отдельности: против одного диапазона и с вошедшими
         # в банк живыми позади. Когда они расходятся, `best_action` называет
         # развилку, а не одно из этих действий.
@@ -1118,7 +1214,7 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         assumption=(
             Assumption(
                 range=model_range,
-                source="model:nash_hu_push",
+                source="model:multiway_pushfold",
                 note=_ASSUMPTION_SHOVER
                 + (
                     f"; вдобавок вердикт двигают {len(behind)} живых позади — "
@@ -1130,7 +1226,7 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
             if zone is Zone.ASSUMING
             else None
         ),
-        tools=["nash_hu", "call_shove_ev_bb", "required_equity"],
+        tools=["multiway_pushfold", "call_shove_ev_bb", "required_equity"],
         detail=detail,
     )
 
