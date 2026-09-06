@@ -1387,3 +1387,97 @@ async def test_a_repeat_attempt_does_not_pay_for_the_words_twice(
 
     assert called is False
     assert any("Уже сказано." in shown for shown in _all_texts(fake_sender))
+
+
+@requires_fixtures
+async def test_a_repeat_scan_does_not_pay_for_the_story_twice(
+    db_factory, fake_sender, queue, deps, monkeypatch
+):
+    """Близнец чекпоинта разбора, но для рассказа по турниру (ревью, раздел G).
+
+    Разница с остальными станциями существенна: их повтор даёт ТОТ ЖЕ результат,
+    а повторный вызов модели даёт ДРУГОЙ текст — то есть игроку переписали бы
+    уже прочитанное сообщение, заплатив за это второй раз.
+    """
+    player_id, session_id = await _make_scope(db_factory)
+    tournament_id, _raw_hands = await _seed_checkpointed_hands(
+        db_factory, session_id=session_id, source_file=FIXTURE_DAILY, n=3
+    )
+    jid = await queue.enqueue(
+        type="hh_scan",
+        player_id=player_id,
+        session_id=session_id,
+        payload={
+            "source_file": str(FIXTURE_DAILY),
+            "tournament_id": tournament_id,
+            "hands_saved": True,
+        },
+    )
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+    assert (await job_status(db_factory, jid)) == "done"
+    async with db_factory() as session:
+        row = await session.get(Job, jid)
+        assert row is not None
+        assert row.payload.get("story_message_id") is not None
+
+    called = False
+
+    async def _should_not_be_called(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("модель позвана повторно за уже отправленным рассказом")
+
+    monkeypatch.setattr(pipeline_module, "tournament_text", _should_not_be_called)
+
+    async with db_factory() as session:
+        await session.execute(
+            text("UPDATE jobs SET status = 'queued', locked_by = NULL WHERE id = :id"),
+            {"id": jid},
+        )
+        await session.commit()
+    repeat = await queue.claim("w2")
+    assert repeat is not None
+    await run_job(repeat, deps)
+
+    assert called is False
+    assert (await job_status(db_factory, jid)) == "done"
+
+
+@requires_fixtures
+async def test_range_images_survive_a_model_that_did_not_answer(
+    db_factory, fake_sender, queue, deps, monkeypatch, tmp_path
+):
+    """Картинки диапазонов — выход кода, и отказ модели их не отменяет.
+
+    Раздача берётся та, у которой есть точка с допущением: только у таких точек
+    есть что рисовать (`_render_ranges`). Если в первых раздачах файла её нет,
+    тест проверяет вторую половину утверждения — что разбор всё равно сохранён,
+    а список картинок пуст, а не потерян.
+    """
+    player_id, session_id = await _make_scope(db_factory)
+    jid, _raw = await _seed_one_hand_deep_dive_job(
+        db_factory, queue, player_id=player_id, session_id=session_id
+    )
+
+    async def _boom(*args, **kwargs):
+        raise UnfaithfulText("числа не из расчёта")
+
+    monkeypatch.setattr(pipeline_module, "verdict_text", _boom)
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, replace(deps, data_dir=tmp_path))
+
+    assert (await job_status(db_factory, jid)) == "done"
+    async with db_factory() as session:
+        hand = await HandsRepo(session).find_by_hand_no(session_id, _raw.hand_no)
+        assert hand is not None
+        record = await AnalysesRepo(session).get_by_hand(hand.id)
+    assert record is not None
+    assert record.verdict_text is None
+    assert record.range_images is not None, "список картинок обязан быть записан"
+    for path in record.range_images:
+        assert Path(path).exists(), "нарисованная картинка обязана лежать на диске"

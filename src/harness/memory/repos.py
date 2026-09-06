@@ -406,7 +406,7 @@ class AnalysesRepo:
         return record.id
 
     async def set_explanation(
-        self, *, hand_id: int, verdict_text: str, range_images: list[str]
+        self, *, hand_id: int, verdict_text: str | None = None, range_images: list[str]
     ) -> None:
         """Дописать изложение к УЖЕ сохранённому разбору — чекпоинт станции explain.
 
@@ -414,11 +414,17 @@ class AnalysesRepo:
         считаются разными станциями конвейера и переживают разные падения (задача
         18, чекпоинты). Повторная попытка, у которой числа уже посчитаны, обязана
         дописать к ним слова, а не завести вторую строку на ту же руку.
+
+        `verdict_text=None` — законный случай: картинки диапазонов рисует код, и
+        сохранить их надо даже тогда, когда модель не ответила. Пустой текст при
+        этом НЕ записывается поверх существующего — колонка просто не попадает в
+        `UPDATE` (`test_set_explanation_without_text_keeps_the_saved_one`).
         """
+        values: dict[str, Any] = {"range_images": range_images}
+        if verdict_text is not None:
+            values["verdict_text"] = verdict_text
         await self.db.execute(
-            update(Analysis)
-            .where(Analysis.hand_id == hand_id)
-            .values(verdict_text=verdict_text, range_images=range_images)
+            update(Analysis).where(Analysis.hand_id == hand_id).values(**values)
         )
 
     async def get_by_hand(self, hand_id: int) -> AnalysisRecord | None:

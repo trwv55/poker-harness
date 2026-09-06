@@ -544,8 +544,21 @@ async def _run_hh_scan(job: JobModel, deps: Deps, trace: Trace) -> None:
             # (модель недоступна либо её текст не прошёл проверку) — тогда игрок
             # получает те же два сообщения с числами, и это полноценный ответ.
             async with trace.span("explain"):
-                await _ensure_progress(deps, session, job.id, worker_id, chat_id, "explain")
-                story = await _tournament_story(deps, trace, report)
+                payload = await _ensure_progress(
+                    deps, session, job.id, worker_id, chat_id, "explain"
+                )
+                # Чекпоинт рассказа (ревью, раздел G). `story_message_id` в
+                # payload означает, что рассказ УЖЕ отправлен прошлой попыткой:
+                # звать модель снова значило бы заплатить второй раз и
+                # переписать игроку уже прочитанное сообщение другим текстом —
+                # модель не детерминирована, и это был бы не «тот же результат»,
+                # как у остальных станций, а другой
+                # (`test_a_repeat_scan_does_not_pay_for_the_story_twice`).
+                story = (
+                    None
+                    if payload.get("story_message_id") is not None
+                    else await _tournament_story(deps, trace, report)
+                )
             if story is not None:
                 await _send_idempotent(
                     deps,
@@ -712,14 +725,16 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
                 verdict = VerdictTextOut.model_validate_json(saved)
             else:
                 verdict = await _verdict_prose(deps, trace, result)
+                # Картинки диапазонов — выход КОДА, и от того, ответила ли
+                # модель, они не зависят: сохраняются всегда (ревью, раздел G;
+                # прежде отказ модели выбрасывал уже нарисованные файлы).
                 images = _render_ranges(deps.data_dir, hand.id, result)
-                if verdict is not None:
-                    await analyses_repo.set_explanation(
-                        hand_id=hand.id,
-                        verdict_text=verdict.model_dump_json(),
-                        range_images=images,
-                    )
-                    await session.commit()
+                await analyses_repo.set_explanation(
+                    hand_id=hand.id,
+                    verdict_text=None if verdict is None else verdict.model_dump_json(),
+                    range_images=images,
+                )
+                await session.commit()
 
         elapsed_s = round(deps.clock() - started_at)
         zone = _hand_zone(result)

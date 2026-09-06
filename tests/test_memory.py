@@ -185,6 +185,25 @@ async def test_analyses_save_and_get_by_hand(db):
     assert got.range_images == ["r1.png"]
 
 
+async def test_set_explanation_without_text_keeps_the_saved_one(db):
+    """Картинки диапазонов рисует код, и сохранить их надо даже когда модель не
+    ответила — но пустой текст не имеет права затереть уже сказанное
+    (`worker.pipeline`, станция explain)."""
+    session_id = await _make_session(db)
+    raw = RawHand.model_validate(make_min_raw())
+    hid = await HandsRepo(db).save_raw(session_id=session_id, raw=raw)
+    await AnalysesRepo(db).save(
+        hand_id=hid, result=AnalysisResult(hand_no=raw.hand_no, points=[]), verdict_text="слова"
+    )
+
+    await AnalysesRepo(db).set_explanation(hand_id=hid, range_images=["r1.png"])
+
+    got = await AnalysesRepo(db).get_by_hand(hid)
+    assert got is not None
+    assert got.range_images == ["r1.png"]
+    assert got.verdict_text == "слова"
+
+
 async def test_analyses_get_by_hand_missing_returns_none(db):
     session_id = await _make_session(db)
     raw = RawHand.model_validate(make_min_raw())
