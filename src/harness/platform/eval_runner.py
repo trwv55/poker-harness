@@ -1,5 +1,11 @@
 """Прогон evals по настоящей модели — руками, не в наборе тестов.
 
+Две подкоманды, по одной на каждый вход модели в системе: `verdict` — текст
+разбора одной раздачи, `tournament --hh FILE` — рассказ по турниру. Вторая
+появилась по ревью: у второго входа модели eval не было вовсе, а именно там
+модель написала игроку про «раздачи без явных ошибок» — утверждение о том,
+чего расчёт не судил.
+
 `uv run python -m harness.platform.eval_runner verdict` — этаж 3 EVALS.md:
 берёт кейсы (готовые `AnalysisResult`), зовёт `LLM_VERDICT_MODEL` через тот же
 фасад, что и прод (`platform/llm.py`: лимитер, строки `llm_calls`, ретраи), и
@@ -37,12 +43,16 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 from sqlalchemy import select
 
 from harness.analysis import analyze_hand
-from harness.contracts import AnalysisResult, ValidationStatus
+from harness.analysis.scan import scan_tournament
+from harness.analysis.tournament import tournament_report
+from harness.contracts import AnalysisResult, EnrichedHand, TournamentReport, ValidationStatus
 from harness.engine import enrich
+from harness.explanation.tournament_text import tournament_draft
 from harness.explanation.verdict_text import verdict_draft
 from harness.memory.models import Job, LlmCall, Trace, async_session_factory
 from harness.memory.repos import PlayersRepo, SessionsRepo
@@ -95,6 +105,29 @@ def _cases_from_dir(directory: Path) -> list[tuple[str, AnalysisResult]]:
     ]
 
 
+def _enriched_from_hh(source: Path) -> list[EnrichedHand]:
+    """Раздачи файла, прошедшие движок и валидатор, — общий вход обоих прогонов."""
+    return [
+        enriched
+        for enriched in (
+            enrich(normalize(raw))
+            for raw in parse_file(source.read_text(encoding="utf-8"), str(source))
+        )
+        if enriched.verdict.status is not ValidationStatus.REJECT
+    ]
+
+
+def _report_from_hh(source: Path) -> TournamentReport:
+    """Отчёт по турниру из файла — тот же путь, что у воркера: скан, затем отчёт."""
+    enriched = _enriched_from_hh(source)
+    if not enriched:
+        raise SystemExit(f"в {source} не нашлось ни одной пригодной раздачи")
+    summary = scan_tournament(enriched)
+    return tournament_report(
+        enriched, summary, player_tournaments=[[en.hand for en in enriched]]
+    )
+
+
 def _cases_from_hh(source: Path, limit: int) -> list[tuple[str, AnalysisResult]]:
     """Первые `limit` раздач файла, у которых есть хоть одна судимая точка.
 
@@ -102,10 +135,7 @@ def _cases_from_hh(source: Path, limit: int) -> list[tuple[str, AnalysisResult]]
     не вызывается вовсе (`verdict_text`).
     """
     cases: list[tuple[str, AnalysisResult]] = []
-    for raw in parse_file(source.read_text(encoding="utf-8"), str(source)):
-        enriched = enrich(normalize(raw))
-        if enriched.verdict.status is ValidationStatus.REJECT:
-            continue
+    for enriched in _enriched_from_hh(source):
         result = analyze_hand(enriched)
         if not result.ranked:
             continue
@@ -151,7 +181,66 @@ async def _call_costs(session_factory, trace_id: int) -> list[tuple[str, int, in
         return [tuple(row) for row in rows.all()]
 
 
+async def _open_llm(cfg: Config) -> tuple[LLM, int, Any]:
+    """Фасад модели, служебный трейс и фабрика сессий — общее начало обоих прогонов."""
+    session_factory = async_session_factory(cfg.database_url)
+    llm = LLM(cfg, session_factory)
+    trace_id = await _eval_trace(session_factory)
+    return llm, trace_id, session_factory
+
+
+async def _print_costs(session_factory: Any, trace_id: int) -> None:
+    """Что стоил прогон — одной строкой, из `llm_calls`.
+
+    `tokens_in`/`tokens_out`/`cost` пусты у строк, вставленных ПЕРЕД вызовом и
+    не дошедших до ответа (`llm_calls` пишется до обращения к провайдеру —
+    `platform/llm.py`, пункт 2). Считать их нулями верно: неотвеченная попытка
+    токенов не потратила; скрыть саму строку было бы неправдой о нагрузке.
+    """
+    costs = await _call_costs(session_factory, trace_id)
+    tokens_in = sum(row[1] or 0 for row in costs)
+    tokens_out = sum(row[2] or 0 for row in costs)
+    money = sum(row[3] or 0.0 for row in costs)
+    per_call = len(costs) or 1
+    print(
+        f"Вызовов модели: {len(costs)}; токенов на вход {tokens_in}, на выход "
+        f"{tokens_out}; оценка стоимости ${money:.6f} за прогон, "
+        f"${money / per_call:.6f} за вызов (оценка провайдер-слоя, не счёт)."
+    )
+
+
+async def _run_tournament(args: argparse.Namespace) -> int:
+    """Прогон второго входа модели — рассказа по турниру (ревью, раздел B).
+
+    Кейс здесь всегда один и всегда из файла: синтетического отчёта по турниру,
+    осмысленного для проверки, не существует — его пришлось бы выдумывать
+    целиком, включая траекторию стека и разбиение фишек.
+    """
+    checks = _load_checks()
+    report = _report_from_hh(Path(args.hh))
+    cfg = Config.from_env()
+    llm, trace_id, session_factory = await _open_llm(cfg)
+
+    print(
+        f"Модель вердикта: {cfg.llm_verdict_model}; турнир из {args.hh} "
+        f"({report.hands_total} раздач); трейс {trace_id}\n"
+    )
+    story, digest = await tournament_draft(llm, report, trace_id=trace_id)
+    for index, paragraph in enumerate(story.paragraphs, start=1):
+        print(f"  [{index}] {paragraph}")
+    print()
+    results = checks.run_story_checks(story, digest.allowed)
+    for check in results:
+        mark = "OK  " if check.passed else "ПРОВАЛ"
+        print(f"  {mark} {check.name}{f': {check.detail}' if check.detail else ''}")
+    print()
+    await _print_costs(session_factory, trace_id)
+    print(f"Провалено проверок: {sum(not c.passed for c in results)} из {len(results)}.")
+    return 1 if any(not check.passed for check in results) else 0
+
+
 async def _run_verdict(args: argparse.Namespace) -> int:
+    """Прогон текста разбора: кейсы из каталога либо из настоящего файла раздач."""
     checks = _load_checks()
     cases = (
         _cases_from_hh(Path(args.hh), args.hands)
@@ -160,9 +249,7 @@ async def _run_verdict(args: argparse.Namespace) -> int:
     )
 
     cfg = Config.from_env()
-    session_factory = async_session_factory(cfg.database_url)
-    llm = LLM(cfg, session_factory)
-    trace_id = await _eval_trace(session_factory)
+    llm, trace_id, session_factory = await _open_llm(cfg)
 
     print(f"Модель вердикта: {cfg.llm_verdict_model}; кейсов: {len(cases)}; трейс {trace_id}\n")
     failed = 0
@@ -179,20 +266,7 @@ async def _run_verdict(args: argparse.Namespace) -> int:
         failed += any(not check.passed for check in results)
         print()
 
-    costs = await _call_costs(session_factory, trace_id)
-    # `tokens_in`/`tokens_out`/`cost` пусты у строк, вставленных ПЕРЕД вызовом и
-    # не дошедших до ответа (`llm_calls` пишется до обращения к провайдеру —
-    # `platform/llm.py`, пункт 2). Считать их нулями верно: неотвеченная попытка
-    # токенов не потратила, а вот скрыть саму строку было бы неправдой о нагрузке.
-    tokens_in = sum(row[1] or 0 for row in costs)
-    tokens_out = sum(row[2] or 0 for row in costs)
-    money = sum(row[3] or 0.0 for row in costs)
-    per_call = len(costs) or 1
-    print(
-        f"Вызовов модели: {len(costs)}; токенов на вход {tokens_in}, на выход "
-        f"{tokens_out}; оценка стоимости ${money:.6f} за прогон, "
-        f"${money / per_call:.6f} за вызов (оценка провайдер-слоя, не счёт)."
-    )
+    await _print_costs(session_factory, trace_id)
     print(f"Кейсов провалено: {failed} из {len(cases)}.")
     return 1 if failed else 0
 
@@ -204,7 +278,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     verdict.add_argument("--cases", default=str(_DEFAULT_CASES), help="каталог с кейсами (*.json)")
     verdict.add_argument("--hh", default=None, help="файл hand history вместо каталога кейсов")
     verdict.add_argument("--hands", type=int, default=3, help="сколько раздач взять из --hh")
+    tournament = sub.add_parser("tournament", help="этаж 3: верность рассказа по турниру")
+    tournament.add_argument("--hh", required=True, help="файл hand history одного турнира")
     args = parser.parse_args(argv)
+    if args.suite == "tournament":
+        return asyncio.run(_run_tournament(args))
     return asyncio.run(_run_verdict(args))
 
 

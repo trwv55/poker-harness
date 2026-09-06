@@ -150,9 +150,19 @@ def test_a_point_without_a_verdict_never_reaches_the_model():
 
 
 def test_no_engine_token_reaches_the_model():
-    """То же, что в выжимке турнира: `fold`/`shove` переводятся до промпта."""
-    digest = verdict_digest(_result([_point(dp_index=0, ev_diff_bb=-1.2)]))
+    """То же, что в выжимке турнира: `fold`/`shove` переводятся до промпта, а
+    источник допущения (`model:multiway_pushfold`) в промпт не идёт вовсе —
+    в нём английский токен, который модель раньше переписывала игроку как есть."""
+    digest = verdict_digest(
+        _result(
+            [
+                _point(dp_index=0, ev_diff_bb=-1.2),
+                _point(dp_index=1, ev_diff_bb=-0.9, zone=Zone.ASSUMING),
+            ]
+        )
+    )
     assert "fold" not in digest.text and "shove" not in digest.text
+    assert "model:" not in digest.text and "multiway" not in digest.text
     assert "фолд" in digest.text and "шов" in digest.text
 
 
@@ -286,6 +296,38 @@ async def test_a_number_taken_from_the_digest_passes():
     llm = FakeLLM(_draft((0, "Фолд стоил 1.2 bb, в худшем случае 2.4 bb.")))
     out = await verdict_text(llm, res, trace_id=1)
     assert out.points[0].text.startswith("Фолд стоил")
+
+
+async def test_a_reproach_on_a_near_zero_point_is_rejected():
+    """«Лучше было» на точке, где расчёт не спорит ни с одним из вариантов, —
+    утверждение, которого расчёт не делал. Это верность, а не тон, поэтому отказ."""
+    res = _result(
+        [
+            _point(
+                dp_index=0,
+                ev_diff_bb=0.0,
+                interval=EvInterval(point_bb=0.1, low_bb=-0.3, high_bb=0.4, near_zero=True),
+            )
+        ]
+    )
+    llm = FakeLLM(_draft((0, "Здесь лучше было пасовать.")))
+    with pytest.raises(UnfaithfulText, match="упрекает"):
+        await verdict_text(llm, res, trace_id=1)
+
+
+async def test_a_near_zero_point_without_a_reproach_passes():
+    res = _result(
+        [
+            _point(
+                dp_index=0,
+                ev_diff_bb=0.0,
+                interval=EvInterval(point_bb=0.1, low_bb=-0.3, high_bb=0.4, near_zero=True),
+            )
+        ]
+    )
+    llm = FakeLLM(_draft((0, "Оба варианта допустимы, выбор дёшев.")))
+    out = await verdict_text(llm, res, trace_id=1)
+    assert out.points[0].verdict_label == "ok"
 
 
 async def test_an_assuming_point_without_assumption_words_is_rejected():

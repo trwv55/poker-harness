@@ -27,8 +27,13 @@ from collections.abc import Iterable
 from harness.contracts import VerdictLabel
 
 __all__ = [
+    "ACTION_WORDS",
     "ASSUMPTION_WORDS",
+    "ERROR_WORDS",
+    "error_words_in",
     "has_assumption_words",
+    "names_the_better_line",
+    "near_zero_reproach",
     "numbers_in",
     "unsupported_numbers",
     "verdict_label_for",
@@ -57,6 +62,29 @@ _PRECISION = 1
 # «по модели» — формулировка, уже утверждённая владельцем в изложении
 # (`presentation._ASSUMING_MARKER`, «по модели диапазонов»).
 ASSUMPTION_WORDS: tuple[str, ...] = ("если ", "предполаг", "допущени", "по модели")
+
+# Слова, которыми игроку называют действие. Первое в наборе — то, что печатает
+# выжимка; остальные — синонимы, которыми модель законно пользуется («идти
+# ва-банк» вместо «шов» встретилось в первом же живом прогоне). Требовать
+# ровно нашего слова значило бы наказывать за живой язык, а проверка нужна не
+# за этим: она спрашивает, названа ли ЛУЧШАЯ ЛИНИЯ вообще.
+ACTION_WORDS: dict[str, tuple[str, ...]] = {
+    "fold": ("фолд", "пас", "сброс"),
+    "shove": ("шов", "олл-ин", "ва-банк", "пуш"),
+    "call": ("колл", "уравн"),
+}
+
+# Упрёк, которому неоткуда взяться у точки «около нуля»: расчёт не спорит ни с
+# одним из вариантов, и «лучше было» там — утверждение, которого он не делал.
+NEAR_ZERO_REPROACH: tuple[str, ...] = ("лучше", "стоило", "следовало")
+
+# Слово, которым в этом продукте не называют решение игрока (CLAUDE.md): расчёт
+# судит решение против диапазона, а не против вскрытой карты.
+#
+# Корень «ошиб», а не «ошибк»: родительный падеж множественного числа — «без
+# явных ошибОК», без «к», — и первая версия проверки пропускала ровно ту фразу,
+# ради которой её и написали (живой прогон рассказа по турниру).
+ERROR_WORDS: tuple[str, ...] = ("ошиб", "неверн", "неправильн")
 
 # Пороги метки — из плана дословно. Живут здесь, а не в `analysis`: ядро считает
 # цену, а раскладка цены на три слова — дело изложения.
@@ -97,6 +125,36 @@ def verdict_label_for(ev_diff_bb: float) -> VerdictLabel:
     if ev_diff_bb < _MISTAKE_BELOW_BB:
         return "mistake"
     return "marginal"
+
+
+def names_the_better_line(text: str, best_action: str) -> bool:
+    """Названа ли в тексте лучшая линия — та, что посчитало ядро.
+
+    Проверка направления, которой не хватало: числа могут быть верны, метка
+    ставится кодом, а текст при этом способен объяснять что угодно. Если ядро
+    говорит «лучше был шов», текст обязан этот шов НАЗВАТЬ.
+
+    Действие, которого нет в `ACTION_WORDS` (готовая формулировка развилки из
+    `preflop`), проверить нечем — тогда ответ «да»: молчание лучше выдуманного
+    требования.
+    """
+    words = ACTION_WORDS.get(best_action)
+    if words is None:
+        return True
+    lowered = text.lower()
+    return any(word in lowered for word in words)
+
+
+def near_zero_reproach(text: str) -> list[str]:
+    """Слова упрёка в тексте точки «около нуля» — там их быть не может."""
+    lowered = text.lower()
+    return [word for word in NEAR_ZERO_REPROACH if word in lowered]
+
+
+def error_words_in(text: str) -> list[str]:
+    """Слова «ошибка»/«неверно»/«неправильно» — их в тексте игроку быть не должно."""
+    lowered = text.lower()
+    return [word for word in ERROR_WORDS if word in lowered]
 
 
 def has_assumption_words(text: str) -> bool:

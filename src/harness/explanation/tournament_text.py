@@ -33,7 +33,7 @@ from harness.contracts import (
     Zone,
 )
 from harness.explanation.digest import NumberBook
-from harness.explanation.faithfulness import unsupported_numbers
+from harness.explanation.faithfulness import error_words_in, unsupported_numbers
 from harness.explanation.verdict_text import (
     _ACTION_BRIEF,
     _SPOT_BRIEF,
@@ -43,7 +43,7 @@ from harness.explanation.verdict_text import (
     VerdictLLM,
 )
 
-__all__ = ["tournament_digest", "tournament_text"]
+__all__ = ["tournament_digest", "tournament_draft", "tournament_text"]
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "tournament.md"
 
@@ -222,6 +222,20 @@ def tournament_digest(report: TournamentReport) -> Digest:
     return Digest(text="\n".join(lines).strip(), allowed=book.allowed)
 
 
+async def tournament_draft(
+    llm: VerdictLLM, report: TournamentReport, *, trace_id: int
+) -> tuple[TournamentTextOut, Digest]:
+    """Один вызов модели: сырой рассказ и выжимка, по которой его положено проверять.
+
+    Зеркало `verdict_draft` и по той же причине: eval-прогон обязан видеть ответ
+    ДО отбраковки (`evals/verdict/checks.py`), иначе измерять нечего.
+    """
+    digest = tournament_digest(report)
+    prompt = _PROMPT_PATH.read_text(encoding="utf-8").replace("{digest}", digest.text)
+    draft, _meta = await llm("verdict_text", TournamentTextOut, prompt=prompt, trace_id=trace_id)
+    return draft, digest
+
+
 async def tournament_text(
     llm: VerdictLLM, report: TournamentReport, *, trace_id: int
 ) -> TournamentTextOut:
@@ -230,10 +244,16 @@ async def tournament_text(
     Пустой ответ (модель не нашла что сказать) — это отказ, а не текст: пустые
     абзацы игроку не показываются, и молчаливое «ничего» неотличимо от поломки
     (`test_an_empty_answer_is_a_refusal_not_a_text`).
+
+    **Слово «ошибка» здесь — вопрос верности, а не тона, и потому тоже отказ.**
+    В разборе одной раздачи точка СУДИМА, и спор идёт о слове. В рассказе по
+    турниру покрытие всегда неполное, и фраза вроде «остальное потеряно без
+    явных ошибок» — утверждение о раздачах, которых расчёт НЕ СУДИЛ. Такое
+    утверждение нельзя ни подтвердить, ни поправить, поэтому политика та же, что
+    с числами: отказ целиком, а не правка текста
+    (`test_a_story_that_calls_something_an_error_is_refused`).
     """
-    digest = tournament_digest(report)
-    prompt = _PROMPT_PATH.read_text(encoding="utf-8").replace("{digest}", digest.text)
-    draft, _meta = await llm("verdict_text", TournamentTextOut, prompt=prompt, trace_id=trace_id)
+    draft, digest = await tournament_draft(llm, report, trace_id=trace_id)
 
     paragraphs = [paragraph.strip() for paragraph in draft.paragraphs if paragraph.strip()]
     if not paragraphs:
@@ -242,4 +262,10 @@ async def tournament_text(
         invented = unsupported_numbers(paragraph, digest.allowed)
         if invented:
             raise UnfaithfulText(f"абзац {index + 1}: числа не из расчёта — {invented}")
+        errors = error_words_in(paragraph)
+        if errors:
+            raise UnfaithfulText(
+                f"абзац {index + 1}: решение названо ошибкой — {errors}; расчёт судит "
+                f"решение против диапазона и о несудимых раздачах не говорит ничего"
+            )
     return TournamentTextOut(paragraphs=paragraphs)

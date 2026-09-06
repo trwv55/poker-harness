@@ -12,14 +12,21 @@
 from __future__ import annotations
 
 from harness.explanation.faithfulness import (
+    error_words_in,
     has_assumption_words,
+    names_the_better_line,
+    near_zero_reproach,
     numbers_in,
     unsupported_numbers,
     verdict_label_for,
 )
 from harness.explanation.hand_replay import HandReplay, ReplaySpan, hand_replay
 from harness.explanation.range_render import range_svg, render_range_png
-from harness.explanation.tournament_text import tournament_digest, tournament_text
+from harness.explanation.tournament_text import (
+    tournament_digest,
+    tournament_draft,
+    tournament_text,
+)
 from harness.explanation.verdict_text import (
     Digest,
     UnfaithfulText,
@@ -37,12 +44,16 @@ __all__ = [
     "UnfaithfulText",
     "VerdictDraft",
     "VerdictLLM",
+    "error_words_in",
     "hand_replay",
     "has_assumption_words",
+    "names_the_better_line",
+    "near_zero_reproach",
     "numbers_in",
     "range_svg",
     "render_range_png",
     "tournament_digest",
+    "tournament_draft",
     "tournament_text",
     "unsupported_numbers",
     "verdict_digest",

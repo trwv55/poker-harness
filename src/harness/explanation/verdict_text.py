@@ -46,7 +46,9 @@ from harness.contracts import (
 )
 from harness.explanation.digest import NumberBook
 from harness.explanation.faithfulness import (
+    ACTION_WORDS,
     has_assumption_words,
+    near_zero_reproach,
     unsupported_numbers,
     verdict_label_for,
 )
@@ -89,7 +91,11 @@ _STREET_BRIEF: dict[Street, str] = {
 # pushfold_unopened» и «закончились на preflopе». Английский токен в тексте
 # игрока запрещён (SESSIONS_UX: никакой внутренней кухни), а надёжнее всего он
 # не появляется тогда, когда модель его не видела.
-_ACTION_BRIEF: dict[str, str] = {"fold": "фолд", "shove": "шов", "call": "колл"}
+#
+# Слово берётся первым из `faithfulness.ACTION_WORDS` — того же набора, по
+# которому проверяется, названа ли лучшая линия: писать словарь второй раз
+# значило бы завести рассинхрон между тем, что мы показали, и тем, что требуем.
+_ACTION_BRIEF: dict[str, str] = {action: words[0] for action, words in ACTION_WORDS.items()}
 
 # Единственные величины из `PointVerdict.detail`, которые модель видит, — с их
 # подписями (см. `_detail_lines`). Ключи ставит `analysis/preflop.py`.
@@ -279,13 +285,22 @@ def _validate(draft: VerdictDraft, res: AnalysisResult, allowed: frozenset[float
             raise UnfaithfulText(
                 f"точка {draft_point.dp_index}: числа не из расчёта — {invented}"
             )
-        if by_dp[draft_point.dp_index].zone is Zone.ASSUMING and not has_assumption_words(
-            draft_point.text
-        ):
+        point = by_dp[draft_point.dp_index]
+        if point.zone is Zone.ASSUMING and not has_assumption_words(draft_point.text):
             raise UnfaithfulText(
                 f"точка {draft_point.dp_index}: зона «предполагая», а допущение в тексте "
                 f"не названо"
             )
+        # Упрёк на точке «около нуля» — утверждение, которого расчёт не делал:
+        # он не спорит ни с одним из вариантов. Это уже не тон, а верность,
+        # поэтому отказ, а не замечание в eval.
+        if point.interval is not None and point.interval.near_zero:
+            reproach = near_zero_reproach(draft_point.text)
+            if reproach:
+                raise UnfaithfulText(
+                    f"точка {draft_point.dp_index}: расчёт не спорит ни с одним из "
+                    f"вариантов, а текст упрекает — {reproach}"
+                )
     invented_summary = unsupported_numbers(draft.summary, allowed)
     if invented_summary:
         raise UnfaithfulText(f"вывод по раздаче: числа не из расчёта — {invented_summary}")

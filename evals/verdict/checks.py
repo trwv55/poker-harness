@@ -22,15 +22,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from harness.contracts import AnalysisResult, Zone
+from harness.contracts import AnalysisResult, TournamentTextOut, Zone
 from harness.explanation.faithfulness import (
+    error_words_in,
     has_assumption_words,
+    names_the_better_line,
+    near_zero_reproach,
     unsupported_numbers,
     verdict_label_for,
 )
 from harness.explanation.verdict_text import VerdictDraft
 
-__all__ = ["CheckResult", "run_checks"]
+__all__ = ["CheckResult", "run_checks", "run_story_checks"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,37 +60,42 @@ def _check_numbers(
     return CheckResult("числа из расчёта", not invented, "; ".join(invented))
 
 
-def _check_labels(draft: VerdictDraft, res: AnalysisResult) -> CheckResult:
-    """2. Метка каждой точки совпадает с меткой ядра по порогам плана.
+def _check_direction(draft: VerdictDraft, res: AnalysisResult) -> CheckResult:
+    """2. Текст ведёт в ту же сторону, что и ядро (EVALS этаж 3, пункт 2).
 
-    Что эта проверка МОЖЕТ поймать: расхождение порогов между планом и кодом
-    (`faithfulness.verdict_label_for`) и ответ модели про точки, которых разбор
-    не судил. Чего она поймать НЕ может: похвалу в прозе там, где ядро видит
-    расхождение, — метка модели не принадлежит вовсе, её ставит код, и потому
-    противоречия «текст против метки» здесь не бывает по построению. Смысловое
-    расхождение прозы и вердикта ловит человек, читающий вывод прогона.
+    Прежняя версия этой проверки была тавтологией: она считала метку ядра дважды
+    одной формулой и печатала «OK» всегда, ни разу не заглянув в текст модели
+    (ревью, раздел B). Теперь проверяется то, ради чего пункт и написан:
+
+    * точка, которую ядро НЕ считает сыгранной верно, обязана получить в тексте
+      названную лучшую линию — «колл −1.2 bb» не имеет права стать рассказом
+      вообще без упоминания того, что было лучше;
+    * точка «около нуля» не имеет права получить упрёк: расчёт не спорит ни с
+      одним из вариантов.
+
+    Ответ про точку, которой разбор не судил, — тоже провал: сопоставлять текст
+    с числами тогда не с чем.
     """
-    core = {
-        res.points[index].dp_index: verdict_label_for(res.points[index].ev_diff_bb)
-        for index in res.ranked
-    }
-    problems = [
-        f"точка {point.dp_index}: разбор её не судит"
-        for point in draft.points
-        if point.dp_index not in core
-    ]
-    expected_by_thresholds = {
-        dp_index: ("ok" if ev >= -0.1 else "mistake" if ev < -0.5 else "marginal")
-        for dp_index, ev in (
-            (res.points[i].dp_index, res.points[i].ev_diff_bb) for i in res.ranked
-        )
-    }
-    problems += [
-        f"точка {dp_index}: код ставит {core[dp_index]}, пороги плана — {expected}"
-        for dp_index, expected in expected_by_thresholds.items()
-        if core[dp_index] != expected
-    ]
-    return CheckResult("метка совпадает с ядром", not problems, "; ".join(problems))
+    by_dp = {res.points[i].dp_index: res.points[i] for i in res.ranked}
+    problems: list[str] = []
+    for draft_point in draft.points:
+        point = by_dp.get(draft_point.dp_index)
+        if point is None:
+            problems.append(f"точка {draft_point.dp_index}: разбор её не судит")
+            continue
+        label = verdict_label_for(point.ev_diff_bb)
+        if label != "ok" and not names_the_better_line(draft_point.text, point.best_action):
+            problems.append(
+                f"точка {draft_point.dp_index}: метка «{label}», а лучшая линия "
+                f"«{point.best_action}» в тексте не названа"
+            )
+        if point.interval is not None and point.interval.near_zero:
+            reproach = near_zero_reproach(draft_point.text)
+            if reproach:
+                problems.append(
+                    f"точка {draft_point.dp_index}: «около нуля», а текст упрекает — {reproach}"
+                )
+    return CheckResult("текст ведёт туда же, куда ядро", not problems, "; ".join(problems))
 
 
 def _check_assumptions(draft: VerdictDraft, res: AnalysisResult) -> CheckResult:
@@ -114,14 +122,12 @@ def _check_wording(draft: VerdictDraft) -> CheckResult:
     написала игроку «единственное неверное решение» там, где расчёт судит
     решение против диапазона и об ошибке не говорит.
     """
-    forbidden = ("ошибк", "неверн", "неправильн")
     hits = [
         f"точка {point.dp_index}: «{word}»"
         for point in draft.points
-        for word in forbidden
-        if word in point.text.lower()
+        for word in error_words_in(point.text)
     ]
-    hits += [f"вывод: «{word}»" for word in forbidden if word in draft.summary.lower()]
+    hits += [f"вывод: «{word}»" for word in error_words_in(draft.summary)]
     return CheckResult("решение не названо ошибкой", not hits, "; ".join(hits))
 
 
@@ -131,7 +137,33 @@ def run_checks(
     """Все проверки одного кейса, в порядке важности."""
     return [
         _check_numbers(draft, allowed),
-        _check_labels(draft, res),
+        _check_direction(draft, res),
         _check_assumptions(draft, res),
         _check_wording(draft),
+    ]
+
+
+def run_story_checks(story: TournamentTextOut, allowed: frozenset[float]) -> list[CheckResult]:
+    """Проверки рассказа по турниру — второго входа модели, у которого eval не было
+    вовсе (ревью, раздел B).
+
+    Здесь только числа и слова: точек решения у рассказа нет, а значит нет ни
+    метки, ни лучшей линии. Слово «ошибка» в рассказе — не тон, а утверждение о
+    НЕСУДИМЫХ раздачах, и прод его уже отвергает (`explanation.tournament_text`);
+    проверка стоит рядом, чтобы прогон показывал такие случаи текстом, а не
+    только фактом отказа.
+    """
+    invented = [
+        f"абзац {index + 1}: {unsupported_numbers(paragraph, allowed)}"
+        for index, paragraph in enumerate(story.paragraphs)
+        if unsupported_numbers(paragraph, allowed)
+    ]
+    errors = [
+        f"абзац {index + 1}: {error_words_in(paragraph)}"
+        for index, paragraph in enumerate(story.paragraphs)
+        if error_words_in(paragraph)
+    ]
+    return [
+        CheckResult("числа из расчёта", not invented, "; ".join(invented)),
+        CheckResult("ничего не названо ошибкой", not errors, "; ".join(errors)),
     ]

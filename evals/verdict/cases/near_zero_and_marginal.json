@@ -8,7 +8,7 @@
       "spot": "pushfold_unopened",
       "zone": "assuming",
       "action_taken": "shove",
-      "best_action": "шов или фолд — оба допустимы",
+      "best_action": "около нуля, оба варианта допустимы",
       "ev_diff_bb": 0.0,
       "interval": {
         "point_bb": 0.1,

@@ -222,6 +222,21 @@ async def test_an_invented_number_rejects_the_report_text():
         await tournament_text(llm, _report(), trace_id=1)
 
 
+async def test_a_story_that_calls_something_an_error_is_refused():
+    """«Без явных ошибок» — утверждение о раздачах, которых расчёт НЕ СУДИЛ.
+    Подтвердить его нечем и поправить нечем, поэтому политика та же, что с
+    числами: отказ целиком."""
+    llm = FakeLLM(_answer("Остальное потеряно в раздачах без явных ошибок."))
+    with pytest.raises(UnfaithfulText, match="ошибкой"):
+        await tournament_text(llm, _report(), trace_id=1)
+
+
+async def test_a_story_that_stays_within_the_words_passes():
+    llm = FakeLLM(_answer("Расхождений расчёт нашёл мало; остальное — дисперсия."))
+    out = await tournament_text(llm, _report(), trace_id=1)
+    assert len(out.paragraphs) == 1
+
+
 async def test_an_empty_answer_is_a_refusal_not_a_text():
     llm = FakeLLM(_answer("", "   "))
     with pytest.raises(UnfaithfulText):
