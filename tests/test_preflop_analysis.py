@@ -685,36 +685,62 @@ def test_a_realistic_calling_model_passes_the_checksum():
     assert _model_checksum(realistic, "A5s") == ""
 
 
-def test_an_unstable_bracket_gets_no_point_estimate():
-    """Q9o на 10bb в двоих позади: вердикт переворачивается внутри вилки ширин.
+def test_an_interval_across_zero_gets_the_near_zero_verdict_with_a_ceiling():
+    """Q9o на 10bb в двоих позади: интервал EV лежит по обе стороны нуля.
 
     Контрольную сумму этот спот проходит (проход шова 0.40, отвечающих 0.74),
-    снимает вердикт именно неустойчивость вилки: одного числа тут нет, а
-    показанное было бы точечной оценкой того, что от ширины и зависит.
+    поэтому вердикт есть — но не точечный: при одних моделях колла шов
+    прибылен, при других убыточен.
     """
     en = _make_multiway_shove_hand(hero_cards=("Qc", "9d"), eff_bb=10.0, players_behind=2)
     p = analyze_hand(en).points[0]
 
     assert p.spot == "pushfold_unopened"
-    assert p.best_action == "" and p.ev_diff_bb == 0.0 and p.assumption is None
-    reason = p.detail["unjudged"]
-    assert "переворачивается" in reason
-    assert "цену шова" not in reason  # причина именно вилки, а не контрольной суммы
-    # Числа расчёта остаются в вердикте: по ним видно, что вилка и правда рвётся —
-    # против узкой модели шов плюсовой, против широкой минусовой.
+    assert "unjudged" not in p.detail  # вердикт есть, отказа нет
+    assert p.best_action == "около нуля, оба варианта допустимы"
+    assert p.ev_diff_bb == 0.0
     assert p.detail["bracket"] == "unstable"
+
+    interval = p.interval
+    assert interval is not None and interval.near_zero is True
+    assert interval.low_bb < 0.0 < interval.high_bb
+    assert interval.low_bb <= interval.point_bb <= interval.high_bb
+    # Потолок ограничивает цену ошибки в ЛЮБУЮ сторону: пас стоит не больше
+    # верхнего конца, вход — не больше модуля нижнего.
+    assert interval.cost_ceiling_bb == max(abs(interval.low_bb), interval.high_bb)
     values = list(p.detail["ev_shove_by_width_bb"].values())
     assert min(values) < 0.0 < max(values)
 
 
-def test_an_unstable_bracket_facing_a_shove_gets_no_point_estimate():
-    """То же правило на другом споте: колл против шова, вилка по диапазону шовера."""
+def test_an_interval_across_zero_facing_a_shove_gets_the_near_zero_verdict():
+    """То же правило на другом споте: колл против шова, модели диапазона шовера."""
     en = _make_facing_shove_hand(hero_cards=("Kd", "Ts"), eff_bb=12.0, shover_bb=12.0)
     p = analyze_hand(en).points[0]
 
     assert p.spot == "pushfold_facing_shove"
-    assert p.best_action == "" and p.ev_diff_bb == 0.0 and p.assumption is None
-    assert "переворачивается" in p.detail["unjudged"]
+    assert "unjudged" not in p.detail
+    assert p.best_action == "около нуля, оба варианта допустимы"
+    assert p.ev_diff_bb == 0.0
+    assert p.interval is not None and p.interval.near_zero is True
+    assert p.interval.low_bb < 0.0 < p.interval.high_bb
+
+
+def test_a_wide_interval_on_one_side_of_zero_keeps_its_point_verdict():
+    """АА в неоткрытый банк: интервал широкий, но целиком плюсовой — вердикт обычный.
+
+    Правило показа стоит по ЗНАКУ интервала, а не по его ширине: пока обе
+    границы по одну сторону нуля, разброс по моделям колла вердикта не трогает
+    и формы «около нуля» не включает.
+    """
+    en = _make_multiway_shove_hand(hero_cards=("Ac", "As"), eff_bb=12.0, players_behind=3)
+    p = analyze_hand(en).points[0]
+
+    assert p.best_action == "shove"
+    interval = p.interval
+    assert interval is not None and interval.near_zero is False
+    assert interval.low_bb > 0.0
+    # Ширина интервала здесь больше bb — и всё равно ни на что не влияет.
+    assert interval.high_bb - interval.low_bb > 1.0
 
 
 # --- Квантование глубины --------------------------------------------------------
@@ -1199,9 +1225,10 @@ def test_an_ante_only_forfeit_does_not_open_the_heads_up_equilibrium():
     p = analyze_hand(en).points[0]
     assert p.spot == "pushfold_unopened"
     assert "равновеси" not in p.detail["zone_reason"]
-    # Гейт закрыт — значит вилка вердикт не держит, и точечной оценки у точки нет
-    # (`_UNSTABLE_SHOVE`). Было бы открыто равновесие — вердикт бы остался.
-    assert p.detail["bracket"] == "unstable" and p.best_action == ""
+    # Гейт закрыт — значит интервал вердикт не держит, и точечной оценки у точки
+    # нет, а есть форма «около нуля». Было бы открыто равновесие — вердикт бы остался.
+    assert p.detail["bracket"] == "unstable"
+    assert p.best_action == "около нуля, оба варианта допустимы"
 
 
 def test_a_dead_small_blind_is_not_the_heads_up_equilibrium_against_a_shove():
@@ -1235,9 +1262,10 @@ def test_a_dead_small_blind_is_not_the_heads_up_equilibrium_against_a_shove():
     p = analyze_hand(en).points[0]
     assert p.spot == "pushfold_facing_shove"
     assert "равновеси" not in p.detail["zone_reason"]
-    # Тот же вывод, что и у шова в неоткрытый банк: гейт закрыт, вилка не держит,
-    # точечной оценки нет (`_UNSTABLE_CALL`).
-    assert p.detail["bracket"] == "unstable" and p.best_action == ""
+    # Тот же вывод, что и у шова в неоткрытый банк: гейт закрыт, интервал не
+    # держит, точечной оценки нет — вердикт «около нуля».
+    assert p.detail["bracket"] == "unstable"
+    assert p.best_action == "около нуля, оба варианта допустимы"
 
 
 def test_a_forfeited_seat_could_not_have_answered_the_shove():
@@ -1721,9 +1749,10 @@ def test_players_behind_axis_is_computed_and_can_disagree():
     p = analyze_hand(enrich(normalize(raw))).points[0]
     assert p.detail["ev_call_bb"] > 0.0 > p.detail["ev_call_all_behind_bb"]
     assert p.detail["behind_axis"] == "unstable"
-    # Вилка по диапазону шовера на этой руке тоже рвётся, поэтому точечной оценки
-    # у точки нет (`_UNSTABLE_CALL`); ось при этом посчитана и видна в `detail`.
-    assert p.best_action == "" and p.detail["bracket"] == "unstable"
+    # Интервал по моделям шова на этой руке тоже лежит по обе стороны нуля, поэтому
+    # точечной оценки у точки нет; ось при этом посчитана и видна в `detail`.
+    assert p.best_action == "около нуля, оба варианта допустимы"
+    assert p.detail["bracket"] == "unstable"
 
 
 def test_zone_for_takes_the_players_behind_axis():
@@ -1758,8 +1787,11 @@ def test_interior_reversal_of_the_bracket_gets_no_point_estimate():
     assert min(values[1:-1]) < 0.0
     assert p.detail["dead_extra_bb"] == pytest.approx(1.0, abs=0.03)
     assert "внутри" in p.detail["zone_reason"]
-    # Разворот внутри интервала — ровно тот случай, в котором точечной оценки нет.
-    assert p.best_action == ""
+    # Разворот внутри интервала — ровно тот случай, в котором точечной оценки нет,
+    # а есть форма «около нуля»: концы интервала берутся по ВСЕЙ сетке, поэтому
+    # нижний конец отрицателен, хотя оба конца сетки плюсовые.
+    assert p.best_action == "около нуля, оба варианта допустимы"
+    assert p.interval is not None and p.interval.low_bb < 0.0 < p.interval.high_bb
 
 
 def test_a_tight_end_still_never_objects_to_a_junk_shove_and_that_is_honest():
@@ -1780,7 +1812,7 @@ def test_a_tight_end_still_never_objects_to_a_junk_shove_and_that_is_honest():
     assert values[0] > 0.0  # вдвое более тесное поле — шов прибылен
     assert values[-1] < 0.0  # вдвое более широкое — крупный минус
     assert p.detail["ev_shove_bb"] < 0.0  # и по самой модели шов минусовой
-    assert p.best_action == ""
+    assert p.best_action == "около нуля, оба варианта допустимы"
 
 
 # --- Цена не должна опираться на то, что вторая ось уже опровергла ---------------
@@ -1838,9 +1870,10 @@ def test_a_verdict_that_flips_with_the_players_behind_names_the_fork():
     assert split.detail["ev_call_bb"] > 0.0 > split.detail["ev_call_all_behind_bb"]
     assert split.detail["best_vs_one"] == "call"
     assert split.detail["best_all_behind"] == "fold"
-    # Вилка по диапазону шовера на этой руке рвётся, и точечной оценки у точки
-    # нет (`_UNSTABLE_CALL`) — развилка остаётся в `detail` двумя вердиктами.
-    assert split.best_action == "" and split.ev_diff_bb == 0.0
+    # Интервал по моделям шова на этой руке лежит по обе стороны нуля, поэтому
+    # точечной оценки у точки нет — развилка остаётся в `detail` двумя вердиктами.
+    assert split.best_action == "около нуля, оба варианта допустимы"
+    assert split.ev_diff_bb == 0.0
 
     agreed = hand(["Ah", "Ad"], hero_calls=True)
     assert agreed.detail["best_vs_one"] == agreed.detail["best_all_behind"] == "call"
