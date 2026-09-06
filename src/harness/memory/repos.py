@@ -491,14 +491,36 @@ class CalcCacheRepo:
         return {key[len(prefix) :]: float(value) for key, value in rows}
 
     async def upsert_many(self, prefix: str, entries: Mapping[str, float]) -> None:
+        """Записать пачку значений, разбивая её на куски по `_UPSERT_CHUNK` строк.
+
+        Куски обязательны, а не оптимизация: одна строка стоит двух связанных
+        параметров, а протокол Postgres их больше 32767 в одном запросе не
+        принимает — с 16384-й строки asyncpg роняет запрос целиком
+        («the number of query arguments cannot exceed 32767»). Кэш эквити растёт
+        от турнира к турниру и этот рубеж переходит; поймано прогоном, где
+        накопленный дисковый кэш дорос до 16884 записей и КАЖДАЯ задача воркера
+        стала падать на записи в `calc_cache`. Закреплено
+        `test_calc_cache_upsert_survives_more_rows_than_one_statement_allows`.
+        """
         if not entries:
             return
         values: list[dict[str, Any]] = [
             {"key": f"{prefix}{key}", "value": value} for key, value in entries.items()
         ]
-        stmt = pg_insert(CalcCache).values(values).on_conflict_do_nothing(index_elements=["key"])
-        await self.db.execute(stmt)
+        for start in range(0, len(values), _UPSERT_CHUNK):
+            stmt = (
+                pg_insert(CalcCache)
+                .values(values[start : start + _UPSERT_CHUNK])
+                .on_conflict_do_nothing(index_elements=["key"])
+            )
+            await self.db.execute(stmt)
         await self.db.flush()
+
+
+# Сколько строк уходит в БД одним INSERT. Потолок протокола Postgres — 32767
+# связанных параметров на запрос, строка кэша стоит двух (ключ и значение),
+# то есть жёсткий предел 16383 строки. 5000 — с запасом и без лишних рейсов.
+_UPSERT_CHUNK = 5000
 
 
 # Квота по умолчанию (спека §9, пример дословно: «разборов 17/50 за 24 ч») — действует,

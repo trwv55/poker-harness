@@ -23,7 +23,9 @@ from harness.engine import enrich
 from harness.memory.models import EvalCase, Job
 from harness.memory.repos import (
     _SESSIONS_LOCK_NS,
+    _UPSERT_CHUNK,
     AnalysesRepo,
+    CalcCacheRepo,
     EvalCasesRepo,
     HandsRepo,
     PlayersRepo,
@@ -293,3 +295,30 @@ async def test_limiter_unlock_all_does_not_steal_the_sessions_lock(db_factory):
             await holder.commit()  # отпускаем лок
             await asyncio.wait_for(waiting, timeout=_RIVAL_TIMEOUT_S)
             await rival.rollback()
+
+
+async def test_calc_cache_upsert_survives_more_rows_than_one_statement_allows(db):
+    """Пачка длиннее одного INSERT записывается целиком, а не роняет задачу.
+
+    Строка кэша стоит двух связанных параметров, а Postgres принимает не больше
+    32767 на запрос: с 16384-й строки asyncpg роняет весь запрос. Кэш эквити
+    растёт от турнира к турниру, и этот рубеж переходит — поймано прогоном, где
+    накопленный дисковый кэш дорос до 16884 записей, и КАЖДАЯ задача воркера
+    стала падать на записи в `calc_cache`, то есть отказ не деградация, а полная
+    остановка обработки.
+
+    Проверяется настоящий предел протокола (больше 16383 строк), а не
+    `_UPSERT_CHUNK`: тест обязан краснеть на неразбитой реализации, а не на
+    неудачно выбранном размере куска.
+    """
+    rows = 16_500
+    assert rows > 32_767 // 2  # тот самый рубеж, а не произвольное большое число
+    entries = {f"k{i}": float(i) for i in range(rows)}
+
+    repo = CalcCacheRepo(db)
+    await repo.upsert_many("equity_mc:test:", entries)
+
+    stored = await repo.get_all("equity_mc:test:")
+    assert len(stored) == rows
+    assert stored["k0"] == 0.0 and stored[f"k{rows - 1}"] == float(rows - 1)
+    assert _UPSERT_CHUNK * 2 <= 32_767  # кусок обязан помещаться в предел протокола
