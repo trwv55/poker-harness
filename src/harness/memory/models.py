@@ -79,6 +79,12 @@ class Player(Base):
     tg_user_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
     # NULL = у игрока нет персонального переопределения, действует дефолт из
     # Config (спека §7: "квоты по умолчанию" — конфиг, не схема БД).
+    # Ник в руме — единственный способ опознать героя на скриншоте КОДОМ, а не
+    # моделью (реестр vision, решение 2026-09-05: измерено, что Sonnet назвал
+    # героем победителя на трёх экранах из трёх, и ни одна контрольная сумма
+    # этого не ловит). NULL — ника ещё не спросили; тогда разбор скрина
+    # упирается в вопрос игроку, а не угадывает.
+    gg_nickname: Mapped[str | None] = mapped_column(String(64))
     quota_daily: Mapped[int | None] = mapped_column(Integer)
     subscription: Mapped[str] = mapped_column(String(32), nullable=False, server_default="free")
     is_dev: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())

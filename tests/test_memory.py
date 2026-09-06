@@ -28,6 +28,7 @@ from harness.memory.repos import (
     CalcCacheRepo,
     EvalCasesRepo,
     HandsRepo,
+    JobsRepo,
     PlayersRepo,
     SessionsRepo,
     TournamentsRepo,
@@ -456,3 +457,88 @@ async def test_past_scan_summaries_do_not_leak_between_players(db):
     )
 
     assert await TournamentsRepo(db).player_scan_summaries(mine, exclude=0) == []
+
+
+# --- задача 22: ник в руме и патч сырой руки ---------------------------------
+
+
+async def test_migration_0003_gives_players_a_room_nickname_column(pg):
+    """Миграция 0003 прокатана тем же путём, что 0001 и 0002 — на живом Postgres.
+
+    Колонка nullable: у игроков, заведённых раньше, ника нет, и разбор скрина у
+    них упирается в вопрос игроку, а не в отказ.
+    """
+    engine = create_async_engine(pg.get_connection_url(driver="asyncpg"))
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "select column_name, is_nullable, character_maximum_length "
+                    "from information_schema.columns "
+                    "where table_name='players' and column_name='gg_nickname'"
+                )
+            )
+            row = result.first()
+    finally:
+        await engine.dispose()
+    assert row is not None
+    assert (row[1], row[2]) == ("YES", 64)
+
+
+async def test_the_room_nickname_is_written_once_and_read_back(db):
+    player = await PlayersRepo(db).get_or_create(tg_user_id=4242)
+    assert player.gg_nickname is None
+    await PlayersRepo(db).set_gg_nickname(player.id, "  nick_on_screen  ")
+    await db.refresh(player)
+    assert player.gg_nickname == "nick_on_screen"
+
+
+async def test_an_empty_room_nickname_is_refused_rather_than_stored(db):
+    """«Ник неизвестен» — это NULL; пустая строка была бы вторым таким значением."""
+    player = await PlayersRepo(db).get_or_create(tg_user_id=4243)
+    with pytest.raises(ValueError, match="пустым"):
+        await PlayersRepo(db).set_gg_nickname(player.id, "   ")
+
+
+async def test_patching_the_raw_hand_resets_the_checkpoints_below_it(db):
+    """Спека §8.3: ответ игрока патчит `raw`, а `canonical`/`enriched` пересчитываются.
+
+    Строка с новым `raw` и старым `enriched` описывала бы две разные руки сразу,
+    поэтому сброс идёт той же записью, что и патч.
+    """
+    session_id = await _make_session(db)
+    en = _make_enriched()
+    hid = await HandsRepo(db).save_raw(
+        session_id=session_id, raw=RawHand.model_validate(make_min_raw())
+    )
+    await HandsRepo(db).save_canonical(hid, en.hand)
+    await HandsRepo(db).save_enriched(hid, en)
+
+    patched = RawHand.model_validate(make_min_raw(level=99))
+    await HandsRepo(db).replace_raw(hid, patched)
+
+    got = await HandsRepo(db).get(hid)
+    assert got.raw.level == 99
+    assert got.canonical is None and got.enriched is None
+
+
+async def test_the_job_waiting_for_the_player_is_found_by_the_player(db):
+    """Состояние ожидания живёт в `jobs`, а не в памяти бота: оно переживает перезапуск."""
+    session_id = await _make_session(db)
+    player = await PlayersRepo(db).get_or_create(tg_user_id=777)
+    await db.execute(
+        insert(Job).values(
+            type="screenshot_analyze",
+            status="awaiting_user",
+            payload={"escalation_field": "pot"},
+            session_id=session_id,
+            player_id=player.id,
+        )
+    )
+    found = await JobsRepo(db).awaiting_user(player.id)
+    assert found is not None and found.payload["escalation_field"] == "pot"
+
+
+async def test_no_waiting_job_is_not_an_error(db):
+    player = await PlayersRepo(db).get_or_create(tg_user_id=778)
+    assert await JobsRepo(db).awaiting_user(player.id) is None

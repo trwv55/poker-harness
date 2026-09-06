@@ -426,3 +426,43 @@ async def test_edit_still_raises_on_any_other_bad_request():
             await sender.edit(777, 4242, Msg(text="Считаю эквити…"))
     finally:
         await client.aclose()
+
+
+def test_the_expensive_vision_model_is_optional_and_empty_means_absent(monkeypatch):
+    """Необязательная переменная: пустая строка равна незаданной (правило `.env.example`).
+
+    `env_file` в Compose передаёт строку `ИМЯ=` как ПУСТОЕ ЗНАЧЕНИЕ, а не как
+    отсутствие переменной, — тот же отказ, что уронил воркер в ревью задачи 20,
+    и закрыт он тем же `optional_env`.
+    """
+    from harness.platform.config import Config
+
+    for name, value in {
+        "LLM_VISION_MODEL": "anthropic:sonnet",
+        "LLM_VERDICT_MODEL": "anthropic:haiku",
+        "LLM_MAX_CONCURRENCY": "4",
+        "LLM_MAX_PER_MINUTE": "60",
+        "DATABASE_URL": "postgresql+asyncpg://x/y",
+        "TELEGRAM_TOKEN": "t",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    monkeypatch.delenv("LLM_VISION_FALLBACK_MODEL", raising=False)
+    assert Config.from_env().llm_vision_fallback_model == ""
+    monkeypatch.setenv("LLM_VISION_FALLBACK_MODEL", "")
+    assert Config.from_env().llm_vision_fallback_model == ""
+    monkeypatch.setenv("LLM_VISION_FALLBACK_MODEL", "anthropic:opus")
+    assert Config.from_env().llm_vision_fallback_model == "anthropic:opus"
+
+
+def test_the_env_example_documents_the_expensive_vision_model_commented_out():
+    """Правило файла: всякая необязательная переменная приезжает закомментированной.
+
+    Раскомментировал значит задал; строка `ИМЯ=` в `.env` означала бы пустое
+    значение, а не отсутствие переменной.
+    """
+    from pathlib import Path
+
+    text = (Path(__file__).parent.parent / ".env.example").read_text(encoding="utf-8")
+    assert "#LLM_VISION_FALLBACK_MODEL=" in text
+    assert "\nLLM_VISION_FALLBACK_MODEL=" not in text

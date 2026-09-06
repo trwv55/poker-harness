@@ -98,6 +98,7 @@ from tests.conftest import FIXTURE_DAILY, requires_fixtures, requires_prompts
 # что модель никогда не резолвится и в сеть эти тесты не стучатся.
 _TEST_CFG = Config(
     llm_vision_model="anthropic:claude-sonnet-test",
+    llm_vision_fallback_model="anthropic:claude-opus-test",
     llm_verdict_model="anthropic:claude-haiku-test",
     llm_max_concurrency=4,
     llm_max_per_minute=1000,

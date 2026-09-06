@@ -124,6 +124,13 @@ class Config:
     """
 
     llm_vision_model: str
+    # Вторая ступень каскада зрения (задача 22): дорогая модель, на которой
+    # перечитывается экран, не прошедший контрольную сумму. НЕОБЯЗАТЕЛЬНА —
+    # пустая строка означает «каскада нет», и тогда первая же несошедшаяся сверка
+    # уходит вопросом игроку. Обязательной её делать нельзя: она добавила бы
+    # седьмую переменную в `from_env`, без которой не поднялся бы и HH-путь,
+    # модель не зовущий вовсе.
+    llm_vision_fallback_model: str
     llm_verdict_model: str
     llm_max_concurrency: int
     llm_max_per_minute: int
@@ -134,6 +141,7 @@ class Config:
     def from_env(cls) -> Config:
         return cls(
             llm_vision_model=_require("LLM_VISION_MODEL"),
+            llm_vision_fallback_model=optional_env("LLM_VISION_FALLBACK_MODEL", ""),
             llm_verdict_model=_require("LLM_VERDICT_MODEL"),
             llm_max_concurrency=_require_int("LLM_MAX_CONCURRENCY"),
             llm_max_per_minute=_require_int("LLM_MAX_PER_MINUTE"),

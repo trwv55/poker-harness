@@ -139,6 +139,15 @@ class LLMSchemaError(Exception):
     """
 
 
+class LLMNotConfigured(Exception):
+    """Назначение вызова требует модели, которой в конфиге нет.
+
+    Отдельно от `LLMProviderError`: провайдер тут ни при чём, дело в переменной
+    окружения, и оператору надо править `.env`, а не ждать, пока провайдер
+    оживёт.
+    """
+
+
 class LLMProviderError(Exception):
     """Провайдер вернул 429/5xx на всех `_MAX_HTTP_ATTEMPTS` попытках экспоненциального
     бэкоффа — исчерпание ретраев, а не первая неудача (см. `LLMSchemaError`)."""
@@ -198,7 +207,7 @@ class LLM:
 
     async def __call__(
         self,
-        purpose: Literal["vision_extract", "verdict_text"],
+        purpose: Literal["vision_extract", "vision_extract_fallback", "verdict_text"],
         schema: type[T],
         *,
         prompt: str,
@@ -274,11 +283,24 @@ class LLM:
             ) from last_schema_error
 
     def _resolve_model(self, purpose: str) -> str:
-        return (
-            self._cfg.llm_vision_model
-            if purpose == "vision_extract"
-            else self._cfg.llm_verdict_model
-        )
+        """Модель по назначению вызова — строка конфига, а не ветка кода.
+
+        `vision_extract_fallback` — вторая ступень каскада зрения (задача 22).
+        Её переменная окружения необязательна, и вызвать это назначение с пустой
+        строкой значит попросить `Agent("")` — отказ провайдера тремя уровнями
+        глубже вместо названной причины. Поэтому проверка здесь: решение «звать
+        ли дорогую модель» принимает адаптер, а этот отказ ловит того, кто
+        решение обошёл.
+        """
+        if purpose == "vision_extract":
+            return self._cfg.llm_vision_model
+        if purpose == "vision_extract_fallback":
+            if not self._cfg.llm_vision_fallback_model:
+                raise LLMNotConfigured(
+                    "LLM_VISION_FALLBACK_MODEL не задана — второй ступени каскада нет"
+                )
+            return self._cfg.llm_vision_fallback_model
+        return self._cfg.llm_verdict_model
 
     async def _attempt(
         self,

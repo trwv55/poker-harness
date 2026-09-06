@@ -58,6 +58,20 @@ class PlayersRepo:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
 
+    async def set_gg_nickname(self, player_id: int, nickname: str) -> None:
+        """Записать ник игрока в руме — вход опознания героя на скриншоте.
+
+        Спрашивается один раз (задачи 19/23); здесь только запись. Пустой строкой
+        не затирается: «ник неизвестен» это NULL, и превращать его в пустую
+        строку значило бы завести второе значение с тем же смыслом.
+        """
+        if not nickname.strip():
+            raise ValueError("ник в руме не может быть пустым")
+        await self.db.execute(
+            update(Player).where(Player.id == player_id).values(gg_nickname=nickname.strip())
+        )
+        await self.db.flush()
+
     async def get_or_create(self, tg_user_id: int) -> Player:
         """Найти игрока или завести — безопасно при гонке (fix round 1 задачи 19).
 
@@ -228,6 +242,21 @@ class HandsRepo:
         self.db.add(record)
         await self.db.flush()
         return record.id
+
+    async def replace_raw(self, hand_id: int, raw: RawHand) -> None:
+        """Переписать `hands.raw` и СБРОСИТЬ чекпоинты ниже по конвейеру.
+
+        Спека §8.3, шаг 2: ответ игрока на вопрос валидатора патчит сырую руку, а
+        `canonical`/`enriched` пересчитываются. Сброс здесь, а не у вызывающего, —
+        потому что разъединить эти две записи некому: строка с новым `raw` и
+        старым `enriched` описывает две разные руки сразу, и любой, кто прочитает
+        её между двумя апдейтами, получит именно это.
+        """
+        record = await self._get_row(hand_id)
+        record.raw = raw.model_dump(mode="json")
+        record.canonical = None
+        record.enriched = None
+        await self.db.flush()
 
     async def save_canonical(self, hand_id: int, canonical: CanonicalHand) -> None:
         record = await self._get_row(hand_id)
@@ -536,6 +565,22 @@ class JobsRepo:
                 Job.type == "hh_scan",
                 Job.payload["source_file"].astext == source_file,
             )
+            .order_by(Job.id.desc())
+            .limit(1)
+        )
+        return await self.db.scalar(stmt)
+
+    async def awaiting_user(self, player_id: int) -> Job | None:
+        """Задача игрока, ждущая его ответа, — самая свежая, если их несколько.
+
+        Ей адресован и нажатый callback эскалации, и число, введённое вручную:
+        состояние ввода живёт в `jobs.payload`, а не в памяти процесса бота
+        (спека §8.3 — точка возврата уже зафиксирована артефактами, и переживать
+        она обязана перезапуск бота так же, как переживает его сама задача).
+        """
+        stmt = (
+            select(Job)
+            .where(Job.player_id == player_id, Job.status == "awaiting_user")
             .order_by(Job.id.desc())
             .limit(1)
         )
