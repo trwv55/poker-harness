@@ -19,6 +19,27 @@ class Provenance(StrEnum):
     SCREENSHOT = "screenshot"
 
 
+class Completeness(StrEnum):
+    """Рука целиком или состояние в точке решения — выводится из ПРОЧИТАННОГО.
+
+    Решение владельца C1 отдельного типа экрана не вводит: классифицировать экран
+    мы не беремся. Полнота — не тип экрана, а свойство того, что на нём удалось
+    прочитать: есть результат или вскрытие — рука дошла до конца и её можно
+    проиграть движком; нет — перед нами состояние в точке решения, без истории
+    улиц, результата и вскрытия (реестр E1).
+
+    Различие меняет путь в ядро: `HAND` идёт в реплей и полную сверку денег,
+    `STATE` — в `harness.engine.state`, где сверки денег с румом нет по
+    построению (у скрина нет строк `collected`). Валидатор при этом НЕ считает
+    неполный вход битым — см. `harness.engine.validation.validate`.
+
+    `hand_history` всегда `HAND`: рум пишет руку целиком.
+    """
+
+    HAND = "hand"
+    STATE = "state"
+
+
 class Street(StrEnum):
     PREFLOP = "preflop"
     FLOP = "flop"
@@ -88,6 +109,36 @@ class SummaryInfo(BaseModel):
     seat_lines: list[str] = []
 
 
+class VisionHop(BaseModel):
+    """Одна ступень каскада моделей: кто читал и чем кончилось.
+
+    Каскад — решение владельца 2026-09-06, п.4: чтение дешёвой моделью
+    (`LLM_VISION_MODEL`), провал любой контрольной суммы — повтор на дорогой
+    (`LLM_VISION_FALLBACK_MODEL`), провал и там — вопрос игроку. Ступени
+    сохраняются здесь, чтобы после эскалации было видно, на какой из них
+    расхождение появилось, а не только что оно есть.
+    """
+
+    role: str  # "primary" | "fallback"
+    model: str
+    failed_checks: list[str] = []
+    error: str | None = None
+
+
+class VisionCheck(BaseModel):
+    """Итог одной контрольной суммы: имя, прошла ли, и два сравненных значения.
+
+    `options` — то, что предъявляется игроку кнопками при эскалации: расхождение
+    двух независимых прочтений даёт ровно два кандидата, и выбирать между ними
+    игроку проще, чем вводить число (спека §8.3).
+    """
+
+    name: str
+    passed: bool
+    detail: str = ""
+    options: list[str] = []
+
+
 class VisionMeta(BaseModel):  # только для скринов
     confidence: dict[str, float] = {}
     needs_review: list[str] = []
@@ -95,11 +146,24 @@ class VisionMeta(BaseModel):  # только для скринов
     nicknames: dict[str, str] = {}
     bounties: dict[str, int] = {}
     displayed_pot: int | None = None
+    # Ниже — поля задачи 22. Все необязательные: правило эволюции контрактов
+    # (Global Constraints плана) разрешает только добавление необязательных
+    # полей, иначе уже записанный jsonb перестал бы читаться новой моделью.
+    hops: list[VisionHop] = []
+    checks: list[VisionCheck] = []
+    unsure_fields: list[str] = []
+    # Ники, прочитанные моделью, среди которых код искал героя по нику из
+    # профиля. Хранятся затем, чтобы эскалация «кто из них вы» могла предложить
+    # тот же список, что видел код, а не перечитывать экран заново.
+    hero_candidates: list[str] = []
 
 
 class RawHand(BaseModel):
     schema_version: int = 1
     provenance: Provenance
+    # Полнота входа (см. `Completeness`). Умолчание — рука целиком: так читается
+    # весь уже записанный jsonb HH-пути, где иначе и не бывает.
+    completeness: Completeness = Completeness.HAND
     source_ref: str
     hand_no: str
     tournament_id: str

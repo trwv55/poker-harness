@@ -1,8 +1,8 @@
 """Контракты данных: модели, которыми обмениваются сервисы конвейера.
 
 Публичный API пакета — реэкспорт из всех подмодулей (`raw`, `canonical`,
-`enriched`, `ranges`, `analysis`, `explanation`), чтобы последующие задачи импортировали
-из `harness.contracts`, а не из отдельных модулей.
+`enriched`, `ranges`, `analysis`, `explanation`, `vision`), чтобы последующие задачи
+импортировали из `harness.contracts`, а не из отдельных модулей.
 """
 
 from __future__ import annotations
@@ -49,6 +49,7 @@ from harness.contracts.ranges import RANKS, Range, all_classes, class_of
 from harness.contracts.raw import (
     ActionKind,
     Collected,
+    Completeness,
     Post,
     PostKind,
     Provenance,
@@ -59,8 +60,11 @@ from harness.contracts.raw import (
     Street,
     SummaryInfo,
     Uncalled,
+    VisionCheck,
+    VisionHop,
     VisionMeta,
 )
+from harness.contracts.vision import SeenAction, SeenPlayer, Unit, VisionReading
 
 __all__ = [
     "RANKS",
@@ -72,6 +76,7 @@ __all__ = [
     "CanonicalHand",
     "ChipMove",
     "Collected",
+    "Completeness",
     "DecisionPoint",
     "EngineReport",
     "EnrichedHand",
@@ -93,6 +98,8 @@ __all__ = [
     "ScanItem",
     "ScanSummary",
     "SeatInfo",
+    "SeenAction",
+    "SeenPlayer",
     "ShowdownEntry",
     "SidePot",
     "SpotKind",
@@ -102,11 +109,15 @@ __all__ = [
     "TournamentReport",
     "TournamentTextOut",
     "Uncalled",
+    "Unit",
     "ValidationStatus",
     "Verdict",
     "VerdictLabel",
     "VerdictTextOut",
+    "VisionCheck",
+    "VisionHop",
     "VisionMeta",
+    "VisionReading",
     "Zone",
     "all_classes",
     "class_of",

@@ -87,3 +87,86 @@ def test_ev_interval_rejects_a_point_outside_its_own_interval():
         EvInterval(point_bb=1.5, low_bb=-0.3, high_bb=0.8)
     with pytest.raises(ValidationError):
         EvInterval(point_bb=0.1, low_bb=0.8, high_bb=-0.3)  # концы перепутаны местами
+
+
+# --- задача 22: полнота входа и схема наблюдений vision -----------------------
+
+
+def test_a_hand_written_before_task_22_reads_as_a_whole_hand():
+    """Уже записанный jsonb без поля полноты обязан читаться как рука целиком.
+
+    Эволюция контрактов — только необязательными полями (Global Constraints
+    плана): весь HH-путь писал `hands.raw` до появления `completeness`, и другой
+    полноты у него не бывает.
+    """
+    from harness.contracts import Completeness
+
+    stored = make_min_raw()
+    assert "completeness" not in stored
+    assert RawHand.model_validate(stored).completeness is Completeness.HAND
+
+
+def test_a_state_hand_is_marked_as_such_and_survives_a_roundtrip():
+    from harness.contracts import Completeness
+
+    hand = RawHand.model_validate(make_min_raw(completeness="state"))
+    assert hand.completeness is Completeness.STATE
+    assert RawHand.model_validate_json(hand.model_dump_json()).completeness is Completeness.STATE
+
+
+def test_a_decision_point_may_have_no_action_taken_yet():
+    """Точка решения без действия — живой стол до хода героя.
+
+    Судить там нечего, и `action` обязан быть необязательным: иначе состояние в
+    точке решения нельзя выразить, не придумав действие, которого игрок не делал.
+    """
+    from harness.contracts import DecisionPoint, Street
+
+    dp = DecisionPoint(
+        index=0,
+        street=Street.PREFLOP,
+        label="Hero",
+        position="BB",
+        to_call=9000,
+        pot_before=14700,
+        eff_stack=36700,
+        eff_stack_bb=36.7,
+    )
+    assert dp.action is None
+
+
+def test_a_verdict_names_the_checks_it_could_not_run():
+    """`not_checked` — то, чего проверить НЕ ИЗ ЧЕГО, названное поимённо."""
+    from harness.contracts import ValidationStatus, Verdict
+
+    assert Verdict(status=ValidationStatus.PASS).not_checked == []
+    named = Verdict(status=ValidationStatus.PASS, not_checked=["payouts"])
+    assert named.not_checked == ["payouts"]
+
+
+def test_the_reading_keeps_the_two_card_renderings_apart():
+    """Карты у места и карты в логе — два независимых наблюдения, а не одно.
+
+    Измерено (реестр, «Карты отрисованы дважды»): спрошенная один раз модель
+    схлопывает избыточность экрана и подставляет одно чтение в оба места.
+    """
+    from harness.contracts import SeenPlayer
+
+    player = SeenPlayer(seat=1, cards_at_seat=["As", "5c"], cards_in_log=["As", "5s"])
+    assert player.cards_at_seat != player.cards_in_log
+
+
+def test_the_reading_keeps_the_ante_pool_apart_from_the_per_player_ante():
+    """Пул анте и подушевое анте — разные поля: делит код, не модель (реестр B2)."""
+    from harness.contracts import Unit, VisionReading
+
+    reading = VisionReading(ante_pool_shown=6800.0, ante_unit=Unit.CHIPS)
+    assert reading.ante_per_player_shown is None
+
+
+def test_the_reading_can_refuse_a_screen_that_is_not_a_hand():
+    """Честный отказ дешевле выдуманной из лобби руки (реестр C3)."""
+    from harness.contracts import VisionReading
+
+    reading = VisionReading(not_a_hand=True, refusal_reason="это лобби турнира")
+    assert reading.players == []

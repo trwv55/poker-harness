@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from harness.contracts.raw import (
     ActionKind,
     Collected,
+    Completeness,
     Post,
     Provenance,
     ShowdownEntry,
@@ -53,6 +54,9 @@ class CanonicalAction(BaseModel):
 class CanonicalHand(BaseModel):
     schema_version: int = 1
     provenance: Provenance
+    # Полнота входа переносится из `RawHand` без изменений: маршрут в ядро
+    # выбирает `harness.engine.enrich`, а он видит только каноническую руку.
+    completeness: Completeness = Completeness.HAND
     tournament_id: str
     hand_no: str
     hand_index: int | None = None
