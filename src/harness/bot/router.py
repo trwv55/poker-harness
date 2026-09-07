@@ -24,25 +24,32 @@ from __future__ import annotations
 import structlog
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     CallbackQuery,
     ErrorEvent,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 
 from harness.bot.handlers import (
     ESCALATION_PREFIX,
+    UI_CALLBACK_PREFIXES,
     BotDeps,
     handle_deep_dive_callback,
     handle_document,
     handle_escalation_callback,
+    handle_invite_command,
     handle_new_session,
+    handle_nickname_command,
     handle_photo,
     handle_start,
     handle_text,
+    handle_ui_callback,
 )
 from harness.presentation import (
     Msg,
@@ -60,7 +67,18 @@ _log = structlog.get_logger(__name__)
 DEEP_DIVE_PREFIX = "deep:"
 
 
-def _markup(msg: Msg) -> InlineKeyboardMarkup | None:
+def _markup(msg: Msg) -> InlineKeyboardMarkup | ReplyKeyboardMarkup | None:
+    """Клавиатура сообщения: инлайн-кнопки ИЛИ нижнее меню — их не бывает двух.
+
+    Взаимное исключение обеспечивает сам `Msg` (у Bot API одно поле
+    `reply_markup`), здесь только выбор ветки. `resize_keyboard` — чтобы шесть
+    кнопок меню не занимали пол-экрана телефона.
+    """
+    if msg.menu is not None:
+        return ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text=label) for label in row] for row in msg.menu],
+            resize_keyboard=True,
+        )
     if not msg.buttons:
         return None
     return InlineKeyboardMarkup(
@@ -69,6 +87,22 @@ def _markup(msg: Msg) -> InlineKeyboardMarkup | None:
             for row in msg.buttons
         ]
     )
+
+
+async def _deliver(bot: Bot, chat_id: int, msg: Msg) -> None:
+    """Отправить сообщение целиком: текст, потом картинки к нему.
+
+    Картинки идут отдельными сообщениями и после текста — так они читаются как
+    приложение к сказанному. Файл берётся с диска (`FSInputFile`): матрицы
+    диапазонов рисует воркер и кладёт в общий том (`docker-compose.yml`), а не
+    передаёт байтами через БД.
+    """
+    if msg.text:
+        await bot.send_message(
+            chat_id, msg.text, reply_markup=_markup(msg), parse_mode=msg.parse_mode
+        )
+    for photo in msg.photos:
+        await bot.send_photo(chat_id, FSInputFile(photo.path), caption=photo.caption)
 
 
 async def _download(bot: Bot, file_id: str) -> bytes:
@@ -97,19 +131,46 @@ def build_router(deps: BotDeps) -> Router:
     """
     router = Router(name="harness")
 
+    @router.message(CommandStart(deep_link=True))
+    async def on_start_with_code(message: Message, bot: Bot, command: CommandObject) -> None:
+        """`/start КОД` — вход по инвайту (deep-link `t.me/бот?start=КОД`)."""
+        if message.from_user is None:
+            return
+        msg = await handle_start(deps, message.from_user.id, command.args or "")
+        await _deliver(bot, message.chat.id, msg)
+
     @router.message(CommandStart())
-    async def on_start(message: Message) -> None:
+    async def on_start(message: Message, bot: Bot) -> None:
         if message.from_user is None:
             return
         msg = await handle_start(deps, message.from_user.id)
-        await message.answer(msg.text, reply_markup=_markup(msg))
+        await _deliver(bot, message.chat.id, msg)
+
+    @router.message(Command("nick"))
+    async def on_nick(message: Message, bot: Bot) -> None:
+        if message.from_user is None:
+            return
+        msg = await handle_nickname_command(deps, message.from_user.id)
+        if msg is None:
+            return
+        await _deliver(bot, message.chat.id, msg)
+
+    @router.message(Command("invite"))
+    async def on_invite(message: Message, bot: Bot) -> None:
+        """`/invite` — команда владельца. Чужому нажатию не отвечает ничего."""
+        if message.from_user is None:
+            return
+        msg = await handle_invite_command(deps, message.from_user.id)
+        if msg is None:
+            return
+        await _deliver(bot, message.chat.id, msg)
 
     @router.message(Command("new"))
-    async def on_new(message: Message) -> None:
+    async def on_new(message: Message, bot: Bot) -> None:
         if message.from_user is None:
             return
         msg = await handle_new_session(deps, message.from_user.id)
-        await message.answer(msg.text, reply_markup=_markup(msg))
+        await _deliver(bot, message.chat.id, msg)
 
     @router.message(F.document)
     async def on_document(message: Message, bot: Bot) -> None:
@@ -122,7 +183,7 @@ def build_router(deps: BotDeps) -> Router:
             file_bytes=file_bytes,
             filename=message.document.file_name or "",
         )
-        await message.answer(msg.text, reply_markup=_markup(msg))
+        await _deliver(bot, message.chat.id, msg)
 
     @router.message(F.photo)
     async def on_photo(message: Message, bot: Bot) -> None:
@@ -138,7 +199,7 @@ def build_router(deps: BotDeps) -> Router:
         msg = await handle_photo(deps, message.from_user.id, file_bytes)
         if msg is None:
             return
-        await message.answer(msg.text, reply_markup=_markup(msg))
+        await _deliver(bot, message.chat.id, msg)
 
     @router.callback_query(F.data.startswith(DEEP_DIVE_PREFIX))
     async def on_deep_dive(callback: CallbackQuery, bot: Bot) -> None:
@@ -154,7 +215,23 @@ def build_router(deps: BotDeps) -> Router:
         # `chat_id == tg_user_id` для приватного чата (то же равенство, что в
         # `worker/pipeline.py::_chat_id`) — не полагаемся на `callback.message`,
         # которого у старого сообщения может уже не быть.
-        await bot.send_message(callback.from_user.id, msg.text, reply_markup=_markup(msg))
+        await _deliver(bot, callback.from_user.id, msg)
+
+    @router.callback_query(F.data.startswith(UI_CALLBACK_PREFIXES))
+    async def on_ui(callback: CallbackQuery, bot: Bot) -> None:
+        """Кнопки экранов задачи 23 — один вход на все префиксы.
+
+        Фильтр перечисляет ровно те префиксы, которые разбирает
+        `handle_ui_callback`: кнопка с любым другим по-прежнему доходит до
+        общего ответа «ещё не работает» ниже, а не пропадает молча.
+        """
+        await callback.answer()
+        if callback.data is None:
+            return
+        msg = await handle_ui_callback(deps, callback.from_user.id, callback.data)
+        if msg is None:
+            return
+        await _deliver(bot, callback.from_user.id, msg)
 
     @router.callback_query(F.data.startswith(ESCALATION_PREFIX))
     async def on_escalation(callback: CallbackQuery, bot: Bot) -> None:
@@ -165,10 +242,10 @@ def build_router(deps: BotDeps) -> Router:
         msg = await handle_escalation_callback(deps, callback.from_user.id, callback.data)
         if msg is None:
             return
-        await bot.send_message(callback.from_user.id, msg.text, reply_markup=_markup(msg))
+        await _deliver(bot, callback.from_user.id, msg)
 
     @router.message(F.text & ~F.text.startswith("/"))
-    async def on_text(message: Message) -> None:
+    async def on_text(message: Message, bot: Bot) -> None:
         """Обычный текст: ник в руме либо число, введённое вручную по эскалации.
 
         Команды сюда не попадают — их обработчики зарегистрированы выше, а
@@ -180,7 +257,7 @@ def build_router(deps: BotDeps) -> Router:
         msg = await handle_text(deps, message.from_user.id, message.text)
         if msg is None:
             return
-        await message.answer(msg.text, reply_markup=_markup(msg))
+        await _deliver(bot, message.chat.id, msg)
 
     @router.callback_query()
     async def on_unhandled_callback(callback: CallbackQuery) -> None:

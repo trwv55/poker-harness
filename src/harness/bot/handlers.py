@@ -35,11 +35,17 @@ from pathlib import Path
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from harness.memory.models import Job
+from harness.bot.menus import render_menu_screen, session_summary_screen
+from harness.contracts import NOTE_COLORS
+from harness.explanation.hand_replay import hand_replay
+from harness.memory.models import Job, Player
 from harness.memory.repos import (
+    AnalysesRepo,
     EvalCasesRepo,
     HandsRepo,
+    InvitesRepo,
     JobsRepo,
+    NotesRepo,
     PlayersRepo,
     QuotaCheck,
     QuotaRepo,
@@ -49,14 +55,42 @@ from harness.memory.repos import (
 from harness.parsers.vision_adapter import apply_vision_answer
 from harness.platform.queue import JobsQueue
 from harness.presentation import (
+    DETAIL_PREFIX,
+    DISAGREE_PREFIX,
+    NEW_SESSION_DATA,
+    NOTE_ADD_PREFIX,
+    NOTE_COLOR_PREFIX,
+    NOTE_COLOR_SET_PREFIX,
+    NOTE_DELETE_PREFIX,
+    NOTE_EDIT_PREFIX,
+    RANGES_PREFIX,
+    SESSION_PREFIX,
+    SET_NICKNAME_DATA,
     Msg,
+    analysis_unavailable_msg,
     ask_gg_nickname_msg,
+    disagreement_saved_msg,
     gg_nickname_saved_msg,
+    gg_nickname_too_long_msg,
     hh_accepted_msg,
     hh_duplicate_msg,
+    invite_accepted_msg,
+    invite_created_msg,
+    invite_required_msg,
     new_session_msg,
+    note_color_prompt_msg,
+    note_color_saved_msg,
+    note_deleted_msg,
+    note_gone_msg,
+    note_prompt_msg,
+    note_saved_msg,
     quota_exceeded_msg,
+    ranges_msg,
+    replay_msg,
+    replay_unavailable_msg,
+    session_unavailable_msg,
     start_msg,
+    unknown_text_msg,
     unsupported_document_msg,
     vision_answer_not_a_number_msg,
     vision_answer_saved_msg,
@@ -65,16 +99,20 @@ from harness.presentation import (
 
 __all__ = [
     "ESCALATION_PREFIX",
+    "UI_CALLBACK_PREFIXES",
     "BotDeps",
     "QuotaCheck",
     "check_quota",
     "handle_deep_dive_callback",
     "handle_document",
     "handle_escalation_callback",
+    "handle_invite_command",
     "handle_new_session",
+    "handle_nickname_command",
     "handle_photo",
     "handle_start",
     "handle_text",
+    "handle_ui_callback",
 ]
 
 # Префикс `callback_data` кнопок эскалации — тот же, что собирает
@@ -84,6 +122,34 @@ ESCALATION_PREFIX = "escalate:"
 
 # Значение, которым кнопка «ввести вручную» отличается от кнопки с числом.
 MANUAL_ANSWER = "manual"
+
+# Что означает следующее текстовое сообщение игрока (`players.pending_input`).
+# Ввод открывается только явным действием — командой или кнопкой; молча в это
+# состояние продукт больше не входит (решение владельца 2026-09-07).
+_INPUT_NICKNAME = "gg_nickname"
+_INPUT_NOTE = "note"
+
+# Ник в руме не длиннее колонки `players.gg_nickname` (`String(64)`). Число здесь
+# не второе определение предела, а ссылка на него: длиннее БД просто не примет.
+_MAX_NICKNAME = 64
+
+# Префиксы `callback_data`, которые разбирает `handle_ui_callback`. Роутер
+# фильтрует нажатия ровно по этому кортежу, поэтому кнопка с любым другим
+# префиксом по-прежнему доходит до общего ответа «ещё не работает» — а не
+# проваливается в тишину (round 5, Item G).
+UI_CALLBACK_PREFIXES: tuple[str, ...] = (
+    SESSION_PREFIX,
+    NEW_SESSION_DATA,
+    NOTE_COLOR_SET_PREFIX,
+    NOTE_COLOR_PREFIX,
+    NOTE_EDIT_PREFIX,
+    NOTE_DELETE_PREFIX,
+    NOTE_ADD_PREFIX,
+    SET_NICKNAME_DATA,
+    RANGES_PREFIX,
+    DETAIL_PREFIX,
+    DISAGREE_PREFIX,
+)
 
 # PokerCraft отдаёт историю раздач текстом; всё остальное сканировать нечем.
 _HH_SUFFIX = ".txt"
@@ -155,21 +221,84 @@ async def check_quota(deps: BotDeps, player_id: int) -> QuotaCheck:
         return await QuotaRepo(db).check(player_id)
 
 
-async def handle_start(deps: BotDeps, tg_user_id: int) -> Msg:
-    """`/start`: завести игрока и объяснить один следующий шаг.
+async def handle_start(deps: BotDeps, tg_user_id: int, payload: str = "") -> Msg:
+    """`/start [код]`: впустить по инвайту и объяснить один следующий шаг.
 
     Сессию НЕ открывает. Молчаливое создание привязано к присланному материалу
     (SESSIONS_UX: «скрин без активной сессии»), а не к нажатию «Start»: сессия,
     открытая на приветствии, к вечеру игры отношения не имеет и только
     испортила бы границу первого настоящего вечера.
 
-    Инвайты — задача 23; до неё `players`-запись заводится без ограничений
-    (закрытый догфудинг, бриф задачи 19 дословно).
+    **Вход по инвайту (задача 23).** Уже заведённый игрок здоровается как
+    прежде — код у него не спрашивают. Незнакомцу нужен код: `players`-строка
+    заводится и код гасится в ОДНОЙ транзакции, поэтому непогашенный код не
+    оставляет за собой игрока, которого никто не приглашал
+    (`test_a_start_with_a_bad_code_leaves_no_player_behind`).
+
+    Код приезжает из deep-link (`t.me/bot?start=КОД` — Телеграм отдаёт его
+    аргументом команды), поэтому это внешние данные: гасит их `InvitesRepo`
+    одним `UPDATE ... WHERE used_by IS NULL`, а не проверка «прочитали и
+    записали».
     """
     async with deps.db_factory() as db:
-        await PlayersRepo(db).get_or_create(tg_user_id)
+        players = PlayersRepo(db)
+        player = await players.find(tg_user_id)
+        if player is not None:
+            await db.commit()
+            return start_msg()
+        code = payload.strip()
+        if not code:
+            await db.commit()
+            return invite_required_msg()
+        created = await players.get_or_create(tg_user_id)
+        if not await InvitesRepo(db).redeem(code, created.id):
+            await db.rollback()
+            return invite_required_msg()
         await db.commit()
-    return start_msg()
+    return invite_accepted_msg()
+
+
+async def _known_player(db: AsyncSession, tg_user_id: int) -> Player | None:
+    """Игрок, уже впущенный в продукт, — либо `None`, и тогда вход закрыт.
+
+    Проверяется на КАЖДОМ входе, а не только в `/start`: иначе незнакомец,
+    приславший файл первым сообщением, заводил бы себе строку `players` в обход
+    инвайта (`test_a_stranger_without_an_invite_is_refused_on_every_entry`).
+    """
+    return await PlayersRepo(db).find(tg_user_id)
+
+
+async def handle_invite_command(deps: BotDeps, tg_user_id: int) -> Msg | None:
+    """`/invite`: выпустить код. Только владельцу (`players.is_dev`).
+
+    Чужому игроку команда не отвечает НИЧЕГО — не «вам нельзя»: сообщение о
+    существовании команды и есть половина приглашения ею воспользоваться.
+    Решение о раздаче кодов — владельца; здесь только механика (бриф задачи 23).
+    """
+    async with deps.db_factory() as db:
+        player = await _known_player(db, tg_user_id)
+        if player is None or not player.is_dev:
+            await db.commit()
+            return None
+        code = await InvitesRepo(db).mint(player.id)
+        await db.commit()
+    return invite_created_msg(code)
+
+
+async def handle_nickname_command(deps: BotDeps, tg_user_id: int) -> Msg | None:
+    """`/nick`: открыть ввод ника в руме — та же FSM, что у кнопки в «Настройках».
+
+    Явная команда вместо «первого текстового сообщения» (решение владельца
+    2026-09-07): до этой задачи ником молча становилась любая случайная реплика.
+    """
+    async with deps.db_factory() as db:
+        player = await _known_player(db, tg_user_id)
+        if player is None:
+            await db.commit()
+            return invite_required_msg()
+        await PlayersRepo(db).set_pending_input(player.id, {"kind": _INPUT_NICKNAME})
+        await db.commit()
+    return ask_gg_nickname_msg()
 
 
 async def handle_document(deps: BotDeps, tg_user_id: int, file_bytes: bytes, filename: str) -> Msg:
@@ -226,7 +355,10 @@ async def handle_document(deps: BotDeps, tg_user_id: int, file_bytes: bytes, fil
     source_file = str(path)
 
     async with deps.db_factory() as db:
-        player = await PlayersRepo(db).get_or_create(tg_user_id)
+        player = await _known_player(db, tg_user_id)
+        if player is None:
+            await db.commit()
+            return invite_required_msg()
         session_row = await SessionsRepo(db).active_or_create(player.id)
         tournaments = TournamentsRepo(db)
 
@@ -279,8 +411,10 @@ async def handle_deep_dive_callback(deps: BotDeps, tg_user_id: int, hand_no: str
     не за чем оставлять пустой контейнер вечера.
     """
     async with deps.db_factory() as db:
-        player = await PlayersRepo(db).get_or_create(tg_user_id)
+        player = await _known_player(db, tg_user_id)
         await db.commit()
+        if player is None:
+            return invite_required_msg()
         player_id = player.id
 
     # Между этой проверкой и `enqueue` ниже — граница транзакций (у очереди своя,
@@ -318,7 +452,10 @@ async def handle_new_session(deps: BotDeps, tg_user_id: int) -> Msg:
     """
     async with deps.db_factory() as db:
         sessions = SessionsRepo(db)
-        player = await PlayersRepo(db).get_or_create(tg_user_id)
+        player = await _known_player(db, tg_user_id)
+        if player is None:
+            await db.commit()
+            return invite_required_msg()
         previous_closed = await sessions.close_active(player.id)
         opened = await sessions.active_or_create(player.id)
         await db.commit()
@@ -338,12 +475,20 @@ async def handle_photo(deps: BotDeps, tg_user_id: int, file_bytes: bytes) -> Msg
     (SESSIONS_UX), и второй текст от бота стал бы дублем.
     """
     async with deps.db_factory() as db:
-        player = await PlayersRepo(db).get_or_create(tg_user_id)
-        await db.commit()
+        player = await _known_player(db, tg_user_id)
+        if player is None:
+            await db.commit()
+            return invite_required_msg()
         player_id, nickname = player.id, player.gg_nickname
-
-    if not nickname:
-        return ask_gg_nickname_msg()
+        if not nickname:
+            # Вопрос задан — значит следующий текст и есть ответ на него. Это не
+            # возврат к «первому тексту = ник» (тот срабатывал на любую реплику
+            # без всякого вопроса): состояние ставится ровно потому, что бот
+            # только что спросил, и снимается любым нажатием меню.
+            await PlayersRepo(db).set_pending_input(player_id, {"kind": _INPUT_NICKNAME})
+            await db.commit()
+            return ask_gg_nickname_msg()
+        await db.commit()
 
     quota = await check_quota(deps, player_id)
     if not quota.allowed:
@@ -407,7 +552,10 @@ async def handle_escalation_callback(deps: BotDeps, tg_user_id: int, data: str) 
         return None
     job_id, field, raw_value = parsed
     async with deps.db_factory() as db:
-        player = await PlayersRepo(db).get_or_create(tg_user_id)
+        player = await _known_player(db, tg_user_id)
+        if player is None:
+            await db.commit()
+            return None
         job = await JobsRepo(db).get_awaiting(job_id, player.id)
         if job is None:
             await db.commit()
@@ -429,16 +577,36 @@ async def handle_escalation_callback(deps: BotDeps, tg_user_id: int, data: str) 
 
 
 async def handle_text(deps: BotDeps, tg_user_id: int, text: str) -> Msg | None:
-    """Обычное сообщение: либо ник в руме, либо число, введённое вручную.
+    """Обычное сообщение: кнопка меню, число по эскалации, начатый ввод — в этом порядке.
 
-    Состояние ввода живёт в `jobs.payload`, а не в памяти процесса бота
-    (`manual_entry`): точка возврата задачи и так зафиксирована артефактами
-    (спека §8.2), и держать половину состояния рядом с ней, а половину в памяти,
-    значило бы потерять эту половину при первом же перезапуске.
+    **Порядок не произволен.** Нижнее меню Телеграма присылает нажатие ОБЫЧНЫМ
+    текстом, поэтому подпись кнопки проверяется первой: игрок, нажавший «Мои
+    лики» посреди ввода заметки, хочет экран, а не заметку с таким текстом.
+    Нажатие меню поэтому же и снимает начатый ввод — иначе следующая же реплика
+    попала бы в него неожиданно для игрока.
+
+    Состояние ввода живёт в БД, а не в памяти процесса бота: число по эскалации
+    — в `jobs.payload` (спека §8.3, задача 22), ник и текст заметки — в
+    `players.pending_input` (задача 23). Перезапуск бота не теряет ни того, ни
+    другого.
+
+    **Ник больше не берётся из первого текста** (решение владельца 2026-09-07):
+    ввод открывается только `/nick` или кнопкой в «Настройках», и текст без
+    начатого ввода получает честное «не понял», а не тихо оказывается в профиле.
     """
     answer = text.strip()
     async with deps.db_factory() as db:
-        player = await PlayersRepo(db).get_or_create(tg_user_id)
+        player = await _known_player(db, tg_user_id)
+        if player is None:
+            await db.commit()
+            return invite_required_msg()
+
+        screen = await render_menu_screen(db, player, answer)
+        if screen is not None:
+            await PlayersRepo(db).set_pending_input(player.id, None)
+            await db.commit()
+            return screen
+
         # Ждущих задач у игрока может быть несколько, а ручного ввода ждёт та, у
         # которой он и был начат: искать «свежайшую ждущую» значило бы подставить
         # число в чужую руку (ревью раунда 1, R2).
@@ -456,12 +624,35 @@ async def handle_text(deps: BotDeps, tg_user_id: int, text: str) -> Msg | None:
             await deps.queue.resume(job_id)
             return vision_answer_saved_msg()
 
-        if not player.gg_nickname and answer:
-            await PlayersRepo(db).set_gg_nickname(player.id, answer)
-            await db.commit()
-            return gg_nickname_saved_msg(answer.strip())
+        pending = dict(player.pending_input or {})
+        reply = await _apply_pending_input(db, player, pending, answer)
         await db.commit()
-    return None
+    return reply
+
+
+async def _apply_pending_input(
+    db: AsyncSession, player: Player, pending: dict, answer: str
+) -> Msg:
+    """Текст в начатый ввод: ник в руме или заметка на оппонента.
+
+    Пустое сообщение ввод не закрывает и не сбрасывает: игрок, приславший
+    пробелы, должен получить ту же просьбу, а не потерять начатое.
+    """
+    kind = pending.get("kind")
+    if not answer:
+        return unknown_text_msg() if kind is None else note_gone_msg()
+    if kind == _INPUT_NICKNAME:
+        if len(answer) > _MAX_NICKNAME:
+            return gg_nickname_too_long_msg(_MAX_NICKNAME)
+        await PlayersRepo(db).set_gg_nickname(player.id, answer)
+        await PlayersRepo(db).set_pending_input(player.id, None)
+        return gg_nickname_saved_msg(answer)
+    if kind == _INPUT_NOTE:
+        nick = str(pending.get("nick", ""))
+        await NotesRepo(db).upsert(owner_player_id=player.id, nick=nick, text_=answer)
+        await PlayersRepo(db).set_pending_input(player.id, None)
+        return note_saved_msg(nick)
+    return unknown_text_msg()
 
 
 def _question_of(job: Job) -> str:
@@ -503,3 +694,170 @@ async def _apply_answer(db: AsyncSession, job: Job, field: str, value: str) -> N
     payload.pop("manual_entry", None)
     payload["last_answer"] = {"field": field, "value": value}
     await _remember_payload(db, job.id, payload)
+
+
+async def handle_ui_callback(deps: BotDeps, tg_user_id: int, data: str) -> Msg | None:
+    """Нажатия кнопок задачи 23: сессии, заметки, ник, диапазоны, реплей, возражение.
+
+    Один обработчик на все префиксы `UI_CALLBACK_PREFIXES`, а не десять входов в
+    роутер: роутер по контракту не решает ничего (`bot/router.py`), и разбор
+    `callback_data` обязан жить там же, где решения, — то есть здесь.
+
+    **Номера в кнопках приходят из внешнего мира.** Ни один из них не
+    используется без сверки владельца: сессия — в `SessionsRepo.summary`,
+    заметка — в `NotesRepo`, раздача — в `HandsRepo.find_session_by_hand_no`
+    (`test_a_button_of_another_players_note_changes_nothing`).
+    """
+    async with deps.db_factory() as db:
+        player = await _known_player(db, tg_user_id)
+        if player is None:
+            await db.commit()
+            return invite_required_msg()
+        reply = await _dispatch_ui(deps, db, player, data)
+        await db.commit()
+    if reply is _NEW_SESSION_REQUESTED:
+        # «Начать новую» — та же логика, что `/new` (SESSIONS_UX: обработчик
+        # один). Зовётся ПОСЛЕ коммита: `handle_new_session` открывает свою
+        # транзакцию, и вложенной она быть не может.
+        return await handle_new_session(deps, tg_user_id)
+    return reply
+
+
+# Метка «этот путь заканчивается вызовом `/new`»: сам вызов делается за границей
+# транзакции, поэтому диспетчер возвращает признак, а не сообщение.
+_NEW_SESSION_REQUESTED = Msg(text="")
+
+
+async def _dispatch_ui(deps: BotDeps, db: AsyncSession, player: Player, data: str) -> Msg | None:
+    """Разбор `callback_data` по префиксам. Порядок проверок значим: `notecolorset:`
+    и `notecolor:` начинаются одинаково, и общий префикс обязан проверяться позже.
+    """
+    if data == NEW_SESSION_DATA:
+        return _NEW_SESSION_REQUESTED
+    if data == SET_NICKNAME_DATA:
+        await PlayersRepo(db).set_pending_input(player.id, {"kind": _INPUT_NICKNAME})
+        return ask_gg_nickname_msg()
+    if data.startswith(SESSION_PREFIX):
+        rest = data.removeprefix(SESSION_PREFIX)
+        if not rest.isdigit():
+            return session_unavailable_msg()
+        screen = await session_summary_screen(db, player, int(rest))
+        return session_unavailable_msg() if screen is None else screen
+    if data.startswith(NOTE_COLOR_SET_PREFIX):
+        return await _set_note_color(db, player, data.removeprefix(NOTE_COLOR_SET_PREFIX))
+    if data.startswith(NOTE_COLOR_PREFIX):
+        note = await _note_by_data(db, player, data.removeprefix(NOTE_COLOR_PREFIX))
+        return note_gone_msg() if note is None else note_color_prompt_msg(note)
+    if data.startswith(NOTE_EDIT_PREFIX):
+        note = await _note_by_data(db, player, data.removeprefix(NOTE_EDIT_PREFIX))
+        if note is None:
+            return note_gone_msg()
+        await PlayersRepo(db).set_pending_input(
+            player.id, {"kind": _INPUT_NOTE, "nick": note.nick}
+        )
+        return note_prompt_msg(note.nick, note)
+    if data.startswith(NOTE_DELETE_PREFIX):
+        note = await _note_by_data(db, player, data.removeprefix(NOTE_DELETE_PREFIX))
+        if note is None or not await NotesRepo(db).delete(note.note_id, player.id):
+            return note_gone_msg()
+        return note_deleted_msg(note.nick)
+    if data.startswith(NOTE_ADD_PREFIX):
+        nick = data.removeprefix(NOTE_ADD_PREFIX)
+        if not nick:
+            return note_gone_msg()
+        await PlayersRepo(db).set_pending_input(player.id, {"kind": _INPUT_NOTE, "nick": nick})
+        return note_prompt_msg(nick, await NotesRepo(db).find_by_nick(player.id, nick))
+    if data.startswith(RANGES_PREFIX):
+        return await _ranges_reply(db, player, data.removeprefix(RANGES_PREFIX))
+    if data.startswith(DETAIL_PREFIX):
+        return await _replay_reply(db, player, data.removeprefix(DETAIL_PREFIX))
+    if data.startswith(DISAGREE_PREFIX):
+        return await _disagree_reply(db, player, data.removeprefix(DISAGREE_PREFIX))
+    return None
+
+
+async def _note_by_data(db: AsyncSession, player: Player, raw_id: str):
+    """Заметка по номеру из кнопки — только своя. Нецифровой номер это не заметка."""
+    if not raw_id.isdigit():
+        return None
+    return await NotesRepo(db).get(int(raw_id), player.id)
+
+
+async def _set_note_color(db: AsyncSession, player: Player, rest: str) -> Msg:
+    """`notecolorset:{id}:{цвет}` — цвет ставится только из известного набора.
+
+    Ключ цвета сверяется с `NOTE_COLORS`, а не пишется как есть: `callback_data`
+    приходит из внешнего мира, и в колонке `notes.color` не должно оказаться
+    значения, которого экран не умеет показать.
+    """
+    raw_id, _, key = rest.partition(":")
+    color = next((item for item in NOTE_COLORS if item.key == key), None)
+    note = await _note_by_data(db, player, raw_id)
+    if note is None or color is None:
+        return note_gone_msg()
+    await NotesRepo(db).set_color(note.note_id, player.id, color.key)
+    return note_color_saved_msg(note.nick, color.label)
+
+
+async def _hand_with_analysis(db: AsyncSession, player: Player, hand_no: str):
+    """Рука игрока и её разбор по номеру раздачи — либо `(None, None)`.
+
+    Ищется по ВСЕЙ истории игрока (`find_session_by_hand_no`), а не в активной
+    сессии: кнопка живёт под сообщением, которое игрок может открыть спустя
+    вечер, и разбор принадлежит той сессии, где рука лежит (тот же рулинг, что
+    у кнопки «разобрать», задача 22).
+    """
+    session_id = await HandsRepo(db).find_session_by_hand_no(player.id, hand_no)
+    if session_id is None:
+        return None, None
+    hand = await HandsRepo(db).find_by_hand_no(session_id, hand_no)
+    if hand is None:
+        return None, None
+    return hand, await AnalysesRepo(db).get_by_hand(hand.id)
+
+
+async def _ranges_reply(db: AsyncSession, player: Player, hand_no: str) -> Msg:
+    """Кнопка «Диапазоны»: картинки матриц 13×13 из уже нарисованного разбора.
+
+    Файлы рисует воркер и складывает пути в `analyses.range_images`
+    (`worker.pipeline._render_ranges`); бот ничего не считает и не рисует — он
+    отдаёт то, что посчитано, тем же путём, каким уходит текст.
+    """
+    _hand, analysis = await _hand_with_analysis(db, player, hand_no)
+    if analysis is None:
+        return analysis_unavailable_msg()
+    return ranges_msg(analysis.range_images or [], analysis.result)
+
+
+async def _replay_reply(db: AsyncSession, player: Player, hand_no: str) -> Msg:
+    """Кнопка «Подробнее»: ход раздачи с выделенной точкой решения героя.
+
+    Реплей считается из `hands.enriched` в момент нажатия, а не хранится: это
+    чистая функция от сохранённой руки (`explanation.hand_replay` — ноль токенов
+    и ноль расчётов), и держать её результат второй копией было бы вторым
+    источником одного и того же.
+    """
+    hand, _analysis = await _hand_with_analysis(db, player, hand_no)
+    if hand is None or hand.enriched is None:
+        return replay_unavailable_msg()
+    return replay_msg(hand_replay(hand.enriched), hand_no)
+
+
+async def _disagree_reply(db: AsyncSession, player: Player, hand_no: str) -> Msg:
+    """Кнопка «Не согласен»: возражение игрока уходит в eval-датасет.
+
+    Самая ценная кнопка продукта (SESSIONS_UX) и вход четвёртого этажа EVALS:
+    строка `eval_cases(kind="verdict_dispute")` — это будущий регрессионный
+    случай. Разбор при этом не меняется: возражение — данные, а не правка
+    вердикта.
+    """
+    hand, analysis = await _hand_with_analysis(db, player, hand_no)
+    if hand is None or analysis is None:
+        return analysis_unavailable_msg()
+    await EvalCasesRepo(db).add(
+        kind="verdict_dispute",
+        hand_id=hand.id,
+        ground_truth={"hand_no": hand_no, "disagreed_with": analysis.id},
+        source="disagree_button",
+    )
+    return disagreement_saved_msg()

@@ -50,6 +50,8 @@ from harness.presentation import (
     button_not_ready_msg,
     hh_accepted_msg,
     hh_duplicate_msg,
+    invite_accepted_msg,
+    invite_required_msg,
     new_session_msg,
     quota_exceeded_msg,
     start_msg,
@@ -76,6 +78,21 @@ def deps(db_factory, queue, tmp_path: Path) -> BotDeps:
     return BotDeps(db_factory=db_factory, queue=queue, data_dir=tmp_path)
 
 
+@pytest.fixture
+async def invited(db_factory):
+    """Игрок, уже впущенный в продукт, — предусловие почти всех сценариев.
+
+    С задачи 23 вход закрыт инвайтом: незнакомец не заводит себе `players`-строку
+    ни файлом, ни скрином, ни кнопкой. Тесты, которые проверяют НЕ вход, а то,
+    что происходит внутри продукта, начинают с уже впущенного игрока — как
+    начинал бы любой реальный сценарий после `/start КОД`.
+    """
+    async with db_factory() as session:
+        player = await PlayersRepo(session).get_or_create(tg_user_id=_TG_USER_ID)
+        await session.commit()
+        return player.id
+
+
 async def fetch_all(db_factory, sql: str) -> list[dict]:
     async with db_factory() as session:
         rows = (await session.execute(text(sql))).mappings().all()
@@ -86,6 +103,17 @@ async def fetch_one(db_factory, sql: str) -> dict:
     rows = await fetch_all(db_factory, sql)
     assert len(rows) == 1, f"ожидали ровно одну строку, получили {len(rows)}"
     return rows[0]
+
+
+async def _mint_invite(db_factory, *, owner_tg_user_id: int = 4242) -> str:
+    """Код, выпущенный владельцем, — вход незнакомца в закрытый продукт."""
+    from harness.memory.repos import InvitesRepo
+
+    async with db_factory() as session:
+        owner = await PlayersRepo(session).get_or_create(tg_user_id=owner_tg_user_id)
+        code = await InvitesRepo(session).mint(owner.id)
+        await session.commit()
+        return code
 
 
 async def _seed_player(
@@ -206,7 +234,7 @@ async def _set_job_age(db_factory, job_id: int, age: timedelta) -> None:
 # --- HH-путь: файл → молчаливая сессия → задача ------------------------------------
 
 
-async def test_document_creates_session_silently(db_factory, deps):
+async def test_document_creates_session_silently(db_factory, deps, invited):
     """Спека §6/§13 шаг 6: игрок не просил открывать сессию — она появляется
     молча, потому что результату нужно куда лечь (`jobs.session_id NOT NULL`).
     """
@@ -227,7 +255,7 @@ async def test_document_creates_session_silently(db_factory, deps):
     assert "сесси" not in msg.text.lower()
 
 
-async def test_document_payload_matches_what_worker_reads(db_factory, deps, tmp_path: Path):
+async def test_document_payload_matches_what_worker_reads(db_factory, deps, tmp_path: Path, invited):
     """Стык с задачей 18: `_run_hh_scan` читает `payload["source_file"]` и, если
     он есть, `payload["tournament_id"]` — второй строки `tournaments` на тот же
     файл не заводится. Имя файла на диске — sha256 содержимого (`DATA_DIR/hh/
@@ -245,7 +273,7 @@ async def test_document_payload_matches_what_worker_reads(db_factory, deps, tmp_
     assert t["session_id"] == j["session_id"]
 
 
-async def test_second_file_same_session(db_factory, deps):
+async def test_second_file_same_session(db_factory, deps, invited):
     """«Турнир — единица внутри сессии, а не сессия» (SESSIONS_UX): второй файл
     вечера прикрепляется к уже активной сессии, а не открывает новую.
     """
@@ -263,7 +291,7 @@ async def test_second_file_same_session(db_factory, deps):
     assert {t["session_id"] for t in tournaments} == {sessions[0]["id"]}
 
 
-async def test_same_file_twice_is_not_analysed_twice(db_factory, deps):
+async def test_same_file_twice_is_not_analysed_twice(db_factory, deps, invited):
     """Тот же файл, присланный дважды: второй раз не заводится ни турнир, ни
     задача (fix round 1). Без этого игрок получал бы вторую копию всех `hands` в
     одной сессии и две одинаковые сводки.
@@ -282,7 +310,7 @@ async def test_same_file_twice_is_not_analysed_twice(db_factory, deps):
     assert len(await fetch_all(db_factory, "select * from sessions")) == 1
 
 
-async def test_different_files_in_one_session_are_both_accepted(db_factory, deps):
+async def test_different_files_in_one_session_are_both_accepted(db_factory, deps, invited):
     """Защита от дубля не должна ловить РАЗНЫЕ файлы: имя на диске — хэш
     содержимого, и второй турнир вечера обязан приниматься как обычно.
     """
@@ -296,7 +324,7 @@ async def test_different_files_in_one_session_are_both_accepted(db_factory, deps
     assert len(await fetch_all(db_factory, "select * from tournaments")) == 2
 
 
-async def test_reupload_after_failed_scan_retries_on_the_same_tournament(db_factory, deps):
+async def test_reupload_after_failed_scan_retries_on_the_same_tournament(db_factory, deps, invited):
     """Скан провалился — повторная загрузка это законная повторная попытка, а не
     дубль: новая задача ставится, но турнир переиспользуется (его чекпоинты
     пропустят руки, сохранённые до сбоя).
@@ -322,26 +350,37 @@ async def test_reupload_after_failed_scan_retries_on_the_same_tournament(db_fact
     assert "внутренняя причина" not in again.text
 
 
-async def test_two_files_at_once_from_a_new_player_create_one_player(db_factory, deps, monkeypatch):
-    """Два файла подряд от НЕЗНАКОМОГО игрока обрабатываются одновременно:
+async def test_two_starts_at_once_from_a_new_player_create_one_player(
+    db_factory, deps, monkeypatch
+):
+    """Два `/start` подряд от НЕЗНАКОМОГО игрока обрабатываются одновременно:
     `players.tg_user_id` уникален, и «прочитали — не нашли — вставили» без
     `ON CONFLICT` роняло вторую транзакцию `IntegrityError` (fix round 1).
 
-    Проверяет РОВНО это. Сериализация сессий сюда не входит: вставка игрока с
-    `ON CONFLICT` сама заставляет второго ждать коммита первого, и к моменту его
-    пробуждения сессия уже создана и видна — тест про сессии был бы зелёным и без
-    лока (проверено falsификацией), поэтому он живёт отдельно, на ЗНАКОМОМ игроке.
+    Дверь с задачи 23 одна — `/start` с кодом (файл и скрин незнакомца больше не
+    заводят игрока вовсе), поэтому гонка вставки живёт здесь. Проверяет РОВНО
+    это: один игрок на двоих вошедших, и код погашен один раз.
     """
+    code = await _mint_invite(db_factory)
     _rendezvous(monkeypatch, PlayersRepo, "get_or_create")
 
     first, second = await asyncio.gather(
-        handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=b"file one", filename="a.txt"),
-        handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=b"file two", filename="b.txt"),
+        handle_start(deps, tg_user_id=999006, payload=code),
+        handle_start(deps, tg_user_id=999006, payload=code),
     )
 
-    assert first == hh_accepted_msg() and second == hh_accepted_msg()
-    assert len(await fetch_all(db_factory, "select * from players")) == 1
-    assert len(await fetch_all(db_factory, "select * from jobs")) == 2
+    entered = [
+        row
+        for row in await fetch_all(db_factory, "select * from players")
+        if row["tg_user_id"] == 999006
+    ]
+    assert len(entered) == 1
+    assert {msg.text for msg in (first, second)} == {
+        invite_accepted_msg().text,
+        invite_required_msg().text,
+    }
+    used = await fetch_one(db_factory, "select used_by from invites")
+    assert used["used_by"] == entered[0]["id"]
 
 
 async def test_two_files_at_once_from_a_known_player_share_one_session(
@@ -391,7 +430,7 @@ async def test_non_txt_document_refused_without_side_effects(db_factory, deps, t
 # --- /new и /start -----------------------------------------------------------------
 
 
-async def test_new_closes_and_opens(db_factory, deps):
+async def test_new_closes_and_opens(db_factory, deps, invited):
     """`/new` закрывает активную и открывает новую (SESSIONS_UX): следующий файл
     ложится уже в новую, а старая остаётся закрытой — контейнер прошлого вечера.
     """
@@ -411,7 +450,7 @@ async def test_new_closes_and_opens(db_factory, deps):
     assert jobs[-1]["session_id"] == rows[1]["id"]
 
 
-async def test_new_without_active_session_only_opens(db_factory, deps):
+async def test_new_without_active_session_only_opens(db_factory, deps, invited):
     """Закрывать нечего — и сообщение не заявляет, что что-то закрыто."""
     msg = await handle_new_session(deps, tg_user_id=_TG_USER_ID)
 
@@ -420,17 +459,100 @@ async def test_new_without_active_session_only_opens(db_factory, deps):
     assert msg == new_session_msg(rows[0]["title"], previous_closed=False)
 
 
-async def test_start_registers_player_without_session(db_factory, deps):
-    """`/start` заводит игрока (инвайты — задача 23, до неё без ограничений), но
-    сессию не открывает: молчаливое создание привязано к присланному материалу,
-    а не к нажатию кнопки «Start».
+async def test_start_with_a_code_registers_player_without_session(db_factory, deps):
+    """`/start КОД` заводит игрока, но сессию не открывает: молчаливое создание
+    привязано к присланному материалу, а не к нажатию кнопки «Start».
     """
-    msg = await handle_start(deps, tg_user_id=_TG_USER_ID)
+    from harness.presentation import invite_accepted_msg
 
-    player = await fetch_one(db_factory, "select * from players")
+    code = await _mint_invite(db_factory)
+
+    msg = await handle_start(deps, tg_user_id=_TG_USER_ID, payload=code)
+
+    player = await fetch_one(db_factory, f"select * from players where tg_user_id={_TG_USER_ID}")
     assert player["tg_user_id"] == _TG_USER_ID
     assert await fetch_all(db_factory, "select * from sessions") == []
-    assert msg == start_msg()
+    assert msg == invite_accepted_msg()
+
+
+async def test_a_known_player_is_greeted_without_asking_for_a_code(deps, invited):
+    """Уже впущенного игрока `/start` не выставляет за дверь."""
+    assert await handle_start(deps, tg_user_id=_TG_USER_ID) == start_msg()
+
+
+async def test_a_start_without_a_code_leaves_no_player_behind(db_factory, deps):
+    """Без кода — вежливый отказ (план задачи 23), и ни строки в `players`."""
+    from harness.presentation import invite_required_msg
+
+    msg = await handle_start(deps, tg_user_id=999001)
+
+    assert msg == invite_required_msg()
+    assert await fetch_all(db_factory, "select * from players") == []
+
+
+async def test_a_start_with_a_bad_code_leaves_no_player_behind(db_factory, deps):
+    """Непогашенный код не оставляет за собой игрока: одна транзакция на оба шага."""
+    from harness.presentation import invite_required_msg
+
+    msg = await handle_start(deps, tg_user_id=999002, payload="не-код")
+
+    assert msg == invite_required_msg()
+    assert await fetch_all(db_factory, "select * from players") == []
+
+
+async def test_an_invite_lets_exactly_one_stranger_in(db_factory, deps):
+    """Код гасится один раз: второму незнакомцу с тем же кодом вход закрыт."""
+    from harness.presentation import invite_accepted_msg, invite_required_msg
+
+    code = await _mint_invite(db_factory)
+
+    first = await handle_start(deps, tg_user_id=999003, payload=code)
+    second = await handle_start(deps, tg_user_id=999004, payload=code)
+
+    assert first == invite_accepted_msg()
+    assert second == invite_required_msg()
+    tg_ids = {row["tg_user_id"] for row in await fetch_all(db_factory, "select * from players")}
+    assert 999004 not in tg_ids
+
+
+async def test_a_stranger_without_an_invite_is_refused_on_every_entry(db_factory, deps):
+    """Вход закрыт на всех дверях сразу, а не только в `/start`.
+
+    Иначе незнакомец, приславший файл или скрин первым сообщением, заводил бы
+    себе `players`-строку в обход инвайта — то есть инвайта бы не было.
+    """
+    from harness.bot.handlers import handle_photo, handle_text, handle_ui_callback
+    from harness.presentation import invite_required_msg
+
+    stranger = 999005
+    refusal = invite_required_msg()
+
+    assert await handle_document(
+        deps, tg_user_id=stranger, file_bytes=_HH_BYTES, filename="t.txt"
+    ) == refusal
+    assert await handle_photo(deps, stranger, _SCREEN_BYTES) == refusal
+    assert await handle_text(deps, stranger, "привет") == refusal
+    assert await handle_new_session(deps, stranger) == refusal
+    assert await handle_deep_dive_callback(deps, stranger, "TM1") == refusal
+    assert await handle_ui_callback(deps, stranger, "session:1") == refusal
+    assert await fetch_all(db_factory, "select * from players") == []
+
+
+async def test_the_invite_command_answers_only_its_owner(db_factory, deps, invited):
+    """`/invite` — команда владельца (`is_dev`); чужому она не отвечает ничего."""
+    from harness.bot.handlers import handle_invite_command
+
+    assert await handle_invite_command(deps, _TG_USER_ID) is None
+
+    async with db_factory() as session:
+        await session.execute(text(f"update players set is_dev = true where id = {invited}"))
+        await session.commit()
+
+    msg = await handle_invite_command(deps, _TG_USER_ID)
+
+    assert msg is not None
+    code = (await fetch_one(db_factory, "select code, issued_by, used_by from invites"))["code"]
+    assert code in msg.text
 
 
 # --- квота: скользящее окно 24 ч (спека §9) ----------------------------------------
@@ -544,7 +666,7 @@ async def test_quota_default_total_without_personal_override(db_factory, deps):
 # --- кнопка [разобрать] ------------------------------------------------------------
 
 
-async def test_deep_dive_callback_enqueues_silently(db_factory, deps):
+async def test_deep_dive_callback_enqueues_silently(db_factory, deps, invited):
     """Нажатие кнопки под сводкой ставит `deep_dive` в сессию, где лежит раздача,
     и НИЧЕГО не отвечает: дальше говорит воркер (прогресс-сообщение, задача 18),
     а второй текст от бота был бы дублем.
@@ -562,7 +684,7 @@ async def test_deep_dive_callback_enqueues_silently(db_factory, deps):
     assert jobs[-1]["session_id"] == active["id"]
 
 
-async def test_deep_dive_goes_to_the_session_that_holds_the_hand(db_factory, deps):
+async def test_deep_dive_goes_to_the_session_that_holds_the_hand(db_factory, deps, invited):
     """Кнопка под сводкой ЗАКРЫТОГО вечера работает (рулинг fix round 1).
 
     Разбор ищет руку как `find_by_hand_no(job.session_id, hand_no)`, поэтому
@@ -584,7 +706,7 @@ async def test_deep_dive_goes_to_the_session_that_holds_the_hand(db_factory, dep
     assert job["session_id"] == old_session["id"], "задача ушла в активную сессию, а не в свою"
 
 
-async def test_deep_dive_never_resolves_into_another_players_session(db_factory, deps):
+async def test_deep_dive_never_resolves_into_another_players_session(db_factory, deps, invited):
     """Область поиска — сессии ЭТОГО игрока: `hand_no` уникален в рамках
     источника, а не глобально, и одинаковый номер у двух игроков не должен
     отправлять разбор одного в сессию другого.
@@ -605,7 +727,7 @@ async def test_deep_dive_never_resolves_into_another_players_session(db_factory,
     assert job["player_id"] != stranger_id
 
 
-async def test_deep_dive_falls_back_to_active_session_when_hand_is_unknown(db_factory, deps):
+async def test_deep_dive_falls_back_to_active_session_when_hand_is_unknown(db_factory, deps, invited):
     """Раздачи нет ни в одной сессии игрока — ставим в активную и даём воркеру
     отказать своим единым текстом, а не заводим второй путь отказа.
     """
@@ -637,16 +759,15 @@ async def test_deep_dive_callback_refuses_when_quota_exhausted(db_factory, deps)
 # --- кнопки без обработчика: ответ вместо «часиков» (round 5, Item G) ---------------
 
 
-async def test_every_verdict_button_gets_an_answer_not_a_spinner(deps):
-    """`keyboards.verdict_buttons` вешает под КАЖДЫМ разбором три кнопки —
-    `ranges:`, `detail:`, `disagree:` — а хендлер в роутере до round 5 был
-    зарегистрирован только на `deep:`. Нажатие любой из трёх не отвечало ничего:
-    Телеграм крутит «часики» на кнопке, пока не сдаётся с ошибкой, — и это под
-    единственным сообщением, которое умеет присылать путь разбора.
+async def test_a_button_without_a_handler_still_gets_an_answer_not_a_spinner(deps):
+    """Кнопка без обработчика обязана получать честный ответ, а не «часики».
 
-    Проверяем два утверждения сразу: catch-all существует и стоит ПОСЛЕДНИМ
-    (иначе он перехватил бы `deep:` у настоящего обработчика), и его тело
-    действительно отвечает текстом из `presentation`.
+    Три кнопки под вердиктом (`ranges:`, `detail:`, `disagree:`) с задачи 23
+    разбираются по-настоящему (`handle_ui_callback`), но catch-all не убран: он
+    закрывает ЛЮБОЙ будущий префикс, у которого обработчика ещё нет. Проверяются
+    оба утверждения: catch-all стоит последним и без фильтра (иначе он перехватил
+    бы `deep:` у настоящего обработчика), и его тело отвечает текстом из
+    `presentation`.
     """
     router = build_router(deps)
     handlers = router.callback_query.handlers
@@ -665,10 +786,23 @@ async def test_every_verdict_button_gets_an_answer_not_a_spinner(deps):
         async def answer(self, text: str | None = None, **_kwargs: object) -> None:
             answered.append(text or "")
 
-    for prefix in ("ranges:", "detail:", "disagree:"):
-        await handlers[-1].call(_FakeCallback(f"{prefix}TM123"))
+    await handlers[-1].call(_FakeCallback("будущая-кнопка:TM123"))
 
-    assert answered == [button_not_ready_msg().text] * 3
+    assert answered == [button_not_ready_msg().text]
+
+
+async def test_every_verdict_button_is_routed_to_a_real_handler(deps):
+    """Ни одна из трёх кнопок под вердиктом больше не проваливается в catch-all.
+
+    Фильтр UI-обработчика перечисляет префиксы, которые разбирает
+    `handle_ui_callback`; расхождение между кнопкой и фильтром означало бы
+    «часики» под единственным сообщением, которое умеет присылать разбор.
+    """
+    from harness.bot.handlers import UI_CALLBACK_PREFIXES
+    from harness.presentation import verdict_buttons
+
+    for button in verdict_buttons("TM123"):
+        assert button.callback_data.startswith(UI_CALLBACK_PREFIXES), button.callback_data
 
 
 # --- задача 22: скрин, ник в руме, эскалация ---------------------------------
@@ -676,7 +810,7 @@ async def test_every_verdict_button_gets_an_answer_not_a_spinner(deps):
 _SCREEN_BYTES = b"\x89PNG\r\n\x1a\n synthetic screenshot bytes"
 
 
-async def test_a_screenshot_from_a_player_without_a_room_nickname_asks_for_it_first(deps, db_factory):
+async def test_a_screenshot_from_a_player_without_a_room_nickname_asks_for_it_first(deps, db_factory, invited):
     """Героя на экране опознаёт код по нику из профиля — без ника разбирать некого.
 
     Спросить сразу дешевле, чем заплатить за чтение и упереться в вопрос после
@@ -690,23 +824,35 @@ async def test_a_screenshot_from_a_player_without_a_room_nickname_asks_for_it_fi
     assert await fetch_all(db_factory, "select id from jobs") == []
 
 
-async def test_the_first_plain_message_becomes_the_room_nickname(deps, db_factory):
-    from harness.bot.handlers import handle_text
-    from harness.presentation import gg_nickname_saved_msg
+async def test_a_plain_message_no_longer_becomes_the_room_nickname(deps, db_factory, invited):
+    """Задача 22 записывала ником ПЕРВОЕ текстовое сообщение — задача 23 это убрала.
 
-    await handle_start(deps, _TG_USER_ID)
+    Решение владельца 2026-09-07: ник вводится явной командой или кнопкой в
+    «Настройках». Проверяются обе половины: случайная реплика в профиль не
+    попадает и получает честный ответ, а открытый ввод — попадает.
+    """
+    from harness.bot.handlers import handle_nickname_command, handle_text
+    from harness.presentation import ask_gg_nickname_msg, gg_nickname_saved_msg, unknown_text_msg
+
+    assert await handle_text(deps, _TG_USER_ID, "привет") == unknown_text_msg()
+    assert (await fetch_one(db_factory, "select gg_nickname from players"))["gg_nickname"] is None
+
+    assert await handle_nickname_command(deps, _TG_USER_ID) == ask_gg_nickname_msg()
     msg = await handle_text(deps, _TG_USER_ID, "  screen_nick  ")
+
     assert msg == gg_nickname_saved_msg("screen_nick")
-    row = await fetch_one(db_factory, "select gg_nickname from players")
+    row = await fetch_one(db_factory, "select gg_nickname, pending_input from players")
     assert row["gg_nickname"] == "screen_nick"
+    assert row["pending_input"] is None
 
 
 async def test_a_screenshot_lands_on_disk_and_becomes_a_job_the_worker_can_read(
-    deps, db_factory
+    deps, db_factory, invited
 ):
     """Контракт стыка с воркером: путь к файлу и хэш картинки в `jobs.payload`."""
-    from harness.bot.handlers import handle_photo, handle_text
+    from harness.bot.handlers import handle_nickname_command, handle_photo, handle_text
 
+    await handle_nickname_command(deps, _TG_USER_ID)
     await handle_text(deps, _TG_USER_ID, "screen_nick")
     assert await handle_photo(deps, _TG_USER_ID, _SCREEN_BYTES) is None
 
@@ -718,10 +864,11 @@ async def test_a_screenshot_lands_on_disk_and_becomes_a_job_the_worker_can_read(
     assert Path(job["payload"]["image_file"]).read_bytes() == _SCREEN_BYTES
 
 
-async def test_the_same_screenshot_twice_does_not_occupy_the_disk_twice(deps):
+async def test_the_same_screenshot_twice_does_not_occupy_the_disk_twice(deps, invited):
     """Имя файла — хэш содержимого, поэтому вторая присылка перезаписывает ту же."""
-    from harness.bot.handlers import handle_photo, handle_text
+    from harness.bot.handlers import handle_nickname_command, handle_photo, handle_text
 
+    await handle_nickname_command(deps, _TG_USER_ID)
     await handle_text(deps, _TG_USER_ID, "screen_nick")
     await handle_photo(deps, _TG_USER_ID, _SCREEN_BYTES)
     await handle_photo(deps, _TG_USER_ID, _SCREEN_BYTES)
@@ -973,3 +1120,343 @@ async def test_an_answer_about_cards_is_applied_to_the_named_player(deps, db_fac
     assert hand["raw"]["showdowns"] == [{"label": "S2", "cards": ["Kh", "Ad"]}]
     # Проверка закрыта ответом игрока — станция больше не считает её спорной.
     assert [c["passed"] for c in hand["raw"]["vision"]["checks"]] == [True]
+
+
+# --- задача 23: меню, заметки, сводка вечера, кнопки под разбором --------------
+
+
+async def test_every_menu_button_answers_with_its_own_screen(deps, invited):
+    """Нижнее меню присылает боту ТЕКСТ кнопки — и каждая подпись обязана
+    опознаваться. Кнопка, чью подпись бот не знает, выглядит сломанной: игрок
+    получил бы «не понял» в ответ на собственный интерфейс.
+    """
+    from harness.bot.handlers import handle_text
+    from harness.presentation import MAIN_MENU, unknown_text_msg
+
+    for row in MAIN_MENU:
+        for label in row:
+            msg = await handle_text(deps, _TG_USER_ID, label)
+            assert msg is not None and msg != unknown_text_msg(), label
+            assert msg.text.strip()
+
+
+async def test_the_settings_screen_shows_the_nickname_and_the_quota_left(deps, db_factory, invited):
+    """«Настройки»: ник в руме и остаток дневного лимита — те же числа, что у квоты."""
+    from harness.bot.handlers import handle_nickname_command, handle_text
+    from harness.presentation import MENU_SETTINGS
+
+    await handle_nickname_command(deps, _TG_USER_ID)
+    await handle_text(deps, _TG_USER_ID, "screen_nick")
+
+    msg = await handle_text(deps, _TG_USER_ID, MENU_SETTINGS)
+    assert msg is not None
+
+    quota = await check_quota(deps, invited)
+    assert "screen_nick" in msg.text
+    assert f"разборов {quota.left}/{quota.total} за 24 ч" in msg.text
+
+
+async def test_the_nickname_button_in_settings_opens_the_input(deps, db_factory, invited):
+    """Кнопка «Указать ник» — второй (и последний) вход ввода ника, кроме `/nick`."""
+    from harness.bot.handlers import handle_text, handle_ui_callback
+    from harness.presentation import SET_NICKNAME_DATA, ask_gg_nickname_msg, gg_nickname_saved_msg
+
+    assert await handle_ui_callback(deps, _TG_USER_ID, SET_NICKNAME_DATA) == ask_gg_nickname_msg()
+
+    assert await handle_text(deps, _TG_USER_ID, "nick_from_settings") == gg_nickname_saved_msg(
+        "nick_from_settings"
+    )
+    row = await fetch_one(db_factory, "select gg_nickname from players")
+    assert row["gg_nickname"] == "nick_from_settings"
+
+
+async def test_a_menu_press_cancels_an_input_that_was_started(deps, db_factory, invited):
+    """Игрок, нажавший кнопку меню посреди ввода, хочет экран, а не запись.
+
+    Без этого следующая реплика попала бы в начатый ввод неожиданно для него —
+    ровно та тихая запись, ради отмены которой убран «первый текст = ник».
+    """
+    from harness.bot.handlers import handle_nickname_command, handle_text
+    from harness.presentation import MENU_LEAKS, unknown_text_msg
+
+    await handle_nickname_command(deps, _TG_USER_ID)
+    await handle_text(deps, _TG_USER_ID, MENU_LEAKS)
+
+    assert await handle_text(deps, _TG_USER_ID, "случайная реплика") == unknown_text_msg()
+    row = await fetch_one(db_factory, "select gg_nickname, pending_input from players")
+    assert row["gg_nickname"] is None and row["pending_input"] is None
+
+
+async def test_a_note_starts_from_the_hand_with_the_opponent_already_filled_in(
+    deps, db_factory, invited
+):
+    """Путь заметки начинается ИЗ РАЗБОРА с подставленным оппонентом (2026-09-04).
+
+    Кнопка несёт ник, ввод открывается ею, и следующий текст становится
+    наблюдением об этом оппоненте — без единого экрана выбора между ними.
+    """
+    from harness.bot.handlers import handle_text, handle_ui_callback
+    from harness.presentation import note_saved_msg
+
+    prompt = await handle_ui_callback(deps, _TG_USER_ID, "note:villain")
+    assert prompt is not None and "villain" in prompt.text
+
+    saved = await handle_text(deps, _TG_USER_ID, "фолдит на опен")
+
+    assert saved == note_saved_msg("villain")
+    note = await fetch_one(db_factory, "select opponent_nick, text, color from notes")
+    assert (note["opponent_nick"], note["text"]) == ("villain", "фолдит на опен")
+
+
+async def test_a_note_can_be_edited_recoloured_and_deleted(deps, db_factory, invited):
+    """CRUD заметки целиком — тем же путём, каким его пройдёт игрок кнопками."""
+    from harness.bot.handlers import handle_text, handle_ui_callback
+    from harness.presentation import MENU_NOTES, note_deleted_msg
+
+    await handle_ui_callback(deps, _TG_USER_ID, "note:villain")
+    await handle_text(deps, _TG_USER_ID, "фолдит на опен")
+    note_id = (await fetch_one(db_factory, "select id from notes"))["id"]
+
+    await handle_ui_callback(deps, _TG_USER_ID, f"noteedit:{note_id}")
+    await handle_text(deps, _TG_USER_ID, "донкает флоп")
+    await handle_ui_callback(deps, _TG_USER_ID, f"notecolorset:{note_id}:red")
+
+    listed = await handle_text(deps, _TG_USER_ID, MENU_NOTES)
+    assert listed is not None
+    assert "донкает флоп" in listed.text
+    assert "villain" in listed.text
+    row = await fetch_one(db_factory, "select text, color from notes")
+    assert (row["text"], row["color"]) == ("донкает флоп", "red")
+
+    assert await handle_ui_callback(deps, _TG_USER_ID, f"notedel:{note_id}") == note_deleted_msg(
+        "villain"
+    )
+    assert await fetch_all(db_factory, "select * from notes") == []
+
+
+async def test_an_unknown_colour_from_a_button_is_not_written_to_the_note(
+    deps, db_factory, invited
+):
+    """`callback_data` приходит из внешнего мира: в колонку цвета попадает только
+    ключ из известного набора, иначе экран показал бы то, чего не умеет.
+    """
+    from harness.bot.handlers import handle_text, handle_ui_callback
+    from harness.presentation import note_gone_msg
+
+    await handle_ui_callback(deps, _TG_USER_ID, "note:villain")
+    await handle_text(deps, _TG_USER_ID, "фолдит на опен")
+    note_id = (await fetch_one(db_factory, "select id from notes"))["id"]
+
+    assert await handle_ui_callback(
+        deps, _TG_USER_ID, f"notecolorset:{note_id}:фиолетовый"
+    ) == note_gone_msg()
+    assert (await fetch_one(db_factory, "select color from notes"))["color"] == "none"
+
+
+async def test_a_button_of_another_players_note_changes_nothing(deps, db_factory, invited):
+    """Номер заметки в кнопке — внешние данные: чужую нажатием не тронуть."""
+    from harness.bot.handlers import handle_ui_callback
+    from harness.memory.repos import NotesRepo
+    from harness.presentation import note_gone_msg
+
+    async with db_factory() as session:
+        stranger = await PlayersRepo(session).get_or_create(tg_user_id=999007)
+        foreign = await NotesRepo(session).upsert(
+            owner_player_id=stranger.id, nick="theirs", text_="их заметка"
+        )
+        await session.commit()
+
+    assert await handle_ui_callback(deps, _TG_USER_ID, f"noteedit:{foreign}") == note_gone_msg()
+    assert await handle_ui_callback(deps, _TG_USER_ID, f"notedel:{foreign}") == note_gone_msg()
+    assert (await fetch_one(db_factory, "select text from notes"))["text"] == "их заметка"
+    # Начатого ввода после отказа тоже нет: иначе следующий текст игрока ушёл бы
+    # в чужую заметку.
+    assert (await fetch_one(db_factory, "select pending_input from players where tg_user_id = "
+                            f"{_TG_USER_ID}"))["pending_input"] is None
+
+
+async def test_the_session_button_shows_the_summary_of_that_evening(deps, db_factory, invited):
+    """Сводка вечера считается ПО ЗАПРОСУ — нажатием на сессию (решение владельца)."""
+    from harness.bot.handlers import handle_text, handle_ui_callback
+    from harness.presentation import MENU_SESSIONS
+
+    await handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="t.txt")
+    session_row = await fetch_one(db_factory, "select * from sessions")
+
+    listed = await handle_text(deps, _TG_USER_ID, MENU_SESSIONS)
+    assert listed is not None
+    assert session_row["title"] in listed.text
+    assert f"session:{session_row['id']}" in [
+        btn.callback_data for row in listed.buttons for btn in row
+    ]
+
+    summary = await handle_ui_callback(deps, _TG_USER_ID, f"session:{session_row['id']}")
+    assert summary is not None
+    assert session_row["title"] in summary.text
+
+
+async def test_a_session_button_of_another_player_shows_nothing(deps, db_factory, invited):
+    from harness.bot.handlers import handle_ui_callback
+    from harness.presentation import session_unavailable_msg
+
+    async with db_factory() as session:
+        stranger = await PlayersRepo(session).get_or_create(tg_user_id=999008)
+        theirs = await SessionsRepo(session).active_or_create(stranger.id)
+        await session.commit()
+        foreign_id = theirs.id
+
+    assert await handle_ui_callback(
+        deps, _TG_USER_ID, f"session:{foreign_id}"
+    ) == session_unavailable_msg()
+
+
+async def test_the_new_session_button_does_what_the_command_does(deps, db_factory, invited):
+    """«Начать новую» — та же логика, что `/new` (SESSIONS_UX: обработчик один)."""
+    from harness.bot.handlers import handle_ui_callback
+    from harness.presentation import NEW_SESSION_DATA
+
+    await handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="t.txt")
+
+    msg = await handle_ui_callback(deps, _TG_USER_ID, NEW_SESSION_DATA)
+
+    rows = await fetch_all(db_factory, "select * from sessions order by id")
+    assert len(rows) == 2 and rows[0]["closed_at"] is not None
+    assert msg == new_session_msg(rows[1]["title"], previous_closed=True)
+
+
+async def _seed_analysis(db_factory, *, session_id: int, hand_no: str, images: list[str]):
+    """Разобранная рука с картинками диапазонов — то, что читают кнопки разбора."""
+    from harness.contracts import (
+        AnalysisResult,
+        Assumption,
+        PointVerdict,
+        Range,
+        SpotKind,
+        Street,
+        Zone,
+    )
+    from harness.memory.repos import AnalysesRepo
+
+    point = PointVerdict(
+        dp_index=0,
+        street=Street.PREFLOP,
+        spot=SpotKind.PUSHFOLD_FACING_SHOVE,
+        zone=Zone.ASSUMING,
+        action_taken="call",
+        best_action="fold",
+        ev_diff_bb=-1.2,
+        assumption=Assumption(range=Range(weights={"AA": 1.0}), source="model:test"),
+    )
+    result = AnalysisResult(hand_no=hand_no, points=[point], ranked=[0])
+    hand_id = await _seed_hand(db_factory, session_id=session_id, hand_no=hand_no)
+    async with db_factory() as session:
+        await AnalysesRepo(session).save(hand_id=hand_id, result=result, range_images=images)
+        await session.commit()
+    return hand_id, result
+
+
+async def test_the_ranges_button_sends_the_pictures_that_were_rendered(
+    deps, db_factory, invited
+):
+    """PNG диапазонов рендерились и не отправлялись (хвост задачи 22) — теперь уходят."""
+    from harness.bot.handlers import handle_ui_callback
+
+    await handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="t.txt")
+    active = await fetch_one(db_factory, "select * from sessions")
+    await _seed_analysis(
+        db_factory, session_id=active["id"], hand_no="RC1234", images=["/data/ranges/1-0.png"]
+    )
+
+    msg = await handle_ui_callback(deps, _TG_USER_ID, "ranges:RC1234")
+
+    assert msg is not None
+    assert [photo.path for photo in msg.photos] == ["/data/ranges/1-0.png"]
+    assert "колл шова" in msg.photos[0].caption
+
+
+async def test_the_details_button_shows_the_replay_of_the_hand(deps, db_factory, invited):
+    """«Подробнее» отдаёт ход раздачи — тот, что ушёл из сообщения с вердиктом."""
+    from harness.bot.handlers import handle_ui_callback
+    from harness.engine import enrich
+    from harness.memory.repos import HandsRepo
+    from harness.normalizer import normalize
+    from harness.parsers.hh_parser import parse_hand
+    from tests.test_hh_parser import SAMPLE
+
+    await handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="t.txt")
+    active = await fetch_one(db_factory, "select * from sessions")
+    raw = parse_hand(SAMPLE, source_ref="x").model_copy(update={"hand_no": "RC1234"})
+    async with db_factory() as session:
+        hands = HandsRepo(session)
+        hand_id = await hands.save_raw(session_id=active["id"], raw=raw)
+        canonical = normalize(raw)
+        await hands.save_canonical(hand_id, canonical)
+        await hands.save_enriched(hand_id, enrich(canonical))
+        await session.commit()
+
+    msg = await handle_ui_callback(deps, _TG_USER_ID, "detail:RC1234")
+
+    assert msg is not None
+    assert msg.parse_mode == "HTML"
+    assert "ПРЕФЛОП" in msg.text
+
+
+async def test_the_details_button_of_an_unfinished_hand_says_so(deps, db_factory, invited):
+    """Рука осталась на чекпоинте ниже — показывать нечего, и это говорится прямо."""
+    from harness.bot.handlers import handle_ui_callback
+    from harness.presentation import replay_unavailable_msg
+
+    await handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="t.txt")
+    active = await fetch_one(db_factory, "select * from sessions")
+    await _seed_hand(db_factory, session_id=active["id"], hand_no="RC1234")
+
+    assert await handle_ui_callback(
+        deps, _TG_USER_ID, "detail:RC1234"
+    ) == replay_unavailable_msg()
+
+
+async def test_the_disagree_button_writes_the_objection_to_the_eval_dataset(
+    deps, db_factory, invited
+):
+    """Самая ценная кнопка продукта (SESSIONS_UX): возражение — вход этажа 4 EVALS."""
+    from harness.bot.handlers import handle_ui_callback
+    from harness.presentation import disagreement_saved_msg
+
+    await handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="t.txt")
+    active = await fetch_one(db_factory, "select * from sessions")
+    hand_id, _result = await _seed_analysis(
+        db_factory, session_id=active["id"], hand_no="RC1234", images=[]
+    )
+
+    msg = await handle_ui_callback(deps, _TG_USER_ID, "disagree:RC1234")
+
+    assert msg == disagreement_saved_msg()
+    case = await fetch_one(db_factory, "select kind, hand_id, source from eval_cases")
+    assert (case["kind"], case["hand_id"], case["source"]) == (
+        "verdict_dispute",
+        hand_id,
+        "disagree_button",
+    )
+
+
+async def test_a_button_under_a_hand_that_is_not_mine_shows_nothing(deps, db_factory, invited):
+    """Номер раздачи в кнопке — внешние данные: чужой разбор ею не открыть."""
+    from harness.bot.handlers import handle_ui_callback
+    from harness.presentation import analysis_unavailable_msg
+
+    async with db_factory() as session:
+        stranger = await PlayersRepo(session).get_or_create(tg_user_id=999009)
+        their_session = await SessionsRepo(session).active_or_create(stranger.id)
+        await session.commit()
+        their_session_id = their_session.id
+    await _seed_analysis(
+        db_factory, session_id=their_session_id, hand_no="THEIRS1", images=["/data/x.png"]
+    )
+
+    assert await handle_ui_callback(
+        deps, _TG_USER_ID, "ranges:THEIRS1"
+    ) == analysis_unavailable_msg()
+    assert await handle_ui_callback(
+        deps, _TG_USER_ID, "disagree:THEIRS1"
+    ) == analysis_unavailable_msg()
+    assert await fetch_all(db_factory, "select * from eval_cases") == []
