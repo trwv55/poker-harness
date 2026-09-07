@@ -1331,7 +1331,15 @@ async def test_deep_dive_saves_the_model_text_and_shows_it_to_the_player(
     texts = _all_texts(fake_sender)
     assert record.verdict_text is not None
     assert any("Разбор без выдуманных чисел." in text for text in texts)
-    assert any("ПРЕФЛОП" in text for text in texts), "ход раздачи обязан быть в разборе"
+    # Ход раздачи с задачи 23 уходит не с вердиктом, а по кнопке «Подробнее»
+    # (`presentation.replay_msg`): в самом разборе его больше нет, а кнопка есть.
+    assert not any("ПРЕФЛОП" in text for text in texts)
+    assert any(
+        btn.callback_data.startswith("detail:")
+        for msg in [*fake_sender.sent, *(m for _mid, m in fake_sender.edits)]
+        for row in msg.buttons
+        for btn in row
+    ), "кнопка «Подробнее» обязана стоять под разбором"
 
 
 @requires_fixtures

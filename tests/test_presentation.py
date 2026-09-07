@@ -62,6 +62,7 @@ from harness.presentation import (
     new_session_msg,
     progress_text,
     quota_exceeded_msg,
+    replay_msg,
     scan_summary_msg,
     start_msg,
     tournament_report_msg,
@@ -1041,17 +1042,41 @@ def test_deep_dive_msg_without_prose_has_no_holes_in_it():
     assert "−2.3 bb" in msg.text
 
 
-def test_deep_dive_msg_shows_the_replay_above_the_verdicts():
-    """Ход раздачи — до вердиктов: разбор без хода руки нечитаем (спека §5.6)."""
-    msg = deep_dive_msg(_prose_result(), 12, Zone.STRICT, 17, 50, replay=_replay())
-    assert "Hero олл-ин 990" in msg.text
-    assert msg.text.index("ПРЕФЛОП") < msg.text.index("пуш-фолд")
+def test_the_replay_left_the_verdict_message_for_the_details_button():
+    """Ход раздачи ушёл под кнопку «Подробнее» (задача 23), а сама кнопка осталась.
+
+    Реплей занимал в сообщении больше места, чем разбор, и упирался в предел
+    `sendMessage` в 4096 символов вместе с прозой модели. Проверяются оба
+    утверждения сразу: в вердикте хода нет, а нажать на него по-прежнему есть
+    где — иначе «убрали» превратилось бы в «потеряли».
+    """
+    msg = deep_dive_msg(_prose_result(), 12, Zone.STRICT, 17, 50, verdict=_verdict_text())
+    assert "ПРЕФЛОП" not in msg.text
+    assert any(btn.callback_data.startswith("detail:") for row in msg.buttons for btn in row)
 
 
-def test_deep_dive_msg_with_replay_and_prose_fits_one_telegram_message():
-    msg = deep_dive_msg(
-        _prose_result(), 12, Zone.ASSUMING, 17, 50, replay=_replay(), verdict=_verdict_text()
-    )
+def test_replay_msg_marks_the_hero_decision_in_bold():
+    """Точка решения героя выделена прямо в потоке действий (спека §5.6).
+
+    Выделение — разметка Телеграма, поэтому у сообщения стоит `parse_mode`, и
+    выделен ровно тот кусок, который пометил `explanation.hand_replay`.
+    """
+    msg = replay_msg(_replay(), "TM77")
+    assert msg.parse_mode == "HTML"
+    assert "<b>Hero олл-ин 990 (9.9bb)</b>" in msg.text
+    assert "<b>ПРЕФЛОП" not in msg.text
+
+
+def test_replay_msg_escapes_a_nickname_that_looks_like_a_tag():
+    """Ники приходят со скрина: незакрытый `<` уронил бы отправку целиком."""
+    replay = HandReplay(spans=[ReplaySpan(text="<script> & Hero"), ReplaySpan(text="шов", emphasis=True)])
+    msg = replay_msg(replay, "TM<1>")
+    assert "&lt;script&gt; &amp; Hero" in msg.text
+    assert "<script>" not in msg.text
+
+
+def test_deep_dive_msg_with_prose_fits_one_telegram_message():
+    msg = deep_dive_msg(_prose_result(), 12, Zone.ASSUMING, 17, 50, verdict=_verdict_text())
     assert len(msg.text) < 4096
 
 
@@ -1226,3 +1251,280 @@ def test_an_unjudged_point_without_a_known_reason_keeps_the_general_line():
     )
     assert "По этой раздаче точек с вердиктом нет." in msg.text
     assert "перебор подмножеств" not in msg.text
+
+
+# --- экраны нижнего меню (задача 23) -------------------------------------------------
+
+
+def _leak_overview(*pairs, judged: int = 10, total: int = 40):
+    """Экран «Мои лики» из пар «ключ правила → (частота, цена)»."""
+    from harness.contracts import LEAK_RULES, LeaksOverview, LeakStat
+
+    by_key = {rule.key: rule for rule in LEAK_RULES}
+    return LeaksOverview(
+        points_judged=judged,
+        points_total=total,
+        leaks=[
+            LeakStat(rule=by_key[key], count=count, loss_bb=loss)
+            for key, count, loss in pairs
+        ],
+    )
+
+
+def test_leaks_msg_names_frequency_and_cost_next_to_every_type():
+    """Рядом с каждым типом лика — частота и цена (постановка владельца дословно)."""
+    from harness.presentation import leaks_msg
+
+    msg = leaks_msg(_leak_overview(("no_shove", 7, 5.4), ("call_too_wide", 1, 3.1)))
+
+    assert "Не шовит, где надо — 7 раз, −5.4 bb" in msg.text
+    assert "Коллирует шов слишком широко — 1 раз, −3.1 bb" in msg.text
+
+
+def test_leaks_msg_puts_the_coverage_above_the_list():
+    """Покрытие — первым: короткий список ликов без него читается как «сыграно чисто»."""
+    from harness.presentation import leaks_msg
+
+    msg = leaks_msg(_leak_overview(("no_shove", 2, 1.0), judged=10, total=40))
+
+    assert "Оценено решений: 10 из 40 за всю историю." in msg.text
+    assert msg.text.index("Оценено решений") < msg.text.index("Не шовит")
+
+
+def test_leaks_msg_of_a_clean_history_still_shows_the_coverage():
+    """Пустой список — не «всё хорошо»: покрытие и оговорка остаются на месте."""
+    from harness.presentation import leaks_msg
+
+    msg = leaks_msg(_leak_overview(judged=3, total=41))
+
+    assert "не нашлось" in msg.text
+    assert "Оценено решений: 3 из 41" in msg.text
+    assert "не судит" in msg.text
+
+
+def test_leaks_msg_without_any_analysis_says_there_is_nothing_to_count():
+    """Ноль точек — это «не из чего считать», а не «ликов нет»."""
+    from harness.presentation import leaks_msg
+
+    msg = leaks_msg(_leak_overview(judged=0, total=0))
+
+    assert "не из чего считать" in msg.text.lower()
+    assert "Оценено решений" not in msg.text
+
+
+def test_leaks_msg_never_blames_the_outcome_of_a_hand():
+    """Лик — про решение против диапазона, а не про проигранную раздачу (CLAUDE.md)."""
+    from harness.presentation import leaks_msg
+
+    msg = leaks_msg(_leak_overview(("no_shove", 3, 2.0)))
+
+    assert "ошиб" not in msg.text.lower()
+    assert "по решениям, а не по исходам" in msg.text
+
+
+def _session_line(session_id: int, title: str, *, active: bool):
+    from datetime import UTC, datetime
+
+    from harness.contracts import SessionLine
+
+    return SessionLine(
+        session_id=session_id, title=title, started_at=datetime.now(UTC), is_active=active
+    )
+
+
+def test_sessions_msg_marks_the_open_evening_and_offers_a_new_one():
+    from harness.presentation import sessions_msg
+
+    msg = sessions_msg(
+        [
+            _session_line(2, "Сессия 7 сен", active=True),
+            _session_line(1, "Сессия 5 сен", active=False),
+        ]
+    )
+
+    assert "Сессия 7 сен · сейчас идёт" in msg.text
+    assert "Сессия 5 сен\n" in msg.text
+    data = [btn.callback_data for row in msg.buttons for btn in row]
+    assert data == ["session:2", "session:1", "newsession"]
+
+
+def test_sessions_msg_without_a_single_session_still_offers_to_start_one():
+    from harness.presentation import sessions_msg
+
+    msg = sessions_msg([])
+
+    assert "Сессий пока нет" in msg.text
+    assert [btn.callback_data for row in msg.buttons for btn in row] == ["newsession"]
+
+
+def _summary(**over):
+    from harness.contracts import SessionSummary
+
+    base = {
+        "session_id": 1,
+        "title": "Сессия 5 сен",
+        "tournaments": 1,
+        "hands": 12,
+        "loss_bb": 6.3,
+        "points_judged": 18,
+        "points_total": 24,
+    }
+    base.update(over)
+    return SessionSummary(**base)
+
+
+def test_session_summary_msg_counts_the_evening_and_names_its_leak():
+    from harness.contracts import LEAK_RULES, LeakStat
+    from harness.presentation import session_summary_msg
+
+    rule = next(r for r in LEAK_RULES if r.key == "fold_vs_shove")
+    msg = session_summary_msg(
+        _summary(top_leak=LeakStat(rule=rule, count=3, loss_bb=4.1))
+    )
+
+    assert "Турниров: 1 · разобрано раздач: 12." in msg.text
+    assert "Оценено решений: 18 из 24" in msg.text
+    assert "Суммарная потеря по всем точкам разбора: −6.3 bb." in msg.text
+    assert "Сбрасывает против шова, где колл плюсовой — 3 раза, −4.1 bb" in msg.text
+
+
+def test_session_summary_msg_stays_silent_about_a_leak_it_did_not_find():
+    """Безусловная строка «повторяющийся лик» была бы сообщением о ненайденном."""
+    from harness.presentation import session_summary_msg
+
+    msg = session_summary_msg(_summary(top_leak=None))
+
+    assert "не нашёл" in msg.text
+
+
+def test_session_summary_msg_of_an_empty_evening_promises_no_numbers():
+    from harness.presentation import session_summary_msg
+
+    msg = session_summary_msg(_summary(hands=0, tournaments=0, loss_bb=0.0))
+
+    assert "ещё ничего не разобрано" in msg.text
+    assert "Суммарная потеря" not in msg.text
+
+
+def _note(note_id: int = 1, *, nick: str = "villain", color: str = "red", text: str = "фолдит на опен"):
+    from datetime import UTC, datetime
+
+    from harness.contracts import NoteRecord
+
+    return NoteRecord(
+        note_id=note_id, nick=nick, color=color, text=text, updated_at=datetime.now(UTC)
+    )
+
+
+def test_notes_msg_shows_the_colour_the_nick_and_the_observation():
+    from harness.presentation import notes_msg
+
+    msg = notes_msg([_note()])
+
+    assert "🔴 агрессор · villain" in msg.text
+    assert "фолдит на опен" in msg.text
+    assert [btn.callback_data for btn in msg.buttons[0]] == [
+        "noteedit:1",
+        "notecolor:1",
+        "notedel:1",
+    ]
+
+
+def test_notes_msg_says_where_a_new_note_starts():
+    """Экран правит, но не заводит: путь заметки начинается из разбора руки."""
+    from harness.presentation import notes_msg
+
+    empty = notes_msg([])
+    filled = notes_msg([_note()])
+
+    for msg in (empty, filled):
+        assert "из разбора раздачи" in msg.text
+
+
+def test_note_prompt_msg_shows_what_is_already_written():
+    from harness.presentation import note_prompt_msg
+
+    fresh = note_prompt_msg("villain")
+    editing = note_prompt_msg("villain", _note(text="донкает флоп"))
+
+    assert "Сейчас записано" not in fresh.text
+    assert "Сейчас записано: донкает флоп" in editing.text
+
+
+def test_settings_msg_shows_the_nickname_the_quota_and_a_button_to_change_it():
+    from harness.presentation import settings_msg
+
+    known = settings_msg("screen_nick", 17, 50)
+    unknown = settings_msg(None, 17, 50)
+
+    assert "Ник в руме: screen_nick" in known.text
+    assert "разборов 17/50 за 24 ч" in known.text
+    assert known.buttons[0][0].callback_data == "setnick"
+    assert "не задан" in unknown.text
+    assert unknown.buttons[0][0].text == "✏️ Указать ник"
+
+
+def test_settings_msg_mentions_the_invite_command_only_to_its_owner():
+    """`/invite` — команда владельца; обычному игроку она не показывается."""
+    from harness.presentation import settings_msg
+
+    assert "/invite" in settings_msg("nick", 1, 50, is_dev=True).text
+    assert "/invite" not in settings_msg("nick", 1, 50, is_dev=False).text
+
+
+def test_help_msg_carries_the_bottom_menu_and_names_every_button():
+    from harness.presentation import MAIN_MENU, help_msg
+
+    msg = help_msg()
+
+    assert msg.menu == MAIN_MENU
+    for row in MAIN_MENU:
+        for label in row:
+            if label != "❓ Help":
+                assert label in msg.text
+
+
+def test_a_message_cannot_carry_both_keyboards():
+    """У сообщения Bot API ровно одно `reply_markup` — тип не даёт собрать два."""
+    import pytest
+
+    from harness.presentation import MAIN_MENU, Btn, Msg
+
+    with pytest.raises(ValueError, match="одна клавиатура"):
+        Msg(text="x", buttons=[[Btn(text="b", callback_data="d")]], menu=MAIN_MENU)
+
+
+def test_ranges_msg_captions_every_picture_with_its_own_point():
+    """Подпись картинки принадлежит своей точке — порядок тот же, что у рисовальщика."""
+    from harness.presentation import ranges_msg
+
+    res = _mixed_result()
+    msg = ranges_msg(["/data/ranges/1-1.png"], res)
+
+    assert [photo.path for photo in msg.photos] == ["/data/ranges/1-1.png"]
+    assert "колл шова" in msg.photos[0].caption
+
+
+def test_range_photos_do_not_borrow_a_caption_from_another_point():
+    """Лишний путь (разбор пересчитали) остаётся без подписи, а не с чужой."""
+    from harness.presentation import range_photos
+
+    res = _mixed_result()
+    photos = range_photos(["/a.png", "/b.png"], res)
+
+    assert photos[1].caption == ""
+
+
+def test_ranges_msg_of_a_strict_hand_explains_why_there_is_no_picture():
+    """Строгой точке рисовать нечего, и отказ называет причину, а не молчит."""
+    from harness.presentation import ranges_msg
+
+    strict = AnalysisResult(
+        hand_no="H1",
+        points=[_point(spot=SpotKind.PUSHFOLD_UNOPENED, ev_diff_bb=-1.0, zone=Zone.STRICT)],
+        ranked=[0],
+    )
+    msg = ranges_msg([], strict)
+
+    assert msg.photos == []
+    assert "не опирается на догадку" in msg.text

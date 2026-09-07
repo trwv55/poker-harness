@@ -74,6 +74,7 @@ from harness.contracts import (
     AnalysisResult,
     CanonicalHand,
     EnrichedHand,
+    Identity,
     RawHand,
     ScanSummary,
     TournamentReport,
@@ -86,7 +87,6 @@ from harness.contracts import (
 from harness.engine import enrich
 from harness.explanation import (
     UnfaithfulText,
-    hand_replay,
     render_range_png,
     tournament_text,
     verdict_text,
@@ -691,6 +691,23 @@ def _render_ranges(data_dir: Path | None, hand_id: int, result: AnalysisResult) 
     return paths
 
 
+# Сколько ников уходит в кнопки заметок. Ограничивает их сам конструктор кнопок
+# (`presentation.keyboards.note_buttons_for_hand`); здесь список только собирается.
+def _note_nicks(canonical: CanonicalHand) -> list[str]:
+    """Оппоненты, на которых игрок может записать заметку одним тапом.
+
+    Только те, чью личность источник знает по нику (`Identity.NICK`), то есть
+    только скрин: в HH оппоненты обезличены (спека §5.2), и заметка на хэш,
+    который не переживёт турнир, бессмысленна. Герой в список не попадает —
+    заметки пишут на других.
+    """
+    return [
+        player.label
+        for player in canonical.players
+        if player.identity is Identity.NICK
+    ]
+
+
 def _hand_zone(result: AnalysisResult, not_checked: Sequence[str] = ()) -> Zone | None:
     """Зона доверия ВСЕЙ руки — из всех судимых точек, консервативно (round 5, Item H).
 
@@ -1043,9 +1060,9 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
             _hand_zone(result, enriched.verdict.not_checked),
             quota_left,
             quota_total,
-            replay=hand_replay(enriched),
             verdict=verdict,
             not_checked=enriched.verdict.not_checked,
+            note_nicks=_note_nicks(enriched.hand),
         )
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
         await session.commit()
@@ -1122,9 +1139,9 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
             zone,
             quota_left,
             quota_total,
-            replay=hand_replay(hand.enriched),
             verdict=verdict,
             not_checked=hand.enriched.verdict.not_checked,
+            note_nicks=_note_nicks(hand.enriched.hand),
         )
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
         await session.commit()

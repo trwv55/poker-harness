@@ -71,7 +71,7 @@ from itertools import pairwise
 from math import ceil, floor
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from harness.contracts.analysis import (
     UNJUDGED_DECISION_NOT_TAKEN,
@@ -90,36 +90,78 @@ from harness.contracts.analysis import (
     Zone,
 )
 from harness.contracts.explanation import TournamentTextOut, VerdictTextOut
+from harness.contracts.history import (
+    NOTE_COLORS,
+    LeaksOverview,
+    LeakStat,
+    NoteRecord,
+    SessionLine,
+    SessionSummary,
+)
 from harness.contracts.raw import Street
 from harness.explanation.hand_replay import HandReplay
 from harness.presentation.keyboards import (
+    MAIN_MENU,
+    MENU_LEAKS,
+    MENU_NOTES,
+    MENU_SESSIONS,
+    MENU_SETTINGS,
+    MENU_TOURNAMENT,
     Btn,
     deep_dive_button,
     escalation_buttons,
+    note_buttons_for_hand,
+    note_color_buttons,
+    note_row,
+    session_buttons,
+    set_nickname_button,
     verdict_buttons,
 )
 
 __all__ = [
     "Msg",
+    "Photo",
     "ask_gg_nickname_msg",
     "bot_failure_msg",
     "button_not_ready_msg",
     "deep_dive_msg",
+    "disagreement_saved_msg",
     "escalation_msg",
     "failed_msg",
     "gg_nickname_saved_msg",
+    "help_msg",
     "hh_accepted_msg",
     "hh_duplicate_msg",
+    "hh_prompt_msg",
+    "invite_accepted_msg",
+    "invite_created_msg",
+    "invite_required_msg",
+    "leaks_msg",
     "new_session_msg",
     "not_a_hand_msg",
+    "note_color_prompt_msg",
+    "note_color_saved_msg",
+    "note_deleted_msg",
+    "note_gone_msg",
+    "note_prompt_msg",
+    "note_saved_msg",
+    "notes_msg",
     "progress_text",
     "quota_exceeded_msg",
     "range_image_title",
+    "range_photos",
+    "ranges_msg",
+    "replay_msg",
+    "replay_unavailable_msg",
     "scan_summary_msg",
     "send_as_file_msg",
+    "session_summary_msg",
+    "sessions_msg",
+    "settings_msg",
     "start_msg",
     "tournament_report_msg",
     "tournament_story_msg",
+    "unknown_text_msg",
     "unsupported_document_msg",
     "vision_answer_not_a_number_msg",
     "vision_answer_saved_msg",
@@ -128,11 +170,48 @@ __all__ = [
 ]
 
 
+class Photo(BaseModel):
+    """Картинка к сообщению: файл на диске и подпись под ним.
+
+    Путь, а не байты: картинки диапазонов рисует и кладёт на диск воркер
+    (`worker.pipeline._render_ranges`), в `analyses.range_images` лежат пути, и
+    таскать мегабайты через слой текста незачем.
+    """
+
+    path: str
+    caption: str
+
+
 class Msg(BaseModel):
-    """Готовое к отправке сообщение: текст плюс раскладка инлайн-кнопок рядами."""
+    """Готовое к отправке сообщение: текст, инлайн-кнопки, меню, картинки.
+
+    **`buttons` и `menu` взаимно исключены** — не стилистикой, а Bot API: у
+    сообщения ровно одно поле `reply_markup`, и положить туда обе клавиатуры
+    нельзя. Проверяет это сам тип, а не вызывающий: ошибка иначе всплыла бы
+    отказом Телеграма в проде (`test_a_message_cannot_carry_both_keyboards`).
+
+    `menu` — постоянная нижняя клавиатура (SESSIONS_UX): список рядов подписей.
+    Телеграм присылает нажатие такой кнопки обычным текстовым сообщением, и
+    разбирает его `bot/menus.py`.
+    """
 
     text: str
     buttons: list[list[Btn]] = []
+    menu: list[list[str]] | None = None
+    photos: list[Photo] = []
+    # Разметка Телеграма для этого сообщения (`HTML`), либо `None` — текст как
+    # есть. Ставится ровно там, где выделение несёт смысл: реплей выделяет точку
+    # решения героя (спека §5.6). Везде, где разметки нет, экранировать текст не
+    # требуется, и общий режим на всё подряд её бы и потребовал.
+    parse_mode: str | None = None
+
+    @model_validator(mode="after")
+    def _one_keyboard_at_a_time(self) -> Msg:
+        if self.buttons and self.menu is not None:
+            raise ValueError(
+                "у сообщения одна клавиатура: либо инлайн-кнопки, либо нижнее меню"
+            )
+        return self
 
 
 # --- Словари перевода внутренних токенов в слова игрока -------------------------
@@ -462,9 +541,9 @@ def deep_dive_msg(
     quota_left: int,
     quota_total: int,
     dev_line: str | None = None,
-    replay: HandReplay | None = None,
     verdict: VerdictTextOut | None = None,
     not_checked: Sequence[str] = (),
+    note_nicks: Sequence[str] = (),
 ) -> Msg:
     """Полный разбор раздачи: точки решения числами (текст LLM — задача 21) +
     статус-строка (⏱ время · зона доверия · остаток квоты) + три кнопки.
@@ -492,11 +571,19 @@ def deep_dive_msg(
     пометка обещала не допустить. Понижение зоны делает вызывающий
     (`_hand_zone`), а называет непроверенное эта строка: одно без другого
     оставляет либо неназванную оговорку, либо неоправданную уверенность.
+
+    **Реплея здесь нет — он под кнопкой «Подробнее»** (задача 23). Ход раздачи
+    печатался прямо в этом сообщении и занимал в нём больше места, чем сам
+    разбор, а `sendMessage` жёстко ограничен 4096 символами: длинная раздача с
+    прозой модели упиралась в этот предел (`_MAX_STORY_CHARS` рядом — про ту же
+    границу). Кнопка отдаёт тот же реплей отдельным сообщением, где выделение
+    точки решения ещё и видно (`replay_msg`).
+
+    `note_nicks` — оппоненты, на которых можно записать заметку одним тапом
+    (решение владельца 2026-09-04: путь заметки начинается ИЗ РАЗБОРА). Ники
+    приходят только со скрина; на HH-пути список пуст, потому что там их нет.
     """
     lines = [f"Рука {res.hand_no}", ""]
-    if replay is not None:
-        lines.append(replay.plain)
-        lines.append("")
 
     prose = {} if verdict is None else {point.dp_index: point.text for point in verdict.points}
 
@@ -545,7 +632,8 @@ def deep_dive_msg(
     if dev_line is not None:
         lines.append(dev_line)
 
-    return Msg(text="\n".join(lines), buttons=[verdict_buttons(res.hand_no)])
+    buttons = [verdict_buttons(res.hand_no), *note_buttons_for_hand(note_nicks)]
+    return Msg(text="\n".join(lines), buttons=buttons)
 
 
 def range_image_title(point: PointVerdict) -> str:
@@ -612,15 +700,21 @@ def start_msg() -> Msg:
     один шаг (прислать файл), а не показывает карту продукта. Про сессии здесь
     не сказано ни слова намеренно — их создание молчаливое, и заставлять новичка
     думать о них до первого результата значило бы отменить это решение.
+
+    Нижнее меню приезжает вместе с этим сообщением (`menu`) — оно и есть «всё
+    остальное» из того же правила: главное действие остаётся не кнопкой, а
+    попасть в историю, лики и заметки больше неоткуда.
     """
     return Msg(
         text=(
             "Разбираю покерные раздачи с проверенным расчётом: точное считает код, "
             "словами объясняю отдельно.\n\n"
-            "Пришлите файл раздач (.txt) из PokerCraft — сделаю префлоп-скан турнира и "
-            "покажу расхождения по цене. Под каждой раздачей будет кнопка «разобрать».\n\n"
+            "Пришлите скриншот стола — разберу раздачу. Или файл раздач (.txt) из "
+            "PokerCraft — сделаю префлоп-скан турнира и покажу расхождения по цене. "
+            "Под каждой раздачей будет кнопка «разобрать».\n\n"
             "/new — начать новую сессию."
-        )
+        ),
+        menu=MAIN_MENU,
     )
 
 
@@ -1067,3 +1161,410 @@ def tournament_story_msg(narrative: TournamentTextOut) -> Msg:
         noun = _plural_form(count, "абзац", "абзаца", "абзацев")
         shown.append(f"{verb} {count} {noun} из {total} — текст не поместился целиком.")
     return Msg(text="\n\n".join(shown))
+
+
+# --- экраны нижнего меню (задача 23) -------------------------------------------------
+
+# Сколько заметок печатается на экране «Заметки». Тот же предел `sendMessage` в
+# 4096 символов, что режет списки выше; заметка длиннее строки скана (ник, дата,
+# текст наблюдения плюс ряд из трёх кнопок), поэтому потолок ниже.
+_MAX_RENDERED_NOTES = 10
+
+# Строка честности экрана «Мои лики». Список считается по вердиктам ядра, а те
+# судят решение против диапазона, а не против вскрытой карты (CLAUDE.md): без
+# этой строки игрок вправе прочесть список как «вот из-за чего я проиграл».
+_LEAKS_DISCLAIMER = (
+    "Считаю по решениям, а не по исходам: раздача, проигранная по случайности, "
+    "в этот список не попадает."
+)
+
+# Что означает пустое покрытие. Судятся сегодня только префлоп-споты пуш-фолда
+# (`JUDGED_SPOTS`), и молчание об этом превратило бы короткий список ликов в
+# заявление «в остальном всё хорошо».
+_COVERAGE_NOTE = "Остальные решения расчёт пока не судит — про них он не говорит ничего."
+
+
+def _coverage_line(judged: int, total: int) -> str:
+    return f"Оценено решений: {judged} из {total} за всю историю."
+
+
+def _times_word(count: int) -> str:
+    return _plural_form(count, "раз", "раза", "раз")
+
+
+def _leak_line(stat: LeakStat) -> str:
+    """Строка типа лика: подпись, частота, цена. Ровно то, что просил владелец."""
+    return (
+        f"{stat.rule.title} — {stat.count} {_times_word(stat.count)}, "
+        f"{_fmt_bb(-stat.loss_bb)}"
+    )
+
+
+def leaks_msg(overview: LeaksOverview) -> Msg:
+    """Экран «Мои лики»: покрытие сверху, типы ликов по цене под ним.
+
+    Группировка по ТИПУ ЛИКА (решение владельца 2026-09-07), а не по споту:
+    «не шовит, где надо» и «шовит слишком широко» — противоположные привычки,
+    и в одной строке они были бы бессмысленны. Точки «около нуля» и точки без
+    вердикта сюда не попадают — их отсеивает сама таблица правил
+    (`memory.repos.LeaksRepo`, `contracts.history`).
+
+    Покрытие печатается ВСЕГДА и первым, как в сводке скана: короткий список
+    ликов без него читается как «в остальном сыграно чисто».
+    """
+    if overview.points_total == 0:
+        return Msg(
+            text=(
+                "Пока не из чего считать: разобранных раздач нет.\n\n"
+                "Пришлите скриншот стола или файл раздач (.txt) из PokerCraft — "
+                "лики копятся по всей истории разборов."
+            )
+        )
+    lines = ["Мои лики — по всей истории разборов.", "", _coverage_line(overview.points_judged, overview.points_total)]
+    if overview.leaks:
+        lines.append("")
+        lines.extend(_leak_line(stat) for stat in overview.leaks)
+    else:
+        lines.append("")
+        lines.append("Среди оценённых решений повторяющихся расхождений не нашлось.")
+    lines.append("")
+    lines.append(_LEAKS_DISCLAIMER)
+    lines.append(_COVERAGE_NOTE)
+    return Msg(text="\n".join(lines))
+
+
+def sessions_msg(sessions: Sequence[SessionLine]) -> Msg:
+    """Экран «Сессии»: список вечеров, сводка — по нажатию на вечер.
+
+    Сводка считается ПО ЗАПРОСУ (решение владельца 2026-09-07), поэтому в
+    списке ни рук, ни цены: строка называет вечер и говорит, идёт ли он.
+    Кнопка «Начать новую» — та же логика, что `/new` (SESSIONS_UX).
+    """
+    if not sessions:
+        return Msg(
+            text=(
+                "Сессий пока нет. Сессия — это вечер игры: она откроется сама, "
+                "как только пришлёте скриншот раздачи или файл из PokerCraft."
+            ),
+            buttons=session_buttons([]),
+        )
+    lines = ["Сессии — по одной на вечер игры.", ""]
+    for line in sessions:
+        lines.append(f"{line.title}{' · сейчас идёт' if line.is_active else ''}")
+    lines.append("")
+    lines.append("Нажмите на сессию — покажу сводку вечера.")
+    return Msg(
+        text="\n".join(lines),
+        buttons=session_buttons([(line.session_id, line.title) for line in sessions]),
+    )
+
+
+def session_summary_msg(summary: SessionSummary) -> Msg:
+    """Сводка вечера: турниры, разобранные руки, цена расхождений, лик вечера.
+
+    Число потери подписано теми же словами, что и в сводке скана («суммарная
+    потеря по всем точкам разбора»): это одна и та же величина, посчитанная по
+    судимым точкам, и две разные подписи читались бы как два разных числа.
+    """
+    lines = [summary.title, ""]
+    if summary.hands == 0:
+        lines.append("За этот вечер ещё ничего не разобрано.")
+        return Msg(text="\n".join(lines))
+    lines.append(
+        f"Турниров: {summary.tournaments} · разобрано раздач: {summary.hands}."
+    )
+    lines.append(_coverage_line(summary.points_judged, summary.points_total))
+    lines.append(
+        f"Суммарная потеря по всем точкам разбора: {_fmt_bb(-summary.loss_bb)}."
+    )
+    lines.append("")
+    if summary.top_leak is None:
+        lines.append("Повторяющегося расхождения за этот вечер расчёт не нашёл.")
+    else:
+        lines.append(f"Чаще всего за вечер: {_leak_line(summary.top_leak)}.")
+    return Msg(text="\n".join(lines))
+
+
+def _note_lines(note: NoteRecord) -> list[str]:
+    label = next(
+        (color.label for color in NOTE_COLORS if color.key == note.color), note.color
+    )
+    return [f"{label} · {note.nick}", note.text]
+
+
+def notes_msg(notes: Sequence[NoteRecord]) -> Msg:
+    """Экран «Заметки»: наблюдения об оппонентах, свежие первыми.
+
+    Экран показывает и правит, но НЕ заводит новых: заметка ценна скоростью
+    записи в момент наблюдения, поэтому путь «добавить» начинается из разбора
+    руки с уже подставленным оппонентом (решение владельца 2026-09-04). Об этом
+    прямо сказано текстом — иначе экран выглядел бы сломанным.
+    """
+    head = "Заметки на оппонентов — то, чего не показывает HUD."
+    tail = (
+        "Новая заметка начинается из разбора раздачи: под вердиктом есть кнопка "
+        "с ником оппонента. Заметки живут только на скринах — в файлах PokerCraft "
+        "ники обезличены."
+    )
+    if not notes:
+        return Msg(text=f"{head}\n\nПока пусто.\n\n{tail}")
+    shown = list(notes[:_MAX_RENDERED_NOTES])
+    lines = [head, ""]
+    buttons: list[list[Btn]] = []
+    for note in shown:
+        lines.extend(_note_lines(note))
+        lines.append("")
+        buttons.append(note_row(note.note_id))
+    if len(shown) < len(notes):
+        lines.append(f"Показаны {len(shown)} из {len(notes)} — самые свежие.")
+        lines.append("")
+    lines.append(tail)
+    return Msg(text="\n".join(lines), buttons=buttons)
+
+
+def note_prompt_msg(nick: str, existing: NoteRecord | None = None) -> Msg:
+    """Просьба написать наблюдение об оппоненте — вход FSM заметки.
+
+    Примеры в тексте — из решения владельца 2026-09-04 дословно: заметка
+    фиксирует то, чего не выводится из счётчиков.
+    """
+    lines = [f"Заметка на {nick}."]
+    if existing is not None:
+        lines.append(f"Сейчас записано: {existing.text}")
+    lines.append(
+        "Напишите наблюдение одним сообщением — то, чего не покажет HUD: "
+        "«фолдит на опен», «донкает флоп». Новый текст заменит прежний."
+    )
+    return Msg(text="\n".join(lines))
+
+
+def note_saved_msg(nick: str) -> Msg:
+    return Msg(text=f"Записал заметку на {nick}.")
+
+
+def note_deleted_msg(nick: str) -> Msg:
+    return Msg(text=f"Удалил заметку на {nick}.")
+
+
+def note_color_prompt_msg(note: NoteRecord) -> Msg:
+    """Выбор цветового архетипа — вторая половина двухслойной разметки заметок."""
+    return Msg(
+        text=f"Цвет заметки на {note.nick}: выберите архетип.",
+        buttons=note_color_buttons(
+            note.note_id, [(color.key, color.label) for color in NOTE_COLORS]
+        ),
+    )
+
+
+def note_color_saved_msg(nick: str, label: str) -> Msg:
+    return Msg(text=f"{nick} — {label}.")
+
+
+def note_gone_msg() -> Msg:
+    """Кнопка нажата, а заметки уже нет (удалена соседним нажатием)."""
+    return Msg(text="Этой заметки больше нет.")
+
+
+def settings_msg(
+    nickname: str | None, quota_left: int, quota_total: int, *, is_dev: bool = False
+) -> Msg:
+    """Экран «Настройки»: ник в руме, остаток дневного лимита, о боте.
+
+    Ник вводится отсюда — явной кнопкой (решение владельца 2026-09-07). Раньше
+    ником становилось первое же текстовое сообщение игрока, и случайная реплика
+    молча оказывалась в профиле.
+
+    Остаток квоты — те же числа и та же формулировка, что в подписи под
+    разбором (`_quota_line`): второго счётчика в продукте нет.
+    """
+    lines = ["Настройки", ""]
+    if nickname:
+        lines.append(f"Ник в руме: {nickname} — по нему я нахожу вас за столом на скриншоте.")
+    else:
+        lines.append(
+            "Ник в руме не задан. Без него скриншот разбирать не на кого: "
+            "героя за столом определяет код, а не модель."
+        )
+    lines.append(f"Доступно: {_quota_line(quota_left, quota_total)}.")
+    lines.append("")
+    lines.append(
+        "О боте: разбираю турнирные раздачи проверенным расчётом — точное считает "
+        "код, словами объясняю отдельно."
+    )
+    if is_dev:
+        lines.append("")
+        lines.append("Режим разработчика включён. /invite — выпустить инвайт-код.")
+    return Msg(text="\n".join(lines), buttons=[[set_nickname_button(bool(nickname))]])
+
+
+def help_msg() -> Msg:
+    """Экран «Help»: что прислать и что делает каждая кнопка нижнего меню.
+
+    Несёт нижнее меню (`menu`) — это ещё и способ вернуть клавиатуру тому, кто
+    её свернул: инлайн-кнопок здесь нет, и место `reply_markup` свободно.
+    """
+    return Msg(
+        text=(
+            "Как этим пользоваться\n\n"
+            "Пришлите скриншот стола — разберу раздачу и покажу цену решений.\n"
+            "Пришлите файл раздач (.txt) из PokerCraft — сделаю префлоп-скан турнира.\n\n"
+            "Кнопки внизу:\n"
+            f"{MENU_SESSIONS} — вечера игры и сводка по каждому.\n"
+            f"{MENU_TOURNAMENT} — как прислать файл раздач.\n"
+            f"{MENU_LEAKS} — типовые расхождения по всей истории.\n"
+            f"{MENU_NOTES} — наблюдения об оппонентах.\n"
+            f"{MENU_SETTINGS} — ник в руме и остаток дневного лимита.\n\n"
+            "/new — начать новую сессию.\n"
+            "/nick — указать ник в руме."
+        ),
+        menu=MAIN_MENU,
+    )
+
+
+def hh_prompt_msg() -> Msg:
+    """Экран «Турнир (HH)»: откуда взять файл и что с ним будет.
+
+    Отдельным экраном, а не одной строкой в help: путь до выгрузки в GG не
+    очевиден, а без файла HH-вход недоступен вовсе.
+    """
+    return Msg(
+        text=(
+            "Разбор турнира по файлу раздач\n\n"
+            "В GG откройте PokerCraft → «История рук» → выберите турнир → "
+            "скачайте историю раздач (.txt) и пришлите файл сюда.\n\n"
+            "Я сделаю префлоп-скан всего турнира и пришлю сводку: расхождения по "
+            "цене, под каждым — кнопка «разобрать». Скан дневной лимит не тратит."
+        )
+    )
+
+
+def range_photos(paths: Sequence[str], res: AnalysisResult) -> list[Photo]:
+    """Картинки диапазонов с подписями — то, что уходит игроку по кнопке «Диапазоны».
+
+    Порядок путей задан рисовальщиком (`worker.pipeline._render_ranges`): он
+    идёт по `res.ranked` и пропускает точки без допущения. Здесь тот же обход
+    повторён, чтобы подпись досталась своей картинке; лишние пути (сохранённые
+    старой версией разбора) остаются без подписи, а не получают чужую
+    (`test_range_photos_do_not_borrow_a_caption_from_another_point`).
+    """
+    points = [
+        res.points[index]
+        for index in res.ranked
+        if res.points[index].assumption is not None
+    ]
+    photos: list[Photo] = []
+    for position, path in enumerate(paths):
+        caption = range_image_title(points[position]) if position < len(points) else ""
+        photos.append(Photo(path=path, caption=caption))
+    return photos
+
+
+def ranges_msg(paths: Sequence[str], res: AnalysisResult) -> Msg:
+    """Ответ на кнопку «Диапазоны»: картинки матриц либо честное «их нет».
+
+    Диапазон рисуется только там, где вывод опирается на допущение о поле
+    (зона «предполагая»). У строгой точки показывать нечего, и картинка
+    подразумевала бы обратное — поэтому отказ называет причину, а не молчит.
+    """
+    photos = range_photos(paths, res)
+    if not photos:
+        return Msg(
+            text=(
+                "По этой раздаче диапазоны не рисуются: вывод не опирается на "
+                "догадку о диапазоне оппонента."
+            )
+        )
+    return Msg(text=f"Диапазоны к раздаче {res.hand_no}:", photos=photos)
+
+
+def _html_escape(text: str) -> str:
+    """Экранирование для `parse_mode=HTML` — только три обязательных символа.
+
+    Телеграм требует экранировать `<`, `>` и `&`; ник оппонента и подписи карт
+    приходят из внешнего мира, и незакрытый `<` уронил бы отправку сообщения
+    целиком (`test_replay_msg_escapes_a_nickname_that_looks_like_a_tag`).
+    """
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def replay_msg(replay: HandReplay, hand_no: str) -> Msg:
+    """Ответ на кнопку «Подробнее»: ход раздачи, точка решения героя — жирным.
+
+    Спека §5.6 требует выделить точку решения прямо в потоке действий;
+    `explanation.hand_replay` отдаёт куски с флагом `emphasis`, а во что
+    превратится выделение — решает этот модуль. Здесь это `<b>` при
+    `parse_mode=HTML`, поэтому весь остальной текст экранируется
+    (`_html_escape`).
+    """
+    body = "".join(
+        f"<b>{_html_escape(span.text)}</b>" if span.emphasis else _html_escape(span.text)
+        for span in replay.spans
+    )
+    return Msg(text=f"Ход раздачи {_html_escape(hand_no)}\n\n{body}", parse_mode="HTML")
+
+
+def replay_unavailable_msg() -> Msg:
+    """Кнопка «Подробнее» нажата под раздачей, хода которой у нас нет.
+
+    Так бывает у старых разборов: реплей строится из `hands.enriched`, а
+    сохранённая рука могла остаться на чекпоинте ниже (спека §8.2).
+    """
+    return Msg(text="Хода этой раздачи у меня не сохранилось — показать нечего.")
+
+
+def disagreement_saved_msg() -> Msg:
+    """«Не согласен» принято: возражение уходит в eval-датасет (EVALS, этаж 4).
+
+    Самая ценная кнопка продукта (SESSIONS_UX), поэтому ответ говорит, что
+    именно произошло с нажатием, а не просто «спасибо».
+    """
+    return Msg(
+        text=(
+            "Записал возражение. Разбор от этого не меняется — но эта раздача "
+            "уходит в набор, на котором мы проверяем расчёт."
+        )
+    )
+
+
+def invite_required_msg() -> Msg:
+    """Вход закрыт: без инвайта — вежливый отказ, а не молчание.
+
+    Отказ называет, чего не хватает, и не намекает, что код можно подобрать:
+    подбирать нечего, коды случайны (`memory.repos.InvitesRepo`).
+    """
+    return Msg(
+        text=(
+            "Пока я работаю по приглашениям. Если у вас есть код — пришлите "
+            "команду /start и код одной строкой: /start ВАШ_КОД."
+        )
+    )
+
+
+def invite_accepted_msg() -> Msg:
+    return Msg(
+        text="Код принят — добро пожаловать.",
+    )
+
+
+def invite_created_msg(code: str) -> Msg:
+    """Выпущенный код — владельцу. Ссылку не собираем: имени бота модуль не знает."""
+    return Msg(
+        text=(
+            f"Инвайт-код: {code}\n\n"
+            f"Приглашённый начинает так: /start {code}"
+        )
+    )
+
+
+def unknown_text_msg() -> Msg:
+    """Текст, который ничего не значит: ни меню, ни ответ на вопрос бота.
+
+    До задачи 23 такое сообщение молча становилось ником в руме. Молчание было
+    бы вторым плохим ответом: игрок не знает, услышали ли его.
+    """
+    return Msg(
+        text=(
+            "Не понял. Пришлите скриншот раздачи или файл из PokerCraft — "
+            "остальное в нижнем меню."
+        )
+    )
