@@ -62,8 +62,16 @@ _MAX_NOTES_LISTED = 20
 
 
 async def _sessions_screen(db: AsyncSession, player: Player) -> Msg:
+    """Сессии: страница списка плюс отдельный счёт всех вечеров игрока.
+
+    Счёт нужен затем, чтобы обрезка была названа вслух: показать 10 вечеров из
+    тридцати молча — та же деградация без огласки, против которой написаны
+    строки обрезки в сводке скана и отчёте по турниру.
+    """
+    sessions = SessionsRepo(db)
     return sessions_msg(
-        await SessionsRepo(db).list_for_player(player.id, limit=_MAX_SESSIONS_LISTED)
+        await sessions.list_for_player(player.id, limit=_MAX_SESSIONS_LISTED),
+        await sessions.count_for_player(player.id),
     )
 
 

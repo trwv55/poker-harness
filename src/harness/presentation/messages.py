@@ -1254,12 +1254,18 @@ def leaks_msg(overview: LeaksOverview) -> Msg:
     return Msg(text="\n".join(lines))
 
 
-def sessions_msg(sessions: Sequence[SessionLine]) -> Msg:
+def sessions_msg(sessions: Sequence[SessionLine], total: int) -> Msg:
     """Экран «Сессии»: список вечеров, сводка — по нажатию на вечер.
 
     Сводка считается ПО ЗАПРОСУ (решение владельца 2026-09-07), поэтому в
     списке ни рук, ни цены: строка называет вечер и говорит, идёт ли он.
     Кнопка «Начать новую» — та же логика, что `/new` (SESSIONS_UX).
+
+    `total` — сколько вечеров у игрока всего (`SessionsRepo.count_for_player`).
+    Список приходит с потолком запроса, и обрезка называется вслух: молчать о
+    ней этот файл запрещает себе дважды — в `scan_summary_msg` и в
+    `tournament_report_msg`
+    (`test_sessions_msg_says_when_the_history_did_not_fit`).
     """
     if not sessions:
         return Msg(
@@ -1273,6 +1279,8 @@ def sessions_msg(sessions: Sequence[SessionLine]) -> Msg:
     for line in sessions:
         lines.append(f"{line.title}{' · сейчас идёт' if line.is_active else ''}")
     lines.append("")
+    if len(sessions) < total:
+        lines.append(f"Показаны {len(sessions)} из {total} — самые свежие.")
     lines.append("Нажмите на сессию — покажу сводку вечера.")
     return Msg(
         text="\n".join(lines),

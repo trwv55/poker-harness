@@ -1339,7 +1339,8 @@ def test_sessions_msg_marks_the_open_evening_and_offers_a_new_one():
         [
             _session_line(2, "Сессия 7 сен", active=True),
             _session_line(1, "Сессия 5 сен", active=False),
-        ]
+        ],
+        2,
     )
 
     assert "Сессия 7 сен · сейчас идёт" in msg.text
@@ -1351,10 +1352,25 @@ def test_sessions_msg_marks_the_open_evening_and_offers_a_new_one():
 def test_sessions_msg_without_a_single_session_still_offers_to_start_one():
     from harness.presentation import sessions_msg
 
-    msg = sessions_msg([])
+    msg = sessions_msg([], 0)
 
     assert "Сессий пока нет" in msg.text
     assert [btn.callback_data for row in msg.buttons for btn in row] == ["newsession"]
+
+
+def test_sessions_msg_says_when_the_history_did_not_fit():
+    """Экран отдаёт страницу истории и обязан сказать, что она страница.
+
+    Молчаливая обрезка запрещена этим же файлом дважды — в сводке скана и в
+    отчёте по турниру.
+    """
+    from harness.presentation import sessions_msg
+
+    lines = [_session_line(i, f"Сессия {i}", active=False) for i in range(10, 0, -1)]
+
+    msg = sessions_msg(lines, 34)
+
+    assert "Показаны 10 из 34 — самые свежие." in msg.text
 
 
 def _summary(**over):

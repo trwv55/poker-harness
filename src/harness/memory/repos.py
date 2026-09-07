@@ -256,6 +256,21 @@ class SessionsRepo:
         await self.db.flush()
         return record
 
+    async def count_for_player(self, player_id: int) -> int:
+        """Сколько вечеров у игрока всего — знаменатель строки обрезки экрана.
+
+        Отдельным запросом: длина `list_for_player` — размер страницы, а не
+        история игрока (`test_the_session_count_does_not_depend_on_the_page_size`).
+        """
+        return int(
+            await self.db.scalar(
+                select(func.count())
+                .select_from(SessionRow)
+                .where(SessionRow.player_id == player_id)
+            )
+            or 0
+        )
+
     async def list_for_player(self, player_id: int, *, limit: int = 10) -> list[SessionLine]:
         """Сессии игрока, свежие первыми, — список экрана «Сессии».
 

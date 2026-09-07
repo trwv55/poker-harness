@@ -768,6 +768,17 @@ async def test_the_session_list_marks_the_open_evening(db):
     assert [line.is_active for line in lines] == [True, False]
 
 
+async def test_the_session_count_does_not_depend_on_the_page_size(db):
+    """Счёт вечеров игрока — отдельный запрос, а не длина отданной страницы."""
+    player_id, _first = await _player_with_session(db, tg_user_id=5017)
+    for _ in range(4):
+        await SessionsRepo(db).close_active(player_id)
+        await SessionsRepo(db).active_or_create(player_id)
+
+    assert len(await SessionsRepo(db).list_for_player(player_id, limit=2)) == 2
+    assert await SessionsRepo(db).count_for_player(player_id) == 5
+
+
 async def test_a_note_is_one_per_opponent_and_editing_keeps_its_colour(db):
     """Заметка накапливается на оппоненте: вторая запись — правка, а не дубль.
 
