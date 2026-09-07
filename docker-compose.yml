@@ -1,7 +1,8 @@
 # Деплой v1 (спека §12): `postgres`, `bot`, `worker` на одном VPS; миграции —
 # отдельный одноразовый шаг `migrate`, а не entrypoint приложений.
 #
-# Порядок деплоя и бэкап — в README, раздел «Деплой».
+# Порядок деплоя и бэкап — в README, раздел «Деплой»; пошаговый запуск на чистом
+# сервере, включая доставку приватных промптов, — docs/deploy-runbook.md.
 #
 # ====== ОБЩИЙ ТОМ ДЛЯ ФАЙЛОВ ИГРОКА ======
 # Бот сохраняет присланный hand history в `DATA_DIR/hh/{sha256}.txt` и кладёт
@@ -39,6 +40,21 @@
 
 name: poker-harness
 
+# ====== РОТАЦИЯ ЛОГОВ ======
+# Драйвер `json-file` по умолчанию не ротирует НИЧЕГО: файл контейнера растёт до
+# конца диска, и на VPS это отказ всего хоста, а не одного сервиса. Дефолт демона
+# правится в /etc/docker/daemon.json, но он общий для машины и на новом сервере
+# его может не быть — поэтому предел объявлен здесь, у проекта: 10 МБ на файл,
+# 5 файлов, то есть не больше ~50 МБ на контейнер.
+# Второй мотив ровно тот же по смыслу, но не про диск: в логи уже однажды уехал
+# токен бота (приёмка 2026-09-05, до `f775d06`), и «логи, которые живут вечно» —
+# это секрет, который живёт вечно. Ротация ограничивает и срок такой утечки.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   postgres:
     image: postgres:16
@@ -48,6 +64,7 @@ services:
       POSTGRES_PASSWORD: ${PG_PASSWORD:?не задан PG_PASSWORD — скопируйте .env.example в .env и заполните}
     volumes:
       - pgdata:/var/lib/postgresql/data
+    logging: *logging
     # Healthcheck не украшение: и `migrate`, и приложения ждут по нему. Голый
     # `depends_on` гарантирует только то, что контейнер СОЗДАН, а `alembic
     # upgrade head` сразу после `up` успевает постучаться в ещё не поднявшийся
@@ -119,9 +136,17 @@ services:
         required: false
     volumes:
       - hh_files:/data
+    logging: *logging
     depends_on:
       postgres:
         condition: service_healthy
+    # У `bot` и `worker` healthcheck'а НЕТ, и это осознанно: у обоих нет ни
+    # порта, ни эндпоинта, а проверка вида «процесс жив» отвечала бы на вопрос,
+    # на который уже отвечает сам Docker. Честная проверка живости у них разная
+    # и внешняя: у бота — `getMe` и ответ на `/start`, у воркера — задача,
+    # доехавшая до `done` (docs/deploy-runbook.md, «Проверка после старта»).
+    # Единственный healthcheck в проекте — у `postgres`, и он нужен не для
+    # мониторинга, а как условие старта: по нему ждут и миграции, и приложения.
     restart: unless-stopped
 
   worker:
@@ -140,6 +165,7 @@ services:
         required: false
     volumes:
       - hh_files:/data
+    logging: *logging
     depends_on:
       postgres:
         condition: service_healthy
