@@ -599,6 +599,12 @@ async def handle_escalation_callback(deps: BotDeps, tg_user_id: int, data: str) 
         if raw_value == MANUAL_ANSWER:
             payload = {**dict(job.payload), "manual_entry": field}
             await _remember_payload(db, job.id, payload)
+            # Начатый ввод заметки или ника гасится здесь: `handle_text`
+            # проверяет `pending_input` раньше эскалации, и без этой строки
+            # число, набранное в ответ на только что заданный вопрос, ушло бы
+            # в заметку
+            # (`test_the_manual_entry_button_closes_an_input_that_was_started`).
+            await PlayersRepo(db).set_pending_input(player.id, None)
             await db.commit()
             return vision_manual_entry_msg(_question_of(job))
         value = _chosen_option(job, raw_value)
@@ -613,13 +619,21 @@ async def handle_escalation_callback(deps: BotDeps, tg_user_id: int, data: str) 
 
 
 async def handle_text(deps: BotDeps, tg_user_id: int, text: str) -> Msg | None:
-    """Обычное сообщение: кнопка меню, число по эскалации, начатый ввод — в этом порядке.
+    """Обычное сообщение: кнопка меню, начатый ввод, число по эскалации — в этом порядке.
 
     **Порядок не произволен.** Нижнее меню Телеграма присылает нажатие ОБЫЧНЫМ
     текстом, поэтому подпись кнопки проверяется первой: игрок, нажавший «Мои
     лики» посреди ввода заметки, хочет экран, а не заметку с таким текстом.
     Нажатие меню поэтому же и снимает начатый ввод — иначе следующая же реплика
     попала бы в него неожиданно для игрока.
+
+    **Ввод из `pending_input` — раньше эскалации.** Эскалация ждёт в статусе
+    `awaiting_user` без срока (SESSIONS_UX), а `pending_input` ставится ровно
+    тем нажатием или командой, на которые игрок отвечает прямо сейчас: обратный
+    порядок отдавал бы висящей задаче и текст заметки, и ник
+    (`test_a_note_typed_while_an_escalation_waits_lands_in_the_note`).
+    Встречный перехват закрыт в другом месте: открывая ручной ввод по
+    эскалации, `handle_escalation_callback` гасит `pending_input`.
 
     Состояние ввода живёт в БД, а не в памяти процесса бота: число по эскалации
     — в `jobs.payload` (спека §8.3, задача 22), ник и текст заметки — в
@@ -643,6 +657,12 @@ async def handle_text(deps: BotDeps, tg_user_id: int, text: str) -> Msg | None:
             await db.commit()
             return screen
 
+        pending = dict(player.pending_input or {})
+        if pending:
+            reply = await _apply_pending_input(db, player, pending, answer)
+            await db.commit()
+            return reply
+
         # Ждущих задач у игрока может быть несколько, а ручного ввода ждёт та, у
         # которой он и был начат: искать «свежайшую ждущую» значило бы подставить
         # число в чужую руку (ревью раунда 1, R2).
@@ -660,7 +680,6 @@ async def handle_text(deps: BotDeps, tg_user_id: int, text: str) -> Msg | None:
             await deps.queue.resume(job_id)
             return vision_answer_saved_msg()
 
-        pending = dict(player.pending_input or {})
         reply = await _apply_pending_input(db, player, pending, answer)
         await db.commit()
     return reply

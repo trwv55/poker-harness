@@ -1187,6 +1187,47 @@ async def test_a_non_number_typed_by_hand_asks_again_instead_of_guessing(deps, d
     assert job["status"] == "awaiting_user"
 
 
+async def test_a_note_typed_while_an_escalation_waits_lands_in_the_note(deps, db_factory):
+    """Явно открытый ввод забирает текст раньше висящей эскалации.
+
+    Эскалация ждёт без срока (SESSIONS_UX), снять её нечем, и до этой правки
+    незакрытый ручной ввод перехватывал ВСЁ: игрок, нажавший «Изменить» у
+    заметки, получал «Это не похоже на число», а заметка не менялась.
+    """
+    from harness.bot.handlers import handle_escalation_callback, handle_text, handle_ui_callback
+    from harness.presentation import note_saved_msg
+
+    job_id, _hand_id = await _awaiting_job(db_factory, deps)
+    await handle_escalation_callback(deps, _TG_USER_ID, f"escalate:{job_id}:pot:manual")
+
+    await handle_ui_callback(deps, _TG_USER_ID, "note:villain")
+    assert await handle_text(deps, _TG_USER_ID, "донкает флоп") == note_saved_msg("villain")
+
+    note = await fetch_one(db_factory, "select opponent_nick, text from notes")
+    assert (note["opponent_nick"], note["text"]) == ("villain", "донкает флоп")
+    job = await fetch_one(db_factory, f"select status from jobs where id = {job_id}")
+    assert job["status"] == "awaiting_user"
+
+
+async def test_the_manual_entry_button_closes_an_input_that_was_started(deps, db_factory):
+    """Встречный перехват: ввод по эскалации гасит начатый ввод заметки.
+
+    Иначе порядок «`pending_input` раньше эскалации» отдал бы заметке число,
+    набранное в ответ на только что заданный вопрос.
+    """
+    from harness.bot.handlers import handle_escalation_callback, handle_text, handle_ui_callback
+
+    job_id, _hand_id = await _awaiting_job(db_factory, deps)
+    await handle_ui_callback(deps, _TG_USER_ID, "note:villain")
+    await handle_escalation_callback(deps, _TG_USER_ID, f"escalate:{job_id}:pot:manual")
+
+    assert await handle_text(deps, _TG_USER_ID, "12,7") is not None
+
+    assert await fetch_all(db_factory, "select * from notes") == []
+    hand = await fetch_one(db_factory, "select raw from hands")
+    assert hand["raw"]["vision"]["displayed_pot"] == 127_000
+
+
 async def test_an_answer_without_a_waiting_job_changes_nothing(deps, db_factory):
     from harness.bot.handlers import handle_escalation_callback
 
