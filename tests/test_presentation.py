@@ -1383,7 +1383,7 @@ def test_session_summary_msg_counts_the_evening_and_names_its_leak():
     )
 
     assert "Турниров: 1 · разобрано раздач: 12." in msg.text
-    assert "Оценено решений: 18 из 24" in msg.text
+    assert "Оценено решений: 18 из 24 за этот вечер." in msg.text
     assert "Суммарная потеря по всем точкам разбора: −6.3 bb." in msg.text
     assert "Сбрасывает против шова, где колл плюсовой — 3 раза, −4.1 bb" in msg.text
 

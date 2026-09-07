@@ -1187,8 +1187,14 @@ _LEAKS_DISCLAIMER = (
 _COVERAGE_NOTE = "Остальные решения расчёт пока не судит — про них он не говорит ничего."
 
 
-def _coverage_line(judged: int, total: int) -> str:
-    return f"Оценено решений: {judged} из {total} за всю историю."
+def _coverage_line(judged: int, total: int, scope: str) -> str:
+    """Покрытие в точках решения. `scope` называет, за что оно посчитано.
+
+    Область обязана быть названа: одна и та же строка печатается на экране
+    ликов (вся история) и в сводке вечера (одна сессия), и «за всю историю» под
+    числами одного вечера было бы неверным утверждением о чужом множестве.
+    """
+    return f"Оценено решений: {judged} из {total} {scope}."
 
 
 def _times_word(count: int) -> str:
@@ -1223,7 +1229,11 @@ def leaks_msg(overview: LeaksOverview) -> Msg:
                 "лики копятся по всей истории разборов."
             )
         )
-    lines = ["Мои лики — по всей истории разборов.", "", _coverage_line(overview.points_judged, overview.points_total)]
+    lines = [
+        "Мои лики — по всей истории разборов.",
+        "",
+        _coverage_line(overview.points_judged, overview.points_total, "за всю историю"),
+    ]
     if overview.leaks:
         lines.append("")
         lines.extend(_leak_line(stat) for stat in overview.leaks)
@@ -1276,7 +1286,7 @@ def session_summary_msg(summary: SessionSummary) -> Msg:
     lines.append(
         f"Турниров: {summary.tournaments} · разобрано раздач: {summary.hands}."
     )
-    lines.append(_coverage_line(summary.points_judged, summary.points_total))
+    lines.append(_coverage_line(summary.points_judged, summary.points_total, "за этот вечер"))
     lines.append(
         f"Суммарная потеря по всем точкам разбора: {_fmt_bb(-summary.loss_bb)}."
     )
