@@ -121,6 +121,7 @@ from harness.presentation.keyboards import (
 __all__ = [
     "Msg",
     "Photo",
+    "analysis_unavailable_msg",
     "ask_gg_nickname_msg",
     "bot_failure_msg",
     "button_not_ready_msg",
@@ -129,6 +130,7 @@ __all__ = [
     "escalation_msg",
     "failed_msg",
     "gg_nickname_saved_msg",
+    "gg_nickname_too_long_msg",
     "help_msg",
     "hh_accepted_msg",
     "hh_duplicate_msg",
@@ -156,6 +158,7 @@ __all__ = [
     "scan_summary_msg",
     "send_as_file_msg",
     "session_summary_msg",
+    "session_unavailable_msg",
     "sessions_msg",
     "settings_msg",
     "start_msg",
@@ -1541,9 +1544,32 @@ def invite_required_msg() -> Msg:
 
 
 def invite_accepted_msg() -> Msg:
-    return Msg(
-        text="Код принят — добро пожаловать.",
-    )
+    """Код принят: приветствие и тот же первый экран, что у `/start`.
+
+    Текст первого экрана берётся у `start_msg`, а не пишется второй раз: два
+    приветствия разошлись бы при первой же правке одного из них.
+    """
+    start = start_msg()
+    return Msg(text=f"Код принят — добро пожаловать.\n\n{start.text}", menu=start.menu)
+
+
+def gg_nickname_too_long_msg(limit: int) -> Msg:
+    """Ник длиннее колонки в БД: честный отказ вместо тихого обрезания.
+
+    Обрезанный ник не совпал бы с ником на экране, и опознание героя кодом
+    перестало бы работать — молча и не в том месте, где ошиблись.
+    """
+    return Msg(text=f"Слишком длинный ник: в руме он не длиннее {limit} символов. Пришлите ещё раз.")
+
+
+def session_unavailable_msg() -> Msg:
+    """Нажали на сессию, которой у игрока нет: номер приехал из внешнего мира."""
+    return Msg(text="Такой сессии у вас нет.")
+
+
+def analysis_unavailable_msg() -> Msg:
+    """Кнопка под разбором нажата, а самого разбора у нас не осталось."""
+    return Msg(text="Разбора этой раздачи у меня не сохранилось.")
 
 
 def invite_created_msg(code: str) -> Msg:
