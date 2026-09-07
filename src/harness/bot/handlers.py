@@ -384,14 +384,17 @@ async def handle_document(deps: BotDeps, tg_user_id: int, file_bytes: bytes, fil
         # 20 секунд ради «не получилось разобрать» из воркера игроку незачем.
         return unsupported_document_msg()
 
-    path = _store_hh_file(deps.data_dir, file_bytes)
-    source_file = str(path)
-
     async with deps.db_factory() as db:
         player = await _known_player(db, tg_user_id)
         if player is None:
             await db.commit()
             return invite_required_msg()
+        # Байты ложатся на диск ТОЛЬКО за проверкой инвайта. Телеграм отдаёт
+        # документы до 20 МБ, и запись до неё складывала в общий том файлы
+        # любого, кто нашёл бота
+        # (`test_a_stranger_without_an_invite_leaves_nothing_in_the_volume`).
+        path = _store_hh_file(deps.data_dir, file_bytes)
+        source_file = str(path)
         session_row = await SessionsRepo(db).active_or_create(player.id)
         tournaments = TournamentsRepo(db)
 

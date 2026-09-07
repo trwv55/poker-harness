@@ -546,6 +546,23 @@ async def test_a_stranger_without_an_invite_is_refused_on_every_entry(db_factory
     assert await fetch_all(db_factory, "select * from players") == []
 
 
+async def test_a_stranger_without_an_invite_leaves_nothing_in_the_volume(deps, db_factory):
+    """Отказ незнакомцу — до записи байтов, а не после неё.
+
+    Телеграм отдаёт документы до 20 МБ, и общий том с файлами игроков не должен
+    наполняться кем угодно, кто нашёл бота.
+    """
+    from harness.presentation import invite_required_msg
+
+    msg = await handle_document(
+        deps, tg_user_id=999006, file_bytes=_HH_BYTES, filename="t.txt"
+    )
+
+    assert msg == invite_required_msg()
+    assert not (deps.data_dir / "hh").exists()
+    assert await fetch_all(db_factory, "select * from jobs") == []
+
+
 async def test_the_invite_command_answers_only_its_owner(db_factory, deps, invited):
     """`/invite` — команда владельца (`is_dev`); чужому она не отвечает ничего."""
     from harness.bot.handlers import handle_invite_command
