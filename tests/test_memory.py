@@ -799,6 +799,17 @@ async def test_a_note_is_one_per_opponent_and_editing_keeps_its_colour(db):
     assert len(await notes.list_for_player(player_id)) == 1
 
 
+def test_the_note_upsert_docstring_points_at_a_test_that_exists():
+    """Ссылка на тест обязана вести к тесту: иначе гарантия только на словах."""
+    import re
+
+    from harness.memory.repos import NotesRepo
+
+    referenced = re.findall(r"`(test_\w+)`", NotesRepo.upsert.__doc__ or "")
+    assert referenced
+    assert all(name in globals() for name in referenced), referenced
+
+
 async def test_an_empty_note_is_refused_rather_than_stored(db):
     from harness.memory.repos import NotesRepo
 

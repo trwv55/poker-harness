@@ -91,6 +91,22 @@ def test_data_dir_treats_empty_value_as_unset(monkeypatch):
     assert bot_main.data_dir() == Path("/data")
 
 
+def test_the_compose_file_does_not_deny_that_the_worker_reads_data_dir():
+    """`docker-compose.yml` называл строку `DATA_DIR` у воркера защитной.
+
+    Воркер зовёт ту же `bot.main.data_dir()` и кладёт по ней картинки диапазонов
+    (`worker/pipeline.py`, `_render_ranges`), то есть переменная у него несущая:
+    комментарий, называющий её ни на что не влияющей, приглашает её убрать.
+    """
+    import harness.worker.main as worker_main
+
+    assert worker_main.data_dir is bot_main.data_dir
+
+    compose = Path("docker-compose.yml").read_text(encoding="utf-8")
+    assert "`DATA_DIR` не читает" not in compose
+    assert "`DATA_DIR` читает ТОЛЬКО БОТ" not in compose
+
+
 def test_data_dir_reads_the_value_when_it_is_set(monkeypatch):
     monkeypatch.setenv("DATA_DIR", "/mnt/hh")
     assert bot_main.data_dir() == Path("/mnt/hh")

@@ -54,7 +54,7 @@ from harness.bot.handlers import (
 from harness.presentation import (
     Msg,
     bot_failure_msg,
-    button_not_ready_msg,
+    unknown_button_msg,
 )
 
 __all__ = ["DEEP_DIVE_PREFIX", "build_router"]
@@ -263,22 +263,19 @@ def build_router(deps: BotDeps) -> Router:
     async def on_unhandled_callback(callback: CallbackQuery) -> None:
         """Ответ на любую кнопку, у которой обработчика ещё нет (round 5, Item G).
 
-        Регистрируется ПОСЛЕ `on_deep_dive` и без фильтра: aiogram отдаёт
-        обновление первому подошедшему обработчику, поэтому `deep:` по-прежнему
-        уходит наверх, а всё остальное — сюда. Сейчас «остальное» это три кнопки
-        под каждым разбором (`ranges:`, `detail:`, `disagree:` из
-        `keyboards.verdict_buttons`, контракт задачи 21): они стоят под ЕДИНСТВЕННЫМ
-        сообщением, которое умеет присылать путь разбора, и до этой правки ни одна
-        из них не отвечала ничего — Телеграм крутил «часики», пока не сдавался с
-        ошибкой. Кнопки не убраны намеренно: их обещает план, а честный ответ
-        «ещё не работает» — не то же самое, что их отсутствие.
+        Регистрируется ПОСЛЕ остальных и без фильтра: aiogram отдаёт обновление
+        первому подошедшему обработчику, поэтому кнопки с известными префиксами
+        уходят наверх, а всё остальное — сюда
+        (`test_a_button_without_a_handler_still_gets_an_answer_not_a_spinner`).
+        Без этого обработчика Телеграм крутил бы «часики» на кнопке, пока не
+        сдался с ошибкой.
 
         В лог идёт только ПРЕФИКС `callback_data`: за ним следует номер руки, а
         это приватные данные игрока (docs/publishing-policy.md).
         """
         prefix = (callback.data or "").split(":", 1)[0]
         _log.info("callback_without_handler", prefix=prefix)
-        await callback.answer(button_not_ready_msg().text)
+        await callback.answer(unknown_button_msg().text)
 
     @router.errors()
     async def on_error(event: ErrorEvent, bot: Bot) -> None:

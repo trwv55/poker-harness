@@ -125,7 +125,6 @@ __all__ = [
     "analysis_unavailable_msg",
     "ask_gg_nickname_msg",
     "bot_failure_msg",
-    "button_not_ready_msg",
     "deep_dive_msg",
     "disagreement_saved_msg",
     "escalation_msg",
@@ -165,6 +164,7 @@ __all__ = [
     "start_msg",
     "tournament_report_msg",
     "tournament_story_msg",
+    "unknown_button_msg",
     "unknown_text_msg",
     "unsupported_document_msg",
     "vision_answer_not_a_number_msg",
@@ -671,17 +671,15 @@ def failed_msg(reason_public: str) -> Msg:
     return Msg(text=f"Не получилось разобрать раздачу: {reason_public}")
 
 
-def button_not_ready_msg() -> Msg:
-    """Кнопка нажата, а обработчика у неё ещё нет (round 5, Item G).
+def unknown_button_msg() -> Msg:
+    """Ответ на нажатие, которое не разобрал ни один обработчик (round 5, Item G).
 
-    Три кнопки под каждым разбором (`keyboards.verdict_buttons`) — контракт
-    задачи 21, они стоят под сообщением уже сейчас, а разбирать нажатие пока
-    некому. Без ответа Телеграм крутит «часики» на кнопке, пока не свалится в
-    ошибку — молчание, неотличимое от поломки. Текст короткий намеренно: он
-    показывается всплывающим уведомлением callback-ответа, а у того жёсткий
-    лимит около 200 символов.
+    Без ответа Телеграм крутит «часики» на кнопке, пока не свалится в ошибку —
+    молчание, неотличимое от поломки. Текст короткий намеренно: он показывается
+    всплывающим уведомлением callback-ответа, а у того жёсткий лимит около 200
+    символов.
     """
-    return Msg(text="Эта кнопка ещё не работает — появится вместе с разбором словами.")
+    return Msg(text="Эта кнопка не работает.")
 
 
 def quota_exceeded_msg(hours_to_free: int) -> Msg:
@@ -698,7 +696,7 @@ def quota_exceeded_msg(hours_to_free: int) -> Msg:
 
 
 def start_msg() -> Msg:
-    """`/start`: что это и что сделать прямо сейчас — без меню и без настроек.
+    """`/start`: что это и что сделать прямо сейчас — один шаг, без экрана настроек.
 
     «Основное действие — не кнопка» (SESSIONS_UX): первый экран объясняет ровно
     один шаг (прислать файл), а не показывает карту продукта. Про сессии здесь
@@ -1677,7 +1675,7 @@ def gg_nickname_too_long_msg(limit: int) -> Msg:
     Обрезанный ник не совпал бы с ником на экране, и опознание героя кодом
     перестало бы работать — молча и не в том месте, где ошиблись.
     """
-    return Msg(text=f"Слишком длинный ник: в руме он не длиннее {limit} символов. Пришлите ещё раз.")
+    return Msg(text=f"Слишком длинный ник: принимаю не длиннее {limit} символов. Пришлите ещё раз.")
 
 
 def session_unavailable_msg() -> Msg:

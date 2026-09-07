@@ -1147,7 +1147,7 @@ class NotesRepo:
 
         `color=None` означает «цвет не трогать»: цвет ставится отдельной
         кнопкой, и правка текста не имеет права его стирать
-        (`test_editing_the_text_of_a_note_keeps_its_colour`).
+        (`test_a_note_is_one_per_opponent_and_editing_keeps_its_colour`).
         """
         stripped = text_.strip()
         if not stripped:

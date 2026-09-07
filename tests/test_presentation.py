@@ -542,6 +542,42 @@ def test_entry_messages_are_plain_text_without_buttons():
         assert msg.buttons == []
 
 
+def test_start_msg_does_not_deny_the_menu_it_carries():
+    """Первая строка докстринга обещала «без меню», четвёртый абзац — обратное.
+
+    Меню сообщение действительно везёт, значит неверна была первая строка.
+    """
+    from harness.presentation import MAIN_MENU, start_msg
+
+    assert start_msg().menu == MAIN_MENU
+    assert "без меню" not in (start_msg.__doc__ or "")
+
+
+def test_unknown_button_msg_does_not_promise_a_button_that_will_work_later():
+    """Три кнопки под вердиктом разбираются по-настоящему с задачи 23.
+
+    Текст обещал, что кнопка «появится вместе с разбором словами», а сюда
+    доходит теперь только нажатие, которого не разобрал никто.
+    """
+    from harness.presentation import unknown_button_msg
+
+    text = unknown_button_msg().text
+    assert "появится" not in text
+    assert len(text) <= 200  # предел всплывающего уведомления callback-ответа
+
+
+def test_gg_nickname_too_long_msg_does_not_speak_for_the_room():
+    """64 — ширина колонки `players.gg_nickname`, а не правило GG.
+
+    Правил рума про длину ника проект не знает, а текст утверждал их игроку.
+    """
+    from harness.presentation import gg_nickname_too_long_msg
+
+    text = gg_nickname_too_long_msg(64).text
+    assert "в руме" not in text
+    assert "64" in text
+
+
 def test_hh_accepted_msg_promises_nothing_it_cannot_know():
     """Подтверждение приёма не называет ни числа рук, ни времени ожидания — файл
     ещё не разобран, и любое такое число было бы выдуманным (CLAUDE.md).

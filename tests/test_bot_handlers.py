@@ -54,7 +54,6 @@ from harness.normalizer import normalize
 from harness.platform.logs import configure_logging
 from harness.platform.queue import JobsQueue
 from harness.presentation import (
-    button_not_ready_msg,
     hh_accepted_msg,
     hh_duplicate_msg,
     invite_accepted_msg,
@@ -63,6 +62,7 @@ from harness.presentation import (
     owner_admitted_msg,
     quota_exceeded_msg,
     start_msg,
+    unknown_button_msg,
     unsupported_document_msg,
 )
 
@@ -960,7 +960,10 @@ async def test_a_button_without_a_handler_still_gets_an_answer_not_a_spinner(dep
 
     await handlers[-1].call(_FakeCallback("будущая-кнопка:TM123"))
 
-    assert answered == [button_not_ready_msg().text]
+    assert answered == [unknown_button_msg().text]
+    # Докстринг catch-all перечислял `ranges:`/`detail:`/`disagree:` как то, что
+    # до него доходит; с задачи 23 они разбираются, и перечень стал неверным.
+    assert "три кнопки" not in (handlers[-1].callback.__doc__ or "")
 
 
 async def test_every_verdict_button_is_routed_to_a_real_handler(deps):
