@@ -51,7 +51,14 @@ packages = ["src/harness"]
 # копирует `.gitignore` в контекст сборки, hatchling внутри builder-стадии его не
 # видит и потому включает всё. Опираться на отсутствие файла нельзя — здесь
 # сказано явно.
-artifacts = ["src/harness/*/prompts/*.md"]
+#
+# Шаблон нарочно широкий: `**` вместо одного уровня и `*` вместо `*.md`. Узкая
+# редакция (`src/harness/*/prompts/*.md`) молча теряла бы промпт во вложенном
+# каталоге и промпт не в markdown, а цена потери одна и та же: `PromptUnavailable`
+# перед игроком. Лишнего не заберёт: каталог `prompts` в этом дереве существует
+# ровно для промптов (проверено подсадными файлами — шаблон забрал все шесть,
+# включая `prompts/nested/deep.md` и `prompts/decoy.txt`).
+artifacts = ["src/harness/**/prompts/*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
