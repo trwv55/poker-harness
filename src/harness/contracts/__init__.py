@@ -46,6 +46,21 @@ from harness.contracts.explanation import (
     VerdictLabel,
     VerdictTextOut,
 )
+from harness.contracts.history import (
+    JUDGED_SPOTS,
+    LEAK_RULES,
+    NOTE_COLOR_NONE,
+    NOTE_COLORS,
+    LeakRule,
+    LeaksOverview,
+    LeakStat,
+    NoteColor,
+    NoteRecord,
+    SessionLine,
+    SessionSummary,
+    leak_rule_for,
+    leak_rule_of_point,
+)
 from harness.contracts.ranges import RANKS, Range, all_classes, class_of
 from harness.contracts.raw import (
     ActionKind,
@@ -75,6 +90,10 @@ from harness.contracts.vision import (
 )
 
 __all__ = [
+    "JUDGED_SPOTS",
+    "LEAK_RULES",
+    "NOTE_COLORS",
+    "NOTE_COLOR_NONE",
     "RANKS",
     "UNJUDGED_DECISION_NOT_TAKEN",
     "ActionKind",
@@ -93,7 +112,12 @@ __all__ = [
     "EvSplit",
     "Finding",
     "Identity",
+    "LeakRule",
+    "LeakStat",
+    "LeaksOverview",
     "LevelLine",
+    "NoteColor",
+    "NoteRecord",
     "PlayerState",
     "PlayerStats",
     "PointText",
@@ -111,6 +135,8 @@ __all__ = [
     "SeenPlayer",
     "SeenPost",
     "SeenWin",
+    "SessionLine",
+    "SessionSummary",
     "ShowdownEntry",
     "SidePot",
     "SpotKind",
@@ -132,4 +158,6 @@ __all__ = [
     "Zone",
     "all_classes",
     "class_of",
+    "leak_rule_for",
+    "leak_rule_of_point",
 ]

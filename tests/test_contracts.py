@@ -170,3 +170,112 @@ def test_the_reading_can_refuse_a_screen_that_is_not_a_hand():
 
     reading = VisionReading(not_a_hand=True, refusal_reason="это лобби турнира")
     assert reading.players == []
+
+
+# --- таксономия ликов (задача 23) ----------------------------------------------------
+
+
+def _leak_point(*, spot, action_taken, best_action, ev_diff_bb=-1.0, **over):
+    """Точка решения ровно с той тройкой, по которой опознаётся тип лика."""
+    from harness.contracts import PointVerdict, Street, Zone
+
+    return PointVerdict(
+        dp_index=0,
+        street=Street.PREFLOP,
+        spot=spot,
+        zone=Zone.STRICT,
+        action_taken=action_taken,
+        best_action=best_action,
+        ev_diff_bb=ev_diff_bb,
+        **over,
+    )
+
+
+def test_every_leak_rule_recognises_its_own_point():
+    """Таблица правил и опознание по ней — одно и то же, а не два списка.
+
+    Правило заводится строкой, и строка обязана быть достаточной: точка,
+    собранная ИЗ правила, обязана этим же правилом и опознаться.
+    """
+    from harness.contracts import LEAK_RULES, leak_rule_of_point
+
+    for rule in LEAK_RULES:
+        point = _leak_point(
+            spot=rule.spot, action_taken=rule.action_taken, best_action=rule.best_action
+        )
+        assert leak_rule_of_point(point) is rule
+
+
+def test_leak_rule_keys_and_titles_are_unique():
+    """Два типа с одним ключом молча слились бы в один столбец агрегата."""
+    from harness.contracts import LEAK_RULES
+
+    assert len({rule.key for rule in LEAK_RULES}) == len(LEAK_RULES)
+    assert len({rule.title for rule in LEAK_RULES}) == len(LEAK_RULES)
+
+
+def test_a_near_zero_point_matches_no_leak_rule():
+    """«Около нуля» — не лик: упрекать не за что, и цена решения ноль.
+
+    Точка такой формы несёт в `best_action` русскую фразу ядра, а не токен
+    действия, поэтому ни одна тройка таблицы с ней не совпадает.
+    """
+    from harness.contracts import EvInterval, SpotKind, leak_rule_of_point
+
+    point = _leak_point(
+        spot=SpotKind.PUSHFOLD_UNOPENED,
+        action_taken="fold",
+        best_action="около нуля, оба варианта допустимы",
+        ev_diff_bb=0.0,
+        interval=EvInterval(point_bb=0.1, low_bb=-0.3, high_bb=0.4, near_zero=True),
+    )
+    assert leak_rule_of_point(point) is None
+
+
+def test_an_unjudged_point_matches_no_leak_rule():
+    """Точка без вердикта несёт пустой `best_action` — это «не посчитано», не лик."""
+    from harness.contracts import SpotKind, leak_rule_of_point
+
+    point = _leak_point(
+        spot=SpotKind.POSTFLOP, action_taken="fold", best_action="", ev_diff_bb=0.0
+    )
+    assert leak_rule_of_point(point) is None
+
+
+def test_the_reserved_open_raise_leak_matches_nothing_the_core_judges_today():
+    """«Открывает слишком широко» зарезервирован под чарты и сегодня пуст.
+
+    Держится не намерением, а тем, что судимых спотов у ядра ровно два
+    (`analysis.error_cost._JUDGED_SPOTS`), и спот этого правила в них не входит:
+    вердикта с таким спотом ядро не выносит, значит и совпасть правилу не с чем.
+    """
+    from harness.analysis.error_cost import _JUDGED_SPOTS
+    from harness.contracts import LEAK_RULES
+
+    reserved = next(rule for rule in LEAK_RULES if rule.key == "open_too_wide")
+    assert reserved.spot not in _JUDGED_SPOTS
+
+
+def test_the_judged_spots_of_history_agree_with_the_core():
+    """Покрытие «Моих ликов» считается в SQL тем же набором спотов, что и в ядре.
+
+    Память не имеет права импортировать `analysis` (образ бота не тянет
+    расчётный стек), поэтому набор продублирован в контрактах. Этот тест —
+    единственное, что не даёт двум спискам разойтись молча.
+    """
+    from harness.analysis.error_cost import _JUDGED_SPOTS
+    from harness.contracts import JUDGED_SPOTS
+
+    assert JUDGED_SPOTS == _JUDGED_SPOTS
+
+
+def test_a_leak_rule_is_found_by_the_raw_strings_of_jsonb():
+    """Память группирует точки в SQL и приносит спот строкой, а не `SpotKind`.
+
+    Правило обязано опознаваться и так: иначе агрегат из БД не совпал бы ни с
+    одним типом, и экран «Мои лики» был бы пуст при полной базе разборов.
+    """
+    from harness.contracts import LEAK_RULES, leak_rule_for
+
+    rule = LEAK_RULES[0]
+    assert leak_rule_for(str(rule.spot), rule.action_taken, rule.best_action) is rule
