@@ -42,6 +42,16 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/harness"]
+# Промпты моделей (`parsers/prompts/`, `explanation/prompts/`) закрыты политикой
+# публикации и лежат в `.gitignore` — а hatchling по умолчанию ИСКЛЮЧАЕТ из колеса
+# всё, что игнорирует VCS. Без этой строки `uv build --wheel` в рабочем дереве
+# собирает колесо БЕЗ промптов (проверено: до строки в архиве их нет, после —
+# три файла), и сервис падает `PromptUnavailable` на первом же вызове модели.
+# В образе это до сих пор не проявлялось только по случайности: Dockerfile не
+# копирует `.gitignore` в контекст сборки, hatchling внутри builder-стадии его не
+# видит и потому включает всё. Опираться на отсутствие файла нельзя — здесь
+# сказано явно.
+artifacts = ["src/harness/*/prompts/*.md"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
