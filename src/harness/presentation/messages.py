@@ -1278,6 +1278,10 @@ def session_summary_msg(summary: SessionSummary) -> Msg:
     Число потери подписано теми же словами, что и в сводке скана («суммарная
     потеря по всем точкам разбора»): это одна и та же величина, посчитанная по
     судимым точкам, и две разные подписи читались бы как два разных числа.
+
+    Строка лика подписана ЦЕНОЙ, а не частотой: `summary.top_leak` — первый
+    элемент списка, который `LeaksRepo.by_type` упорядочивает по цене
+    (`test_session_summary_msg_signs_the_leak_by_its_price_not_its_frequency`).
     """
     lines = [summary.title, ""]
     if summary.hands == 0:
@@ -1294,7 +1298,7 @@ def session_summary_msg(summary: SessionSummary) -> Msg:
     if summary.top_leak is None:
         lines.append("Повторяющегося расхождения за этот вечер расчёт не нашёл.")
     else:
-        lines.append(f"Чаще всего за вечер: {_leak_line(summary.top_leak)}.")
+        lines.append(f"Дороже всего за вечер: {_leak_line(summary.top_leak)}.")
     return Msg(text="\n".join(lines))
 
 

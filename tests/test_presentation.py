@@ -1388,6 +1388,23 @@ def test_session_summary_msg_counts_the_evening_and_names_its_leak():
     assert "Сбрасывает против шова, где колл плюсовой — 3 раза, −4.1 bb" in msg.text
 
 
+def test_session_summary_msg_signs_the_leak_by_its_price_not_its_frequency():
+    """Подпись обязана называть то, что посчитано: `top_leak` — самый ДОРОГОЙ.
+
+    Список упорядочен ценой (`LeaksRepo.by_type`), поэтому первым встаёт лик,
+    который случился реже дешёвого. Подпись «чаще всего» под этой строкой была
+    бы утверждением о частоте, которого никто не считал.
+    """
+    from harness.contracts import LEAK_RULES, LeakStat
+    from harness.presentation import session_summary_msg
+
+    rule = next(r for r in LEAK_RULES if r.key == "fold_vs_shove")
+    msg = session_summary_msg(_summary(top_leak=LeakStat(rule=rule, count=2, loss_bb=20.0)))
+
+    assert "Чаще всего" not in msg.text
+    assert "Дороже всего за вечер:" in msg.text
+
+
 def test_session_summary_msg_stays_silent_about_a_leak_it_did_not_find():
     """Безусловная строка «повторяющийся лик» была бы сообщением о ненайденном."""
     from harness.presentation import session_summary_msg
