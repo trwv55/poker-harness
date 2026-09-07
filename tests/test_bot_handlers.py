@@ -26,17 +26,23 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
+import logging
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import structlog
 from sqlalchemy import text
 
+import harness.bot.handlers as handlers_module
 from harness.bot.handlers import (
     BotDeps,
     check_quota,
     handle_deep_dive_callback,
     handle_document,
+    handle_invite_command,
     handle_new_session,
     handle_start,
 )
@@ -45,6 +51,7 @@ from harness.contracts import Provenance, RawHand
 from harness.memory.models import Job
 from harness.memory.repos import HandsRepo, PlayersRepo, SessionsRepo
 from harness.normalizer import normalize
+from harness.platform.logs import configure_logging
 from harness.platform.queue import JobsQueue
 from harness.presentation import (
     button_not_ready_msg,
@@ -53,6 +60,7 @@ from harness.presentation import (
     invite_accepted_msg,
     invite_required_msg,
     new_session_msg,
+    owner_admitted_msg,
     quota_exceeded_msg,
     start_msg,
     unsupported_document_msg,
@@ -553,6 +561,153 @@ async def test_the_invite_command_answers_only_its_owner(db_factory, deps, invit
     assert msg is not None
     code = (await fetch_one(db_factory, "select code, issued_by, used_by from invites"))["code"]
     assert code in msg.text
+
+
+# --- первый вход владельца на чистой базе ------------------------------------------
+#
+# Дефект, ради которого эта секция существует: на пустой базе войти не мог НИКТО.
+# Вход закрыт инвайтом, инвайт выпускает `/invite`, а `/invite` отвечает только
+# игроку с `is_dev` — которого на чистой базе нет ни одного. Круг разрывается
+# ровно одним способом: id владельца в окружении процесса (`OWNER_TG_USER_ID`,
+# `bot/main.py`), приезжающий сюда полем `BotDeps.owner_tg_user_id`.
+
+# Не `_TG_USER_ID` (777): «владелец из окружения» и «игрок, уже заведённый в
+# базе» обязаны быть разными людьми, иначе тесты ниже проходили бы по совпадению.
+_OWNER_TG_USER_ID = 4242
+
+
+def _deps_with_owner(deps: BotDeps, owner_tg_user_id: int | None) -> BotDeps:
+    """Те же зависимости, но с владельцем из окружения — как их собирает `main()`."""
+    return replace(deps, owner_tg_user_id=owner_tg_user_id)
+
+
+async def test_the_owner_from_the_environment_enters_an_empty_product_without_a_code(
+    db_factory, deps
+):
+    """`/start` от id из окружения на ПУСТОЙ базе заводит владельца — без кода.
+
+    Это и есть разорванный круг: строка появляется с `is_dev`, поэтому владелец
+    тут же может выпустить первый инвайт. Сессию, как и обычный `/start`, вход не
+    открывает.
+    """
+    owner_deps = _deps_with_owner(deps, _OWNER_TG_USER_ID)
+
+    msg = await handle_start(owner_deps, tg_user_id=_OWNER_TG_USER_ID)
+
+    assert msg == owner_admitted_msg()
+    row = await fetch_one(
+        db_factory, f"select * from players where tg_user_id = {_OWNER_TG_USER_ID}"
+    )
+    assert row["is_dev"] is True
+    assert await fetch_all(db_factory, "select * from sessions") == []
+    assert await handle_invite_command(owner_deps, _OWNER_TG_USER_ID) is not None
+    # Второй `/start` — обычное приветствие уже знакомого игрока, а не второй вход.
+    assert await handle_start(owner_deps, tg_user_id=_OWNER_TG_USER_ID) == start_msg()
+
+
+async def test_the_owner_bootstrap_is_spent_once_per_database(db_factory, deps, invited):
+    """Как только в `players` есть хоть одна строка, переменная не значит ничего.
+
+    Иначе имя в окружении осталось бы постоянной дверью: продукт, полный людей,
+    впускал бы по одной переменной, а забытая в `.env` строка была бы не следом
+    деплоя, а действующим доступом. Здесь база НЕ пуста (`invited`), и владелец
+    получает тот же отказ, что любой незнакомец.
+    """
+    owner_deps = _deps_with_owner(deps, _OWNER_TG_USER_ID)
+
+    msg = await handle_start(owner_deps, tg_user_id=_OWNER_TG_USER_ID)
+
+    assert msg == invite_required_msg()
+    tg_ids = {row["tg_user_id"] for row in await fetch_all(db_factory, "select * from players")}
+    assert tg_ids == {_TG_USER_ID}
+
+
+async def test_without_the_owner_variable_the_door_stays_shut(db_factory, deps):
+    """Переменная не задана — вход закрыт всем, и это безопасное умолчание.
+
+    Нынешний отказ и есть правильное поведение ненастроенного окружения: пустое
+    значение из `env_file` не имеет права никого впускать.
+    """
+    assert deps.owner_tg_user_id is None
+
+    msg = await handle_start(deps, tg_user_id=_OWNER_TG_USER_ID)
+
+    assert msg == invite_required_msg()
+    assert await fetch_all(db_factory, "select * from players") == []
+
+
+async def test_after_the_owner_a_second_person_still_needs_an_invite(db_factory, deps):
+    """Впущен ровно один человек: второму нужен код, выпущенный владельцем.
+
+    И код этот делает гостя гостем, а не вторым владельцем: `is_dev` остаётся
+    ложью, то есть `/invite` у него не работает (`test_the_invite_command_
+    answers_only_its_owner`).
+    """
+    owner_deps = _deps_with_owner(deps, _OWNER_TG_USER_ID)
+    await handle_start(owner_deps, tg_user_id=_OWNER_TG_USER_ID)
+    guest = 999007
+
+    assert await handle_start(owner_deps, tg_user_id=guest) == invite_required_msg()
+
+    assert await handle_invite_command(owner_deps, _OWNER_TG_USER_ID) is not None
+    code = (await fetch_one(db_factory, "select code from invites"))["code"]
+    assert await handle_start(owner_deps, tg_user_id=guest, payload=code) == invite_accepted_msg()
+    row = await fetch_one(db_factory, f"select * from players where tg_user_id = {guest}")
+    assert row["is_dev"] is False
+
+
+async def test_the_owner_bootstrap_leaves_a_line_in_the_log(db_factory, deps, monkeypatch):
+    """Единственный вход в продукт без кода обязан быть виден в логе сервера.
+
+    Событие называется `owner_bootstrapped` и несёт оба числа, по которым потом
+    опознают вход: id в Телеграме и заведённую строку `players`.
+
+    Логгер модуля пересоздаётся здесь намеренно: `cache_logger_on_first_use`
+    замораживает конфигурацию структлога на ПЕРВОМ использовании прокси, и без
+    этого утверждение теста зависело бы от того, какой тест в прогоне сработал
+    раньше, а не от кода бота.
+    """
+    buf = io.StringIO()
+    configure_logging(stream=buf)
+    monkeypatch.setattr(handlers_module, "_log", structlog.get_logger("harness.bot.handlers"))
+    try:
+        await handle_start(_deps_with_owner(deps, _OWNER_TG_USER_ID), tg_user_id=_OWNER_TG_USER_ID)
+    finally:
+        # Рут не остаётся настроенным на StringIO для остальных тестов сессии —
+        # тот же явный teardown, что в `test_configure_logging_routes_limiter_warnings`.
+        logging.getLogger().handlers = []
+
+    output = buf.getvalue()
+    player = await fetch_one(
+        db_factory, f"select id from players where tg_user_id = {_OWNER_TG_USER_ID}"
+    )
+    assert "owner_bootstrapped" in output
+    assert str(_OWNER_TG_USER_ID) in output
+    assert str(player["id"]) in output
+
+
+async def test_two_owner_starts_at_once_admit_one_owner(db_factory, deps, monkeypatch):
+    """Два `/start` владельца одновременно: строка `players` заводится ОДНА.
+
+    «Прочитали пустую таблицу — вставили» разошлось бы здесь так же, как в
+    `get_or_create` до `ON CONFLICT` (`test_two_starts_at_once_from_a_new_player_
+    create_one_player`), поэтому пустота проверяется тем же оператором, который
+    вставляет.
+    """
+    owner_deps = _deps_with_owner(deps, _OWNER_TG_USER_ID)
+    _rendezvous(monkeypatch, PlayersRepo, "bootstrap_owner")
+
+    first, second = await asyncio.gather(
+        handle_start(owner_deps, tg_user_id=_OWNER_TG_USER_ID),
+        handle_start(owner_deps, tg_user_id=_OWNER_TG_USER_ID),
+    )
+
+    rows = await fetch_all(db_factory, "select * from players")
+    assert len(rows) == 1 and rows[0]["is_dev"] is True
+    assert {msg.text for msg in (first, second)} == {
+        owner_admitted_msg().text,
+        invite_required_msg().text,
+    }
 
 
 # --- квота: скользящее окно 24 ч (спека §9) ----------------------------------------

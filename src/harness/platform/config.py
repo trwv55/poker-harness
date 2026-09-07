@@ -108,6 +108,23 @@ def optional_int(name: str, default: int) -> int:
     return _parse_int(name, raw)
 
 
+def optional_int_or_none(name: str) -> int | None:
+    """Необязательная целочисленная переменная БЕЗ дефолта: не задана — `None`.
+
+    Отдельно от `optional_int`: там «не задано» подменяется числом, а есть
+    переменные, у которых подменять его нечем — `OWNER_TG_USER_ID` (`bot/main.py`)
+    либо назван, либо двери нет вовсе, и никакое число не означает «не назван».
+    Пустое значение по-прежнему считается незаданным (см. `optional_env`: строка
+    `ИМЯ=` из `env_file` приезжает пустым значением), а непустое разбирается общим
+    `_parse_int` и потому ошибается так же внятно, как обязательные переменные
+    (`test_owner_tg_user_id_rejects_garbage_by_naming_the_variable`).
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    return _parse_int(name, raw)
+
+
 @dataclass(frozen=True, slots=True)
 class Config:
     """Снимок конфигурации на момент запуска процесса — сам окружение не читает

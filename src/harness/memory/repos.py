@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import bindparam, delete, func, select, text, update
+from sqlalchemy import bindparam, delete, exists, func, literal, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -147,6 +147,41 @@ class PlayersRepo:
         created = await self.db.scalar(select(Player).where(Player.id == created_id))
         if created is None:  # pragma: no cover — только что вставленная строка
             raise LookupError(f"игрок {created_id} не найден сразу после вставки")
+        return created
+
+    async def bootstrap_owner(self, tg_user_id: int) -> Player | None:
+        """Завести владельца ПЕРВОЙ строкой `players` — или не завести ничего.
+
+        Существует ради одного обстоятельства: коды выпускает только игрок с
+        `is_dev`, а на чистой базе такого игрока нет, и продукт после деплоя
+        недостижим никому. Здесь он появляется — ровно один раз на базу.
+
+        `None` означает «таблица уже не пуста», и вызывающий обязан отказать
+        обычным путём (`bot/handlers.py`): пустота — единственное условие, при
+        котором id из окружения кого-то впускает, поэтому дверью после первого
+        игрока эта переменная не остаётся
+        (`test_the_owner_bootstrap_is_spent_once_per_database`).
+
+        Проверка пустоты и вставка — ОДИН оператор (`INSERT ... WHERE NOT
+        EXISTS`), а не «прочитали и записали»: два одновременных `/start` иначе
+        разошлись бы между собой (тот же приём и та же причина, что у
+        `InvitesRepo.redeem` и `get_or_create` выше;
+        `test_two_owner_starts_at_once_admit_one_owner`).
+        """
+        created_id = await self.db.scalar(
+            pg_insert(Player)
+            .from_select(
+                ["tg_user_id", "is_dev"],
+                select(literal(tg_user_id), literal(True)).where(~exists(select(Player.id))),
+            )
+            .on_conflict_do_nothing(index_elements=["tg_user_id"])
+            .returning(Player.id)
+        )
+        if created_id is None:
+            return None
+        created = await self.db.scalar(select(Player).where(Player.id == created_id))
+        if created is None:  # pragma: no cover — только что вставленная строка
+            raise LookupError(f"владелец {created_id} не найден сразу после вставки")
         return created
 
 

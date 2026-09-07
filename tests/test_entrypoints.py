@@ -96,6 +96,48 @@ def test_data_dir_reads_the_value_when_it_is_set(monkeypatch):
     assert bot_main.data_dir() == Path("/mnt/hh")
 
 
+def test_owner_tg_user_id_treats_empty_value_as_unset(monkeypatch):
+    """`OWNER_TG_USER_ID` — одноразовый вход владельца на чистую базу, и «не
+    задана» здесь обязано означать «двери нет».
+
+    Тот же отказ `env_file`, что у `WORKER_CONCURRENCY` и `DATA_DIR`: строка
+    `ИМЯ=` приезжает пустым ЗНАЧЕНИЕМ. Цена его тут своя — `int("")` уронил бы
+    бота в цикл рестартов из-за необязательной переменной, которой никто не
+    задавал.
+    """
+    monkeypatch.setenv("OWNER_TG_USER_ID", "")
+    assert bot_main.owner_tg_user_id() is None
+
+
+def test_owner_tg_user_id_rejects_garbage_by_naming_the_variable(monkeypatch):
+    """Мусор вместо числа — отказ на старте с именем переменной, а не молчание.
+
+    Молчать здесь нельзя вдвойне: `@username` вместо числа выглядит правдоподобно,
+    и «тихо ничего не значит» отправило бы оператора искать поломку в боте.
+    """
+    monkeypatch.setenv("OWNER_TG_USER_ID", "@vitalii")
+    with pytest.raises(InvalidEnvVar, match="OWNER_TG_USER_ID"):
+        bot_main.owner_tg_user_id()
+
+
+def test_owner_tg_user_id_reads_the_value_when_it_is_set(monkeypatch):
+    monkeypatch.setenv("OWNER_TG_USER_ID", "4242")
+    assert bot_main.owner_tg_user_id() == 4242
+
+
+def test_the_env_example_documents_the_owner_variable_commented_out():
+    """Правило файла на новой переменной: необязательная приезжает закомментированной.
+
+    Раскомментировал значит задал; строка `OWNER_TG_USER_ID=` в `.env` означала бы
+    пустое значение, а не отсутствие переменной.
+    """
+    from pathlib import Path
+
+    text = (Path(__file__).parent.parent / ".env.example").read_text(encoding="utf-8")
+    assert "#OWNER_TG_USER_ID=" in text
+    assert "\nOWNER_TG_USER_ID=" not in text
+
+
 @pytest.mark.parametrize("module", [bot_main, worker_main], ids=["bot", "worker"])
 def test_main_does_not_read_environment_directly(module):
     """`main()` не читает окружение сама — только через вынесенные функции.

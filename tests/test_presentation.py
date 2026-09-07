@@ -1472,6 +1472,24 @@ def test_settings_msg_mentions_the_invite_command_only_to_its_owner():
     assert "/invite" not in settings_msg("nick", 1, 50, is_dev=False).text
 
 
+def test_owner_admitted_msg_does_not_claim_a_code_was_used():
+    """Владельца впустило окружение сервера, а не код, — и текст это говорит.
+
+    Отдельным конструктором, а не `invite_accepted_msg`: тот начинается словами
+    «Код принят», которых на этом пути не было. Первый экран продукта не имеет
+    права начинаться с неправды даже в одном слове.
+    """
+    from harness.presentation import invite_accepted_msg, owner_admitted_msg, start_msg
+
+    msg = owner_admitted_msg()
+
+    assert "Код принят" not in msg.text
+    assert msg.text != invite_accepted_msg().text
+    assert start_msg().text in msg.text  # тот же первый экран, а не второе приветствие
+    assert "/invite" in msg.text  # единственное, что владелец умеет и чего не умеет гость
+    assert msg.menu == start_msg().menu
+
+
 def test_help_msg_carries_the_bottom_menu_and_names_every_button():
     from harness.presentation import MAIN_MENU, help_msg
 

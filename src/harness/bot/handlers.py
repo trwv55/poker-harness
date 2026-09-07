@@ -32,6 +32,7 @@ import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
+import structlog
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -84,6 +85,7 @@ from harness.presentation import (
     note_gone_msg,
     note_prompt_msg,
     note_saved_msg,
+    owner_admitted_msg,
     quota_exceeded_msg,
     ranges_msg,
     replay_msg,
@@ -119,6 +121,10 @@ __all__ = [
 # `presentation.keyboards.escalation_buttons`. Держится здесь строкой затем, что
 # разбирает его этот модуль, а не роутер: роутер по контракту не решает ничего.
 ESCALATION_PREFIX = "escalate:"
+
+# Лог бота — тот же структлог, что у роутера и воркера: одна настройка на процесс
+# (`platform/logs.py`), одна строка на событие.
+_log = structlog.get_logger(__name__)
 
 # Значение, которым кнопка «ввести вручную» отличается от кнопки с числом.
 MANUAL_ANSWER = "manual"
@@ -167,11 +173,17 @@ class BotDeps:
     `data_dir` — корень тома с файлами игроков (спека §6: «файлы — на диске в
     volume, в БД путь и хэш»), а не путь к конкретному файлу: имя внутри него
     считается из содержимого, а не приходит снаружи.
+
+    `owner_tg_user_id` — id владельца в Телеграме, если сервер его назвал
+    (`OWNER_TG_USER_ID`, `bot/main.py`): единственный вход на ЧИСТУЮ базу, где
+    инвайт выпустить некому. `None` — обычное состояние и безопасное умолчание:
+    без кода не входит никто (`test_without_the_owner_variable_the_door_stays_shut`).
     """
 
     db_factory: async_sessionmaker[AsyncSession]
     queue: JobsQueue
     data_dir: Path
+    owner_tg_user_id: int | None = None
 
 
 def _store_hh_file(data_dir: Path, file_bytes: bytes) -> Path:
@@ -239,6 +251,18 @@ async def handle_start(deps: BotDeps, tg_user_id: int, payload: str = "") -> Msg
     аргументом команды), поэтому это внешние данные: гасит их `InvitesRepo`
     одним `UPDATE ... WHERE used_by IS NULL`, а не проверка «прочитали и
     записали».
+
+    **Первый вход владельца на чистую базу.** Инвайт выпускает `/invite`, а он
+    отвечает только игроку с `is_dev`; на пустой базе такого игрока нет, и после
+    деплоя в продукт не может войти никто — включая того, кто его развернул.
+    Круг разрывает id владельца из окружения сервера
+    (`deps.owner_tg_user_id`): `/start` от него заводит ПЕРВОГО игрока с
+    `is_dev` и без кода. Три свойства, которыми это не является постоянной
+    дверью: срабатывает только пока `players` пуста (условие проверяет тем же
+    оператором, что и вставляет, — `PlayersRepo.bootstrap_owner`), гостю код
+    по-прежнему нужен (`test_after_the_owner_a_second_person_still_needs_an_
+    invite`), и каждое срабатывание видно в логе сервера
+    (`test_the_owner_bootstrap_leaves_a_line_in_the_log`).
     """
     async with deps.db_factory() as db:
         players = PlayersRepo(db)
@@ -246,6 +270,15 @@ async def handle_start(deps: BotDeps, tg_user_id: int, payload: str = "") -> Msg
         if player is not None:
             await db.commit()
             return start_msg()
+        if deps.owner_tg_user_id is not None and tg_user_id == deps.owner_tg_user_id:
+            owner = await players.bootstrap_owner(tg_user_id)
+            if owner is not None:
+                await db.commit()
+                # После коммита: запись в логе означает состоявшийся вход, а не
+                # намерение. Проигравший гонку сюда не попадает вовсе — у него
+                # `bootstrap_owner` вернул `None`, и он уходит общим путём ниже.
+                _log.info("owner_bootstrapped", player_id=owner.id, tg_user_id=tg_user_id)
+                return owner_admitted_msg()
         code = payload.strip()
         if not code:
             await db.commit()
