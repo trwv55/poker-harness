@@ -37,7 +37,7 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from harness.bot.menus import render_menu_screen, session_summary_screen
-from harness.contracts import NOTE_COLORS
+from harness.contracts import MAX_NOTE_TEXT_CHARS, NOTE_COLORS
 from harness.explanation.hand_replay import hand_replay
 from harness.memory.models import Job, Player
 from harness.memory.repos import (
@@ -85,6 +85,7 @@ from harness.presentation import (
     note_gone_msg,
     note_prompt_msg,
     note_saved_msg,
+    note_too_long_msg,
     owner_admitted_msg,
     quota_exceeded_msg,
     ranges_msg,
@@ -710,6 +711,11 @@ async def _apply_pending_input(
         return gg_nickname_saved_msg(answer)
     if kind == _INPUT_NOTE:
         nick = str(pending.get("nick", ""))
+        if len(answer) > MAX_NOTE_TEXT_CHARS:
+            # Ввод НЕ закрывается: игрок дописывает короче, а не начинает путь
+            # заново
+            # (`test_a_note_longer_than_the_screen_can_show_is_refused_in_words`).
+            return note_too_long_msg(MAX_NOTE_TEXT_CHARS)
         await NotesRepo(db).upsert(owner_player_id=player.id, nick=nick, text_=answer)
         await PlayersRepo(db).set_pending_input(player.id, None)
         return note_saved_msg(nick)

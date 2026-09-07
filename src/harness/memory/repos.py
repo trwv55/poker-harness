@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from harness.contracts import (
     JUDGED_SPOTS,
     LEAK_RULES,
+    MAX_NOTE_TEXT_CHARS,
     NOTE_COLOR_NONE,
     AnalysisResult,
     CanonicalHand,
@@ -1136,6 +1137,11 @@ class NotesRepo:
         stripped = text_.strip()
         if not stripped:
             raise ValueError("заметка не может быть пустой")
+        if len(stripped) > MAX_NOTE_TEXT_CHARS:
+            # Инвариант хранилища, а не текст игроку: отказ словами выдаёт
+            # `bot.handlers` до вызова, здесь стоит нижняя граница
+            # (`test_a_note_longer_than_the_limit_is_refused_rather_than_cut`).
+            raise ValueError(f"заметка длиннее {MAX_NOTE_TEXT_CHARS} символов")
         now = datetime.now(UTC)
         insert = pg_insert(Note).values(
             owner_player_id=owner_player_id,
@@ -1191,6 +1197,22 @@ class NotesRepo:
             )
         )
         return None if record is None else self._to_record(record)
+
+    async def count_for_player(self, owner_player_id: int) -> int:
+        """Сколько заметок у игрока всего — знаменатель строки обрезки экрана.
+
+        Отдельным запросом, потому что `list_for_player` возвращает страницу:
+        её длина — размер страницы, а не то, сколько заметок у игрока
+        (`test_the_note_count_does_not_depend_on_the_page_size`).
+        """
+        return int(
+            await self.db.scalar(
+                select(func.count())
+                .select_from(Note)
+                .where(Note.owner_player_id == owner_player_id)
+            )
+            or 0
+        )
 
     async def list_for_player(self, owner_player_id: int, *, limit: int = 50) -> list[NoteRecord]:
         """Заметки игрока, свежие первыми."""

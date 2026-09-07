@@ -1436,7 +1436,7 @@ def _note(note_id: int = 1, *, nick: str = "villain", color: str = "red", text: 
 def test_notes_msg_shows_the_colour_the_nick_and_the_observation():
     from harness.presentation import notes_msg
 
-    msg = notes_msg([_note()])
+    msg = notes_msg([_note()], 1)
 
     assert "🔴 агрессор · villain" in msg.text
     assert "фолдит на опен" in msg.text
@@ -1451,11 +1451,71 @@ def test_notes_msg_says_where_a_new_note_starts():
     """Экран правит, но не заводит: путь заметки начинается из разбора руки."""
     from harness.presentation import notes_msg
 
-    empty = notes_msg([])
-    filled = notes_msg([_note()])
+    empty = notes_msg([], 0)
+    filled = notes_msg([_note()], 1)
 
     for msg in (empty, filled):
         assert "из разбора раздачи" in msg.text
+
+
+def test_notes_msg_of_the_longest_notes_still_fits_one_telegram_message():
+    """Экран «Заметки» обязан открываться при любом наборе заметок.
+
+    `sendMessage` отказывает на 4096 символах, а на этом же экране живут кнопки
+    правки и удаления: не открывшись, он не оставляет игроку выхода — убрать
+    заметку, из-за которой он не открывается, больше неоткуда.
+    """
+    from harness.contracts import MAX_NOTE_TEXT_CHARS
+    from harness.presentation import notes_msg
+
+    long_notes = [
+        _note(note_id=i, nick=f"opponent_{i}" * 3, text="ы" * MAX_NOTE_TEXT_CHARS)
+        for i in range(1, 41)
+    ]
+
+    msg = notes_msg(long_notes, len(long_notes))
+
+    assert len(msg.text) <= 4096
+    assert len(msg.buttons) < len(long_notes)
+    assert f"из {len(long_notes)} — самые свежие" in msg.text
+
+
+def test_notes_msg_counts_the_notes_a_player_has_not_the_page_it_was_given():
+    """Знаменатель — счёт заметок игрока, а не длина отданной страницы.
+
+    Раньше в нём стоял `limit` запроса: «Показаны 10 из 50» видел и тот, у кого
+    заметок одиннадцать.
+    """
+    from harness.presentation import notes_msg
+
+    notes = [_note(note_id=i, nick=f"opp{i}") for i in range(1, 21)]
+
+    msg = notes_msg(notes[:10], 11)
+
+    assert "из 11 — самые свежие" in msg.text
+    assert "из 20" not in msg.text
+
+
+def test_notes_msg_says_when_a_note_did_not_fit_whole():
+    """Заметка сверх потолка обрезается с оговоркой, а не молча."""
+    from harness.contracts import MAX_NOTE_TEXT_CHARS
+    from harness.presentation import notes_msg
+
+    msg = notes_msg([_note(text="я" * (MAX_NOTE_TEXT_CHARS + 500))], 1)
+
+    assert "показано не целиком" in msg.text
+    assert len(msg.text) <= 4096
+
+
+def test_note_prompt_msg_of_a_long_note_still_fits_one_telegram_message():
+    """Экран правки — единственный способ заменить длинную заметку."""
+    from harness.presentation import note_prompt_msg
+
+    msg = note_prompt_msg("villain", _note(text="я" * 9000))
+
+    assert len(msg.text) <= 4096
+    assert "показано не целиком" in msg.text
+    assert "Новый текст заменит прежний" in msg.text
 
 
 def test_note_prompt_msg_shows_what_is_already_written():

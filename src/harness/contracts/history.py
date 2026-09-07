@@ -30,6 +30,7 @@ from harness.contracts.analysis import PointVerdict, SpotKind
 __all__ = [
     "JUDGED_SPOTS",
     "LEAK_RULES",
+    "MAX_NOTE_TEXT_CHARS",
     "NOTE_COLORS",
     "NOTE_COLOR_NONE",
     "LeakRule",
@@ -226,6 +227,15 @@ NOTE_COLORS: tuple[NoteColor, ...] = (
     NoteColor(key="green", label="🟢 слабый"),
     NoteColor(key="blue", label="🔵 тайтовый"),
 )
+
+
+# Потолок длины одной заметки. Экран «Заметки» — одно сообщение Телеграма, а
+# `sendMessage` жёстко ограничен 4096 символами: заметка, которая одна не влезает
+# в этот предел, делает экран неоткрываемым вместе с кнопками правки и удаления,
+# то есть неисправимым изнутри продукта. 500 держит и этот предел
+# (`test_notes_msg_of_the_longest_notes_still_fits_one_telegram_message`), и то,
+# чем заметка является: одно наблюдение об оппоненте, а не запись раздачи.
+MAX_NOTE_TEXT_CHARS = 500
 
 
 class NoteRecord(BaseModel):

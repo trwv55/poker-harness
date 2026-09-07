@@ -796,6 +796,35 @@ async def test_an_empty_note_is_refused_rather_than_stored(db):
         await NotesRepo(db).upsert(owner_player_id=player_id, nick="villain", text_="   ")
 
 
+async def test_a_note_longer_than_the_limit_is_refused_rather_than_cut(db):
+    """Потолок держит экран «Заметки» открываемым, поэтому он инвариант хранилища.
+
+    Обрезать нельзя: игрок увидел бы на экране не то, что написал.
+    """
+    from harness.contracts import MAX_NOTE_TEXT_CHARS
+    from harness.memory.repos import NotesRepo
+
+    player_id, _session_id = await _player_with_session(db, tg_user_id=5015)
+    with pytest.raises(ValueError, match="длиннее"):
+        await NotesRepo(db).upsert(
+            owner_player_id=player_id, nick="villain", text_="я" * (MAX_NOTE_TEXT_CHARS + 1)
+        )
+    assert await NotesRepo(db).count_for_player(player_id) == 0
+
+
+async def test_the_note_count_does_not_depend_on_the_page_size(db):
+    """Счёт заметок игрока — отдельный запрос, а не длина отданной страницы."""
+    from harness.memory.repos import NotesRepo
+
+    player_id, _session_id = await _player_with_session(db, tg_user_id=5016)
+    notes = NotesRepo(db)
+    for index in range(7):
+        await notes.upsert(owner_player_id=player_id, nick=f"opp{index}", text_="фолдит")
+
+    assert len(await notes.list_for_player(player_id, limit=3)) == 3
+    assert await notes.count_for_player(player_id) == 7
+
+
 async def test_a_note_of_another_player_is_neither_read_nor_deleted_by_its_number(db):
     """Номер заметки приезжает кнопкой из внешнего мира — владелец сверяется всегда."""
     from harness.memory.repos import NotesRepo

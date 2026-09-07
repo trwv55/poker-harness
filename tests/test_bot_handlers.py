@@ -1441,6 +1441,42 @@ async def test_a_note_starts_from_the_hand_with_the_opponent_already_filled_in(
     assert (note["opponent_nick"], note["text"]) == ("villain", "фолдит на опен")
 
 
+async def test_a_note_longer_than_the_screen_can_show_is_refused_in_words(
+    deps, db_factory, invited
+):
+    """Отказ словами, а не тихое обрезание, и ввод при этом остаётся открытым."""
+    from harness.bot.handlers import handle_text, handle_ui_callback
+    from harness.contracts import MAX_NOTE_TEXT_CHARS
+    from harness.presentation import note_saved_msg, note_too_long_msg
+
+    await handle_ui_callback(deps, _TG_USER_ID, "note:villain")
+
+    refused = await handle_text(deps, _TG_USER_ID, "я" * (MAX_NOTE_TEXT_CHARS + 1))
+    assert refused == note_too_long_msg(MAX_NOTE_TEXT_CHARS)
+    assert await fetch_all(db_factory, "select * from notes") == []
+
+    assert await handle_text(deps, _TG_USER_ID, "донкает флоп") == note_saved_msg("villain")
+
+
+async def test_the_notes_screen_counts_every_note_not_the_page_it_shows(
+    deps, db_factory, invited
+):
+    """Знаменатель строки обрезки — счёт заметок игрока, а не `limit` запроса."""
+    from harness.bot.handlers import handle_text, handle_ui_callback
+    from harness.contracts import MAX_NOTE_TEXT_CHARS
+    from harness.presentation import MENU_NOTES
+
+    for index in range(12):
+        await handle_ui_callback(deps, _TG_USER_ID, f"note:opponent{index}")
+        await handle_text(deps, _TG_USER_ID, "ы" * MAX_NOTE_TEXT_CHARS)
+
+    msg = await handle_text(deps, _TG_USER_ID, MENU_NOTES)
+
+    assert msg is not None
+    assert len(msg.text) <= 4096
+    assert "из 12 — самые свежие" in msg.text
+
+
 async def test_a_note_can_be_edited_recoloured_and_deleted(deps, db_factory, invited):
     """CRUD заметки целиком — тем же путём, каким его пройдёт игрок кнопками."""
     from harness.bot.handlers import handle_text, handle_ui_callback

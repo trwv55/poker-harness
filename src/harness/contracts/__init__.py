@@ -49,6 +49,7 @@ from harness.contracts.explanation import (
 from harness.contracts.history import (
     JUDGED_SPOTS,
     LEAK_RULES,
+    MAX_NOTE_TEXT_CHARS,
     NOTE_COLOR_NONE,
     NOTE_COLORS,
     LeakRule,
@@ -92,6 +93,7 @@ from harness.contracts.vision import (
 __all__ = [
     "JUDGED_SPOTS",
     "LEAK_RULES",
+    "MAX_NOTE_TEXT_CHARS",
     "NOTE_COLORS",
     "NOTE_COLOR_NONE",
     "RANKS",

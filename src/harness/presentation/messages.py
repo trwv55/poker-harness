@@ -91,6 +91,7 @@ from harness.contracts.analysis import (
 )
 from harness.contracts.explanation import TournamentTextOut, VerdictTextOut
 from harness.contracts.history import (
+    MAX_NOTE_TEXT_CHARS,
     NOTE_COLORS,
     LeaksOverview,
     LeakStat,
@@ -1168,9 +1169,16 @@ def tournament_story_msg(narrative: TournamentTextOut) -> Msg:
 
 # --- экраны нижнего меню (задача 23) -------------------------------------------------
 
-# Сколько заметок печатается на экране «Заметки». Тот же предел `sendMessage` в
-# 4096 символов, что режет списки выше; заметка длиннее строки скана (ник, дата,
-# текст наблюдения плюс ряд из трёх кнопок), поэтому потолок ниже.
+# Жёсткий предел `sendMessage`: сообщение длиннее 4096 символов Телеграм не
+# отправляет вовсе. Для экрана «Заметки» цена отказа выше, чем для сводок: на
+# этом же экране живут кнопки правки, цвета и удаления, и он единственный, откуда
+# слишком длинную заметку можно убрать — не открывшись, он не оставляет выхода.
+_TELEGRAM_TEXT_LIMIT = 4096
+
+# Верхняя граница числа заметок на экране. Сколько поместится на самом деле,
+# решает бюджет `_TELEGRAM_TEXT_LIMIT` в `notes_msg`
+# (`test_notes_msg_of_the_longest_notes_still_fits_one_telegram_message`); это
+# число только не даёт вырасти ряду кнопок под каждой заметкой.
 _MAX_RENDERED_NOTES = 10
 
 # Строка честности экрана «Мои лики». Список считается по вердиктам ядра, а те
@@ -1302,20 +1310,48 @@ def session_summary_msg(summary: SessionSummary) -> Msg:
     return Msg(text="\n".join(lines))
 
 
+def _fitted(text: str, budget: int) -> str:
+    """Текст не длиннее `budget` символов; обрезанный говорит об этом прямо.
+
+    Заметка длиннее `MAX_NOTE_TEXT_CHARS` записаться не может, поэтому обрезка
+    здесь — страховка на случай строки, записанной до этого предела; молчаливой
+    она быть не вправе (`test_notes_msg_says_when_a_note_did_not_fit_whole`).
+    """
+    if len(text) <= budget:
+        return text
+    marker = " […показано не целиком]"
+    return text[: max(0, budget - len(marker))] + marker
+
+
 def _note_lines(note: NoteRecord) -> list[str]:
     label = next(
         (color.label for color in NOTE_COLORS if color.key == note.color), note.color
     )
-    return [f"{label} · {note.nick}", note.text]
+    return [f"{label} · {note.nick}", _fitted(note.text, MAX_NOTE_TEXT_CHARS)]
 
 
-def notes_msg(notes: Sequence[NoteRecord]) -> Msg:
+def _notes_cut_line(shown: int, total: int) -> str:
+    return f"Показаны {shown} из {total} — самые свежие."
+
+
+def notes_msg(notes: Sequence[NoteRecord], total: int) -> Msg:
     """Экран «Заметки»: наблюдения об оппонентах, свежие первыми.
 
     Экран показывает и правит, но НЕ заводит новых: заметка ценна скоростью
     записи в момент наблюдения, поэтому путь «добавить» начинается из разбора
     руки с уже подставленным оппонентом (решение владельца 2026-09-04). Об этом
     прямо сказано текстом — иначе экран выглядел бы сломанным.
+
+    `total` — сколько заметок у игрока ВСЕГО (`NotesRepo.count_for_player`), а
+    не длина `notes`: список приходит уже с потолком запроса, и знаменатель по
+    нему называл бы размер страницы вечером игрока
+    (`test_notes_msg_counts_the_notes_a_player_has_not_the_page_it_was_given`).
+
+    Список режется бюджетом `_TELEGRAM_TEXT_LIMIT`, а не только числом заметок:
+    десять заметок по 400 знаков не помещаются в `sendMessage`, и экран
+    переставал открываться вместе с кнопкой удаления той заметки, из-за которой
+    он и не открывался
+    (`test_notes_msg_of_the_longest_notes_still_fits_one_telegram_message`).
     """
     head = "Заметки на оппонентов — то, чего не показывает HUD."
     tail = (
@@ -1325,18 +1361,31 @@ def notes_msg(notes: Sequence[NoteRecord]) -> Msg:
     )
     if not notes:
         return Msg(text=f"{head}\n\nПока пусто.\n\n{tail}")
-    shown = list(notes[:_MAX_RENDERED_NOTES])
-    lines = [head, ""]
-    buttons: list[list[Btn]] = []
-    for note in shown:
-        lines.extend(_note_lines(note))
-        lines.append("")
-        buttons.append(note_row(note.note_id))
-    if len(shown) < len(notes):
-        lines.append(f"Показаны {len(shown)} из {len(notes)} — самые свежие.")
+
+    shown: list[NoteRecord] = []
+    body: list[str] = []
+    # Хвост и строка обрезки печатаются ПОСЛЕ списка, поэтому место под них
+    # занимается до него: посчитать их постфактум значило бы вылезти за предел
+    # ровно тогда, когда список и так пришлось резать. Длина строки обрезки
+    # берётся по её же шаблону при самом длинном возможном числе показанных.
+    length = len(head) + len(tail) + len(_notes_cut_line(_MAX_RENDERED_NOTES, total)) + 4
+    for note in notes[:_MAX_RENDERED_NOTES]:
+        block = [*_note_lines(note), ""]
+        cost = sum(len(line) + 1 for line in block)
+        if shown and length + cost > _TELEGRAM_TEXT_LIMIT:
+            break
+        shown.append(note)
+        body.extend(block)
+        length += cost
+
+    lines = [head, "", *body]
+    if len(shown) < total:
+        lines.append(_notes_cut_line(len(shown), total))
         lines.append("")
     lines.append(tail)
-    return Msg(text="\n".join(lines), buttons=buttons)
+    return Msg(
+        text="\n".join(lines), buttons=[note_row(note.note_id) for note in shown]
+    )
 
 
 def note_prompt_msg(nick: str, existing: NoteRecord | None = None) -> Msg:
@@ -1344,14 +1393,23 @@ def note_prompt_msg(nick: str, existing: NoteRecord | None = None) -> Msg:
 
     Примеры в тексте — из решения владельца 2026-09-04 дословно: заметка
     фиксирует то, чего не выводится из счётчиков.
+
+    Прежний текст показывается в бюджете `_TELEGRAM_TEXT_LIMIT`: экран правки —
+    единственный способ заменить слишком длинную заметку, и упереться в предел
+    `sendMessage` он не вправе
+    (`test_note_prompt_msg_of_a_long_note_still_fits_one_telegram_message`).
     """
-    lines = [f"Заметка на {nick}."]
-    if existing is not None:
-        lines.append(f"Сейчас записано: {existing.text}")
-    lines.append(
+    head = f"Заметка на {nick}."
+    ask = (
         "Напишите наблюдение одним сообщением — то, чего не покажет HUD: "
         "«фолдит на опен», «донкает флоп». Новый текст заменит прежний."
     )
+    lines = [head]
+    if existing is not None:
+        shown_now = "Сейчас записано: "
+        budget = _TELEGRAM_TEXT_LIMIT - len(head) - len(ask) - len(shown_now) - 4
+        lines.append(f"{shown_now}{_fitted(existing.text, budget)}")
+    lines.append(ask)
     return Msg(text="\n".join(lines))
 
 
@@ -1375,6 +1433,21 @@ def note_color_prompt_msg(note: NoteRecord) -> Msg:
 
 def note_color_saved_msg(nick: str, label: str) -> Msg:
     return Msg(text=f"{nick} — {label}.")
+
+
+def note_too_long_msg(limit: int) -> Msg:
+    """Заметка длиннее потолка: честный отказ вместо тихого обрезания.
+
+    Обрезать нельзя по той же причине, что и ник: игрок увидел бы на экране не
+    то, что написал. Потолок держит экран «Заметки» открываемым — а он
+    единственное место, откуда заметку можно поправить или убрать.
+    """
+    return Msg(
+        text=(
+            f"Слишком длинная заметка: принимаю не длиннее {limit} символов. "
+            f"Заметка — одно наблюдение об оппоненте; пришлите короче."
+        )
+    )
 
 
 def note_gone_msg() -> Msg:

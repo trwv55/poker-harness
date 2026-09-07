@@ -55,6 +55,11 @@ __all__ = ["is_menu_label", "render_menu_screen", "session_summary_screen"]
 # смысла: история нужна, чтобы вернуться во вчерашний вечер, а не листать месяц.
 _MAX_SESSIONS_LISTED = 10
 
+# Сколько заметок запрашивается для экрана. Сколько из них поместится в одно
+# сообщение, решает `presentation.notes_msg`; этот потолок только не даёт
+# вытащить из базы страницу, которую всё равно некуда напечатать.
+_MAX_NOTES_LISTED = 20
+
 
 async def _sessions_screen(db: AsyncSession, player: Player) -> Msg:
     return sessions_msg(
@@ -71,7 +76,17 @@ async def _leaks_screen(db: AsyncSession, player: Player) -> Msg:
 
 
 async def _notes_screen(db: AsyncSession, player: Player) -> Msg:
-    return notes_msg(await NotesRepo(db).list_for_player(player.id))
+    """Заметки: страница списка плюс отдельный счёт всех заметок игрока.
+
+    Знаменатель строки обрезки обязан быть числом заметок, а не размером
+    страницы: `limit` запроса игроку ни о чём не говорит
+    (`test_the_notes_screen_counts_every_note_not_the_page_it_shows`).
+    """
+    notes = NotesRepo(db)
+    return notes_msg(
+        await notes.list_for_player(player.id, limit=_MAX_NOTES_LISTED),
+        await notes.count_for_player(player.id),
+    )
 
 
 async def _settings_screen(db: AsyncSession, player: Player) -> Msg:
