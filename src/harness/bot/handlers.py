@@ -690,12 +690,18 @@ async def _apply_pending_input(
 ) -> Msg:
     """Текст в начатый ввод: ник в руме или заметка на оппонента.
 
-    Пустое сообщение ввод не закрывает и не сбрасывает: игрок, приславший
-    пробелы, должен получить ту же просьбу, а не потерять начатое.
+    Пустое сообщение ввод не закрывает и не сбрасывает: игрок, приславший одни
+    пробелы, получает ту же просьбу, с которой ввод и начался
+    (`test_a_blank_message_repeats_the_request_that_was_made`).
     """
     kind = pending.get("kind")
     if not answer:
-        return unknown_text_msg() if kind is None else note_gone_msg()
+        if kind == _INPUT_NICKNAME:
+            return ask_gg_nickname_msg()
+        if kind == _INPUT_NOTE:
+            nick = str(pending.get("nick", ""))
+            return note_prompt_msg(nick, await NotesRepo(db).find_by_nick(player.id, nick))
+        return unknown_text_msg()
     if kind == _INPUT_NICKNAME:
         if len(answer) > _MAX_NICKNAME:
             return gg_nickname_too_long_msg(_MAX_NICKNAME)

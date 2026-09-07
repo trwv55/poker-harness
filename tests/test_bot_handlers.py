@@ -1400,6 +1400,26 @@ async def test_a_menu_press_cancels_an_input_that_was_started(deps, db_factory, 
     assert row["gg_nickname"] is None and row["pending_input"] is None
 
 
+async def test_a_blank_message_repeats_the_request_that_was_made(deps, db_factory, invited):
+    """Пробел в начатом вводе — повод повторить просьбу, а не говорить о заметке.
+
+    Одна ветка на оба ввода отвечала «Этой заметки больше нет»: игроку, который
+    вводил ник, — про заметку, которую он не трогал.
+    """
+    from harness.bot.handlers import handle_nickname_command, handle_text, handle_ui_callback
+    from harness.presentation import ask_gg_nickname_msg, note_prompt_msg
+
+    await handle_nickname_command(deps, _TG_USER_ID)
+    assert await handle_text(deps, _TG_USER_ID, "\xa0") == ask_gg_nickname_msg()
+
+    await handle_ui_callback(deps, _TG_USER_ID, "note:villain")
+    assert await handle_text(deps, _TG_USER_ID, "   ") == note_prompt_msg("villain")
+
+    row = await fetch_one(db_factory, "select gg_nickname, pending_input from players")
+    assert row["gg_nickname"] is None
+    assert row["pending_input"] == {"kind": "note", "nick": "villain"}
+
+
 async def test_a_note_starts_from_the_hand_with_the_opponent_already_filled_in(
     deps, db_factory, invited
 ):
