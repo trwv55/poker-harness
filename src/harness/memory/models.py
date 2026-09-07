@@ -2,7 +2,7 @@
 
 Источник — `docs/superpowers/specs/2026-08-28-poker-harness-tech-spec-design.md`,
 раздел "6. Схема БД". Колонки — по табличным строкам спеки дословно; `?` у поля в
-спеке значит nullable, отсутствие `?` — `NOT NULL`. Три отступления от этого
+спеке значит nullable, отсутствие `?` — `NOT NULL`. Четыре отступления от этого
 правила и почему они не нарушают "дословно":
 
 1. `llm_calls.started_at` — таблица §6 её не называет среди "ключевых полей", но §7
@@ -20,6 +20,12 @@
    плюс отдельно помеченный уникальный бизнес-ключ. `calc_cache.key` — образец
    противоположного случая: там натуральный ключ и есть PK, и спека его никак не
    помечает (UNIQUE избыточен для PK). Инвайты собраны по образцу `players`.
+4. `players.pending_input` (задача 23, миграция 0005) — колонки нет в §6 вовсе.
+   Она хранит не знание о покере, а незакрытый диалог бота: что означает
+   следующее текстовое сообщение игрока. Спека §8.3 требует, чтобы состояние
+   ожидания ответа жило в БД, а не в памяти процесса, — для задач это
+   `jobs.payload`, но ввод ника и текста заметки задачей не сопровождается, и
+   складывать его было некуда.
 
 jsonb-колонки хранят `model_dump(mode="json")` пайплайн-контрактов (`RawHand`,
 `CanonicalHand`, `EnrichedHand`, `AnalysisResult`) — уже JSON-совместимые
@@ -87,6 +93,13 @@ class Player(Base):
     quota_daily: Mapped[int | None] = mapped_column(Integer)
     subscription: Mapped[str] = mapped_column(String(32), nullable=False, server_default="free")
     is_dev: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    # Что означает СЛЕДУЮЩЕЕ текстовое сообщение игрока: ник в руме, текст
+    # заметки — либо ничего (NULL, обычное состояние). Состояние ввода живёт в
+    # БД, а не в памяти процесса бота, по той же причине, что и состояние
+    # эскалации в `jobs.payload` (спека §8.3): перезапуск бота не имеет права
+    # терять половину диалога. Колонки в таблице §6 нет — это 4-е отступление,
+    # см. пункт 4 модульного докстринга.
+    pending_input: Mapped[Any | None] = mapped_column(JSONB)
 
 
 class Invite(Base):
@@ -166,10 +179,25 @@ class Analysis(Base):
     range_images: Mapped[Any | None] = mapped_column(JSONB)
 
 
+# Имя уникального индекса `notes(owner_player_id, opponent_nick)` — константа по
+# тому же правилу, что `JOBS_RUNNING_UNIQUE_INDEX` ниже: по этому имени
+# `NotesRepo.upsert` строит `ON CONFLICT`, и переименование индекса здесь без
+# правки репозитория иначе разошлось бы молча.
+NOTES_OPPONENT_UNIQUE_INDEX = "uq_notes_owner_player_id_opponent_nick"
+
+
 class Note(Base):
-    """Заметки на игроков: `notes`. Только через vision — в HH ники анонимны."""
+    """Заметки на игроков: `notes`. Только через vision — в HH ники анонимны.
+
+    Заметка на оппонента одна и накапливается (SESSIONS_UX: «оппонент
+    встречается в разных сессиях, заметка должна накапливаться»), поэтому пара
+    «владелец + ник» уникальна — это и обеспечивает индекс ниже (миграция 0005).
+    """
 
     __tablename__ = "notes"
+    __table_args__ = (
+        Index(NOTES_OPPONENT_UNIQUE_INDEX, "owner_player_id", "opponent_nick", unique=True),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     owner_player_id: Mapped[int] = mapped_column(

@@ -11,25 +11,50 @@
 from __future__ import annotations
 
 import math
+import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import bindparam, delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from harness.contracts import (
+    JUDGED_SPOTS,
+    LEAK_RULES,
+    NOTE_COLOR_NONE,
     AnalysisResult,
     CanonicalHand,
     EnrichedHand,
+    LeakRule,
+    LeaksOverview,
+    LeakStat,
+    NoteRecord,
     Provenance,
     RawHand,
     ScanSummary,
+    SessionLine,
+    SessionSummary,
+    leak_rule_for,
 )
-from harness.memory.models import Analysis, CalcCache, EvalCase, Hand, Job, Player, Tournament
+from harness.memory.models import (
+    Analysis,
+    CalcCache,
+    EvalCase,
+    Hand,
+    Invite,
+    Job,
+    Note,
+    Player,
+    Tournament,
+)
 from harness.memory.models import Session as SessionRow
+
+# Сколько случайных байт в инвайт-коде. 9 байт — 12 символов в base64url;
+# перебором такой код не находится, а продиктовать его голосом всё ещё можно.
+_INVITE_CODE_BYTES = 9
 
 _MONTHS_RU_ABBR = (
     "янв",
@@ -69,6 +94,26 @@ class PlayersRepo:
             raise ValueError("ник в руме не может быть пустым")
         await self.db.execute(
             update(Player).where(Player.id == player_id).values(gg_nickname=nickname.strip())
+        )
+        await self.db.flush()
+
+    async def find(self, tg_user_id: int) -> Player | None:
+        """Игрок, если он уже заведён, — и НИКОГДА не заводит нового.
+
+        Отдельно от `get_or_create` затем, что с задачи 23 вход закрыт инвайтом:
+        обработчику надо уметь спросить «этот игрок уже наш?», не впуская
+        незнакомца самим фактом вопроса.
+        """
+        return await self.db.scalar(select(Player).where(Player.tg_user_id == tg_user_id))
+
+    async def set_pending_input(self, player_id: int, value: dict[str, Any] | None) -> None:
+        """Запомнить (или снять) то, что означает следующее текстовое сообщение.
+
+        `None` снимает ожидание. Состояние живёт в БД, а не в памяти бота, — см.
+        комментарий к колонке `players.pending_input` (`memory/models.py`).
+        """
+        await self.db.execute(
+            update(Player).where(Player.id == player_id).values(pending_input=value)
         )
         await self.db.flush()
 
@@ -174,6 +219,98 @@ class SessionsRepo:
         self.db.add(record)
         await self.db.flush()
         return record
+
+    async def list_for_player(self, player_id: int, *, limit: int = 10) -> list[SessionLine]:
+        """Сессии игрока, свежие первыми, — список экрана «Сессии».
+
+        Без агрегатов: сводка вечера считается ПО ЗАПРОСУ (решение владельца
+        2026-09-07), и список не платит за неё на каждой строке.
+        """
+        stmt = (
+            select(SessionRow)
+            .where(SessionRow.player_id == player_id)
+            .order_by(SessionRow.started_at.desc(), SessionRow.id.desc())
+            .limit(limit)
+        )
+        return [
+            SessionLine(
+                session_id=row.id,
+                title=row.title,
+                started_at=row.started_at,
+                is_active=row.closed_at is None,
+            )
+            for row in await self.db.scalars(stmt)
+        ]
+
+    async def summary(self, session_id: int, player_id: int) -> SessionSummary | None:
+        """Агрегат вечера: турниры, разобранные руки, цена расхождений, лик вечера.
+
+        `None` — сессии нет или она чужая: номер приезжает из `callback_data`,
+        то есть из внешнего мира, и «показать по номеру» без сверки владельца
+        отдало бы чужой вечер.
+
+        `hands` — руки, по которым есть РАЗБОР (строка `analyses`), а не все
+        сохранённые: сводка вечера отвечает на «сколько разобрано».
+
+        `loss_bb` — сумма отрицательных расхождений по судимым точкам, взятая по
+        модулю; ровно та величина, которую `ScanSummary.total_loss_bb` называет
+        «суммарной потерей по всем точкам разбора», только за сессию целиком.
+        """
+        row = await self.db.scalar(
+            select(SessionRow).where(
+                SessionRow.id == session_id, SessionRow.player_id == player_id
+            )
+        )
+        if row is None:
+            return None
+        tournaments = int(
+            await self.db.scalar(
+                select(func.count())
+                .select_from(Tournament)
+                .where(Tournament.session_id == session_id)
+            )
+            or 0
+        )
+        hands = int(
+            await self.db.scalar(
+                select(func.count(func.distinct(Hand.id)))
+                .select_from(Hand)
+                .join(Analysis, Analysis.hand_id == Hand.id)
+                .where(Hand.session_id == session_id)
+            )
+            or 0
+        )
+        leaks = LeaksRepo(self.db)
+        judged, total = await leaks.coverage(player_id, session_id=session_id)
+        by_type = await leaks.by_type(player_id, session_id=session_id)
+        loss = await self._session_loss_bb(player_id, session_id)
+        return SessionSummary(
+            session_id=session_id,
+            title=row.title,
+            tournaments=tournaments,
+            hands=hands,
+            loss_bb=loss,
+            points_judged=judged,
+            points_total=total,
+            top_leak=by_type[0] if by_type else None,
+        )
+
+    async def _session_loss_bb(self, player_id: int, session_id: int) -> float:
+        """Цена расхождений вечера — сумма отрицательных `ev_diff_bb` судимых точек."""
+        sql = text(
+            f"select coalesce(sum({_EV_DIFF}) filter "
+            f"(where {_JUDGED_CONDITION} and {_EV_DIFF} < 0), 0.0) as loss "
+            f"{_POINTS_SOURCE}and s.id = :session_id"
+        ).bindparams(bindparam("judged_spots", expanding=True))
+        loss = await self.db.scalar(
+            sql,
+            {
+                "player_id": player_id,
+                "session_id": session_id,
+                "judged_spots": _judged_spot_values(),
+            },
+        )
+        return -float(loss or 0.0)
 
     async def close_active(self, player_id: int) -> bool:
         """Закрыть открытые сессии игрока; вернуть, было ли что закрывать.
@@ -816,3 +953,262 @@ class EvalCasesRepo:
         self.db.add(record)
         await self.db.flush()
         return record.id
+
+
+# Откуда берутся точки решения для сквозных агрегатов «Моих ликов» и агрегата
+# сессии: каждая строка результата — ОДНА точка (`jsonb_array_elements` по
+# `analyses.result->'points'`), привязанная к игроку через руку и сессию.
+# Текстом, а не выражениями ORM: боковое соединение с разворотом jsonb-массива
+# в строки на языке SQLAlchemy пришлось бы собирать из `func.jsonb_array_elements`
+# и `.lateral()`, и читаемость запроса, который считает деньги игрока, важнее
+# единообразия с соседними методами.
+_POINTS_SOURCE = """
+    from analyses a
+    join hands h on h.id = a.hand_id
+    join sessions s on s.id = h.session_id
+    cross join lateral jsonb_array_elements(a.result -> 'points') as p
+    where s.player_id = :player_id
+"""
+
+# Условие «по этой точке есть вердикт» — то же правило, что у
+# `analysis.error_cost.is_judged` (спот из `JUDGED_SPOTS` и непустое
+# `best_action`), выраженное в SQL. Набор спотов приезжает параметром из
+# контрактов, а не переписан сюда строками: см. комментарий к `JUDGED_SPOTS`.
+_JUDGED_CONDITION = "p ->> 'spot' in :judged_spots and p ->> 'best_action' <> ''"
+
+_EV_DIFF = "(p ->> 'ev_diff_bb')::double precision"
+
+
+def _judged_spot_values() -> list[str]:
+    return [str(spot) for spot in JUDGED_SPOTS]
+
+
+class LeaksRepo:
+    """Сквозная статистика ошибок по всей истории игрока — экран «Мои лики».
+
+    **Группировка по ТИПУ ЛИКА, а не по споту** (решение владельца 2026-09-07):
+    тип — строка таблицы `LEAK_RULES` (`contracts/history.py`), то есть тройка
+    «спот · сыграно · лучше». SQL группирует точки по этой тройке, Python
+    сопоставляет тройки с таблицей правил; тройка, которой в таблице нет, в
+    экран не попадает — этим же отсекаются точки «около нуля» (в `best_action`
+    у них русская фраза ядра) и точки без вердикта (пустой `best_action`),
+    которые в лики не входят по постановке.
+
+    Читается по всей истории игрока, а не по сессии: «типовые ошибки копятся по
+    всей истории, иначе „твой повторяющийся лик“ не вычислить» (SESSIONS_UX,
+    раздел «Что сквозное»). Тот же агрегат с `session_id` — лик одного вечера.
+    """
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def overview(self, player_id: int) -> LeaksOverview:
+        """Экран целиком: покрытие за всю историю плюс типы ликов по цене."""
+        judged, total = await self.coverage(player_id)
+        return LeaksOverview(
+            points_judged=judged,
+            points_total=total,
+            leaks=await self.by_type(player_id),
+        )
+
+    async def coverage(self, player_id: int, *, session_id: int | None = None) -> tuple[int, int]:
+        """Сколько точек решения оценено из скольких — за историю или за сессию.
+
+        Пара, которую экран печатает строкой «оценено N из M решений»: без неё
+        список ликов читается как полная картина игры, хотя судится сегодня
+        только префлоп-пуш-фолд (`JUDGED_SPOTS`).
+        """
+        sql = text(
+            f"select count(*) as points_total, "
+            f"count(*) filter (where {_JUDGED_CONDITION}) as points_judged "
+            f"{_POINTS_SOURCE}{'and s.id = :session_id' if session_id is not None else ''}"
+        ).bindparams(bindparam("judged_spots", expanding=True))
+        params: dict[str, Any] = {
+            "player_id": player_id,
+            "judged_spots": _judged_spot_values(),
+        }
+        if session_id is not None:
+            params["session_id"] = session_id
+        row = (await self.db.execute(sql, params)).one()
+        return int(row.points_judged), int(row.points_total)
+
+    async def by_type(self, player_id: int, *, session_id: int | None = None) -> list[LeakStat]:
+        """Типы ликов с частотой и ценой, самый дорогой первым.
+
+        `loss_bb` положителен («столько ушло»), как в `EvSplit`: складываются
+        только отрицательные `ev_diff_bb`, потому что лик — это потеря, а не
+        сальдо (положительных расхождений у судимой точки не бывает по
+        построению ядра, и полагаться на это правило здесь не нужно).
+        """
+        sql = text(
+            f"select p ->> 'spot' as spot, p ->> 'action_taken' as action_taken, "
+            f"p ->> 'best_action' as best_action, count(*) as n, "
+            f"coalesce(sum({_EV_DIFF}) filter (where {_EV_DIFF} < 0), 0.0) as loss "
+            f"{_POINTS_SOURCE}{'and s.id = :session_id' if session_id is not None else ''} "
+            f"group by 1, 2, 3"
+        )
+        params: dict[str, Any] = {"player_id": player_id}
+        if session_id is not None:
+            params["session_id"] = session_id
+        counts: dict[str, int] = {}
+        losses: dict[str, float] = {}
+        rules: dict[str, LeakRule] = {}
+        for row in (await self.db.execute(sql, params)).all():
+            rule = leak_rule_for(row.spot, row.action_taken, row.best_action)
+            if rule is None:
+                continue
+            rules[rule.key] = rule
+            counts[rule.key] = counts.get(rule.key, 0) + int(row.n)
+            losses[rule.key] = losses.get(rule.key, 0.0) + float(row.loss)
+        stats = [
+            LeakStat(rule=rules[key], count=counts[key], loss_bb=-losses[key])
+            for key in rules
+        ]
+        # Дорогой лик — первым, при равной цене — более частый. Третий ключ
+        # (порядок в таблице правил) делает порядок полным: две строки с
+        # одинаковой ценой и частотой иначе менялись бы местами от запроса к
+        # запросу, и экран «Мои лики» выглядел бы по-разному без причины.
+        order = {rule.key: index for index, rule in enumerate(LEAK_RULES)}
+        stats.sort(key=lambda stat: (-stat.loss_bb, -stat.count, order[stat.rule.key]))
+        return stats
+
+
+class NotesRepo:
+    """`notes`: заметки на оппонентов — сквозные, одна на пару «игрок + ник».
+
+    Живут только на vision-пути: в GG-HH оппоненты анонимизированы, и
+    идентичность не переживает турнир (ARCHITECTURE §6, спека §5.2). Ник сюда
+    приходит с экрана, поэтому все методы, кроме списка, сверяют владельца —
+    номер заметки приезжает из `callback_data`, то есть из внешнего мира.
+    """
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def upsert(
+        self, *, owner_player_id: int, nick: str, text_: str, color: str | None = None
+    ) -> int:
+        """Записать наблюдение об оппоненте; вторая запись на тот же ник — правка.
+
+        Заметка накапливается на оппоненте, а не на вечере (SESSIONS_UX), и
+        уникальный индекс `notes(owner_player_id, opponent_nick)` (миграция
+        0005) делает это структурной гарантией, а не соглашением вызывающего.
+
+        `color=None` означает «цвет не трогать»: цвет ставится отдельной
+        кнопкой, и правка текста не имеет права его стирать
+        (`test_editing_the_text_of_a_note_keeps_its_colour`).
+        """
+        stripped = text_.strip()
+        if not stripped:
+            raise ValueError("заметка не может быть пустой")
+        now = datetime.now(UTC)
+        insert = pg_insert(Note).values(
+            owner_player_id=owner_player_id,
+            opponent_nick=nick.strip(),
+            color=color if color is not None else NOTE_COLOR_NONE,
+            text=stripped,
+            updated_at=now,
+        )
+        updates: dict[str, Any] = {"text": stripped, "updated_at": now}
+        if color is not None:
+            updates["color"] = color
+        stmt = insert.on_conflict_do_update(
+            index_elements=["owner_player_id", "opponent_nick"], set_=updates
+        ).returning(Note.id)
+        note_id = await self.db.scalar(stmt)
+        await self.db.flush()
+        if note_id is None:  # pragma: no cover — upsert всегда возвращает строку
+            raise LookupError(f"заметка на {nick!r} не записалась")
+        return int(note_id)
+
+    async def set_color(self, note_id: int, owner_player_id: int, color: str) -> bool:
+        """Поставить цветовой архетип; `False` — заметки нет или она чужая."""
+        result = await self.db.execute(
+            update(Note)
+            .where(Note.id == note_id, Note.owner_player_id == owner_player_id)
+            .values(color=color, updated_at=datetime.now(UTC))
+            .returning(Note.id)
+        )
+        await self.db.flush()
+        return result.first() is not None
+
+    async def delete(self, note_id: int, owner_player_id: int) -> bool:
+        """Удалить заметку; `False` — её нет или она чужая."""
+        result = await self.db.execute(
+            delete(Note)
+            .where(Note.id == note_id, Note.owner_player_id == owner_player_id)
+            .returning(Note.id)
+        )
+        await self.db.flush()
+        return result.first() is not None
+
+    async def get(self, note_id: int, owner_player_id: int) -> NoteRecord | None:
+        record = await self.db.scalar(
+            select(Note).where(Note.id == note_id, Note.owner_player_id == owner_player_id)
+        )
+        return None if record is None else self._to_record(record)
+
+    async def find_by_nick(self, owner_player_id: int, nick: str) -> NoteRecord | None:
+        """Заметка на этого оппонента, если она уже есть, — для показа перед правкой."""
+        record = await self.db.scalar(
+            select(Note).where(
+                Note.owner_player_id == owner_player_id, Note.opponent_nick == nick.strip()
+            )
+        )
+        return None if record is None else self._to_record(record)
+
+    async def list_for_player(self, owner_player_id: int, *, limit: int = 50) -> list[NoteRecord]:
+        """Заметки игрока, свежие первыми."""
+        stmt = (
+            select(Note)
+            .where(Note.owner_player_id == owner_player_id)
+            .order_by(Note.updated_at.desc(), Note.id.desc())
+            .limit(limit)
+        )
+        return [self._to_record(row) for row in await self.db.scalars(stmt)]
+
+    @staticmethod
+    def _to_record(record: Note) -> NoteRecord:
+        return NoteRecord(
+            note_id=record.id,
+            nick=record.opponent_nick,
+            color=record.color,
+            text=record.text,
+            updated_at=record.updated_at,
+        )
+
+
+class InvitesRepo:
+    """`invites`: доступ по коду. Выдаёт владелец (`players.is_dev`), гасит `/start`.
+
+    Код — случайные байты из `secrets`, а не последовательность: инвайт это
+    пропуск в закрытый продукт, и угадываемый код отменял бы саму его цель.
+    """
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def mint(self, issued_by: int) -> str:
+        """Создать неиспользованный код и вернуть его текст."""
+        code = secrets.token_urlsafe(_INVITE_CODE_BYTES)
+        record = Invite(code=code, issued_by=issued_by)
+        self.db.add(record)
+        await self.db.flush()
+        return code
+
+    async def redeem(self, code: str, used_by: int) -> bool:
+        """Погасить код на игрока; `False` — кода нет или он уже использован.
+
+        Одним `UPDATE ... WHERE used_by IS NULL`, а не «прочитать и записать»:
+        два одновременных `/start` с одним кодом иначе прошли бы оба, и один
+        инвайт впустил бы двоих (тот же приём, что `ON CONFLICT DO NOTHING` в
+        `PlayersRepo.get_or_create`).
+        """
+        result = await self.db.execute(
+            update(Invite)
+            .where(Invite.code == code.strip(), Invite.used_by.is_(None))
+            .values(used_by=used_by, used_at=datetime.now(UTC))
+            .returning(Invite.id)
+        )
+        await self.db.flush()
+        return result.first() is not None

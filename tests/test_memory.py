@@ -573,3 +573,305 @@ async def test_manual_entry_is_looked_up_by_the_started_input_not_by_the_status(
     await _awaiting(db, player.id, session_id, escalation_field="cards")
     found = await JobsRepo(db).awaiting_manual_entry(player.id)
     assert found is not None and found.id == started
+
+
+# --- задача 23: лики, агрегат сессии, заметки, инвайты ------------------------
+
+
+def _verdict(spot, taken: str, best: str, ev_diff_bb: float, **over):
+    """Точка решения с заданной тройкой — вход таксономии ликов."""
+    from harness.contracts import PointVerdict, Street, Zone
+
+    return PointVerdict(
+        dp_index=0,
+        street=Street.PREFLOP,
+        spot=spot,
+        zone=Zone.STRICT,
+        action_taken=taken,
+        best_action=best,
+        ev_diff_bb=ev_diff_bb,
+        **over,
+    )
+
+
+async def _save_analysis(db, *, session_id: int, hand_no: str, points) -> int:
+    """Рука с сохранённым разбором — то, из чего считаются лики и агрегат вечера."""
+    from harness.contracts import AnalysisResult
+
+    raw = RawHand.model_validate(make_min_raw(hand_no=hand_no))
+    hand_id = await HandsRepo(db).save_raw(session_id=session_id, raw=raw)
+    result = AnalysisResult(hand_no=hand_no, points=list(points))
+    await AnalysesRepo(db).save(hand_id=hand_id, result=result)
+    return hand_id
+
+
+async def test_leaks_are_grouped_by_type_over_the_whole_history(db):
+    """Тип лика — тройка «спот · сыграно · лучше», и он копится по всем сессиям.
+
+    Две одинаковых тройки из РАЗНЫХ вечеров обязаны сложиться в один тип с
+    частотой два: «типовые ошибки копятся по всей истории» (SESSIONS_UX).
+    """
+    from harness.contracts import SpotKind
+    from harness.memory.repos import LeaksRepo
+
+    player_id, first = await _player_with_session(db, tg_user_id=5001)
+    await _save_analysis(
+        db,
+        session_id=first,
+        hand_no="L1",
+        points=[_verdict(SpotKind.PUSHFOLD_UNOPENED, "fold", "shove", -2.0)],
+    )
+    await SessionsRepo(db).close_active(player_id)
+    second = (await SessionsRepo(db).active_or_create(player_id)).id
+    await _save_analysis(
+        db,
+        session_id=second,
+        hand_no="L2",
+        points=[
+            _verdict(SpotKind.PUSHFOLD_UNOPENED, "fold", "shove", -1.0),
+            _verdict(SpotKind.PUSHFOLD_FACING_SHOVE, "call", "fold", -5.0),
+        ],
+    )
+
+    leaks = await LeaksRepo(db).by_type(player_id)
+
+    assert [(stat.rule.key, stat.count, round(stat.loss_bb, 2)) for stat in leaks] == [
+        ("call_too_wide", 1, 5.0),
+        ("no_shove", 2, 3.0),
+    ]
+
+
+async def test_leaks_ignore_near_zero_and_unjudged_points(db):
+    """В лики не входят ни точки «около нуля», ни точки без вердикта.
+
+    У первых в `best_action` стоит русская фраза ядра, у вторых — пустая
+    строка; ни то, ни другое не совпадает ни с одной тройкой таблицы правил.
+    """
+    from harness.contracts import EvInterval, SpotKind
+    from harness.memory.repos import LeaksRepo
+
+    player_id, session_id = await _player_with_session(db, tg_user_id=5002)
+    await _save_analysis(
+        db,
+        session_id=session_id,
+        hand_no="N1",
+        points=[
+            _verdict(
+                SpotKind.PUSHFOLD_UNOPENED,
+                "fold",
+                "около нуля, оба варианта допустимы",
+                0.0,
+                interval=EvInterval(point_bb=0.0, low_bb=-0.2, high_bb=0.3, near_zero=True),
+            ),
+            _verdict(SpotKind.POSTFLOP, "call", "", 0.0),
+        ],
+    )
+
+    assert await LeaksRepo(db).by_type(player_id) == []
+
+
+async def test_leak_coverage_counts_every_point_of_the_history(db):
+    """Строка «оценено N из M решений» — по тому же правилу, что покрытие скана."""
+    from harness.contracts import SpotKind
+    from harness.memory.repos import LeaksRepo
+
+    player_id, session_id = await _player_with_session(db, tg_user_id=5003)
+    await _save_analysis(
+        db,
+        session_id=session_id,
+        hand_no="C1",
+        points=[
+            _verdict(SpotKind.PUSHFOLD_UNOPENED, "fold", "shove", -2.0),
+            _verdict(SpotKind.POSTFLOP, "call", "", 0.0),
+            _verdict(SpotKind.PREFLOP_OTHER, "raise", "", 0.0),
+        ],
+    )
+
+    overview = await LeaksRepo(db).overview(player_id)
+
+    assert (overview.points_judged, overview.points_total) == (1, 3)
+    assert [stat.rule.key for stat in overview.leaks] == ["no_shove"]
+
+
+async def test_leaks_do_not_leak_between_players(db):
+    """Чужая история — не моя статистика: фильтр по игроку идёт через сессию."""
+    from harness.contracts import SpotKind
+    from harness.memory.repos import LeaksRepo
+
+    mine, my_session = await _player_with_session(db, tg_user_id=5004)
+    _theirs, their_session = await _player_with_session(db, tg_user_id=5005)
+    await _save_analysis(
+        db,
+        session_id=their_session,
+        hand_no="X1",
+        points=[_verdict(SpotKind.PUSHFOLD_UNOPENED, "shove", "fold", -3.0)],
+    )
+    await _save_analysis(
+        db,
+        session_id=my_session,
+        hand_no="M1",
+        points=[_verdict(SpotKind.PUSHFOLD_UNOPENED, "fold", "shove", -1.0)],
+    )
+
+    assert [stat.rule.key for stat in await LeaksRepo(db).by_type(mine)] == ["no_shove"]
+
+
+async def test_the_session_summary_counts_the_evening_and_names_its_leak(db):
+    """Агрегат вечера: турниры, разобранные руки, цена расхождений, лик вечера."""
+    from harness.contracts import SpotKind
+
+    player_id, session_id = await _player_with_session(db, tg_user_id=5006)
+    await TournamentsRepo(db).create(session_id=session_id, source_file="a.txt")
+    await _save_analysis(
+        db,
+        session_id=session_id,
+        hand_no="S1",
+        points=[_verdict(SpotKind.PUSHFOLD_FACING_SHOVE, "fold", "call", -1.5)],
+    )
+    await _save_analysis(
+        db,
+        session_id=session_id,
+        hand_no="S2",
+        points=[_verdict(SpotKind.PUSHFOLD_FACING_SHOVE, "fold", "call", -0.5)],
+    )
+    # Рука без разбора: сохранена, но в «разобрано» не входит.
+    await HandsRepo(db).save_raw(
+        session_id=session_id, raw=RawHand.model_validate(make_min_raw(hand_no="S3"))
+    )
+
+    summary = await SessionsRepo(db).summary(session_id, player_id)
+
+    assert summary is not None
+    assert (summary.tournaments, summary.hands) == (1, 2)
+    assert round(summary.loss_bb, 2) == 2.0
+    assert summary.top_leak is not None and summary.top_leak.rule.key == "fold_vs_shove"
+    assert (summary.points_judged, summary.points_total) == (2, 2)
+
+
+async def test_a_session_summary_of_another_player_is_not_reachable_by_its_number(db):
+    """Номер сессии приезжает из `callback_data` — то есть из внешнего мира."""
+    mine, _my_session = await _player_with_session(db, tg_user_id=5007)
+    _theirs, their_session = await _player_with_session(db, tg_user_id=5008)
+
+    assert await SessionsRepo(db).summary(their_session, mine) is None
+
+
+async def test_the_session_list_marks_the_open_evening(db):
+    """Список сессий: свежие первыми, активная помечена — по ней и идёт разбор."""
+    player_id, first = await _player_with_session(db, tg_user_id=5009)
+    await SessionsRepo(db).close_active(player_id)
+    second = (await SessionsRepo(db).active_or_create(player_id)).id
+
+    lines = await SessionsRepo(db).list_for_player(player_id)
+
+    assert [line.session_id for line in lines] == [second, first]
+    assert [line.is_active for line in lines] == [True, False]
+
+
+async def test_a_note_is_one_per_opponent_and_editing_keeps_its_colour(db):
+    """Заметка накапливается на оппоненте: вторая запись — правка, а не дубль.
+
+    Цвет ставится отдельной кнопкой, поэтому правка текста его не стирает.
+    """
+    from harness.memory.repos import NotesRepo
+
+    player_id, _session_id = await _player_with_session(db, tg_user_id=5010)
+    notes = NotesRepo(db)
+    first = await notes.upsert(owner_player_id=player_id, nick="villain", text_="фолдит на опен")
+    await notes.set_color(first, player_id, "red")
+    again = await notes.upsert(owner_player_id=player_id, nick="villain", text_="донкает флоп")
+
+    assert again == first
+    stored = await notes.get(first, player_id)
+    assert stored is not None
+    assert (stored.text, stored.color) == ("донкает флоп", "red")
+    assert len(await notes.list_for_player(player_id)) == 1
+
+
+async def test_an_empty_note_is_refused_rather_than_stored(db):
+    from harness.memory.repos import NotesRepo
+
+    player_id, _session_id = await _player_with_session(db, tg_user_id=5011)
+    with pytest.raises(ValueError, match="пустой"):
+        await NotesRepo(db).upsert(owner_player_id=player_id, nick="villain", text_="   ")
+
+
+async def test_a_note_of_another_player_is_neither_read_nor_deleted_by_its_number(db):
+    """Номер заметки приезжает кнопкой из внешнего мира — владелец сверяется всегда."""
+    from harness.memory.repos import NotesRepo
+
+    mine, _my_session = await _player_with_session(db, tg_user_id=5012)
+    theirs, _their_session = await _player_with_session(db, tg_user_id=5013)
+    notes = NotesRepo(db)
+    foreign = await notes.upsert(owner_player_id=theirs, nick="villain", text_="их заметка")
+
+    assert await notes.get(foreign, mine) is None
+    assert await notes.delete(foreign, mine) is False
+    assert await notes.set_color(foreign, mine, "red") is False
+    assert await notes.delete(foreign, theirs) is True
+
+
+async def test_an_invite_code_opens_the_door_exactly_once(db):
+    """Инвайт гасится одним UPDATE: второй игрок с тем же кодом внутрь не попадает."""
+    from harness.memory.repos import InvitesRepo
+
+    owner, _session_id = await _player_with_session(db, tg_user_id=5014)
+    guest, _guest_session = await _player_with_session(db, tg_user_id=5015)
+    latecomer, _late_session = await _player_with_session(db, tg_user_id=5016)
+    invites = InvitesRepo(db)
+    code = await invites.mint(owner)
+
+    assert await invites.redeem(code, guest) is True
+    assert await invites.redeem(code, latecomer) is False
+    assert await invites.redeem("не-код", latecomer) is False
+
+
+async def test_minted_invite_codes_differ(db):
+    from harness.memory.repos import InvitesRepo
+
+    owner, _session_id = await _player_with_session(db, tg_user_id=5017)
+    invites = InvitesRepo(db)
+    codes = {await invites.mint(owner) for _ in range(5)}
+    assert len(codes) == 5
+
+
+async def test_pending_input_is_remembered_and_cleared(db):
+    """Что означает следующее текстовое сообщение, помнит БД, а не память бота."""
+    players = PlayersRepo(db)
+    player = await players.get_or_create(tg_user_id=5018)
+    assert player.pending_input is None
+
+    await players.set_pending_input(player.id, {"kind": "note", "nick": "villain"})
+    await db.refresh(player)
+    assert player.pending_input == {"kind": "note", "nick": "villain"}
+
+    await players.set_pending_input(player.id, None)
+    await db.refresh(player)
+    assert player.pending_input is None
+
+
+async def test_migration_0005_adds_pending_input_and_the_note_uniqueness(pg):
+    """Миграция 0005 прокатана на живом Postgres — колонка и уникальный индекс."""
+    engine = create_async_engine(pg.get_connection_url(driver="asyncpg"))
+    try:
+        async with engine.connect() as conn:
+            column = (
+                await conn.execute(
+                    text(
+                        "select is_nullable from information_schema.columns "
+                        "where table_name='players' and column_name='pending_input'"
+                    )
+                )
+            ).first()
+            index = (
+                await conn.execute(
+                    text(
+                        "select indexdef from pg_indexes where tablename='notes' "
+                        "and indexname='uq_notes_owner_player_id_opponent_nick'"
+                    )
+                )
+            ).first()
+    finally:
+        await engine.dispose()
+    assert column is not None and column[0] == "YES"
+    assert index is not None and "UNIQUE" in index[0]
