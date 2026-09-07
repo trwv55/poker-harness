@@ -36,6 +36,7 @@ import socket
 from asyncio import FIRST_COMPLETED
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import suppress
+from pathlib import Path
 
 import httpx
 import structlog
@@ -46,7 +47,7 @@ from harness.platform.config import Config, EnvVarError, optional_int
 from harness.platform.llm import LLM
 from harness.platform.logs import configure_logging
 from harness.platform.queue import JobsQueue
-from harness.presentation import Btn, Msg
+from harness.presentation import Btn, Msg, Photo
 from harness.worker.pipeline import Deps, run_job
 
 __all__ = [
@@ -223,6 +224,29 @@ class TelegramSender:
 
     async def send(self, chat_id: int, msg: Msg) -> int:
         response = await self._call("sendMessage", _payload(msg, chat_id=chat_id))
+        return int(response.json()["result"]["message_id"])
+
+    async def send_photo(self, chat_id: int, photo: Photo) -> int:
+        """Отправить картинку файлом (`sendPhoto`, multipart) — матрицу диапазона.
+
+        Матрица 13×13 — визуальное доказательство того, что числа настоящие
+        (ARCHITECTURE, «Ценностное ядро»): до этой задачи она рисовалась и
+        ложилась на диск, но игроку не уходила.
+
+        Файл едет ТЕЛОМ запроса, а не ссылкой: PNG лежит в томе воркера, и
+        публичного URL у него нет и не должно быть — это данные игрока.
+        Поэтому здесь свой `post`, а не общий `_call` (тот шлёт JSON); разбор
+        отказа общий — `_describe`, то есть и здесь в текст исключения не
+        попадает ни URL, ни токен.
+        """
+        path = Path(photo.path)
+        response = await self._client.post(
+            f"{self._base_url}/sendPhoto",
+            data={"chat_id": chat_id, "caption": photo.caption},
+            files={"photo": (path.name, path.read_bytes(), "image/png")},
+        )
+        if not response.is_success:
+            raise TelegramDeliveryError("sendPhoto", response.status_code, self._describe(response))
         return int(response.json()["result"]["message_id"])
 
     async def edit(self, chat_id: int, message_id: int, msg: Msg) -> None:

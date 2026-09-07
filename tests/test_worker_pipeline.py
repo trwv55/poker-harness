@@ -81,7 +81,7 @@ from harness.parsers.vision_adapter import reading_to_raw
 from harness.platform.config import Config
 from harness.platform.llm import LLM, LLMProviderError
 from harness.platform.queue import JobsQueue
-from harness.presentation import Msg, deep_dive_msg
+from harness.presentation import Msg, Photo, deep_dive_msg
 from harness.worker import pipeline as pipeline_module
 from harness.worker.main import configure_logging
 from harness.worker.pipeline import (
@@ -123,13 +123,14 @@ def _raise_for_log() -> None:
 
 
 class FakeSender:
-    """Тестовый `Sender` (протокол задачи 18): список отправленного и
-    отредактированного, без единого сетевого вызова.
+    """Тестовый `Sender` (протокол задач 18 и 23): список отправленного,
+    отредактированного и отправленных картинок, без единого сетевого вызова.
     """
 
     def __init__(self) -> None:
         self.sent: list[Msg] = []
         self.edits: list[tuple[int, Msg]] = []
+        self.photos: list[Photo] = []
         self._next_id = 1000
 
     async def send(self, chat_id: int, msg: Msg) -> int:
@@ -139,6 +140,11 @@ class FakeSender:
 
     async def edit(self, chat_id: int, message_id: int, msg: Msg) -> None:
         self.edits.append((message_id, msg))
+
+    async def send_photo(self, chat_id: int, photo: Photo) -> int:
+        self.photos.append(photo)
+        self._next_id += 1
+        return self._next_id
 
 
 @pytest.fixture
@@ -1265,6 +1271,28 @@ async def _seed_hands_and_pick_a_judged_one(
     raise AssertionError(f"среди первых {n} раздач фикстуры нет ни одной с вердиктом")
 
 
+async def _seed_hands_and_pick_an_assuming_one(
+    db_factory, *, session_id: int, n: int
+) -> tuple[str, AnalysisResult]:
+    """Первая раздача, у которой есть точка с ДОПУЩЕНИЕМ о диапазоне оппонента.
+
+    Только у таких точек есть что рисовать: матрица показывает допущение, на
+    которое опирается вывод в зоне «предполагая» (`_render_ranges`).
+    """
+    _tournament_id, raw_hands = await _seed_checkpointed_hands(
+        db_factory, session_id=session_id, source_file=FIXTURE_DAILY, n=n
+    )
+    async with db_factory() as session:
+        hands_repo = HandsRepo(session)
+        for raw in raw_hands:
+            hand = await hands_repo.find_by_hand_no(session_id, raw.hand_no)
+            assert hand is not None and hand.enriched is not None
+            result = analyze_hand(hand.enriched)
+            if any(result.points[i].assumption is not None for i in result.ranked):
+                return raw.hand_no, result
+    raise AssertionError(f"среди первых {n} раздач фикстуры нет точки с допущением")
+
+
 def _all_texts(sender: FakeSender) -> list[str]:
     """Всё, что игрок увидел: и отправленное, и вписанное правкой сообщения."""
     return [msg.text for msg in sender.sent] + [msg.text for _msg_id, msg in sender.edits]
@@ -1980,3 +2008,106 @@ async def test_a_failed_check_the_player_cannot_settle_is_not_asked_about_at_all
     assert analyses == []
     assert not any(msg.buttons for msg in fake_sender.sent)
     assert any("файл" in msg.text.casefold() for msg in fake_sender.sent)
+
+
+# --- задача 23: картинки диапазонов доходят до игрока --------------------------
+
+
+@requires_fixtures
+async def test_the_rendered_range_pictures_reach_the_player(
+    db_factory, fake_sender, queue, deps, tmp_path
+):
+    """Хвост задачи 22: PNG рисовались и оставались на диске — теперь уходят.
+
+    Отправляется ровно то, что нарисовано (`analyses.range_images`), и каждая
+    картинка идёт со своей подписью. Если у раздачи не оказалось ни одной точки
+    с допущением, рисовать нечего — тогда проверяется вторая половина
+    утверждения: лишних картинок не отправлено.
+    """
+    player_id, session_id = await _make_scope(db_factory)
+    # Раздача с ДОПУЩЕНИЕМ: рисуются только такие точки (`_render_ranges`), и на
+    # раздаче без них тест проверял бы пустоту (та же ловушка, что у теста про
+    # текст модели, — см. `_seed_hands_and_pick_a_judged_one`).
+    hand_no, _result = await _seed_hands_and_pick_an_assuming_one(
+        db_factory, session_id=session_id, n=20
+    )
+    jid = await enqueue_deep_dive(queue, hand_no, player_id=player_id, session_id=session_id)
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, replace(deps, data_dir=tmp_path))
+
+    assert (await job_status(db_factory, jid)) == "done"
+    async with db_factory() as session:
+        hand = await HandsRepo(session).find_by_hand_no(session_id, hand_no)
+        assert hand is not None
+        record = await AnalysesRepo(session).get_by_hand(hand.id)
+    assert record is not None
+    assert record.range_images, "у этой раздачи обязана быть хотя бы одна точка с допущением"
+    assert [photo.path for photo in fake_sender.photos] == record.range_images
+    for photo in fake_sender.photos:
+        assert photo.caption.strip(), "картинка без подписи не говорит, чей это диапазон"
+
+
+async def test_a_repeated_attempt_does_not_send_the_same_picture_twice(
+    db_factory, fake_sender, queue, deps, tmp_path
+):
+    """Отправленную картинку не отредактировать — поэтому отметка идёт счётчиком.
+
+    Повтор попытки (обычное дело: `reap()` вернул задачу, воркер вошёл в ту же
+    станцию) обязан продолжить с непосланной картинки, а не прислать все заново.
+    """
+    from harness.worker.pipeline import _send_range_photos
+
+    player_id, session_id = await _make_scope(db_factory)
+    first = tmp_path / "a.png"
+    second = tmp_path / "b.png"
+    for path in (first, second):
+        path.write_bytes(b"PNG")
+    photos = [
+        Photo(path=str(first), caption="колл шова: допущение"),
+        Photo(path=str(second), caption="пуш-фолд: допущение"),
+    ]
+    job_id = await queue.enqueue(
+        type="deep_dive", player_id=player_id, session_id=session_id, payload={"hand_no": "X"}
+    )
+    job = await queue.claim("w1")
+    assert job is not None and job.id == job_id
+
+    async with db_factory() as session:
+        await _send_range_photos(deps, session, job_id, "w1", 777, photos)
+        await session.commit()
+    assert [photo.path for photo in fake_sender.photos] == [str(first), str(second)]
+
+    async with db_factory() as session:
+        await _send_range_photos(deps, session, job_id, "w1", 777, photos)
+        await session.commit()
+    assert len(fake_sender.photos) == 2, "повтор попытки прислал картинки заново"
+
+
+async def test_a_missing_picture_file_does_not_take_the_verdict_away(
+    db_factory, fake_sender, queue, deps, tmp_path
+):
+    """Картинка — дополнение к числам, а не они сами: пропавший файл не роняет задачу."""
+    from harness.worker.pipeline import _send_range_photos
+
+    player_id, session_id = await _make_scope(db_factory)
+    job_id = await queue.enqueue(
+        type="deep_dive", player_id=player_id, session_id=session_id, payload={"hand_no": "X"}
+    )
+    job = await queue.claim("w1")
+    assert job is not None
+
+    async with db_factory() as session:
+        await _send_range_photos(
+            deps,
+            session,
+            job_id,
+            "w1",
+            777,
+            [Photo(path=str(tmp_path / "нет-такого.png"), caption="колл шова")],
+        )
+        await session.commit()
+
+    assert fake_sender.photos == []
+    assert (await job_status(db_factory, job_id)) == "running"

@@ -113,12 +113,14 @@ from harness.platform.queue import JobPreconditionFailed, JobsQueue
 from harness.platform.trace import Clock, Trace
 from harness.presentation import (
     Msg,
+    Photo,
     deep_dive_msg,
     escalation_msg,
     failed_msg,
     not_a_hand_msg,
     progress_text,
     range_image_title,
+    range_photos,
     scan_summary_msg,
     send_as_file_msg,
     tournament_report_msg,
@@ -218,12 +220,18 @@ def _public_failure_reason(exc: BaseException) -> str:
 
 class Sender(Protocol):
     """То, чем `run_job` доставляет сообщения игроку — реализация (Телеграм или
-    тестовый двойник) ему не известна, только эти два метода.
+    тестовый двойник) ему не известна, только эти три метода.
+
+    `send_photo` — отдельным методом, а не полем `Msg`: картинка уходит своим
+    запросом Bot API (`sendPhoto`, multipart), и идемпотентность у неё своя —
+    отредактировать уже отправленную картинку, как текст, нельзя.
     """
 
     async def send(self, chat_id: int, msg: Msg) -> int: ...
 
     async def edit(self, chat_id: int, message_id: int, msg: Msg) -> None: ...
+
+    async def send_photo(self, chat_id: int, photo: Photo) -> int: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,6 +403,70 @@ async def _send_idempotent(
     else:
         await deps.sender.edit(chat_id, message_id, msg)
     return payload
+
+
+# Сколько картинок диапазонов уже ушло игроку по этой задаче. Число, а не флаг:
+# отправка идёт по одной, и повтор попытки обязан продолжить с той, на которой
+# оборвалось, а не прислать заново всё (`_send_range_photos`).
+_RANGE_PHOTOS_SENT = "range_photos_sent"
+
+
+async def _saved_range_images(analyses_repo: AnalysesRepo, hand_id: int) -> list[str]:
+    """Пути картинок из `analyses.range_images` — источник один и он в БД.
+
+    Читается заново, а не берётся из переменной станции `explain`: у повторной
+    попытки, которая нашла готовый разбор чекпоинтом, этой переменной нет вовсе,
+    а картинки уже нарисованы.
+    """
+    record = await analyses_repo.get_by_hand(hand_id)
+    return [] if record is None else (record.range_images or [])
+
+
+async def _send_range_photos(
+    deps: Deps,
+    session: AsyncSession,
+    job_id: int,
+    worker_id: str | None,
+    chat_id: int,
+    photos: list[Photo],
+) -> None:
+    """Отправить матрицы диапазонов вслед за вердиктом — по одной, с отметкой.
+
+    Матрица 13×13 — визуальное доказательство того, что числа настоящие
+    (ARCHITECTURE, «Ценностное ядро»). До этой задачи она рисовалась
+    (`_render_ranges`) и оставалась на диске: `Sender` не умел отправлять
+    картинки вовсе.
+
+    **Идемпотентность — счётчиком, а не флагом.** Отправленную картинку нельзя
+    отредактировать, как текст (`_send_idempotent`), поэтому повтор попытки
+    обязан знать, сколько уже ушло: `payload[_RANGE_PHOTOS_SENT]` растёт после
+    КАЖДОЙ картинки, и обрыв на третьей из пяти стоит игроку двух недошедших,
+    а не пяти дублей.
+
+    **Пропавший файл не роняет разбор.** Картинка — дополнение к числам, а не
+    они сами (то же правило, что у `_render_ranges`); файл мог исчезнуть вместе
+    с томом, и падать из-за него после уже отправленного вердикта незачем.
+    """
+    if not photos:
+        return
+    current_payload, current_owner = (
+        await session.execute(
+            select(JobModel.payload, JobModel.locked_by).where(JobModel.id == job_id)
+        )
+    ).one()
+    if current_owner != worker_id:
+        raise JobPreconditionFailed(
+            f"задача {job_id}: воркер {worker_id!r} больше не владелец — отправка отменена"
+        )
+    payload = dict(current_payload or {})
+    already = int(payload.get(_RANGE_PHOTOS_SENT, 0))
+    for index, photo in enumerate(photos[already:], start=already):
+        if not Path(photo.path).exists():
+            _log.warning("range_image_missing", job_id=job_id)
+            continue
+        await deps.sender.send_photo(chat_id, photo)
+        payload[_RANGE_PHOTOS_SENT] = index + 1
+        await _fenced_update(session, job_id, worker_id, payload=payload)
 
 
 async def _ensure_progress(
@@ -1066,6 +1138,15 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
         )
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
         await session.commit()
+        await _send_range_photos(
+            deps,
+            session,
+            job.id,
+            worker_id,
+            chat_id,
+            range_photos(await _saved_range_images(analyses_repo, hand_id), result),
+        )
+        await session.commit()
     return hand_id
 
 
@@ -1144,6 +1225,15 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
             note_nicks=_note_nicks(hand.enriched.hand),
         )
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
+        await session.commit()
+        await _send_range_photos(
+            deps,
+            session,
+            job.id,
+            worker_id,
+            chat_id,
+            range_photos(await _saved_range_images(analyses_repo, hand.id), result),
+        )
         await session.commit()
 
         hand_id = hand.id

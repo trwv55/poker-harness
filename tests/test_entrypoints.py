@@ -466,3 +466,53 @@ def test_the_env_example_documents_the_expensive_vision_model_commented_out():
     text = (Path(__file__).parent.parent / ".env.example").read_text(encoding="utf-8")
     assert "#LLM_VISION_FALLBACK_MODEL=" in text
     assert "\nLLM_VISION_FALLBACK_MODEL=" not in text
+
+
+async def test_sender_uploads_the_range_picture_as_a_file(tmp_path):
+    """Задача 23: матрица диапазона уходит `sendPhoto` — телом запроса, не ссылкой.
+
+    PNG лежит в томе воркера, публичного URL у него нет и не должно быть: это
+    данные игрока. Пришпилено ровно то, что от запроса требуется — метод,
+    multipart с файлом, `chat_id` и подпись рядом с ним.
+    """
+    from harness.presentation import Photo
+
+    picture = tmp_path / "1-0.png"
+    picture.write_bytes(b"\x89PNG\r\n\x1a\nbody of the picture")
+    requests: list[httpx.Request] = []
+    sender, client = _sender_recording_into(requests, httpx.Response(200, json=_OK))
+    try:
+        assert await sender.send_photo(777, Photo(path=str(picture), caption="колл шова")) == 4242
+    finally:
+        await client.aclose()
+
+    request = requests[0]
+    assert str(request.url).rsplit("/", 1)[-1] == "sendPhoto"
+    assert request.headers["content-type"].startswith("multipart/form-data")
+    body = request.content
+    assert b"\x89PNG" in body
+    assert "колл шова".encode() in body
+    assert b'name="chat_id"' in body and b"777" in body
+
+
+async def test_sender_photo_error_keeps_the_token_out_of_the_message(tmp_path):
+    """У картинки свой `post`, а не общий `_call`, — и отказ обязан быть так же
+    безопасен: ни URL, ни токена в тексте исключения (дефект №1 живой приёмки).
+    """
+    from harness.presentation import Photo
+
+    picture = tmp_path / "1-0.png"
+    picture.write_bytes(b"PNG")
+    body = {"ok": False, "error_code": 400, "description": "Bad Request: PHOTO_INVALID_DIMENSIONS"}
+    sender, client = _sender_recording_into([], httpx.Response(400, json=body))
+    try:
+        with pytest.raises(TelegramDeliveryError) as caught:
+            await sender.send_photo(777, Photo(path=str(picture), caption="колл шова"))
+    finally:
+        await client.aclose()
+
+    for rendered in (str(caught.value), repr(caught.value)):
+        assert _TEST_TOKEN not in rendered
+        assert "api.telegram.org" not in rendered
+    assert "PHOTO_INVALID_DIMENSIONS" in str(caught.value)
+    assert "sendPhoto" in str(caught.value)
