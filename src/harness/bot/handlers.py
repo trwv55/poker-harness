@@ -83,6 +83,7 @@ from harness.presentation import (
     note_color_saved_msg,
     note_deleted_msg,
     note_gone_msg,
+    note_nicks_for_hand,
     note_prompt_msg,
     note_saved_msg,
     note_too_long_msg,
@@ -829,11 +830,7 @@ async def _dispatch_ui(deps: BotDeps, db: AsyncSession, player: Player, data: st
             return note_gone_msg()
         return note_deleted_msg(note.nick)
     if data.startswith(NOTE_ADD_PREFIX):
-        nick = data.removeprefix(NOTE_ADD_PREFIX)
-        if not nick:
-            return note_gone_msg()
-        await PlayersRepo(db).set_pending_input(player.id, {"kind": _INPUT_NOTE, "nick": nick})
-        return note_prompt_msg(nick, await NotesRepo(db).find_by_nick(player.id, nick))
+        return await _note_prompt_from_button(db, player, data.removeprefix(NOTE_ADD_PREFIX))
     if data.startswith(RANGES_PREFIX):
         return await _ranges_reply(db, player, data.removeprefix(RANGES_PREFIX))
     if data.startswith(DETAIL_PREFIX):
@@ -841,6 +838,28 @@ async def _dispatch_ui(deps: BotDeps, db: AsyncSession, player: Player, data: st
     if data.startswith(DISAGREE_PREFIX):
         return await _disagree_reply(db, player, data.removeprefix(DISAGREE_PREFIX))
     return None
+
+
+async def _note_prompt_from_button(db: AsyncSession, player: Player, rest: str) -> Msg:
+    """Кнопка «заметка на оппонента» под разбором: `«{hand_no}:{index}»` → ник.
+
+    Кнопка возит индекс, а не ник (`keyboards.note_buttons_for_hand`), поэтому
+    ник берётся из сохранённой руки той же функцией, которая строила список
+    кнопок: два разных порядка дали бы заметку не на того оппонента.
+    """
+    hand_no, _, raw_index = rest.rpartition(":")
+    if not hand_no or not raw_index.isdigit():
+        return analysis_unavailable_msg()
+    hand, _analysis = await _hand_with_analysis(db, player, hand_no)
+    if hand is None or hand.canonical is None:
+        return analysis_unavailable_msg()
+    nicks = note_nicks_for_hand(hand.canonical)
+    index = int(raw_index)
+    if index >= len(nicks):
+        return analysis_unavailable_msg()
+    nick = nicks[index]
+    await PlayersRepo(db).set_pending_input(player.id, {"kind": _INPUT_NOTE, "nick": nick})
+    return note_prompt_msg(nick, await NotesRepo(db).find_by_nick(player.id, nick))
 
 
 async def _note_by_data(db: AsyncSession, player: Player, raw_id: str):

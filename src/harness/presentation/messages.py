@@ -636,7 +636,7 @@ def deep_dive_msg(
     if dev_line is not None:
         lines.append(dev_line)
 
-    buttons = [verdict_buttons(res.hand_no), *note_buttons_for_hand(note_nicks)]
+    buttons = [verdict_buttons(res.hand_no), *note_buttons_for_hand(res.hand_no, note_nicks)]
     return Msg(text="\n".join(lines), buttons=buttons)
 
 

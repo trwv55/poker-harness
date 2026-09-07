@@ -1439,6 +1439,56 @@ def test_session_summary_msg_of_an_empty_evening_promises_no_numbers():
     assert "Суммарная потеря" not in msg.text
 
 
+def _canonical_with_nicks(*nicks: str):
+    """Каноническая рука со скрина: герой плюс названные ником оппоненты."""
+    from harness.contracts import Provenance, RawHand
+    from harness.normalizer import normalize
+    from tests.test_contracts import make_min_raw
+
+    seats = [{"seat": 4, "label": "Hero", "stack": 100_000}]
+    nicknames = {"Hero": "me"}
+    for index, nick in enumerate(nicks):
+        seats.append({"seat": 5 + index, "label": nick, "stack": 100_000})
+        nicknames[nick] = nick
+    raw = RawHand.model_validate(
+        make_min_raw(
+            provenance=Provenance.SCREENSHOT.value,
+            button_seat=4,
+            seats=seats,
+            vision={"displayed_pot": 100_000, "nicknames": nicknames},
+        )
+    )
+    return normalize(raw)
+
+
+def test_a_note_button_survives_a_nick_too_long_for_callback_data():
+    """`callback_data` Телеграма — 64 байта, и отказ Bot API валит ВСЁ сообщение.
+
+    Ник приезжает из чтения скрина и ничем не ограничен: кириллический ник в
+    тридцать знаков — уже 60 байт, а с префиксом больше 64. Кнопка поэтому
+    возит индекс, как и эскалация.
+    """
+    from harness.presentation import note_buttons_for_hand, note_nicks_for_hand
+
+    long_nick = "оппонентсдлиннымименем" * 3
+    hand = _canonical_with_nicks(long_nick, "villain")
+    nicks = note_nicks_for_hand(hand)
+
+    rows = note_buttons_for_hand("RC1234", nicks)
+
+    data = [btn.callback_data for row in rows for btn in row]
+    assert all(len(item.encode()) <= 64 for item in data), data
+    assert data == ["note:RC1234:0", "note:RC1234:1"]
+    assert nicks[0] == long_nick
+
+
+def test_note_nicks_for_hand_leaves_the_hero_out():
+    """Заметки пишут на других: герой — `Identity.HERO`, не `Identity.NICK`."""
+    from harness.presentation import note_nicks_for_hand
+
+    assert note_nicks_for_hand(_canonical_with_nicks("villain", "fish")) == ["villain", "fish"]
+
+
 def _note(note_id: int = 1, *, nick: str = "villain", color: str = "red", text: str = "фолдит на опен"):
     from datetime import UTC, datetime
 

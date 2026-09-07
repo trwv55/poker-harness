@@ -19,6 +19,8 @@ from collections.abc import Sequence
 
 from pydantic import BaseModel
 
+from harness.contracts.canonical import CanonicalHand, Identity
+
 
 class Btn(BaseModel):
     """Одна инлайн-кнопка: подпись и то, что вернётся боту при нажатии."""
@@ -86,19 +88,45 @@ def verdict_buttons(hand_no: str) -> list[Btn]:
 _MAX_NOTE_BUTTONS = 5
 
 
-def note_buttons_for_hand(nicks: Sequence[str]) -> list[list[Btn]]:
+def note_nicks_for_hand(hand: CanonicalHand) -> list[str]:
+    """Оппоненты, на которых игрок может записать заметку одним тапом.
+
+    Только те, чью личность источник знает по нику (`Identity.NICK`), то есть
+    только скрин: в HH оппоненты обезличены (спека §5.2), и заметка на хэш,
+    который не переживёт турнир, бессмысленна. Герой — `Identity.HERO`, и в
+    список не попадает: заметки пишут на других.
+
+    Живёт рядом с конструктором кнопок, потому что порядок этого списка —
+    часть контракта `callback_data`: кнопка возит ИНДЕКС, и бот восстанавливает
+    ник, вызывая ту же функцию на той же сохранённой руке
+    (`test_a_note_button_survives_a_nick_too_long_for_callback_data`).
+    """
+    return [
+        player.label
+        for player in hand.players
+        if player.identity is Identity.NICK
+    ][:_MAX_NOTE_BUTTONS]
+
+
+def note_buttons_for_hand(hand_no: str, nicks: Sequence[str]) -> list[list[Btn]]:
     """Ряды кнопок «заметка на оппонента» под разбором раздачи.
 
     Путь «добавить заметку» начинается ИЗ РАЗБОРА с подставленным оппонентом
-    (решение владельца 2026-09-04), поэтому ник едет прямо в `callback_data`, а
-    не выбирается на отдельном экране. Ники приходят только со скрина: в HH они
+    (решение владельца 2026-09-04). Ники приходят только со скрина: в HH они
     анонимизированы (спека §5.2), и вызывающий передаёт пустой список.
+
+    **Значение — ИНДЕКС ника, а не сам ник.** `callback_data` Телеграма
+    ограничен 64 байтами, а ник приезжает из чтения скрина и ничем не ограничен:
+    кириллический ник в 30 знаков уже даёт 65 байт, и Bot API отказывает не в
+    кнопке, а во ВСЁМ сообщении вердикта. Тот же приём, что у
+    `escalation_buttons`; список восстанавливается из сохранённой руки
+    (`note_nicks_for_hand`).
 
     По две кнопки в ряд — ник длинный, и в один ряд их влезает немного.
     """
     buttons = [
-        Btn(text=f"🃏 {nick}", callback_data=f"{NOTE_ADD_PREFIX}{nick}")
-        for nick in list(nicks)[:_MAX_NOTE_BUTTONS]
+        Btn(text=f"🃏 {nick}", callback_data=f"{NOTE_ADD_PREFIX}{hand_no}:{index}")
+        for index, nick in enumerate(list(nicks)[:_MAX_NOTE_BUTTONS])
     ]
     return [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
 
@@ -193,6 +221,7 @@ __all__ = [
     "escalation_buttons",
     "note_buttons_for_hand",
     "note_color_buttons",
+    "note_nicks_for_hand",
     "note_row",
     "session_buttons",
     "set_nickname_button",

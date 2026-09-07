@@ -30,6 +30,7 @@ from harness.presentation.keyboards import (
     deep_dive_button,
     escalation_buttons,
     note_buttons_for_hand,
+    note_nicks_for_hand,
     verdict_buttons,
 )
 from harness.presentation.messages import (
@@ -137,6 +138,7 @@ __all__ = [
     "note_color_saved_msg",
     "note_deleted_msg",
     "note_gone_msg",
+    "note_nicks_for_hand",
     "note_prompt_msg",
     "note_saved_msg",
     "note_too_long_msg",

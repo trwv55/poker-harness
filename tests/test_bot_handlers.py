@@ -1198,9 +1198,11 @@ async def test_a_note_typed_while_an_escalation_waits_lands_in_the_note(deps, db
     from harness.presentation import note_saved_msg
 
     job_id, _hand_id = await _awaiting_job(db_factory, deps)
+    session_row = await fetch_one(db_factory, "select id from sessions")
+    hand_no = await _seed_screenshot_hand(db_factory, session_id=session_row["id"])
     await handle_escalation_callback(deps, _TG_USER_ID, f"escalate:{job_id}:pot:manual")
 
-    await handle_ui_callback(deps, _TG_USER_ID, "note:villain")
+    await handle_ui_callback(deps, _TG_USER_ID, f"note:{hand_no}:0")
     assert await handle_text(deps, _TG_USER_ID, "донкает флоп") == note_saved_msg("villain")
 
     note = await fetch_one(db_factory, "select opponent_nick, text from notes")
@@ -1217,14 +1219,16 @@ async def test_the_manual_entry_button_closes_an_input_that_was_started(deps, db
     """
     from harness.bot.handlers import handle_escalation_callback, handle_text, handle_ui_callback
 
-    job_id, _hand_id = await _awaiting_job(db_factory, deps)
-    await handle_ui_callback(deps, _TG_USER_ID, "note:villain")
+    job_id, escalated_hand = await _awaiting_job(db_factory, deps)
+    session_row = await fetch_one(db_factory, "select id from sessions")
+    hand_no = await _seed_screenshot_hand(db_factory, session_id=session_row["id"])
+    await handle_ui_callback(deps, _TG_USER_ID, f"note:{hand_no}:0")
     await handle_escalation_callback(deps, _TG_USER_ID, f"escalate:{job_id}:pot:manual")
 
     assert await handle_text(deps, _TG_USER_ID, "12,7") is not None
 
     assert await fetch_all(db_factory, "select * from notes") == []
-    hand = await fetch_one(db_factory, "select raw from hands")
+    hand = await fetch_one(db_factory, f"select raw from hands where id = {escalated_hand}")
     assert hand["raw"]["vision"]["displayed_pot"] == 127_000
 
 
@@ -1412,12 +1416,59 @@ async def test_a_blank_message_repeats_the_request_that_was_made(deps, db_factor
     await handle_nickname_command(deps, _TG_USER_ID)
     assert await handle_text(deps, _TG_USER_ID, "\xa0") == ask_gg_nickname_msg()
 
-    await handle_ui_callback(deps, _TG_USER_ID, "note:villain")
+    hand_no = await _hand_with_opponents(deps, db_factory)
+    await handle_ui_callback(deps, _TG_USER_ID, f"note:{hand_no}:0")
     assert await handle_text(deps, _TG_USER_ID, "   ") == note_prompt_msg("villain")
 
     row = await fetch_one(db_factory, "select gg_nickname, pending_input from players")
     assert row["gg_nickname"] is None
     assert row["pending_input"] == {"kind": "note", "nick": "villain"}
+
+
+async def _seed_screenshot_hand(
+    db_factory, *, session_id: int, hand_no: str = "RC1234", nicks: tuple[str, ...] = ("villain",)
+) -> str:
+    """Сохранённая рука со скрина: оппоненты названы ником (`Identity.NICK`).
+
+    Кнопка «заметка на оппонента» возит ИНДЕКС ника, а не сам ник, и бот
+    восстанавливает ник по этой самой руке — без сохранённой руки нажимать
+    нечего.
+    """
+    from harness.memory.repos import HandsRepo
+    from harness.normalizer import normalize
+
+    seats = [{"seat": 4, "label": "Hero", "stack": 100_000}]
+    nicknames = {"Hero": "screen_nick"}
+    for index, nick in enumerate(nicks):
+        seats.append({"seat": 5 + index, "label": nick, "stack": 100_000})
+        nicknames[nick] = nick
+    raw = RawHand.model_validate(
+        {
+            **_raw_dict(
+                seats=seats,
+                vision={"displayed_pot": 100_000, "nicknames": nicknames},
+            ),
+            "provenance": Provenance.SCREENSHOT.value,
+            "hand_no": hand_no,
+        }
+    )
+    async with db_factory() as session:
+        hands = HandsRepo(session)
+        hand_id = await hands.save_raw(session_id=session_id, raw=raw)
+        await hands.save_canonical(hand_id, normalize(raw))
+        await session.commit()
+    return hand_no
+
+
+async def _hand_with_opponents(
+    deps, db_factory, *, nicks: tuple[str, ...] = ("villain",), hand_no: str = "RC1234"
+) -> str:
+    """Вечер игрока с одной сохранённой рукой со скрина — под кнопки заметок."""
+    await handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="t.txt")
+    active = await fetch_one(db_factory, "select * from sessions")
+    return await _seed_screenshot_hand(
+        db_factory, session_id=active["id"], hand_no=hand_no, nicks=nicks
+    )
 
 
 async def test_a_note_starts_from_the_hand_with_the_opponent_already_filled_in(
@@ -1431,7 +1482,8 @@ async def test_a_note_starts_from_the_hand_with_the_opponent_already_filled_in(
     from harness.bot.handlers import handle_text, handle_ui_callback
     from harness.presentation import note_saved_msg
 
-    prompt = await handle_ui_callback(deps, _TG_USER_ID, "note:villain")
+    hand_no = await _hand_with_opponents(deps, db_factory)
+    prompt = await handle_ui_callback(deps, _TG_USER_ID, f"note:{hand_no}:0")
     assert prompt is not None and "villain" in prompt.text
 
     saved = await handle_text(deps, _TG_USER_ID, "фолдит на опен")
@@ -1449,7 +1501,8 @@ async def test_a_note_longer_than_the_screen_can_show_is_refused_in_words(
     from harness.contracts import MAX_NOTE_TEXT_CHARS
     from harness.presentation import note_saved_msg, note_too_long_msg
 
-    await handle_ui_callback(deps, _TG_USER_ID, "note:villain")
+    hand_no = await _hand_with_opponents(deps, db_factory)
+    await handle_ui_callback(deps, _TG_USER_ID, f"note:{hand_no}:0")
 
     refused = await handle_text(deps, _TG_USER_ID, "я" * (MAX_NOTE_TEXT_CHARS + 1))
     assert refused == note_too_long_msg(MAX_NOTE_TEXT_CHARS)
@@ -1462,13 +1515,20 @@ async def test_the_notes_screen_counts_every_note_not_the_page_it_shows(
     deps, db_factory, invited
 ):
     """Знаменатель строки обрезки — счёт заметок игрока, а не `limit` запроса."""
-    from harness.bot.handlers import handle_text, handle_ui_callback
+    from harness.bot.handlers import handle_text
     from harness.contracts import MAX_NOTE_TEXT_CHARS
+    from harness.memory.repos import NotesRepo
     from harness.presentation import MENU_NOTES
 
-    for index in range(12):
-        await handle_ui_callback(deps, _TG_USER_ID, f"note:opponent{index}")
-        await handle_text(deps, _TG_USER_ID, "ы" * MAX_NOTE_TEXT_CHARS)
+    async with db_factory() as session:
+        notes = NotesRepo(session)
+        for index in range(12):
+            await notes.upsert(
+                owner_player_id=invited,
+                nick=f"opponent{index}",
+                text_="ы" * MAX_NOTE_TEXT_CHARS,
+            )
+        await session.commit()
 
     msg = await handle_text(deps, _TG_USER_ID, MENU_NOTES)
 
@@ -1477,12 +1537,48 @@ async def test_the_notes_screen_counts_every_note_not_the_page_it_shows(
     assert "из 12 — самые свежие" in msg.text
 
 
+async def test_a_long_nick_in_a_note_button_still_opens_the_right_note(
+    deps, db_factory, invited
+):
+    """Кнопка возит индекс, ник бот берёт из сохранённой руки.
+
+    Ник длиннее 64 байт в `callback_data` не помещался, и отказ Bot API ронял
+    ВСЁ сообщение вердикта, а не одну кнопку.
+    """
+    from harness.bot.handlers import handle_text, handle_ui_callback
+    from harness.presentation import note_saved_msg
+
+    long_nick = "оппонентсдлиннымименем" * 3
+    hand_no = await _hand_with_opponents(deps, db_factory, nicks=("villain", long_nick))
+
+    prompt = await handle_ui_callback(deps, _TG_USER_ID, f"note:{hand_no}:1")
+    assert prompt is not None and long_nick in prompt.text
+    assert await handle_text(deps, _TG_USER_ID, "донкает флоп") == note_saved_msg(long_nick)
+
+    note = await fetch_one(db_factory, "select opponent_nick from notes")
+    assert note["opponent_nick"] == long_nick
+
+
+async def test_a_note_button_of_a_hand_that_is_not_mine_opens_nothing(deps, db_factory, invited):
+    """Номер раздачи в кнопке — внешние данные: чужую руку нажатием не открыть."""
+    from harness.bot.handlers import handle_ui_callback
+    from harness.presentation import analysis_unavailable_msg
+
+    assert await handle_ui_callback(
+        deps, _TG_USER_ID, "note:RC404:0"
+    ) == analysis_unavailable_msg()
+    assert await fetch_all(db_factory, "select * from notes") == []
+    row = await fetch_one(db_factory, "select pending_input from players")
+    assert row["pending_input"] is None
+
+
 async def test_a_note_can_be_edited_recoloured_and_deleted(deps, db_factory, invited):
     """CRUD заметки целиком — тем же путём, каким его пройдёт игрок кнопками."""
     from harness.bot.handlers import handle_text, handle_ui_callback
     from harness.presentation import MENU_NOTES, note_deleted_msg
 
-    await handle_ui_callback(deps, _TG_USER_ID, "note:villain")
+    hand_no = await _hand_with_opponents(deps, db_factory)
+    await handle_ui_callback(deps, _TG_USER_ID, f"note:{hand_no}:0")
     await handle_text(deps, _TG_USER_ID, "фолдит на опен")
     note_id = (await fetch_one(db_factory, "select id from notes"))["id"]
 
@@ -1512,7 +1608,8 @@ async def test_an_unknown_colour_from_a_button_is_not_written_to_the_note(
     from harness.bot.handlers import handle_text, handle_ui_callback
     from harness.presentation import note_gone_msg
 
-    await handle_ui_callback(deps, _TG_USER_ID, "note:villain")
+    hand_no = await _hand_with_opponents(deps, db_factory)
+    await handle_ui_callback(deps, _TG_USER_ID, f"note:{hand_no}:0")
     await handle_text(deps, _TG_USER_ID, "фолдит на опен")
     note_id = (await fetch_one(db_factory, "select id from notes"))["id"]
 
