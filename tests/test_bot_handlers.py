@@ -529,7 +529,12 @@ async def test_a_stranger_without_an_invite_is_refused_on_every_entry(db_factory
     Иначе незнакомец, приславший файл или скрин первым сообщением, заводил бы
     себе `players`-строку в обход инвайта — то есть инвайта бы не было.
     """
-    from harness.bot.handlers import handle_photo, handle_text, handle_ui_callback
+    from harness.bot.handlers import (
+        handle_alias_command,
+        handle_photo,
+        handle_text,
+        handle_ui_callback,
+    )
     from harness.presentation import invite_required_msg
 
     stranger = 999005
@@ -543,6 +548,7 @@ async def test_a_stranger_without_an_invite_is_refused_on_every_entry(db_factory
     assert await handle_new_session(deps, stranger) == refusal
     assert await handle_deep_dive_callback(deps, stranger, "TM1") == refusal
     assert await handle_ui_callback(deps, stranger, "session:1") == refusal
+    assert await handle_alias_command(deps, stranger, "BTN Vasya") == refusal
     assert await fetch_all(db_factory, "select * from players") == []
 
 
@@ -1589,7 +1595,12 @@ async def test_a_blank_message_repeats_the_request_that_was_made(deps, db_factor
 
 
 async def _seed_screenshot_hand(
-    db_factory, *, session_id: int, hand_no: str = "RC1234", nicks: tuple[str, ...] = ("villain",)
+    db_factory,
+    *,
+    session_id: int,
+    hand_no: str = "RC1234",
+    nicks: tuple[str, ...] = ("villain",),
+    tournament_id: str | None = None,
 ) -> str:
     """Сохранённая рука со скрина: оппоненты названы ником (`Identity.NICK`).
 
@@ -1605,11 +1616,13 @@ async def _seed_screenshot_hand(
     for index, nick in enumerate(nicks):
         seats.append({"seat": 5 + index, "label": nick, "stack": 100_000})
         nicknames[nick] = nick
+    extra = {} if tournament_id is None else {"tournament_id": tournament_id}
     raw = RawHand.model_validate(
         {
             **_raw_dict(
                 seats=seats,
                 vision={"displayed_pot": 100_000, "nicknames": nicknames},
+                **extra,
             ),
             "provenance": Provenance.SCREENSHOT.value,
             "hand_no": hand_no,
@@ -1989,3 +2002,203 @@ async def test_a_button_under_a_hand_that_is_not_mine_shows_nothing(deps, db_fac
         deps, _TG_USER_ID, "disagree:THEIRS1"
     ) == analysis_unavailable_msg()
     assert await fetch_all(db_factory, "select * from eval_cases") == []
+
+
+# --- /alias: участник разбора называется ником в руме -------------------------------
+
+
+async def _seed_hh_hand(
+    db_factory, *, session_id: int, hand_no: str, tournament_id: str | None = None
+) -> str:
+    """Рука из файла раздач, доведённая до `canonical`, — «последний разбор».
+
+    Участники в ней обезличены (так их пишет комната), поэтому назвать их можно
+    только местом за столом — тем же словом, которым их называет разбор.
+    """
+    from harness.memory.repos import HandsRepo
+    from harness.normalizer import normalize
+    from harness.parsers.hh_parser import parse_hand
+    from tests.test_hh_parser import SAMPLE
+
+    changes: dict[str, str] = {"hand_no": hand_no}
+    if tournament_id is not None:
+        changes["tournament_id"] = tournament_id
+    raw = parse_hand(SAMPLE, source_ref="x").model_copy(update=changes)
+    async with db_factory() as session:
+        hands = HandsRepo(session)
+        hand_id = await hands.save_raw(session_id=session_id, raw=raw)
+        await hands.save_canonical(hand_id, normalize(raw))
+        await session.commit()
+    return normalize(raw).tournament_id
+
+
+async def _evening_with_a_hand(
+    deps, db_factory, *, hand_no: str = "A1", tournament_id: str | None = None
+) -> str:
+    await handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="t.txt")
+    active = await fetch_one(db_factory, "select * from sessions")
+    return await _seed_hh_hand(
+        db_factory, session_id=active["id"], hand_no=hand_no, tournament_id=tournament_id
+    )
+
+
+async def test_the_alias_command_names_the_participant_of_the_last_analysis(
+    deps, db_factory, invited
+):
+    """«Запомни: BTN в этой раздаче — Vasya». Записывается пара «турнир + метка»,
+    а не место: место у человека своё в каждой раздаче, метка — на весь турнир.
+    """
+    from harness.bot.handlers import handle_alias_command
+    from harness.presentation import alias_bound_msg
+
+    tournament = await _evening_with_a_hand(deps, db_factory)
+
+    msg = await handle_alias_command(deps, _TG_USER_ID, "BTN Vasya")
+
+    assert msg == alias_bound_msg("Vasya", "BTN")
+    link = await fetch_one(db_factory, "select * from player_alias_links")
+    alias = await fetch_one(db_factory, "select * from player_aliases")
+    assert link["room_tournament_id"] == tournament
+    assert link["alias_id"] == alias["id"]
+    assert alias["opponent_nick"] == "Vasya"
+    # Метка — та, что стоит за местом BTN в сохранённой раздаче, а не само место.
+    hand = await fetch_one(db_factory, "select canonical from hands")
+    seats = {p["position"]: p["label"] for p in hand["canonical"]["players"]}
+    assert link["participant_label"] == seats["BTN"]
+
+
+async def test_a_second_tournament_joins_the_same_nick(deps, db_factory, invited):
+    """Ради чего всё и делается: в другом турнире у того же человека другая метка,
+    и обе привязки живут под одним ником.
+    """
+    from harness.bot.handlers import handle_alias_command
+
+    first = await _evening_with_a_hand(deps, db_factory, hand_no="A1")
+    await handle_alias_command(deps, _TG_USER_ID, "BTN Vasya")
+    second = await _evening_with_a_hand(
+        deps, db_factory, hand_no="B1", tournament_id="ANOTHER-TOURNAMENT"
+    )
+
+    await handle_alias_command(deps, _TG_USER_ID, "CO Vasya")
+
+    assert first != second
+    aliases = await fetch_all(db_factory, "select * from player_aliases")
+    links = await fetch_all(db_factory, "select * from player_alias_links")
+    assert len(aliases) == 1
+    assert {row["room_tournament_id"] for row in links} == {first, second}
+    assert {row["alias_id"] for row in links} == {aliases[0]["id"]}
+
+
+async def test_a_place_that_is_not_at_the_table_binds_nothing(deps, db_factory, invited):
+    """Гадать, кого имел в виду игрок, нельзя: место называется точно или никак.
+
+    Ник при отказе тоже не заводится: строка появилась бы у оппонента, о котором
+    ничего не сказано.
+    """
+    from harness.bot.handlers import handle_alias_command
+
+    await _evening_with_a_hand(deps, db_factory)
+
+    msg = await handle_alias_command(deps, _TG_USER_ID, "ЛЕВЫЙ Vasya")
+
+    assert msg is not None and "Такого места в последнем разборе нет" in msg.text
+    assert "BTN" in msg.text
+    assert await fetch_all(db_factory, "select * from player_aliases") == []
+    assert await fetch_all(db_factory, "select * from player_alias_links") == []
+
+
+async def test_the_alias_command_without_words_lists_the_opponents(deps, db_factory, invited):
+    from harness.bot.handlers import handle_alias_command
+
+    await _evening_with_a_hand(deps, db_factory)
+    await handle_alias_command(deps, _TG_USER_ID, "BTN Vasya")
+
+    msg = await handle_alias_command(deps, _TG_USER_ID)
+
+    assert msg is not None
+    assert "Vasya — турниров: 1" in msg.text
+
+
+async def test_a_participant_already_named_keeps_his_first_nick(deps, db_factory, invited):
+    """Второй ник на ту же метку не переписывает первый: сказанное владельцем
+    молча не заменяется, а ответ называет, с чем спорит команда.
+    """
+    from harness.bot.handlers import handle_alias_command
+    from harness.presentation import alias_taken_msg
+
+    await _evening_with_a_hand(deps, db_factory)
+    await handle_alias_command(deps, _TG_USER_ID, "BTN Vasya")
+
+    msg = await handle_alias_command(deps, _TG_USER_ID, "BTN Petya")
+
+    assert msg == alias_taken_msg("BTN", "Vasya")
+    link = await fetch_one(db_factory, "select * from player_alias_links")
+    vasya = await fetch_one(
+        db_factory, "select * from player_aliases where opponent_nick = 'Vasya'"
+    )
+    assert link["alias_id"] == vasya["id"]
+
+
+async def test_a_nick_cannot_take_a_second_place_in_one_tournament(deps, db_factory, invited):
+    """В турнире у человека один идентификатор: второе место того же ника сложило
+    бы в его статистику двоих, и раздачи турнира посчитались бы дважды.
+    """
+    from harness.bot.handlers import handle_alias_command
+    from harness.presentation import alias_tournament_taken_msg
+
+    await _evening_with_a_hand(deps, db_factory)
+    await handle_alias_command(deps, _TG_USER_ID, "BTN Vasya")
+
+    msg = await handle_alias_command(deps, _TG_USER_ID, "CO Vasya")
+
+    assert msg == alias_tournament_taken_msg("Vasya", "BTN")
+    assert len(await fetch_all(db_factory, "select * from player_alias_links")) == 1
+
+
+async def test_a_command_without_a_nick_explains_the_two_words(deps, db_factory, invited):
+    from harness.bot.handlers import handle_alias_command
+    from harness.presentation import alias_usage_msg
+
+    await _evening_with_a_hand(deps, db_factory)
+
+    assert await handle_alias_command(deps, _TG_USER_ID, "BTN") == alias_usage_msg()
+
+
+async def test_a_nick_longer_than_the_column_is_refused_in_words(deps, db_factory, invited):
+    """Тот же предел и тот же отказ, что у собственного ника в руме: это один и
+    тот же ник, и второго числа на него в продукте нет.
+    """
+    from harness.bot.handlers import _MAX_NICKNAME, handle_alias_command
+    from harness.presentation import gg_nickname_too_long_msg
+
+    await _evening_with_a_hand(deps, db_factory)
+
+    msg = await handle_alias_command(deps, _TG_USER_ID, "BTN " + "я" * (_MAX_NICKNAME + 1))
+
+    assert msg == gg_nickname_too_long_msg(_MAX_NICKNAME)
+    assert await fetch_all(db_factory, "select * from player_aliases") == []
+
+
+async def test_without_any_analysis_there_is_nothing_to_bind(deps, db_factory, invited):
+    from harness.bot.handlers import handle_alias_command
+    from harness.presentation import alias_no_analysis_msg
+
+    assert await handle_alias_command(deps, _TG_USER_ID, "BTN Vasya") == alias_no_analysis_msg()
+
+
+async def test_a_screenshot_analysis_has_no_tournament_to_bind_to(deps, db_factory, invited):
+    """У скрина нет номера турнира комнаты — привязывать не к чему, и это
+    говорится прямо: на скрине ники видны и так, там работают заметки.
+    """
+    from harness.bot.handlers import handle_alias_command
+    from harness.presentation import alias_screenshot_only_msg
+
+    await handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="t.txt")
+    active = await fetch_one(db_factory, "select * from sessions")
+    # Пустой номер турнира — то, что кладёт в руку зрение
+    # (`parsers/vision_adapter.py`): на экране стола его нет.
+    await _seed_screenshot_hand(db_factory, session_id=active["id"], tournament_id="")
+
+    msg = await handle_alias_command(deps, _TG_USER_ID, "BTN Vasya")
+
+    assert msg == alias_screenshot_only_msg()

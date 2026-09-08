@@ -40,6 +40,7 @@ from harness.bot.handlers import (
     ESCALATION_PREFIX,
     UI_CALLBACK_PREFIXES,
     BotDeps,
+    handle_alias_command,
     handle_deep_dive_callback,
     handle_document,
     handle_escalation_callback,
@@ -153,6 +154,14 @@ def build_router(deps: BotDeps) -> Router:
         msg = await handle_nickname_command(deps, message.from_user.id)
         if msg is None:
             return
+        await _deliver(bot, message.chat.id, msg)
+
+    @router.message(Command("alias"))
+    async def on_alias(message: Message, bot: Bot, command: CommandObject) -> None:
+        """`/alias` — список оппонентов; `/alias МЕСТО НИК` — привязать участника."""
+        if message.from_user is None:
+            return
+        msg = await handle_alias_command(deps, message.from_user.id, command.args or "")
         await _deliver(bot, message.chat.id, msg)
 
     @router.message(Command("invite"))

@@ -1725,3 +1725,47 @@ def test_ranges_msg_of_a_strict_hand_explains_why_there_is_no_picture():
 
     assert msg.photos == []
     assert "не опирается на догадку" in msg.text
+
+
+def _alias(alias_id: int, nick: str, links: int = 0):
+    from harness.contracts import AliasRecord
+
+    return AliasRecord(alias_id=alias_id, nick=nick, links=links)
+
+
+def test_aliases_msg_of_the_longest_names_still_fits_one_telegram_message():
+    """Список оппонентов обязан отправляться при любом их числе: `sendMessage`
+    отказывает на 4096 символах, и не влезший список не пришёл бы игроку вовсе.
+    """
+    from harness.presentation import aliases_msg
+
+    # 64 — предел колонки `player_aliases.opponent_nick`, то же число, что у
+    # собственного ника игрока (`players.gg_nickname`).
+    long_list = [_alias(i, "я" * 64, links=99) for i in range(1, 201)]
+
+    msg = aliases_msg(long_list)
+
+    assert len(msg.text) <= 4096
+    assert f"из {len(long_list)} — по алфавиту" in msg.text
+
+
+def test_aliases_msg_counts_everyone_not_only_the_shown():
+    """Знаменатель — сколько оппонентов у игрока, а не сколько поместилось."""
+    from harness.presentation import aliases_msg
+
+    aliases = [_alias(i, "я" * 64, links=1) for i in range(1, 101)]
+
+    msg = aliases_msg(aliases)
+
+    shown = sum(1 for line in msg.text.splitlines() if line.startswith("я"))
+    assert shown < len(aliases)
+    assert f"Показаны {shown} из {len(aliases)}" in msg.text
+
+
+def test_aliases_msg_says_how_many_tournaments_each_opponent_is_bound_in():
+    """Число турниров — единственный признак, что привязка состоялась: в файлах
+    раздач участник обезличен, и ника за столом не видно.
+    """
+    from harness.presentation import aliases_msg
+
+    assert "Vasya — турниров: 2" in aliases_msg([_alias(1, "Vasya", links=2)]).text

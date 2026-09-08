@@ -93,6 +93,7 @@ from harness.contracts.explanation import TournamentTextOut, VerdictTextOut
 from harness.contracts.history import (
     MAX_NOTE_TEXT_CHARS,
     NOTE_COLORS,
+    AliasRecord,
     LeaksOverview,
     LeakStat,
     NoteRecord,
@@ -1535,7 +1536,8 @@ def help_msg() -> Msg:
             f"{MENU_NOTES} — наблюдения об оппонентах.\n"
             f"{MENU_SETTINGS} — ник в руме и остаток дневного лимита.\n\n"
             "/new — начать новую сессию.\n"
-            "/nick — указать ник в руме."
+            "/nick — указать ник в руме.\n"
+            "/alias — назвать участника разбора ником в руме."
         ),
         menu=MAIN_MENU,
     )
@@ -1732,5 +1734,124 @@ def unknown_text_msg() -> Msg:
         text=(
             "Не понял. Пришлите скриншот раздачи или файл из PokerCraft — "
             "остальное в нижнем меню."
+        )
+    )
+
+
+# --- псевдонимы: оппонент по нику и его метки в турнирах ----------------------------
+
+
+def _alias_line(alias: AliasRecord) -> str:
+    return f"{alias.nick} — турниров: {alias.links}"
+
+
+def _aliases_cut_line(shown: int, total: int) -> str:
+    return f"Показаны {shown} из {total} — по алфавиту."
+
+
+def aliases_msg(aliases: Sequence[AliasRecord]) -> Msg:
+    """Список оппонентов, которых игрок назвал по нику, и сколько турниров у каждого.
+
+    Число турниров — единственный признак, что привязка состоялась: в файлах
+    раздач участник обезличен, и увидеть за столом его ник негде.
+
+    Список приходит целиком (`AliasesRepo.list_for_player` без потолка), поэтому
+    знаменатель строки обрезки — сколько оппонентов у игрока НА САМОМ ДЕЛЕ, а не
+    размер страницы (`test_aliases_msg_counts_everyone_not_only_the_shown`).
+    Режется бюджетом `_TELEGRAM_TEXT_LIMIT`: список длиннее одного сообщения
+    Телеграма не отправился бы вовсе.
+    """
+    head = "Оппоненты, которых вы назвали по нику."
+    tail = (
+        "Привязать участника последнего разбора: /alias МЕСТО НИК — "
+        "например /alias BTN Vasya. В файлах PokerCraft участники обезличены, "
+        "и кто из них кто, знаете только вы."
+    )
+    if not aliases:
+        return Msg(text=f"{head}\n\nПока пусто.\n\n{tail}")
+
+    shown: list[str] = []
+    length = len(head) + len(tail) + len(_aliases_cut_line(len(aliases), len(aliases))) + 4
+    for alias in aliases:
+        line = _alias_line(alias)
+        if shown and length + len(line) + 1 > _TELEGRAM_TEXT_LIMIT:
+            break
+        shown.append(line)
+        length += len(line) + 1
+
+    lines = [head, "", *shown, ""]
+    if len(shown) < len(aliases):
+        lines.append(_aliases_cut_line(len(shown), len(aliases)))
+        lines.append("")
+    lines.append(tail)
+    return Msg(text="\n".join(lines))
+
+
+def alias_usage_msg() -> Msg:
+    """Команда без второго слова: непонятно, кого и как звать."""
+    return Msg(
+        text=(
+            "Нужно два слова: место за столом и ник в руме. "
+            "Например: /alias BTN Vasya. Один /alias без слов покажет список."
+        )
+    )
+
+
+def alias_bound_msg(nick: str, position: str) -> Msg:
+    return Msg(text=f"Запомнил: {position} в последнем разборе — это {nick}.")
+
+
+def alias_taken_msg(position: str, nick: str) -> Msg:
+    """Место уже названо другим ником: молча переписать значило бы потерять сказанное.
+
+    Ник в ответе — тот, что записан сейчас: без него игрок не знает, с чем
+    именно спорит его команда.
+    """
+    return Msg(text=f"{position} в этом турнире уже записан как {nick}.")
+
+
+def alias_tournament_taken_msg(nick: str, position: str) -> Msg:
+    """У ника в этом турнире уже есть другое место.
+
+    В турнире у участника один идентификатор, поэтому второе место того же ника
+    в том же турнире означало бы, что в его статистику сложены двое.
+    """
+    return Msg(text=f"{nick} в этом турнире уже записан на другом месте: {position}.")
+
+
+def alias_position_unknown_msg(positions: Sequence[str]) -> Msg:
+    """Такого места в последнем разборе нет — перечисляем те, что есть.
+
+    Гадать, кого имел в виду игрок, нельзя: связь участников утверждает он, и
+    подставленное за него место записало бы статистику на чужого.
+    """
+    return Msg(
+        text=(
+            "Такого места в последнем разборе нет. Есть: "
+            f"{', '.join(positions)}."
+        )
+    )
+
+
+def alias_no_analysis_msg() -> Msg:
+    """Привязывать не к чему: разборов у игрока ещё не было."""
+    return Msg(
+        text=(
+            "Пока не к чему привязывать: разберите раздачу из файла PokerCraft, "
+            "и участников этой раздачи можно будет назвать по нику."
+        )
+    )
+
+
+def alias_screenshot_only_msg() -> Msg:
+    """Последний разбор — скриншот: у него нет номера турнира комнаты.
+
+    Привязка держится на номере турнира, а на скрине его нет. На скрине ники
+    оппонентов видны и так — там работают заметки.
+    """
+    return Msg(
+        text=(
+            "Последний разбор — со скриншота, а у него нет номера турнира. "
+            "Привязка нужна для файлов PokerCraft, где участники обезличены."
         )
     )

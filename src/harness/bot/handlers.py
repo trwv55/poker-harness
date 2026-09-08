@@ -37,10 +37,11 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from harness.bot.menus import render_menu_screen, session_summary_screen
-from harness.contracts import MAX_NOTE_TEXT_CHARS, NOTE_COLORS
+from harness.contracts import MAX_NOTE_TEXT_CHARS, NOTE_COLORS, CanonicalHand
 from harness.explanation.hand_replay import hand_replay
 from harness.memory.models import Job, Player
 from harness.memory.repos import (
+    AliasesRepo,
     AnalysesRepo,
     EvalCasesRepo,
     HandsRepo,
@@ -69,6 +70,14 @@ from harness.presentation import (
     SESSION_PREFIX,
     SET_NICKNAME_DATA,
     Msg,
+    alias_bound_msg,
+    alias_no_analysis_msg,
+    alias_position_unknown_msg,
+    alias_screenshot_only_msg,
+    alias_taken_msg,
+    alias_tournament_taken_msg,
+    alias_usage_msg,
+    aliases_msg,
     analysis_unavailable_msg,
     ask_gg_nickname_msg,
     disagreement_saved_msg,
@@ -109,6 +118,7 @@ __all__ = [
     "BotDeps",
     "QuotaCheck",
     "check_quota",
+    "handle_alias_command",
     "handle_deep_dive_callback",
     "handle_document",
     "handle_escalation_callback",
@@ -342,6 +352,104 @@ async def handle_nickname_command(deps: BotDeps, tg_user_id: int) -> Msg | None:
         await PlayersRepo(db).set_pending_input(player.id, {"kind": _INPUT_NICKNAME})
         await db.commit()
     return ask_gg_nickname_msg()
+
+
+def _label_at_position(hand: CanonicalHand, position: str) -> str | None:
+    """Метка участника, сидевшего на этом месте в этой раздаче, — или `None`.
+
+    Игрок называет МЕСТО («BTN»), а не метку участника: метка обезличена и в
+    продукте не показывается нигде, а место — то самое слово, которым разбор
+    называет оппонента (`explanation/hand_replay.py`). Регистр не различается:
+    команда набирается руками.
+
+    `None` — такого места за этим столом нет, и подставлять вместо него
+    ближайшее нельзя: связь участников утверждает игрок, и угаданное место
+    записало бы частоты на чужого.
+    """
+    wanted = position.strip().upper()
+    for seat in hand.players:
+        if seat.position.upper() == wanted:
+            return seat.label
+    return None
+
+
+async def handle_alias_command(deps: BotDeps, tg_user_id: int, args: str = "") -> Msg:
+    """`/alias`: без слов — список оппонентов, со словами — привязать участника.
+
+    Минимальный вход в таблицу псевдонимов: без команды она мертва, а владелец
+    проверяет продукт каждый вечер (бриф задачи). Разговорный доступ появится
+    позже и заменит эту команду — поэтому здесь нет ни экранов, ни кнопок.
+    """
+    async with deps.db_factory() as db:
+        player = await _known_player(db, tg_user_id)
+        if player is None:
+            await db.commit()
+            return invite_required_msg()
+        reply = await _alias_reply(db, player, args.strip())
+        await db.commit()
+    return reply
+
+
+async def _alias_reply(db: AsyncSession, player: Player, args: str) -> Msg:
+    """Разбор аргументов команды: `«МЕСТО НИК»` либо пусто.
+
+    Первое слово — место, остальное — ник: ник бывает из нескольких слов, место
+    — никогда, и обратный порядок разбирался бы неоднозначно.
+
+    Ник длиннее колонки `players.gg_nickname` отвергается тем же текстом, что и
+    свой собственный: это один и тот же ник в руме, и второго предела на него в
+    продукте нет.
+    """
+    aliases = AliasesRepo(db)
+    if not args:
+        return aliases_msg(await aliases.list_for_player(player.id))
+    position, _, nick = args.partition(" ")
+    nick = nick.strip()
+    if not nick:
+        return alias_usage_msg()
+    if len(nick) > _MAX_NICKNAME:
+        return gg_nickname_too_long_msg(_MAX_NICKNAME)
+
+    hand = await HandsRepo(db).last_canonical(player.id)
+    if hand is None:
+        return alias_no_analysis_msg()
+    if not hand.tournament_id:
+        return alias_screenshot_only_msg()
+    label = _label_at_position(hand, position)
+    if label is None:
+        return alias_position_unknown_msg([seat.position for seat in hand.players])
+
+    alias_id = await aliases.get_or_create(owner_player_id=player.id, nick=nick)
+    bound = (await aliases.links(alias_id, player.id)).get(hand.tournament_id)
+    if bound is not None and bound != label:
+        return alias_tournament_taken_msg(nick, _position_of(hand, bound))
+    holder = await aliases.link(
+        owner_player_id=player.id,
+        alias_id=alias_id,
+        room_tournament_id=hand.tournament_id,
+        participant_label=label,
+    )
+    if holder is None:  # pragma: no cover — псевдоним заведён этим же вызовом строкой выше
+        raise LookupError(f"оппонент {alias_id} исчез между созданием и привязкой")
+    if holder != alias_id:
+        taken_by = await aliases.get(holder, player.id)
+        if taken_by is None:  # pragma: no cover — привязка есть, а её оппонента нет
+            raise LookupError(f"привязка ведёт на оппонента {holder}, которого нет")
+        return alias_taken_msg(position.strip().upper(), taken_by.nick)
+    return alias_bound_msg(nick, position.strip().upper())
+
+
+def _position_of(hand: CanonicalHand, label: str) -> str:
+    """Место участника по его метке — обратный ход `_label_at_position`.
+
+    Метка в ответе игроку не показывается: она обезличена и ему ни о чём не
+    говорит. Если метки за этим столом уже нет (привязка из другой раздачи того
+    же турнира), возвращается пустая строка — места назвать нечем.
+    """
+    for seat in hand.players:
+        if seat.label == label:
+            return seat.position
+    return ""
 
 
 async def handle_document(
