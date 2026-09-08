@@ -45,6 +45,7 @@ __all__ = [
     "positions_check",
     "pot_check",
     "seats_check",
+    "within_tolerance",
 ]
 
 CHECK_POT = "pot"
@@ -73,7 +74,7 @@ POT_TOLERANCE_BB = 0.1
 EQUITY_TOLERANCE_PP = 1.0
 
 
-def _within_tolerance(delta: float, tolerance: float) -> bool:
+def within_tolerance(delta: float, tolerance: float) -> bool:
     """Расхождение, равное допуску, проходит.
 
     Обе сверки вычитают одну прочитанную с экрана десятичную величину из другой,
@@ -106,7 +107,7 @@ def pot_check(pot_shown_bb: float | None, contributions_bb: float) -> VisionChec
     delta = abs(pot_shown_bb - contributions_bb)
     return VisionCheck(
         name=CHECK_POT,
-        passed=_within_tolerance(delta, POT_TOLERANCE_BB),
+        passed=within_tolerance(delta, POT_TOLERANCE_BB),
         detail=(
             f"банк на экране {pot_shown_bb:.2f} ББ, сумма видимых вкладов "
             f"{contributions_bb:.2f} ББ, расхождение {delta:.2f} ББ"
@@ -206,7 +207,7 @@ def equity_check(
     delta = abs(shown_pct - computed_pct)
     return VisionCheck(
         name=CHECK_EQUITY,
-        passed=_within_tolerance(delta, EQUITY_TOLERANCE_PP),
+        passed=within_tolerance(delta, EQUITY_TOLERANCE_PP),
         detail=(
             f"на экране {shown_pct:.2f}%, по прочитанным картам {computed_pct:.2f}%, "
             f"расхождение {delta:.2f} п.п."

@@ -807,3 +807,32 @@ def test_the_room_middle_position_labels_are_only_aliased_where_measured():
     for seats in (6, 8):
         assert _aliased_position("ББ", seats) == "BB"
         assert _aliased_position("МБ", seats) == "SB"
+
+
+def test_an_answer_off_by_exactly_the_tolerance_closes_the_dispute():
+    """Ответ, расходящийся с вкладами ровно на допуск, обязан закрывать спор.
+
+    Тот же граничный случай, что и в `pot_check`, но на второй его копии — в
+    гейте, который засчитывает ОТВЕТ игрока (`vision_adapter`). Пока он сравнивал
+    голым `<=`, одно и то же расхождение решалось по-разному в зависимости от
+    знака: ответ НИЖЕ вкладов на допуск проходил, ВЫШЕ на тот же допуск — нет.
+    """
+    from harness.parsers.vision_adapter import apply_vision_answer, contributions_bb
+
+    reading = export_reading(ante_pool_shown=None, winners=[])
+    raw, _ = reading_to_raw(reading, hero_nickname=HERO_NICK, source_ref="s")
+    raw.vision = (raw.vision or VisionMeta()).model_copy(
+        update={"checks": [VisionCheck(name=CHECK_POT, passed=False, options=["1", "2"])]}
+    )
+    contributions = contributions_bb(raw)
+    above = round(contributions + POT_TOLERANCE_BB, 2)
+    below = round(contributions - POT_TOLERANCE_BB, 2)
+    # Причина дефекта, зафиксированная числом: разность десятичных в двоичной
+    # плавающей точке больше своего десятичного значения ровно в одну сторону.
+    assert abs(above - contributions) > POT_TOLERANCE_BB
+    assert abs(below - contributions) <= POT_TOLERANCE_BB
+
+    for answer in (f"{above:.2f}", f"{below:.2f}"):
+        settled = apply_vision_answer(raw, "pot", answer)
+        assert settled is not None and settled.vision is not None
+        assert [c.passed for c in settled.vision.checks] == [True], answer

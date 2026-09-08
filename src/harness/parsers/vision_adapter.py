@@ -75,6 +75,7 @@ from harness.parsers.vision_checks import (
     positions_check,
     pot_check,
     seats_check,
+    within_tolerance,
 )
 
 __all__ = [
@@ -878,7 +879,7 @@ def apply_vision_answer(
         # доходит. Иначе получалось так: модель пропустила анте, игрок подтвердил
         # показанный банк, проверка «закрылась» — и разбор уезжал игроку по руке
         # с анте, равным нулю (ревью раунда 2, F1).
-        agrees = abs(shown - contributions_bb(raw)) <= POT_TOLERANCE_BB
+        agrees = within_tolerance(abs(shown - contributions_bb(raw)), POT_TOLERANCE_BB)
         meta = _resolved(raw, field) if agrees or raw.completeness is Completeness.STATE else (
             raw.vision or VisionMeta()
         )
