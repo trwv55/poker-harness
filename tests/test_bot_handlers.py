@@ -259,7 +259,7 @@ async def test_document_creates_session_silently(db_factory, deps, invited):
     # «Молча» — это и про текст: подтверждение не рассказывает про сессию и не
     # просит её открыть. Регресс формулировки («Открыл новую сессию…») ронял бы
     # ровно ту продуктовую гарантию, ради которой сессия и создаётся молча.
-    assert msg == hh_accepted_msg()
+    assert msg is not None and msg == hh_accepted_msg()
     assert "сесси" not in msg.text.lower()
 
 
@@ -355,7 +355,7 @@ async def test_reupload_after_failed_scan_retries_on_the_same_tournament(db_fact
     assert len(jobs) == 2 and len(tournaments) == 1
     assert jobs[-1]["payload"]["tournament_id"] == tournaments[0]["id"]
     # Внутренний текст `jobs.error` не участвует ни в одном ответе игроку.
-    assert "внутренняя причина" not in again.text
+    assert again is not None and "внутренняя причина" not in again.text
 
 
 async def test_two_starts_at_once_from_a_new_player_create_one_player(
@@ -1048,6 +1048,166 @@ async def test_the_same_screenshot_twice_does_not_occupy_the_disk_twice(deps, in
     await handle_photo(deps, _TG_USER_ID, _SCREEN_BYTES)
     await handle_photo(deps, _TG_USER_ID, _SCREEN_BYTES)
     assert len(list((deps.data_dir / "screens").iterdir())) == 1
+
+
+# --- скрин, присланный файлом («отправить без сжатия») ------------------------
+
+
+async def _with_nickname(deps) -> None:
+    """Ник в руме — предусловие любого разбора скрина, а не предмет этих тестов."""
+    from harness.bot.handlers import handle_nickname_command, handle_text
+
+    await handle_nickname_command(deps, _TG_USER_ID)
+    await handle_text(deps, _TG_USER_ID, "screen_nick")
+
+
+async def test_a_picture_sent_as_a_document_goes_to_vision(deps, db_factory, invited):
+    """«Отправить без сжатия» — это документ, и до сих пор он получал отказ.
+
+    Продукт сам просит прислать скрин файлом, когда масти не прочитались
+    (`send_as_file_msg`), поэтому вход обязан быть тем же, что у фотографии:
+    задача `screenshot_analyze` с файлом на диске и хэшем в `payload`.
+    """
+    await _with_nickname(deps)
+
+    msg = await handle_document(
+        deps,
+        tg_user_id=_TG_USER_ID,
+        file_bytes=_SCREEN_BYTES,
+        filename="table.png",
+        mime_type="image/png",
+    )
+
+    assert msg is None  # молчит: дальше говорит воркер
+    job = await fetch_one(db_factory, "select type, payload from jobs")
+    assert job["type"] == "screenshot_analyze"
+    assert job["payload"]["image_hash"] == hashlib.sha256(_SCREEN_BYTES).hexdigest()
+    assert Path(job["payload"]["image_file"]).read_bytes() == _SCREEN_BYTES
+
+
+async def test_a_picture_document_is_recognised_by_name_when_the_type_is_useless(
+    deps, db_factory, invited
+):
+    """Телеграм ставит `application/octet-stream` охотно — имя файла тут запасная примета."""
+    await _with_nickname(deps)
+
+    assert (
+        await handle_document(
+            deps,
+            tg_user_id=_TG_USER_ID,
+            file_bytes=_SCREEN_BYTES,
+            filename="Screenshot 2026-09-08.JPEG",
+            mime_type="application/octet-stream",
+        )
+        is None
+    )
+    assert (
+        await handle_document(
+            deps,
+            tg_user_id=_TG_USER_ID,
+            file_bytes=b"RIFF\x00\x00\x00\x00WEBP second screen",
+            filename="stol.webp",
+            mime_type=None,
+        )
+        is None
+    )
+
+    types = {row["type"] for row in await fetch_all(db_factory, "select type from jobs")}
+    assert types == {"screenshot_analyze"}
+
+
+async def test_a_document_that_is_neither_hands_nor_a_picture_names_both_doors(deps):
+    """Отказ называет обе двери: раздачи `.txt` и скрин картинкой.
+
+    Пока текст предлагал только `.txt`, игрок читал его как «зрения здесь нет».
+    """
+    msg = await handle_document(
+        deps, tg_user_id=_TG_USER_ID, file_bytes=b"PK\x03\x04zip", filename="hands.zip"
+    )
+
+    assert msg is not None and msg == unsupported_document_msg()
+    assert ".txt" in msg.text
+    assert "картинкой" in msg.text
+
+
+async def test_a_stranger_sending_a_picture_as_a_document_leaves_nothing_in_the_volume(
+    deps, db_factory
+):
+    """Новый вход соблюдает тот же порядок: ни байта на диск раньше проверки игрока."""
+    msg = await handle_document(
+        deps,
+        tg_user_id=999007,
+        file_bytes=_SCREEN_BYTES,
+        filename="table.png",
+        mime_type="image/png",
+    )
+
+    assert msg == invite_required_msg()
+    assert not (deps.data_dir / "screens").exists()
+    assert await fetch_all(db_factory, "select * from jobs") == []
+    assert await fetch_all(db_factory, "select * from players") == []
+
+
+async def test_an_oversized_picture_is_refused_before_the_queue(deps, db_factory, invited):
+    """Предел размера называется числом и проверяется ДО постановки задачи.
+
+    Телеграм отдаёт документы до 20 МБ, а модель принимает картинку сильно
+    меньше (`platform/llm.py`): без этой проверки игрок ждал бы двадцать секунд
+    ради ошибки провайдера.
+    """
+    from harness.platform.llm import MAX_IMAGE_BYTES, MAX_IMAGE_MB
+    from harness.presentation import screenshot_too_large_msg
+
+    await _with_nickname(deps)
+    huge = b"\x89PNG\r\n\x1a\n" + b"\x00" * MAX_IMAGE_BYTES
+
+    msg = await handle_document(
+        deps, tg_user_id=_TG_USER_ID, file_bytes=huge, filename="huge.png", mime_type="image/png"
+    )
+
+    assert msg is not None and msg == screenshot_too_large_msg(MAX_IMAGE_MB)
+    assert str(MAX_IMAGE_MB) in msg.text
+    assert await fetch_all(db_factory, "select * from jobs") == []
+    assert not (deps.data_dir / "screens").exists()
+
+
+async def test_the_size_limit_is_not_what_a_stranger_learns(deps, db_factory):
+    """Порядок проверок: незнакомцу с огромным файлом отвечают про инвайт, не про предел."""
+    from harness.platform.llm import MAX_IMAGE_BYTES
+
+    huge = b"\x89PNG\r\n\x1a\n" + b"\x00" * MAX_IMAGE_BYTES
+
+    msg = await handle_document(
+        deps, tg_user_id=999008, file_bytes=huge, filename="huge.png", mime_type="image/png"
+    )
+
+    assert msg == invite_required_msg()
+    assert await fetch_all(db_factory, "select * from players") == []
+
+
+async def test_the_same_screen_by_photo_and_by_document_is_one_file(deps, db_factory, invited):
+    """Дедупликация — по содержимому, и оба входа кладут одинаковые байты одинаково.
+
+    Разными скринами один экран становится не от входа, а от того, что Телеграм
+    отдаёт сжатое фото и несжатый файл как РАЗНЫЕ байты; при одинаковых байтах
+    путь и `image_hash` совпадают.
+    """
+    from harness.bot.handlers import handle_photo
+
+    await _with_nickname(deps)
+    await handle_photo(deps, _TG_USER_ID, _SCREEN_BYTES)
+    await handle_document(
+        deps,
+        tg_user_id=_TG_USER_ID,
+        file_bytes=_SCREEN_BYTES,
+        filename="table.png",
+        mime_type="image/png",
+    )
+
+    assert len(list((deps.data_dir / "screens").iterdir())) == 1
+    jobs = await fetch_all(db_factory, "select payload from jobs")
+    assert len(jobs) == 2  # оба входа дошли до очереди
+    assert {j["payload"]["image_hash"] for j in jobs} == {hashlib.sha256(_SCREEN_BYTES).hexdigest()}
 
 
 async def _awaiting_job(

@@ -174,6 +174,13 @@ def build_router(deps: BotDeps) -> Router:
 
     @router.message(F.document)
     async def on_document(message: Message, bot: Bot) -> None:
+        """Файл: раздачи `.txt` либо скрин без сжатия — какой именно, решает не здесь.
+
+        `mime_type` уходит обработчику как есть, вместе с именем файла: обе
+        приметы приходят от Телеграма, и выбирать между ними — решение, а
+        решений в этом модуле нет. `None` в ответе значит то же, что у кнопки
+        «разобрать»: задача поставлена, дальше говорит воркер.
+        """
         if message.from_user is None or message.document is None:
             return
         file_bytes = await _download(bot, message.document.file_id)
@@ -182,7 +189,10 @@ def build_router(deps: BotDeps) -> Router:
             tg_user_id=message.from_user.id,
             file_bytes=file_bytes,
             filename=message.document.file_name or "",
+            mime_type=message.document.mime_type,
         )
+        if msg is None:
+            return
         await _deliver(bot, message.chat.id, msg)
 
     @router.message(F.photo)

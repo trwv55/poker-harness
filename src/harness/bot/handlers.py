@@ -54,6 +54,7 @@ from harness.memory.repos import (
     TournamentsRepo,
 )
 from harness.parsers.vision_adapter import apply_vision_answer
+from harness.platform.llm import MAX_IMAGE_BYTES, MAX_IMAGE_MB
 from harness.platform.queue import JobsQueue
 from harness.presentation import (
     DETAIL_PREFIX,
@@ -92,6 +93,7 @@ from harness.presentation import (
     ranges_msg,
     replay_msg,
     replay_unavailable_msg,
+    screenshot_too_large_msg,
     session_unavailable_msg,
     start_msg,
     unknown_text_msg,
@@ -161,6 +163,12 @@ UI_CALLBACK_PREFIXES: tuple[str, ...] = (
 
 # PokerCraft отдаёт историю раздач текстом; всё остальное сканировать нечем.
 _HH_SUFFIX = ".txt"
+
+# Картинка, присланная документом («отправить без сжатия»), — тот же вход зрения,
+# что и фотография. Набор УЖЕ, чем понимает `platform/llm.py` (там ещё и GIF):
+# сюда попадает только то, чем бывает сохранённый экран.
+_IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 
 # Скрины кладутся рядом с раздачами, тем же правилом имени: содержимое решает,
 # как файл называется. Расширение условное — формат определяется по магическим
@@ -336,8 +344,20 @@ async def handle_nickname_command(deps: BotDeps, tg_user_id: int) -> Msg | None:
     return ask_gg_nickname_msg()
 
 
-async def handle_document(deps: BotDeps, tg_user_id: int, file_bytes: bytes, filename: str) -> Msg:
+async def handle_document(
+    deps: BotDeps,
+    tg_user_id: int,
+    file_bytes: bytes,
+    filename: str,
+    mime_type: str | None = None,
+) -> Msg | None:
     """`.txt` из PokerCraft: файл на диск → сессия (молча) → турнир → `hh_scan`.
+
+    **Документом приходит и картинка.** «Отправить без сжатия» — это документ, а
+    не фото, и именно так продукт сам просит прислать скрин, когда масти не
+    прочитались (`send_as_file_msg`). Такой документ уходит в тот же путь зрения,
+    что и фотография (`_accept_screenshot`), и потому возвращает `Msg | None`:
+    успешная постановка задачи молчит.
 
     **Молчаливое создание сессии — здесь** (спека §6/§13 шаг 6). Игрок, приславший
     файл, не просил открывать сессию и не должен быть к этому принуждён: сессия
@@ -382,6 +402,8 @@ async def handle_document(deps: BotDeps, tg_user_id: int, file_bytes: bytes, fil
     тот же модульный докстринг бережёт сознательно.
     """
     if not filename.lower().endswith(_HH_SUFFIX):
+        if _is_image_document(mime_type, filename):
+            return await _accept_screenshot(deps, tg_user_id, file_bytes)
         # Отказ до всякой записи: ни файла на диске, ни сессии, ни задачи. Ждать
         # 20 секунд ради «не получилось разобрать» из воркера игроку незачем.
         return unsupported_document_msg()
@@ -501,12 +523,36 @@ async def handle_new_session(deps: BotDeps, tg_user_id: int) -> Msg:
     return new_session_msg(title, previous_closed=previous_closed)
 
 
-async def handle_photo(deps: BotDeps, tg_user_id: int, file_bytes: bytes) -> Msg | None:
-    """Скрин стола: файл на диск -> сессия (молча) -> задача `screenshot_analyze`.
+def _is_image_document(mime_type: str | None, filename: str) -> bool:
+    """Документ — это картинка? Тип из Телеграма, имя файла — запасной признак.
+
+    Оба признака приходят снаружи и оба бывают неверны: `mime_type` Телеграм
+    ставит не всегда, а `application/octet-stream` он ставит охотно. Поэтому
+    признаки складываются, а не заменяют друг друга: совпал любой — файл идёт в
+    зрение. Что внутри на самом деле, решают магические байты у самой модели
+    (`platform/llm.py`), а не эта функция.
+    """
+    if mime_type and mime_type.split(";")[0].strip().lower() in _IMAGE_MIME_TYPES:
+        return True
+    return filename.lower().endswith(_IMAGE_SUFFIXES)
+
+
+async def _accept_screenshot(deps: BotDeps, tg_user_id: int, file_bytes: bytes) -> Msg | None:
+    """Общий путь зрения: скрин на диск -> сессия (молча) -> `screenshot_analyze`.
+
+    Один на оба входа — фотографию и документ-картинку. Дублировать эту
+    последовательность на второй вход значило бы завести второе место, где
+    порядок проверок может разойтись, а порядок здесь и есть гарантия: ни байта
+    на диск раньше `_known_player`
+    (`test_a_stranger_sending_a_picture_as_a_document_leaves_nothing_in_the_volume`).
 
     **Сначала ник в руме.** Героя на экране определяет код, сопоставляя
     прочитанные ники с ником из профиля; без него разбирать некого, и честнее
     спросить сразу, чем заплатить за чтение и упереться в вопрос после него.
+
+    **Предел размера — до очереди.** Картинка тяжелее `MAX_IMAGE_BYTES` до модели
+    не доедет (`platform/llm.py`), и узнать об этом игрок должен сразу, а не через
+    двадцать секунд отказом воркера.
 
     `None` в успешном случае — то же сознательное молчание, что у кнопки
     «разобрать»: дальше говорит воркер одним редактируемым сообщением прогресса
@@ -517,6 +563,11 @@ async def handle_photo(deps: BotDeps, tg_user_id: int, file_bytes: bytes) -> Msg
         if player is None:
             await db.commit()
             return invite_required_msg()
+        if len(file_bytes) > MAX_IMAGE_BYTES:
+            # После проверки игрока, а не до неё: посторонний не должен узнавать
+            # из отказа ничего сверх того, что узнавал раньше.
+            await db.commit()
+            return screenshot_too_large_msg(MAX_IMAGE_MB)
         player_id, nickname = player.id, player.gg_nickname
         if not nickname:
             # Вопрос задан — значит следующий текст и есть ответ на него. Это не
@@ -545,6 +596,11 @@ async def handle_photo(deps: BotDeps, tg_user_id: int, file_bytes: bytes) -> Msg
         payload={"image_file": str(path), "image_hash": digest},
     )
     return None
+
+
+async def handle_photo(deps: BotDeps, tg_user_id: int, file_bytes: bytes) -> Msg | None:
+    """Фотография в чат — главный вход продукта; вся работа в `_accept_screenshot`."""
+    return await _accept_screenshot(deps, tg_user_id, file_bytes)
 
 
 def _parse_escalation(data: str) -> tuple[int, str, str] | None:
