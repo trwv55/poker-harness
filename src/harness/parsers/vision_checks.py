@@ -24,6 +24,8 @@
 
 from __future__ import annotations
 
+import math
+
 from harness.contracts import VisionCheck
 
 __all__ = [
@@ -71,6 +73,26 @@ POT_TOLERANCE_BB = 0.1
 EQUITY_TOLERANCE_PP = 1.0
 
 
+def _within_tolerance(delta: float, tolerance: float) -> bool:
+    """Расхождение, равное допуску, проходит.
+
+    Обе сверки вычитают одну прочитанную с экрана десятичную величину из другой,
+    а в двоичной плавающей точке такая разность бывает чуть больше своего
+    десятичного значения — голое `delta <= tolerance` отвергает тогда ровно
+    граничный случай, который допуск обязан пропускать. Запас здесь
+    относительный (`math.isclose`), а не приписанный к допуску слагаемым:
+    он не зависит от того, каким числом записан сам допуск, и не расширяет его
+    до следующего печатаемого знака.
+
+    Закреплено тестами `test_a_pot_off_by_exactly_the_tolerance_still_passes` и
+    `test_an_equity_off_by_exactly_the_tolerance_still_passes`; что расхождение
+    заведомо больше допуска по-прежнему не проходит — тестами
+    `test_a_pot_off_by_more_than_the_tolerance_still_fails` и
+    `test_an_equity_off_by_more_than_the_tolerance_still_fails`.
+    """
+    return delta <= tolerance or math.isclose(delta, tolerance)
+
+
 def pot_check(pot_shown_bb: float | None, contributions_bb: float) -> VisionCheck:
     """Показанный банк против суммы видимых вкладов (реестр D2).
 
@@ -84,7 +106,7 @@ def pot_check(pot_shown_bb: float | None, contributions_bb: float) -> VisionChec
     delta = abs(pot_shown_bb - contributions_bb)
     return VisionCheck(
         name=CHECK_POT,
-        passed=delta <= POT_TOLERANCE_BB,
+        passed=_within_tolerance(delta, POT_TOLERANCE_BB),
         detail=(
             f"банк на экране {pot_shown_bb:.2f} ББ, сумма видимых вкладов "
             f"{contributions_bb:.2f} ББ, расхождение {delta:.2f} ББ"
@@ -184,7 +206,7 @@ def equity_check(
     delta = abs(shown_pct - computed_pct)
     return VisionCheck(
         name=CHECK_EQUITY,
-        passed=delta <= EQUITY_TOLERANCE_PP,
+        passed=_within_tolerance(delta, EQUITY_TOLERANCE_PP),
         detail=(
             f"на экране {shown_pct:.2f}%, по прочитанным картам {computed_pct:.2f}%, "
             f"расхождение {delta:.2f} п.п."

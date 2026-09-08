@@ -51,7 +51,11 @@ from harness.parsers.vision_checks import (
     CHECK_EQUITY,
     CHECK_HERO,
     CHECK_POT,
+    EQUITY_TOLERANCE_PP,
+    POT_TOLERANCE_BB,
+    equity_check,
     match_hero,
+    pot_check,
 )
 from tests.conftest import requires_prompts
 
@@ -276,6 +280,52 @@ def test_a_missing_ante_pool_is_caught_by_the_pot_checksum():
     # Расхождение равно ровно пропущенному пулу анте — так его и доказали.
     shown, summed = (float(value) for value in pot.options)
     assert shown - summed == pytest.approx(1.20, abs=0.02)
+
+
+def test_a_pot_off_by_exactly_the_tolerance_still_passes():
+    """Живой отказ: банк 23.00 при сумме вкладов 22.90 — расхождение ровно в допуск.
+
+    Разность этих двух чисел в двоичной плавающей точке больше 0.1, поэтому
+    `delta <= POT_TOLERANCE_BB` отвергал случай, который допуск обязан
+    пропускать, — и печатал при этом «расхождение 0.10 ББ» при допуске 0.1.
+    """
+    assert 23.00 - 22.90 > POT_TOLERANCE_BB  # причина отказа, а не описка в числах
+    check = pot_check(23.00, 22.90)
+    assert check.passed, check.detail
+    assert "расхождение 0.10 ББ" in check.detail
+
+
+def test_a_pot_off_by_more_than_the_tolerance_still_fails():
+    """Допуск остался допуском: пропущенное анте (величина блайнда) не проходит."""
+    check = pot_check(24.10, 22.90)
+    assert not check.passed
+
+
+def test_an_equity_off_by_exactly_the_tolerance_still_passes(monkeypatch: pytest.MonkeyPatch):
+    """То же на сверке эквити: 64.51% против 63.51% — ровно допуск в 1 п.п.
+
+    Оракул подменён константой: Монте-Карло возвращает число, чьё десятичное
+    представление заранее не известно, а проверяется здесь граница сравнения, а
+    не расчёт эквити (его проверяют якорные тесты `test_equity.py`).
+    """
+    monkeypatch.setattr(
+        "harness.analysis.tools.equity.equity_hand_vs_hand",
+        lambda hero, villain, board: 0.6351,
+    )
+    assert 64.51 - 63.51 > EQUITY_TOLERANCE_PP  # причина отказа, а не описка в числах
+    check = equity_check(64.51, ["Ad", "Ks"], ["Tc", "Th"], ["2c", "7d", "9s"])
+    assert check.passed, check.detail
+    assert "расхождение 1.00 п.п." in check.detail
+
+
+def test_an_equity_off_by_more_than_the_tolerance_still_fails(monkeypatch: pytest.MonkeyPatch):
+    """Допуск остался допуском: расхождение масти (порядка двух п.п.) не проходит."""
+    monkeypatch.setattr(
+        "harness.analysis.tools.equity.equity_hand_vs_hand",
+        lambda hero, villain, board: 0.6351,
+    )
+    check = equity_check(65.56, ["Ad", "Ks"], ["Tc", "Th"], ["2c", "7d", "9s"])
+    assert not check.passed
 
 
 def test_a_suit_misread_under_the_win_banner_is_caught_by_the_equity_oracle():
