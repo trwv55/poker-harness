@@ -1,8 +1,8 @@
-"""ORM-модели БД: 12 таблиц спеки §6.
+"""ORM-модели БД: 12 таблиц спеки §6 плюс две таблицы псевдонимов.
 
 Источник — `docs/superpowers/specs/2026-08-28-poker-harness-tech-spec-design.md`,
 раздел "6. Схема БД". Колонки — по табличным строкам спеки дословно; `?` у поля в
-спеке значит nullable, отсутствие `?` — `NOT NULL`. Четыре отступления от этого
+спеке значит nullable, отсутствие `?` — `NOT NULL`. Пять отступлений от этого
 правила и почему они не нарушают "дословно":
 
 1. `llm_calls.started_at` — таблица §6 её не называет среди "ключевых полей", но §7
@@ -26,6 +26,12 @@
    ожидания ответа жило в БД, а не в памяти процесса, — для задач это
    `jobs.payload`, но ввод ника и текста заметки задачей не сопровождается, и
    складывать его было некуда.
+5. `player_aliases`/`player_alias_links` (миграция 0006) — таблиц нет в §6:
+   на момент спеки сшивать личность между турнирами было нечем. Идентификатор
+   участника в файлах раздач сквозной внутри турнира и не переживает его, а
+   владелец хочет считать статистику по человеку, а не по турнирной метке.
+   Связь между метками утверждает владелец; кода, который догадывался бы о ней
+   сам, в проекте нет.
 
 jsonb-колонки хранят `model_dump(mode="json")` пайплайн-контрактов (`RawHand`,
 `CanonicalHand`, `EnrichedHand`, `AnalysisResult`) — уже JSON-совместимые
@@ -46,12 +52,15 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     MetaData,
     Numeric,
+    PrimaryKeyConstraint,
     String,
     Text,
+    UniqueConstraint,
     false,
     func,
     text,
@@ -207,6 +216,114 @@ class Note(Base):
     color: Mapped[str] = mapped_column(String(32), nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class PlayerAlias(Base):
+    """`player_aliases`: оппонент владельца, известный по нику в руме.
+
+    Идентификатор участника в файлах раздач сквозной внутри турнира, но между
+    турнирами не живёт — комната выдаёт новый. Ник живёт: к нему привязываются
+    пары «турнир + идентификатор» (`PlayerAliasLink`).
+
+    **Ключ личности — ник, а не произвольный ярлык** (решение владельца). Тот же
+    ключ, что у заметки (`notes.opponent_nick`), и колонка названа так же:
+    заметка и частоты — про одного человека, и разводить их по двум разным
+    понятиям личности значило бы потом нечем связать.
+
+    **Регистр не различается, написание сохраняется.** Назвать тот же ник второй
+    раз — единственный способ сказать «вот этот идентификатор из другого турнира
+    это он же», и разъехаться на собственной опечатке в регистре этот путь не
+    имеет права. Уникальность держит функциональный индекс по
+    `(owner_player_id, lower(opponent_nick))`, а колонка хранит ник так, как его
+    ввели в первый раз (`test_the_same_nick_in_another_case_is_the_same_opponent`).
+    Имени индекса в коде нет и не нужно: `ON CONFLICT` в
+    `AliasesRepo.get_or_create` выводится по тем же выражениям, а не по имени.
+
+    Длина колонки — та же, что у `players.gg_nickname`: ник в руме один и тот
+    же объект, и второго предела на него в схеме нет.
+
+    `uq_player_aliases_id_owner` не проверяет ничего сам: это цель составного
+    внешнего ключа из `player_alias_links` (см. её докстринг), а Postgres
+    требует уникальности на колонках, на которые ссылается FK.
+    """
+
+    __tablename__ = "player_aliases"
+    __table_args__ = (
+        Index(
+            "uq_player_aliases_owner_player_id_lower_nick",
+            "owner_player_id",
+            func.lower(text("opponent_nick")),
+            unique=True,
+        ),
+        UniqueConstraint("id", "owner_player_id", name="uq_player_aliases_id_owner"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    owner_player_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("players.id"), nullable=False
+    )
+    opponent_nick: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class PlayerAliasLink(Base):
+    """`player_alias_links`: пара «турнир + идентификатор участника» → псевдоним.
+
+    **Турнир — тот, которым его нумерует комната** (`CanonicalHand.tournament_id`),
+    а не строка `tournaments`: строк на один турнир бывает несколько (тот же
+    файл, загруженный в другой вечер), и привязка не имеет права от этого
+    раздваиваться. Внешнего ключа на `tournaments` поэтому нет вовсе — удаление
+    строки турнира не оставляет висящей ссылки и не теряет привязку.
+
+    **Ключ таблицы — сама уникальность.** «Один идентификатор в одном турнире у
+    одного владельца привязан не более чем к одному псевдониму» — это первичный
+    ключ, а не проверка в коде: два одновременных вызова `AliasesRepo.link`
+    физически не могут развести одну пару по двум псевдонимам
+    (`test_two_aliases_at_once_claim_one_participant_and_the_first_keeps_him`).
+    Натуральный ключ вместо суррогатного `id` — тот же образец, что
+    `calc_cache.key` (пункт 3 модульного докстринга).
+
+    **Владелец в ключе — денормализация**, без которой это правило нельзя
+    выразить индексом: владелец известен только через `player_aliases`, а
+    индекс не умеет джойнить. Чтобы денормализованная колонка не разошлась с
+    владельцем самого псевдонима, ссылка составная — `(alias_id,
+    owner_player_id)` на `player_aliases(id, owner_player_id)`: строка с чужим
+    владельцем не вставляется вовсе
+    (`test_an_alias_of_another_player_takes_no_bindings`).
+
+    `ON DELETE CASCADE` — по той же логике: привязка без псевдонима не значит
+    ничего, и переживать его не должна.
+
+    `uq_player_alias_links_alias_tournament` — «у одного псевдонима в одном
+    турнире один идентификатор»: в турнире у участника ровно один
+    идентификатор, поэтому вторая метка того же псевдонима в том же турнире
+    означала бы, что в статистику одного человека сложены двое, и раздачи
+    турнира посчитались бы дважды
+    (`test_one_alias_keeps_one_participant_per_tournament`).
+    """
+
+    __tablename__ = "player_alias_links"
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "owner_player_id",
+            "room_tournament_id",
+            "participant_label",
+            name="pk_player_alias_links",
+        ),
+        ForeignKeyConstraint(
+            ["alias_id", "owner_player_id"],
+            ["player_aliases.id", "player_aliases.owner_player_id"],
+            name="fk_player_alias_links_alias_player_aliases",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "alias_id", "room_tournament_id", name="uq_player_alias_links_alias_tournament"
+        ),
+    )
+
+    owner_player_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    room_tournament_id: Mapped[str] = mapped_column(String, nullable=False)
+    participant_label: Mapped[str] = mapped_column(String, nullable=False)
+    alias_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
 class EvalCase(Base):

@@ -13,7 +13,11 @@ from datetime import UTC, datetime
 
 import pytest
 
-from harness.analysis.player_stats import player_stats, player_stats_by_label
+from harness.analysis.player_stats import (
+    player_stats,
+    player_stats_across_tournaments,
+    player_stats_by_label,
+)
 from harness.contracts import (
     ActionKind,
     CanonicalHand,
@@ -93,6 +97,7 @@ def _hand(
     boards: dict[Street, list[str]] | None = None,
     hero_cards: tuple[str, str] = ("Ah", "Kd"),
     showdowns: list[ShowdownEntry] | None = None,
+    tournament_id: str = "T1",
 ) -> CanonicalHand:
     """Рука 6-max, где место героя занимает метка `Hero`, а остальные названы позицией.
 
@@ -111,7 +116,7 @@ def _hand(
         provenance=Provenance.HAND_HISTORY,
         source_ref="synthetic",
         hand_no="SYN",
-        tournament_id="T1",
+        tournament_id=tournament_id,
         tournament_name="synthetic",
         level=1,
         sb=_SB,
@@ -653,3 +658,83 @@ def test_every_numerator_stays_within_its_own_denominator(path):
         assert stats.barrel_river_chances <= stats.barrel_turn
         assert stats.barrel_river <= stats.barrel_river_chances
         assert stats.showdowns <= stats.flops_seen <= stats.hands
+
+
+# --- один человек под разными метками в разных турнирах -----------------------------
+
+
+def _opens_from(position: str, tournament_id: str) -> CanonicalHand:
+    """Раздача, где место `position` открывает рейзом и забирает банк.
+
+    Герой сидит в большом блайнде и пасует, поэтому от турнира к турниру
+    меняется только то, за каким местом сидит интересующий нас человек — ровно
+    то, ради чего эти руки и собраны.
+    """
+    # Порядок хода на префлопе, а не порядок мест: раздачу, где место говорит
+    # не в свой черёд, движок отвергает.
+    order = ("UTG", "HJ", "CO", "BTN", "SB")
+    opener = order.index(position)
+    return _hand(
+        hero_position="BB",
+        tournament_id=tournament_id,
+        actions=[
+            *[_fold(pos) for pos in order[:opener]],
+            _raise_to(position, 6, already=0),
+            *[_fold(pos) for pos in order[opener + 1 :]],
+            _fold("Hero"),
+        ],
+    )
+
+
+def _counters(stats) -> dict[str, int]:
+    return {name: getattr(stats, name) for name in type(stats).model_fields}
+
+
+def test_stats_across_tournaments_add_up_what_each_tournament_counted():
+    """Человек, у которого в каждом турнире своя метка, считается одной статистикой:
+    числители и знаменатели турниров складываются — все до одного.
+    """
+    first = [_opens_from("UTG", "T1")]
+    second = [_opens_from("CO", "T2")]
+
+    across = player_stats_across_tournaments(first + second, {"T1": "UTG", "T2": "CO"})
+
+    apart = _counters(player_stats(first, "UTG"))
+    other = _counters(player_stats(second, "CO"))
+    assert _counters(across) == {name: apart[name] + other[name] for name in apart}
+    assert (across.hands, across.vpip, across.pfr) == (2, 2, 2)
+
+
+def test_a_tournament_nobody_bound_is_not_counted():
+    """Про турнир, которого нет в соответствии, не сказано, кто в нём наш, — и он
+    не попадает ни в числитель, ни в знаменатель.
+    """
+    hands = [_opens_from("UTG", "T1"), _opens_from("UTG", "T3")]
+
+    only_bound = player_stats_across_tournaments(hands, {"T1": "UTG"})
+
+    assert _counters(only_bound) == _counters(player_stats([hands[0]], "UTG"))
+    assert only_bound.hands == 1
+
+
+def test_a_label_that_never_sat_at_that_table_is_not_counted():
+    """Метка, которой за столом нет, не указывает ни на кого: раздача пропускается
+    целиком, а не увеличивает знаменатель на пустом месте.
+    """
+    hands = [_opens_from("UTG", "T1")]
+
+    assert _counters(player_stats_across_tournaments(hands, {"T1": "нет-такого"})) == _counters(
+        player_stats([], "UTG")
+    )
+
+
+def test_the_same_person_under_two_labels_is_not_the_sum_of_two_seats():
+    """Проверка того, что метка берётся ПОСВОЕМУ турниру, а не одна на все:
+    у метки `UTG` в T2 сидит другой человек, и его раздачи в счёт не идут.
+    """
+    hands = [_opens_from("UTG", "T1"), _opens_from("CO", "T2")]
+
+    by_tournament = player_stats_across_tournaments(hands, {"T1": "UTG", "T2": "CO"})
+    one_label_everywhere = player_stats(hands, "UTG")
+
+    assert (by_tournament.pfr, one_label_everywhere.pfr) == (2, 1)

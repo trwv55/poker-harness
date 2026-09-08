@@ -43,12 +43,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 from harness.contracts import ActionKind, CanonicalAction, CanonicalHand, PlayerStats, Street
 
-__all__ = ["player_stats", "player_stats_by_label"]
+__all__ = ["player_stats", "player_stats_across_tournaments", "player_stats_by_label"]
 
 # Действия, которыми игрок добровольно кладёт фишки в банк. Пас и чек не кладут
 # ничего, посты сюда не попадают вовсе (см. докстринг модуля).
@@ -327,3 +327,42 @@ def player_stats_by_label(hands: Iterable[CanonicalHand]) -> dict[str, PlayerSta
         for player in hand.players:
             _accumulate(out.setdefault(player.label, PlayerStats()), view, player.label)
     return out
+
+
+def player_stats_across_tournaments(
+    hands: Iterable[CanonicalHand], labels: Mapping[str, str]
+) -> PlayerStats:
+    """Счётчики ОДНОГО игрока, у которого в каждом турнире своя метка.
+
+    `labels` — «турнир комнаты (`CanonicalHand.tournament_id`) → метка, которая
+    принадлежит ему в этом турнире». Такое соответствие приходит снаружи,
+    целиком: в файлах раздач участники обезличены, метка сквозная только внутри
+    турнира, и связать метки разных турниров может лишь тот, кто утверждает, что
+    это один человек. Здесь эта связь ни выводится, ни проверяется — она
+    аргумент.
+
+    **Второй реализации формул нет.** Складываются те же счётчики тем же
+    накопителем, что у `player_stats`: числители и знаменатели каждого турнира
+    прибавляются к общим, поэтому турнир из 300 раздач весит в среднем ровно в
+    25 раз больше турнира из 12 — как и в `player_stats`, и по той же причине
+    (`test_stats_across_tournaments_add_up_what_each_tournament_counted`).
+
+    **Почему соответствие, а не список пар «рука — метка».** Ключ здесь —
+    турнир, поэтому одна раздача не может попасть в счётчики дважды под двумя
+    метками, как бы ни выглядел вход: у раздачи один турнир, у турнира одна
+    метка. Список пар такой гарантии не даёт, а её нарушение — не отказ, а
+    молча удвоенное число.
+
+    Раздача турнира, которого в соответствии нет, не считается вовсе — ни в
+    числителе, ни в знаменателе: про этот турнир не сказано, кто в нём наш
+    (`test_a_tournament_nobody_bound_is_not_counted`). Так же пропускается
+    раздача, в которой названной метки нет за столом, — то же правило и та же
+    причина, что в `player_stats`.
+    """
+    stats = PlayerStats()
+    for hand in hands:
+        label = labels.get(hand.tournament_id)
+        if label is None or not _seated(hand, label):
+            continue
+        _accumulate(stats, _view(hand), label)
+    return stats

@@ -926,3 +926,414 @@ async def test_migration_0005_adds_pending_input_and_the_note_uniqueness(pg):
         await engine.dispose()
     assert column is not None and column[0] == "YES"
     assert index is not None and "UNIQUE" in index[0]
+
+
+# --- псевдонимы: оппонент по нику и его метки в турнирах ----------------------------
+
+
+async def _opponent(db, owner_player_id: int, nick: str) -> int:
+    from harness.memory.repos import AliasesRepo
+
+    return await AliasesRepo(db).get_or_create(owner_player_id=owner_player_id, nick=nick)
+
+
+async def test_the_same_nick_in_another_case_is_the_same_opponent(db):
+    """Регистр не различается, написание хранится первое (решение владельца).
+
+    Иначе собственная опечатка в регистре развела бы одного человека на двоих, и
+    его частоты посчитались бы по половине истории каждая.
+    """
+    from harness.memory.repos import AliasesRepo
+
+    owner, _session = await _player_with_session(db, tg_user_id=6001)
+    first = await _opponent(db, owner, "Vasya")
+    again = await _opponent(db, owner, "  vASYA ")
+
+    assert again == first
+    assert [(a.nick, a.links) for a in await AliasesRepo(db).list_for_player(owner)] == [
+        ("Vasya", 0)
+    ]
+
+
+async def test_an_empty_nick_is_refused_rather_than_stored(db):
+    owner, _session = await _player_with_session(db, tg_user_id=6002)
+    with pytest.raises(ValueError, match="пустым"):
+        await _opponent(db, owner, "   ")
+
+
+async def test_a_participant_already_bound_keeps_his_first_nick(db):
+    """Метка участника в турнире принадлежит одному нику, и второй её не отнимает.
+
+    Возвращается номер того ника, за которым метка закреплена: вызывающему надо
+    сказать игроку, с чем именно спорит его команда.
+    """
+    from harness.memory.repos import AliasesRepo
+
+    owner, _session = await _player_with_session(db, tg_user_id=6003)
+    first = await _opponent(db, owner, "Vasya")
+    second = await _opponent(db, owner, "Petya")
+    aliases = AliasesRepo(db)
+
+    mine = await aliases.link(
+        owner_player_id=owner, alias_id=first, room_tournament_id="T1", participant_label="p1"
+    )
+    stolen = await aliases.link(
+        owner_player_id=owner, alias_id=second, room_tournament_id="T1", participant_label="p1"
+    )
+
+    assert mine == first
+    assert stolen == first
+    assert await aliases.links(second, owner) == {}
+
+
+async def test_binding_the_same_pair_again_changes_nothing(db):
+    from harness.memory.repos import AliasesRepo
+
+    owner, _session = await _player_with_session(db, tg_user_id=6004)
+    alias_id = await _opponent(db, owner, "Vasya")
+    aliases = AliasesRepo(db)
+
+    once = await aliases.link(
+        owner_player_id=owner, alias_id=alias_id, room_tournament_id="T1", participant_label="p1"
+    )
+    twice = await aliases.link(
+        owner_player_id=owner, alias_id=alias_id, room_tournament_id="T1", participant_label="p1"
+    )
+
+    assert (once, twice) == (alias_id, alias_id)
+    assert await aliases.links(alias_id, owner) == {"T1": "p1"}
+
+
+async def test_one_alias_keeps_one_participant_per_tournament(db):
+    """В турнире у участника один идентификатор, поэтому второй у того же ника —
+    отказ: иначе в статистику одного человека сложились бы двое, и раздачи этого
+    турнира посчитались бы дважды.
+    """
+    from harness.memory.repos import AliasesRepo
+
+    owner, _session = await _player_with_session(db, tg_user_id=6005)
+    alias_id = await _opponent(db, owner, "Vasya")
+    aliases = AliasesRepo(db)
+    await aliases.link(
+        owner_player_id=owner, alias_id=alias_id, room_tournament_id="T1", participant_label="p1"
+    )
+
+    with pytest.raises(ValueError, match="уже есть метка"):
+        await aliases.link(
+            owner_player_id=owner,
+            alias_id=alias_id,
+            room_tournament_id="T1",
+            participant_label="p2",
+        )
+    assert await aliases.links(alias_id, owner) == {"T1": "p1"}
+
+
+async def test_the_bindings_of_an_opponent_come_as_tournament_to_label(db):
+    """Форма привязок — вход `player_stats_across_tournaments` один в один."""
+    from harness.memory.repos import AliasesRepo
+
+    owner, _session = await _player_with_session(db, tg_user_id=6006)
+    alias_id = await _opponent(db, owner, "Vasya")
+    aliases = AliasesRepo(db)
+    await aliases.link(
+        owner_player_id=owner, alias_id=alias_id, room_tournament_id="T1", participant_label="p1"
+    )
+    await aliases.link(
+        owner_player_id=owner, alias_id=alias_id, room_tournament_id="T2", participant_label="zz"
+    )
+
+    assert await aliases.links(alias_id, owner) == {"T1": "p1", "T2": "zz"}
+    assert [(a.nick, a.links) for a in await aliases.list_for_player(owner)] == [("Vasya", 2)]
+
+
+async def test_an_alias_of_another_player_takes_no_bindings(db):
+    """Номер оппонента приходит аргументом — владелец сверяется тем же оператором,
+    который вставляет: составной внешний ключ не даёт записать чужого.
+    """
+    from harness.memory.repos import AliasesRepo
+
+    mine, _my_session = await _player_with_session(db, tg_user_id=6007)
+    theirs, _their_session = await _player_with_session(db, tg_user_id=6008)
+    foreign = await _opponent(db, theirs, "Vasya")
+    aliases = AliasesRepo(db)
+
+    assert (
+        await aliases.link(
+            owner_player_id=mine,
+            alias_id=foreign,
+            room_tournament_id="T1",
+            participant_label="p1",
+        )
+        is None
+    )
+    assert await aliases.links(foreign, mine) == {}
+    assert await aliases.get(foreign, mine) is None
+    assert await aliases.list_for_player(mine) == []
+
+
+async def test_the_same_nick_of_two_players_is_two_opponents(db):
+    """Ник уникален у ВЛАДЕЛЬЦА: один и тот же оппонент у двоих — две строки."""
+    mine, _my_session = await _player_with_session(db, tg_user_id=6009)
+    theirs, _their_session = await _player_with_session(db, tg_user_id=6010)
+
+    assert await _opponent(db, mine, "Vasya") != await _opponent(db, theirs, "Vasya")
+
+
+async def test_unbinding_frees_the_participant_for_another_nick(db):
+    """Ошибку владельца можно отменить: отвязали — метка свободна."""
+    from harness.memory.repos import AliasesRepo
+
+    owner, _session = await _player_with_session(db, tg_user_id=6011)
+    wrong = await _opponent(db, owner, "Vasya")
+    right = await _opponent(db, owner, "Petya")
+    aliases = AliasesRepo(db)
+    await aliases.link(
+        owner_player_id=owner, alias_id=wrong, room_tournament_id="T1", participant_label="p1"
+    )
+
+    assert (
+        await aliases.unlink(
+            owner_player_id=owner, room_tournament_id="T1", participant_label="p1"
+        )
+        is True
+    )
+    assert (
+        await aliases.link(
+            owner_player_id=owner,
+            alias_id=right,
+            room_tournament_id="T1",
+            participant_label="p1",
+        )
+        == right
+    )
+    assert await aliases.links(wrong, owner) == {}
+
+
+async def test_a_binding_of_another_player_is_not_removed_by_its_pair(db):
+    from harness.memory.repos import AliasesRepo
+
+    mine, _my_session = await _player_with_session(db, tg_user_id=6012)
+    theirs, _their_session = await _player_with_session(db, tg_user_id=6013)
+    foreign = await _opponent(db, theirs, "Vasya")
+    aliases = AliasesRepo(db)
+    await aliases.link(
+        owner_player_id=theirs, alias_id=foreign, room_tournament_id="T1", participant_label="p1"
+    )
+
+    assert (
+        await aliases.unlink(
+            owner_player_id=mine, room_tournament_id="T1", participant_label="p1"
+        )
+        is False
+    )
+    assert await aliases.links(foreign, theirs) == {"T1": "p1"}
+
+
+async def test_deleting_an_opponent_takes_his_bindings_with_him(db):
+    """`ON DELETE CASCADE`: привязка без ника не значит ничего и переживать его
+    не должна — висящих ссылок после удаления не остаётся.
+    """
+    from sqlalchemy import delete as sql_delete
+    from sqlalchemy import select as sql_select
+
+    from harness.memory.models import PlayerAlias, PlayerAliasLink
+    from harness.memory.repos import AliasesRepo
+
+    owner, _session = await _player_with_session(db, tg_user_id=6014)
+    alias_id = await _opponent(db, owner, "Vasya")
+    await AliasesRepo(db).link(
+        owner_player_id=owner, alias_id=alias_id, room_tournament_id="T1", participant_label="p1"
+    )
+
+    await db.execute(sql_delete(PlayerAlias).where(PlayerAlias.id == alias_id))
+    await db.flush()
+
+    left = (await db.execute(sql_select(PlayerAliasLink.alias_id))).all()
+    assert left == []
+
+
+async def test_a_binding_outlives_the_tournament_row_it_came_from(db):
+    """Привязка держится за номер турнира КОМНАТЫ, а не за строку `tournaments`.
+
+    Один турнир бывает загружен дважды и строк даёт две; удаление строки не
+    оставляет висящей ссылки (внешнего ключа туда нет вовсе) и не стирает того,
+    что владелец уже сказал.
+    """
+    from sqlalchemy import delete as sql_delete
+
+    from harness.memory.models import Hand as HandRow
+    from harness.memory.models import Tournament as TournamentRow
+    from harness.memory.repos import AliasesRepo
+
+    owner, session_id = await _player_with_session(db, tg_user_id=6015)
+    tournament_row = await TournamentsRepo(db).create(session_id=session_id, source_file="a.txt")
+    hand_id = await _save_hand_in(
+        db, session_id=session_id, tournament_id=tournament_row, hand_no="A1"
+    )
+    hand = await HandsRepo(db).get(hand_id)
+    assert hand.canonical is not None
+    alias_id = await _opponent(db, owner, "Vasya")
+    await AliasesRepo(db).link(
+        owner_player_id=owner,
+        alias_id=alias_id,
+        room_tournament_id=hand.canonical.tournament_id,
+        participant_label=hand.canonical.players[0].label,
+    )
+
+    await db.execute(sql_delete(HandRow).where(HandRow.id == hand_id))
+    await db.execute(sql_delete(TournamentRow).where(TournamentRow.id == tournament_row))
+    await db.flush()
+
+    assert await AliasesRepo(db).links(alias_id, owner) == {
+        hand.canonical.tournament_id: hand.canonical.players[0].label
+    }
+
+
+async def test_two_aliases_at_once_claim_one_participant_and_the_first_keeps_him(db_factory):
+    """Две привязки одной пары, идущие ОДНОВРЕМЕННО, дают одну строку и один ответ.
+
+    Барьер делает одновременность предусловием теста, а не следствием таймингов
+    (тот же приём, что `_rendezvous` в `test_bot_handlers.py`): пока обе
+    корутины не вошли, ни одна не доходит до своего оператора. Проигравший
+    ждёт коммита победителя на самом первичном ключе и возвращает победителя —
+    «прочитали — не нашли — вставили» развело бы пару по двум никам.
+    """
+    from harness.memory.repos import AliasesRepo, PlayersRepo
+
+    async with db_factory() as session:
+        owner = await PlayersRepo(session).get_or_create(tg_user_id=6016)
+        first = await AliasesRepo(session).get_or_create(owner_player_id=owner.id, nick="Vasya")
+        second = await AliasesRepo(session).get_or_create(owner_player_id=owner.id, nick="Petya")
+        owner_id = owner.id
+        await session.commit()
+
+    barrier = asyncio.Barrier(2)
+
+    async def bind(alias_id: int) -> int | None:
+        async with db_factory() as session:
+            await asyncio.wait_for(barrier.wait(), timeout=_RIVAL_TIMEOUT_S)
+            holder = await AliasesRepo(session).link(
+                owner_player_id=owner_id,
+                alias_id=alias_id,
+                room_tournament_id="T1",
+                participant_label="p1",
+            )
+            await session.commit()
+            return holder
+
+    answers = await asyncio.gather(bind(first), bind(second))
+
+    assert len(set(answers)) == 1, f"одна пара досталась двум никам: {answers}"
+    async with db_factory() as session:
+        rows = (
+            await session.execute(text("select alias_id from player_alias_links"))
+        ).scalars().all()
+    assert rows == [answers[0]]
+
+
+async def test_the_last_analysis_is_the_freshest_hand_that_reached_canonical(db):
+    """«Участник последнего разбора» — свежайшая рука игрока с чекпоинтом `canonical`.
+
+    Рука, дошедшая только до `raw`, разбором не считается: состава мест за
+    столом в ней ещё нет, и называть в ней участника не по чему.
+    """
+    player_id, session_id = await _player_with_session(db, tg_user_id=6017)
+    tournament_id = await TournamentsRepo(db).create(session_id=session_id, source_file="a.txt")
+    await _save_hand_in(db, session_id=session_id, tournament_id=tournament_id, hand_no="OLD")
+    await _save_hand_in(db, session_id=session_id, tournament_id=tournament_id, hand_no="NEW")
+    await HandsRepo(db).save_raw(
+        session_id=session_id,
+        tournament_id=tournament_id,
+        raw=parse_hand(SAMPLE, source_ref="x").model_copy(update={"hand_no": "RAW_ONLY"}),
+    )
+
+    last = await HandsRepo(db).last_canonical(player_id)
+
+    assert last is not None and last.hand_no == "NEW"
+
+
+async def test_the_last_analysis_of_another_player_is_not_mine(db):
+    mine, _my_session = await _player_with_session(db, tg_user_id=6018)
+    _theirs, their_session = await _player_with_session(db, tg_user_id=6019)
+    their_tournament = await TournamentsRepo(db).create(
+        session_id=their_session, source_file="b.txt"
+    )
+    await _save_hand_in(
+        db, session_id=their_session, tournament_id=their_tournament, hand_no="THEIRS"
+    )
+
+    assert await HandsRepo(db).last_canonical(mine) is None
+
+
+async def test_migration_0006_holds_the_alias_rules_in_the_database(pg):
+    """Правила псевдонимов держит схема, а не код: индекс по `lower(ник)`,
+    первичный ключ пары и каскад по внешнему ключу — прокатаны на живом Postgres.
+    """
+    engine = create_async_engine(pg.get_connection_url(driver="asyncpg"))
+    try:
+        async with engine.connect() as conn:
+            nick_index = (
+                await conn.execute(
+                    text(
+                        "select indexdef from pg_indexes where tablename='player_aliases' "
+                        "and indexname='uq_player_aliases_owner_player_id_lower_nick'"
+                    )
+                )
+            ).scalar()
+            pair_key = (
+                await conn.execute(
+                    text(
+                        "select pg_get_constraintdef(oid) from pg_constraint "
+                        "where conrelid='player_alias_links'::regclass and contype='p'"
+                    )
+                )
+            ).scalar()
+            foreign_keys = (
+                await conn.execute(
+                    text(
+                        "select pg_get_constraintdef(oid) from pg_constraint "
+                        "where conrelid='player_alias_links'::regclass and contype='f'"
+                    )
+                )
+            ).scalars().all()
+    finally:
+        await engine.dispose()
+
+    assert nick_index is not None
+    assert "UNIQUE" in nick_index and "lower" in nick_index
+    assert pair_key == (
+        "PRIMARY KEY (owner_player_id, room_tournament_id, participant_label)"
+    )
+    # Ровно одна ссылка, и та составная: на `tournaments` внешнего ключа нет
+    # вовсе — привязка живёт номером турнира комнаты.
+    assert foreign_keys == [
+        (
+            "FOREIGN KEY (alias_id, owner_player_id) REFERENCES "
+            "player_aliases(id, owner_player_id) ON DELETE CASCADE"
+        )
+    ]
+
+
+def test_the_models_say_the_same_as_the_migrations(pg):
+    """Схема, собранная миграциями, совпадает с моделями — включая типы и дефолты.
+
+    Тесты этого расхождения не ловят: базу они получают от `alembic upgrade
+    head` (`conftest.pg`), поэтому «модель говорит одно, миграция другое»
+    осталось бы незамеченным ровно до продакшена, где схему строит та же
+    миграция, а читает её ORM.
+    """
+    from alembic.autogenerate import compare_metadata
+    from alembic.migration import MigrationContext
+    from sqlalchemy import create_engine
+
+    from harness.memory.models import Base
+
+    engine = create_engine(pg.get_connection_url(driver="psycopg"))
+    try:
+        with engine.connect() as conn:
+            context = MigrationContext.configure(
+                conn, opts={"compare_type": True, "compare_server_default": True}
+            )
+            assert compare_metadata(context, Base.metadata) == []
+    finally:
+        engine.dispose()

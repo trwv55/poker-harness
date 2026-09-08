@@ -26,6 +26,7 @@ from harness.contracts import (
     LEAK_RULES,
     MAX_NOTE_TEXT_CHARS,
     NOTE_COLOR_NONE,
+    AliasRecord,
     AnalysisResult,
     CanonicalHand,
     EnrichedHand,
@@ -49,6 +50,8 @@ from harness.memory.models import (
     Job,
     Note,
     Player,
+    PlayerAlias,
+    PlayerAliasLink,
     Tournament,
 )
 from harness.memory.models import Session as SessionRow
@@ -560,6 +563,29 @@ class HandsRepo:
                 CanonicalHand.model_validate(canonical)
             )
         return list(grouped.values())
+
+    async def last_canonical(self, player_id: int) -> CanonicalHand | None:
+        """Свежайшая рука игрока, дошедшая до чекпоинта `canonical`, — «последний
+        разбор» для команды псевдонима (`bot/handlers.py`).
+
+        Свежесть — по `hands.id`: он растёт с порядком записи, а времени
+        разбора у таблицы нет вовсе. Руки без `canonical` пропускаются: до
+        состава мест за столом пайплайн по ним не дошёл, и назвать в такой руке
+        участника не по чему.
+
+        Область — сессии этого игрока (JOIN по `sessions.player_id`), как у
+        `find_session_by_hand_no` и `player_hands_by_tournament`: без этого
+        условия «последним разбором» мог бы оказаться чужой.
+        """
+        stmt = (
+            select(Hand.canonical)
+            .join(SessionRow, SessionRow.id == Hand.session_id)
+            .where(SessionRow.player_id == player_id, Hand.canonical.is_not(None))
+            .order_by(Hand.id.desc())
+            .limit(1)
+        )
+        canonical = await self.db.scalar(stmt)
+        return None if canonical is None else CanonicalHand.model_validate(canonical)
 
     def _to_record(self, record: Hand) -> HandRecord:
         return HandRecord(
@@ -1284,3 +1310,211 @@ class InvitesRepo:
         )
         await self.db.flush()
         return result.first() is not None
+
+
+class AliasesRepo:
+    """`player_aliases` + `player_alias_links`: кто из участников турнира — какой ник.
+
+    В файлах раздач участники обезличены, и метка участника сквозная только
+    внутри турнира: между турнирами комната выдаёт новую. Связь между метками
+    разных турниров утверждает ВЛАДЕЛЕЦ. Здесь нет ни одной функции, которая
+    предлагала бы связь сама, — ни по стилю игры, ни по стеку, ни по совпадению
+    чего бы то ни было; методы ниже только записывают и читают сказанное
+    владельцем.
+
+    Личность названа ником в руме — тем же ключом, что у заметки
+    (`NotesRepo`, колонка `notes.opponent_nick`), а не отдельным ярлыком.
+    """
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def get_or_create(self, *, owner_player_id: int, nick: str) -> int:
+        """Номер оппонента по нику; второй раз тот же ник — тот же номер.
+
+        Регистр не различается: `Vasya` и `vasya` — один оппонент
+        (`test_the_same_nick_in_another_case_is_the_same_opponent`). Хранится
+        написание, которым ник назвали в первый раз: переписывать его вторым
+        вызовом значило бы менять то, что владелец уже видит на экране.
+
+        Гонка закрыта тем же приёмом, что в `PlayersRepo.get_or_create`:
+        `ON CONFLICT DO NOTHING` вместо «прочитали — не нашли — вставили», и
+        проигравший перечитывает готовую строку.
+        """
+        stripped = nick.strip()
+        if not stripped:
+            raise ValueError("ник оппонента не может быть пустым")
+        found = await self._find_by_nick(owner_player_id, stripped)
+        if found is not None:
+            return found
+        created_id = await self.db.scalar(
+            pg_insert(PlayerAlias)
+            .values(owner_player_id=owner_player_id, opponent_nick=stripped)
+            .on_conflict_do_nothing(
+                index_elements=[
+                    PlayerAlias.owner_player_id,
+                    func.lower(PlayerAlias.opponent_nick),
+                ]
+            )
+            .returning(PlayerAlias.id)
+        )
+        await self.db.flush()
+        if created_id is not None:
+            return int(created_id)
+        found = await self._find_by_nick(owner_player_id, stripped)
+        if found is None:  # pragma: no cover — конфликт был, а строки нет
+            raise LookupError(f"оппонент {stripped!r} исчез после конфликта вставки")
+        return found
+
+    async def link(
+        self,
+        *,
+        owner_player_id: int,
+        alias_id: int,
+        room_tournament_id: str,
+        participant_label: str,
+    ) -> int | None:
+        """Привязать метку участника В ЭТОМ ТУРНИРЕ к оппоненту.
+
+        Возвращает номер оппонента, за которым пара «турнир + метка» закреплена
+        ПОСЛЕ вызова: он же, если привязка состоялась, и ЧУЖОЙ, если эту пару
+        уже занял другой ник — вызывающему нужно различать эти два исхода, а не
+        получать «не получилось»
+        (`test_a_participant_already_bound_keeps_his_first_nick`). `None` —
+        такого оппонента у этого владельца нет.
+
+        Один оператор, а не «прочитали — не нашли — вставили»: пара занимается
+        первичным ключом `player_alias_links`, и два одновременных вызова
+        физически не могут развести её по двум никам — проигравший ждёт коммита
+        победителя на самом конфликте и возвращает победителя
+        (`test_two_aliases_at_once_claim_one_participant_and_the_first_keeps_him`).
+        `DO UPDATE`, а не `DO NOTHING`, именно ради этого: `DO NOTHING` вернул
+        бы пустоту, неотличимую от «оппонента нет», а отдельным SELECT'ом после
+        него чужую ещё не закоммиченную строку не увидеть.
+
+        Владелец сверяется тем же оператором: строка берётся из
+        `player_aliases`, и чужой номер просто не даёт ни одной строки на
+        вставку (`test_an_alias_of_another_player_takes_no_bindings`).
+        """
+        tournament = room_tournament_id.strip()
+        label = participant_label.strip()
+        if not tournament or not label:
+            raise ValueError("турнир и метка участника не могут быть пустыми")
+        taken = await self.db.scalar(
+            select(PlayerAliasLink.participant_label).where(
+                PlayerAliasLink.alias_id == alias_id,
+                PlayerAliasLink.room_tournament_id == tournament,
+            )
+        )
+        if taken is not None and taken != label:
+            # Пол, ниже которого не пускает уникальный индекс
+            # `uq_player_alias_links_alias_tournament`; словами про это говорит
+            # бот, до вызова
+            # (`test_one_alias_keeps_one_participant_per_tournament`). Проверка
+            # читает уже закоммиченное, поэтому ДВЕ одновременные привязки
+            # разных меток одного турнира к одному нику доходят до индекса, и
+            # проигравший получает `IntegrityError`, а не эти слова: у команды
+            # владельца такой одновременности не бывает, а тихо разойтись
+            # правило не имеет права.
+            raise ValueError("у этого оппонента в этом турнире уже есть метка")
+        source = select(
+            literal(owner_player_id),
+            literal(tournament),
+            literal(label),
+            PlayerAlias.id,
+        ).where(
+            PlayerAlias.id == alias_id, PlayerAlias.owner_player_id == owner_player_id
+        )
+        holder = await self.db.scalar(
+            pg_insert(PlayerAliasLink)
+            .from_select(
+                ["owner_player_id", "room_tournament_id", "participant_label", "alias_id"],
+                source,
+            )
+            .on_conflict_do_update(
+                index_elements=[
+                    PlayerAliasLink.owner_player_id,
+                    PlayerAliasLink.room_tournament_id,
+                    PlayerAliasLink.participant_label,
+                ],
+                set_={"alias_id": PlayerAliasLink.alias_id},
+            )
+            .returning(PlayerAliasLink.alias_id)
+        )
+        await self.db.flush()
+        return None if holder is None else int(holder)
+
+    async def unlink(
+        self, *, owner_player_id: int, room_tournament_id: str, participant_label: str
+    ) -> bool:
+        """Снять привязку пары «турнир + метка»; `False` — её не было или она чужая."""
+        result = await self.db.execute(
+            delete(PlayerAliasLink)
+            .where(
+                PlayerAliasLink.owner_player_id == owner_player_id,
+                PlayerAliasLink.room_tournament_id == room_tournament_id.strip(),
+                PlayerAliasLink.participant_label == participant_label.strip(),
+            )
+            .returning(PlayerAliasLink.alias_id)
+        )
+        await self.db.flush()
+        return result.first() is not None
+
+    async def list_for_player(self, owner_player_id: int) -> list[AliasRecord]:
+        """Все оппоненты владельца по алфавиту, с числом привязок у каждого.
+
+        Без потолка запроса: страницу пришлось бы сопровождать вторым запросом
+        за общим числом (как у заметок, `NotesRepo.count_for_player`), а число
+        оппонентов, которых владелец назвал руками, того же порядка, что число
+        заметок. Обрезку по пределу сообщения делает `presentation`, и она
+        печатает честный знаменатель, потому что видит весь список.
+        """
+        stmt = (
+            select(
+                PlayerAlias.id,
+                PlayerAlias.opponent_nick,
+                func.count(PlayerAliasLink.alias_id),
+            )
+            .outerjoin(PlayerAliasLink, PlayerAliasLink.alias_id == PlayerAlias.id)
+            .where(PlayerAlias.owner_player_id == owner_player_id)
+            .group_by(PlayerAlias.id, PlayerAlias.opponent_nick)
+            .order_by(func.lower(PlayerAlias.opponent_nick), PlayerAlias.id)
+        )
+        return [
+            AliasRecord(alias_id=alias_id, nick=nick, links=links)
+            for alias_id, nick, links in await self.db.execute(stmt)
+        ]
+
+    async def get(self, alias_id: int, owner_player_id: int) -> AliasRecord | None:
+        """Оппонент по номеру — только свой; `None`, если номер чужой или его нет."""
+        found = [
+            record
+            for record in await self.list_for_player(owner_player_id)
+            if record.alias_id == alias_id
+        ]
+        return found[0] if found else None
+
+    async def links(self, alias_id: int, owner_player_id: int) -> dict[str, str]:
+        """Все привязки оппонента: турнир комнаты → метка участника в нём.
+
+        Форма словаря, а не списка пар, — вход `player_stats_across_tournaments`
+        (`analysis/player_stats.py`) один в один. Она не теряет строк: у одного
+        оппонента в одном турнире метка не больше одной, и это держит уникальный
+        индекс `uq_player_alias_links_alias_tournament`, а не порядок обхода
+        (`test_one_alias_keeps_one_participant_per_tournament`).
+        """
+        stmt = select(
+            PlayerAliasLink.room_tournament_id, PlayerAliasLink.participant_label
+        ).where(
+            PlayerAliasLink.alias_id == alias_id,
+            PlayerAliasLink.owner_player_id == owner_player_id,
+        )
+        return {row[0]: row[1] for row in await self.db.execute(stmt)}
+
+    async def _find_by_nick(self, owner_player_id: int, nick: str) -> int | None:
+        return await self.db.scalar(
+            select(PlayerAlias.id).where(
+                PlayerAlias.owner_player_id == owner_player_id,
+                func.lower(PlayerAlias.opponent_nick) == func.lower(nick),
+            )
+        )
