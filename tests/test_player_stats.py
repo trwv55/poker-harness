@@ -1,4 +1,4 @@
-"""Статистика игрока: VPIP, PFR, ре-рейз, сдача на продолженную ставку (задача 23).
+"""Статистика места: VPIP, PFR, ре-рейз, продолженная ставка, баррели, вскрытие.
 
 Синтетические руки собираются как `RawHand` и прогоняются через настоящий
 конвейер (`normalize` → `enrich`) — тот же принцип, что в `test_scan.py`:
@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from harness.analysis.player_stats import player_stats
+import pytest
+
+from harness.analysis.player_stats import player_stats, player_stats_by_label
 from harness.contracts import (
     ActionKind,
     CanonicalHand,
@@ -21,17 +23,22 @@ from harness.contracts import (
     RawAction,
     RawHand,
     SeatInfo,
+    ShowdownEntry,
     Street,
     ValidationStatus,
 )
 from harness.engine import enrich
 from harness.normalizer import normalize
+from tests.conftest import FIXTURE_DAILY, FIXTURE_PKO, requires_fixtures
 
 _SB = 1
 _BB = 2
 _STACK = 200
 _SIX_MAX: tuple[str, ...] = ("SB", "BB", "UTG", "HJ", "CO", "BTN")
 _FLOP = ["Qd", "8c", "3s"]
+_TURN = ["2h"]
+_RIVER = ["7d"]
+_BOARD = {Street.FLOP: _FLOP, Street.TURN: _TURN, Street.RIVER: _RIVER}
 
 
 # --- Синтетика ---------------------------------------------------------------------
@@ -85,6 +92,7 @@ def _hand(
     actions: list[RawAction],
     boards: dict[Street, list[str]] | None = None,
     hero_cards: tuple[str, str] = ("Ah", "Kd"),
+    showdowns: list[ShowdownEntry] | None = None,
 ) -> CanonicalHand:
     """Рука 6-max, где место героя занимает метка `Hero`, а остальные названы позицией.
 
@@ -118,6 +126,7 @@ def _hand(
         dealt={"Hero": list(hero_cards)},
         actions=actions,
         boards=boards or {},
+        showdowns=showdowns or [],
     )
     en = enrich(normalize(raw))
     assert en.verdict.status is not ValidationStatus.REJECT, en.verdict.reasons
@@ -252,6 +261,91 @@ def _flop_bet_comes_from_a_caller() -> CanonicalHand:
     )
 
 
+def _barrel_line(
+    *,
+    hero_bets_turn: bool = True,
+    bb_donks_turn: bool = False,
+    bb_folds_river: bool = False,
+    bb_shows: bool = False,
+) -> CanonicalHand:
+    """Герой открывает с CO, BB уравнивает, и рука идёт до ривера.
+
+    Флоп герой ставит всегда — это точка отсчёта для баррелей; дальше поведение
+    тёрна и ривера задаётся флагами.
+    """
+    if bb_donks_turn:
+        turn = [
+            _bet("BB", 20, street=Street.TURN),
+            _raise_to("Hero", 60, already=0, street=Street.TURN),
+            _call("BB", 40, street=Street.TURN),
+        ]
+    elif hero_bets_turn:
+        turn = [
+            _check("BB", Street.TURN),
+            _bet("Hero", 20, street=Street.TURN),
+            _call("BB", 20, street=Street.TURN),
+        ]
+    else:
+        turn = [_check("BB", Street.TURN), _check("Hero", Street.TURN)]
+    river_tail = (
+        [_fold("BB", Street.RIVER)]
+        if bb_folds_river
+        else [_call("BB", 30, street=Street.RIVER)]
+    )
+    return _hand(
+        hero_position="CO",
+        actions=[
+            _fold("UTG"),
+            _fold("HJ"),
+            _raise_to("Hero", 6, already=0),
+            _fold("BTN"),
+            _fold("SB"),
+            _call("BB", 4),
+            _check("BB", Street.FLOP),
+            _bet("Hero", 10),
+            _call("BB", 10, street=Street.FLOP),
+            *turn,
+            _check("BB", Street.RIVER),
+            _bet("Hero", 30, street=Street.RIVER),
+            *river_tail,
+        ],
+        boards=_BOARD,
+        showdowns=[ShowdownEntry(label="BB", cards=["Js", "Td"])] if bb_shows else None,
+    )
+
+
+def _with_other_labels(hand: CanonicalHand) -> CanonicalHand:
+    """Та же раздача с другими метками оппонентов — как другой стол того же турнира.
+
+    Нужна затем, чтобы «у каждого места свой знаменатель» вообще можно было
+    проверить: у всех синтетических раздач выше состав меток один и тот же, и
+    подсчёт, приписывающий каждую метку каждой раздаче, на них неотличим от
+    верного.
+    """
+    data = hand.model_dump()
+    for group in ("players", "actions", "posts", "showdowns"):
+        for row in data[group]:
+            if row["label"] != hand.hero_label:
+                row["label"] = row["label"] + "*"
+    return CanonicalHand.model_validate(data)
+
+
+def _hero_shoves_and_is_called() -> CanonicalHand:
+    """Герой шовит с CO, BB уравнивает олл-ин — доска доезжает без единого действия."""
+    return _hand(
+        hero_position="CO",
+        actions=[
+            _fold("UTG"),
+            _fold("HJ"),
+            _raise_to("Hero", _STACK, already=0, all_in=True),
+            _fold("BTN"),
+            _fold("SB"),
+            _call("BB", _STACK - _BB, all_in=True),
+        ],
+        boards=_BOARD,
+    )
+
+
 # --- VPIP / PFR --------------------------------------------------------------------
 
 
@@ -366,3 +460,196 @@ def test_no_hands_means_no_shares_at_all():
     assert stats.hands == 0
     assert stats.vpip_pct is None and stats.pfr_pct is None
     assert stats.reraise_pct is None and stats.fold_to_cbet_pct is None
+
+
+# --- Любое место, не только герой --------------------------------------------------
+
+
+def test_stats_are_counted_for_a_seat_that_is_not_hero():
+    """Открывший банк оппонент получает свои VPIP и PFR, а не статистику героя."""
+    hand = _hero_faces_an_open(hero_reraises=True)
+    opener = player_stats([hand], "UTG")
+    assert (opener.hands, opener.vpip, opener.pfr) == (1, 1, 1)
+    assert (opener.reraise_chances, opener.reraise) == (0, 0)
+    hero = player_stats([hand])
+    assert (hero.reraise_chances, hero.reraise) == (1, 1)
+
+
+def test_hands_without_that_label_are_not_counted():
+    """Метки нет за столом — раздача не идёт ни в числитель, ни в знаменатель."""
+    stats = player_stats([_hero_opens_and_takes_it()], "нет-такого-места")
+    assert stats.hands == 0
+    assert stats.vpip_pct is None
+
+
+def test_by_label_matches_the_single_label_call():
+    """Словарь по всем местам и запрос одного места дают одно и то же."""
+    hands = [_barrel_line(), _hero_faces_an_open(hero_reraises=True)]
+    by_label = player_stats_by_label(hands)
+    for label in ("Hero", "UTG", "BB"):
+        assert by_label[label] == player_stats(hands, label)
+
+
+def test_by_label_counts_each_label_in_its_own_hands():
+    """У каждого места свой знаменатель: считаются только те раздачи, где оно за столом."""
+    first = _hero_opens_and_takes_it()
+    by_label = player_stats_by_label([first, _with_other_labels(first)])
+    assert by_label["Hero"].hands == 2
+    assert by_label["BB"].hands == 1 and by_label["BB*"].hands == 1
+    assert set(by_label) == {"Hero"} | {
+        f"{pos}{star}" for pos in ("SB", "BB", "UTG", "HJ", "BTN") for star in ("", "*")
+    }
+
+
+# --- Продолженная ставка и баррели -------------------------------------------------
+
+
+def test_the_preflop_aggressor_betting_the_flop_is_a_cbet():
+    stats = player_stats([_barrel_line()])
+    assert (stats.cbet_flop_chances, stats.cbet_flop) == (1, 1)
+    assert stats.cbet_flop_pct == 100.0
+
+
+def test_a_check_by_the_aggressor_is_a_chance_not_taken():
+    """Агрессор чекнул флоп — возможность была, ставки не было."""
+    stats = player_stats([_flop_bet_comes_from_a_caller()], "CO")
+    assert (stats.cbet_flop_chances, stats.cbet_flop) == (1, 0)
+    assert stats.cbet_flop_pct == 0.0
+
+
+def test_only_the_preflop_aggressor_gets_a_cbet_chance():
+    """Коллер на флопе тоже действует, но продолжать ему нечего — открывал не он."""
+    stats = player_stats([_barrel_line()], "BB")
+    assert (stats.cbet_flop_chances, stats.cbet_flop) == (0, 0)
+    assert stats.cbet_flop_pct is None
+
+
+def test_an_all_in_aggressor_has_no_flop_bet_chance():
+    """Агрессор вошёл во флоп олл-ином — действий у него там нет, ставить нечем."""
+    stats = player_stats([_hero_shoves_and_is_called()])
+    assert (stats.cbet_flop_chances, stats.cbet_flop) == (0, 0)
+    assert stats.cbet_flop_pct is None
+
+
+def test_a_bet_on_each_street_counts_as_a_second_and_third_barrel():
+    stats = player_stats([_barrel_line()])
+    assert (stats.barrel_turn_chances, stats.barrel_turn) == (1, 1)
+    assert (stats.barrel_river_chances, stats.barrel_river) == (1, 1)
+
+
+def test_a_barrel_needs_a_bet_on_the_street_before():
+    """Чек на тёрне: возможность второго барреля была, третьего — не было вовсе."""
+    stats = player_stats([_barrel_line(hero_bets_turn=False)])
+    assert (stats.barrel_turn_chances, stats.barrel_turn) == (1, 0)
+    assert (stats.barrel_river_chances, stats.barrel_river) == (0, 0)
+    assert stats.barrel_river_pct is None
+
+
+def test_raising_someone_elses_turn_bet_is_not_a_barrel():
+    """Первым на тёрне поставил оппонент — повышение поверх баррелем не считается."""
+    stats = player_stats([_barrel_line(bb_donks_turn=True)])
+    assert (stats.barrel_turn_chances, stats.barrel_turn) == (1, 0)
+    assert (stats.barrel_river_chances, stats.barrel_river) == (0, 0)
+
+
+# --- Доход до вскрытия -------------------------------------------------------------
+
+
+def test_reaching_the_river_leaves_both_players_at_showdown():
+    by_label = player_stats_by_label([_barrel_line()])
+    for label in ("Hero", "BB"):
+        assert (by_label[label].flops_seen, by_label[label].showdowns) == (1, 1)
+        assert by_label[label].showdown_pct == 100.0
+
+
+def test_folding_preflop_is_not_a_flop_seen():
+    """Спасовавший до флопа флопа не видел — он не в знаменателе."""
+    stats = player_stats([_barrel_line()], "UTG")
+    assert (stats.flops_seen, stats.showdowns) == (0, 0)
+    assert stats.showdown_pct is None
+
+
+def test_folding_on_the_flop_still_counts_as_seeing_it():
+    """Знаменатель считает дошедших до улицы, а не доигравших её."""
+    stats = player_stats([_hero_faces_a_cbet(hero_folds=True)])
+    assert (stats.flops_seen, stats.showdowns) == (1, 0)
+    assert stats.showdown_pct == 0.0
+
+
+def test_a_river_fold_leaves_no_showdown_for_anyone():
+    """Последнюю ставку не уравняли — карт не открыл никто, включая победителя."""
+    by_label = player_stats_by_label([_barrel_line(bb_folds_river=True)])
+    for label in ("Hero", "BB"):
+        assert (by_label[label].flops_seen, by_label[label].showdowns) == (1, 0)
+
+
+def test_cards_shown_after_a_fold_are_not_a_showdown():
+    """Источник записал показ карт за спасовавшим — вскрытием это не является."""
+    stats = player_stats([_barrel_line(bb_folds_river=True, bb_shows=True)], "BB")
+    assert (stats.flops_seen, stats.showdowns) == (1, 0)
+
+
+# --- Малая выборка -----------------------------------------------------------------
+
+
+def test_a_single_observation_is_returned_with_its_denominator():
+    """Порога на малую выборку нет: доля от одного наблюдения отдаётся вместе с ним.
+
+    Скрыть её значило бы скрыть и знаменатель, а именно он и говорит читателю,
+    чего эта доля стоит.
+    """
+    stats = player_stats([_hero_faces_a_cbet(hero_folds=True)])
+    assert stats.fold_to_cbet_pct == 100.0
+    assert (stats.fold_to_cbet, stats.cbet_faced) == (1, 1)
+
+
+# --- Настоящие файлы ---------------------------------------------------------------
+
+
+@requires_fixtures
+@pytest.mark.parametrize("path", [FIXTURE_DAILY, FIXTURE_PKO])
+def test_showdown_counter_matches_the_cards_the_source_recorded(path):
+    """Доход до вскрытия, посчитанный по пасам и доске, сходится с показом карт в файле.
+
+    Числитель считается двумя независимыми путями и по разным полям: у
+    `player_stats_by_label` — по пасам и доске, здесь — по строкам показа карт
+    самого источника. Из показов вычитаются двое: спасовавшие
+    (`test_cards_shown_after_a_fold_are_not_a_showdown`) и одиночные — показ
+    карт единственным непасовавшим вскрытием не является, он добровольный
+    (`test_a_river_fold_leaves_no_showdown_for_anyone`).
+    """
+    from harness.parsers.hh_parser import parse_file
+
+    hands = [
+        normalize(raw)
+        for raw in parse_file(path.read_text(encoding="utf-8"), source_ref=path.name)
+    ]
+    by_label = player_stats_by_label(hands)
+    from_source = 0
+    for hand in hands:
+        folded = {a.label for a in hand.actions if a.kind is ActionKind.FOLD}
+        shown = {sd.label for sd in hand.showdowns} - folded
+        from_source += len(shown) if len(shown) >= 2 else 0
+    assert sum(stats.showdowns for stats in by_label.values()) == from_source
+
+
+@requires_fixtures
+@pytest.mark.parametrize("path", [FIXTURE_DAILY, FIXTURE_PKO])
+def test_every_numerator_stays_within_its_own_denominator(path):
+    """Знаменатели вложены: третий баррель ⊆ второго ⊆ сибета, вскрытие ⊆ флопов."""
+    from harness.parsers.hh_parser import parse_file
+
+    hands = [
+        normalize(raw)
+        for raw in parse_file(path.read_text(encoding="utf-8"), source_ref=path.name)
+    ]
+    for stats in player_stats_by_label(hands).values():
+        assert stats.vpip <= stats.hands and stats.pfr <= stats.vpip
+        assert stats.reraise <= stats.reraise_chances
+        assert stats.fold_to_cbet <= stats.cbet_faced
+        assert stats.cbet_flop <= stats.cbet_flop_chances
+        assert stats.barrel_turn_chances <= stats.cbet_flop
+        assert stats.barrel_turn <= stats.barrel_turn_chances
+        assert stats.barrel_river_chances <= stats.barrel_turn
+        assert stats.barrel_river <= stats.barrel_river_chances
+        assert stats.showdowns <= stats.flops_seen <= stats.hands

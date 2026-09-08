@@ -223,7 +223,15 @@ class PlayerStats(BaseModel):
     Формулы, по которым считается каждый счётчик, записаны в докстрингах
     `analysis/player_stats.py` — там же названы тесты, которые их пришпиливают.
     Доля отсутствует (`None`), когда знаменатель нулевой: «0 из 0» — это не
-    ноль процентов, а отсутствие данных.
+    ноль процентов, а отсутствие данных. Другого порога у долей нет: при любом
+    ненулевом знаменателе возвращаются и доля, и он сам, и читатель видит, из
+    скольких наблюдений она взята
+    (`test_a_single_observation_is_returned_with_its_denominator`).
+
+    Тип описывает счётчики ЛЮБОГО места за столом, а не только героя:
+    `player_stats(hands, label)` и `player_stats_by_label(hands)` возвращают
+    его же. Метки внутри нет — у одного места одна статистика, а кому она
+    принадлежит, знает тот, кто её запросил (ключ словаря).
     """
 
     hands: int = 0
@@ -233,6 +241,21 @@ class PlayerStats(BaseModel):
     reraise_chances: int = 0
     fold_to_cbet: int = 0
     cbet_faced: int = 0
+    # Постфлоп-частоты. Каждая — пара «числитель, знаменатель», как и всё выше;
+    # знаменатели у них РАЗНЫЕ и вложены друг в друга: возможность второго
+    # барреля есть только у того, кто поставил на флопе, третьего — только у
+    # поставившего на тёрне. Поэтому `barrel_river_chances` не больше
+    # `barrel_turn_chances`, и это не потеря данных, а определение величины
+    # (`test_a_barrel_needs_a_bet_on_the_street_before`,
+    # `test_every_numerator_stays_within_its_own_denominator`).
+    cbet_flop: int = 0
+    cbet_flop_chances: int = 0
+    barrel_turn: int = 0
+    barrel_turn_chances: int = 0
+    barrel_river: int = 0
+    barrel_river_chances: int = 0
+    showdowns: int = 0
+    flops_seen: int = 0
 
     @staticmethod
     def _share(numerator: int, denominator: int) -> float | None:
@@ -253,6 +276,22 @@ class PlayerStats(BaseModel):
     @property
     def fold_to_cbet_pct(self) -> float | None:
         return self._share(self.fold_to_cbet, self.cbet_faced)
+
+    @property
+    def cbet_flop_pct(self) -> float | None:
+        return self._share(self.cbet_flop, self.cbet_flop_chances)
+
+    @property
+    def barrel_turn_pct(self) -> float | None:
+        return self._share(self.barrel_turn, self.barrel_turn_chances)
+
+    @property
+    def barrel_river_pct(self) -> float | None:
+        return self._share(self.barrel_river, self.barrel_river_chances)
+
+    @property
+    def showdown_pct(self) -> float | None:
+        return self._share(self.showdowns, self.flops_seen)
 
 
 class LevelLine(BaseModel):
