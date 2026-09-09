@@ -50,6 +50,7 @@ _ALL_TABLES = {
     "tournaments",
     "hands",
     "analyses",
+    "decision_points",
     "notes",
     "eval_cases",
     "jobs",
@@ -175,7 +176,11 @@ async def test_analyses_save_and_get_by_hand(db):
 
     result = AnalysisResult(hand_no=raw.hand_no, points=[])
     aid = await AnalysesRepo(db).save(
-        hand_id=hid, result=result, verdict_text="норм", range_images=["r1.png"]
+        hand_id=hid,
+        result=result,
+        decision_points=[],
+        verdict_text="норм",
+        range_images=["r1.png"],
     )
 
     got = await AnalysesRepo(db).get_by_hand(hid)
@@ -194,7 +199,10 @@ async def test_set_explanation_without_text_keeps_the_saved_one(db):
     raw = RawHand.model_validate(make_min_raw())
     hid = await HandsRepo(db).save_raw(session_id=session_id, raw=raw)
     await AnalysesRepo(db).save(
-        hand_id=hid, result=AnalysisResult(hand_no=raw.hand_no, points=[]), verdict_text="слова"
+        hand_id=hid,
+        result=AnalysisResult(hand_no=raw.hand_no, points=[]),
+        decision_points=[],
+        verdict_text="слова",
     )
 
     await AnalysesRepo(db).set_explanation(hand_id=hid, range_images=["r1.png"])
@@ -601,7 +609,7 @@ async def _save_analysis(db, *, session_id: int, hand_no: str, points) -> int:
     raw = RawHand.model_validate(make_min_raw(hand_no=hand_no))
     hand_id = await HandsRepo(db).save_raw(session_id=session_id, raw=raw)
     result = AnalysisResult(hand_no=hand_no, points=list(points))
-    await AnalysesRepo(db).save(hand_id=hand_id, result=result)
+    await AnalysesRepo(db).save(hand_id=hand_id, result=result, decision_points=[])
     return hand_id
 
 
@@ -1385,6 +1393,9 @@ def test_migration_0007_collapses_notes_of_one_nick_in_two_cases():
 
     Свой контейнер, а не сессионный `pg`: тест катает схему вперёд и назад, и
     делать это с базой, на которой стоят остальные тесты, нельзя.
+
+    Ревизии названы номерами, а не `head`: тест про 0007, и следующая миграция
+    не имеет права сдвинуть то, что он катает.
     """
     from alembic import command
     from sqlalchemy import create_engine
@@ -1467,7 +1478,7 @@ def test_migration_0007_collapses_notes_of_one_nick_in_two_cases():
                     },
                 ).scalar_one()
 
-            command.upgrade(config, "head")
+            command.upgrade(config, "0007")
 
             with engine.connect() as conn:
                 merged = conn.execute(
@@ -1505,7 +1516,7 @@ def test_migration_0007_collapses_notes_of_one_nick_in_two_cases():
             assert foreign.id == foreign_note
             assert (foreign.opponent_nick, foreign.owner_player_id) == ("vasya", theirs)
 
-            command.downgrade(config, "-1")
+            command.downgrade(config, "0006")
 
             with engine.connect() as conn:
                 back = conn.execute(
@@ -1528,7 +1539,7 @@ def test_migration_0007_collapses_notes_of_one_nick_in_two_cases():
             assert back[0].text == "фолдит на опен\nдонкает флоп"
             assert links == [(named, "T1")]
 
-            command.upgrade(config, "head")
+            command.upgrade(config, "0007")
 
             with engine.connect() as conn:
                 again = conn.execute(

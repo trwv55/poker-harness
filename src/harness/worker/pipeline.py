@@ -1108,7 +1108,11 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
                 result, _exported = await loop.run_in_executor(
                     deps.process_pool, _analyze_hand_with_cache, enriched, {}
                 )
-                await analyses_repo.save(hand_id=hand_id, result=result)
+                await analyses_repo.save(
+                    hand_id=hand_id,
+                    result=result,
+                    decision_points=enriched.report.decision_points,
+                )
                 await session.commit()
 
         async with trace.span("explain"):
@@ -1189,7 +1193,11 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
                 await cache_repo.upsert_many(prefix, exported)
                 await session.commit()
 
-                await analyses_repo.save(hand_id=hand.id, result=result)
+                await analyses_repo.save(
+                    hand_id=hand.id,
+                    result=result,
+                    decision_points=hand.enriched.report.decision_points,
+                )
                 await session.commit()
 
         async with trace.span("explain"):

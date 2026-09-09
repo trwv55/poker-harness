@@ -12,22 +12,22 @@ from __future__ import annotations
 
 import math
 import secrets
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import bindparam, delete, exists, func, literal, select, text, update
+from sqlalchemy import delete, exists, func, literal, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from harness.contracts import (
-    JUDGED_SPOTS,
     LEAK_RULES,
     MAX_NOTE_TEXT_CHARS,
     NOTE_COLOR_NONE,
     AnalysisResult,
     CanonicalHand,
+    DecisionPoint,
     EnrichedHand,
     LeakRule,
     LeaksOverview,
@@ -39,11 +39,13 @@ from harness.contracts import (
     ScanSummary,
     SessionLine,
     SessionSummary,
+    is_judged,
     leak_rule_for,
 )
 from harness.memory.models import (
     Analysis,
     CalcCache,
+    DecisionPointRow,
     EvalCase,
     Hand,
     Invite,
@@ -351,18 +353,15 @@ class SessionsRepo:
 
     async def _session_loss_bb(self, player_id: int, session_id: int) -> float:
         """Цена расхождений вечера — сумма отрицательных `ev_diff_bb` судимых точек."""
-        sql = text(
-            f"select coalesce(sum({_EV_DIFF}) filter "
-            f"(where {_JUDGED_CONDITION} and {_EV_DIFF} < 0), 0.0) as loss "
-            f"{_POINTS_SOURCE}and s.id = :session_id"
-        ).bindparams(bindparam("judged_spots", expanding=True))
         loss = await self.db.scalar(
-            sql,
-            {
-                "player_id": player_id,
-                "session_id": session_id,
-                "judged_spots": _judged_spot_values(),
-            },
+            select(
+                func.coalesce(
+                    func.sum(DecisionPointRow.ev_diff_bb).filter(
+                        DecisionPointRow.judged, DecisionPointRow.ev_diff_bb < 0.0
+                    ),
+                    0.0,
+                )
+            ).where(*_points_of(player_id, session_id))
         )
         return -float(loss or 0.0)
 
@@ -624,8 +623,48 @@ class AnalysisRecord:
     range_images: list[str] | None
 
 
+# Поле `PointVerdict` → колонка `decision_points`. Одна карта на запись и на
+# чтение: два списка полей, обязанных совпадать, — ровно то, чего эта задача
+# избегает. Переименование единственное и вынужденное (`interval` в Postgres
+# зарезервировано); полнота карты проверяется
+# `test_every_field_of_a_point_verdict_has_its_column`.
+_POINT_COLUMNS: Mapping[str, str] = {
+    "dp_index": "dp_index",
+    "street": "street",
+    "spot": "spot",
+    "zone": "zone",
+    "action_taken": "action_taken",
+    "best_action": "best_action",
+    "ev_diff_bb": "ev_diff_bb",
+    "interval": "ev_interval",
+    "assumption": "assumption",
+    "tools": "tools",
+    "detail": "detail",
+}
+
+# Обстановка точки из `DecisionPoint` (`hands.enriched`): имя поля и имя колонки
+# совпадают. Не весь контракт — только то, по чему фильтруют: улица и сыгранное
+# действие уже приехали из вердикта, а метка места и живые оппоненты в фильтрах
+# не участвуют.
+_CONTEXT_COLUMNS: tuple[str, ...] = (
+    "position",
+    "to_call",
+    "pot_before",
+    "eff_stack",
+    "eff_stack_bb",
+    "spr",
+)
+
+
 class AnalysesRepo:
-    """`analyses`: выход ядра (`result`) и изложения (`verdict_text`, `range_images`)."""
+    """`analyses`: выход ядра (`result`) и изложения (`verdict_text`, `range_images`).
+
+    Точки решения лежат НЕ здесь, а строками в `decision_points` (миграция
+    0008): `result` хранит документ без них, `save` раскладывает массив по
+    строкам, `get_by_hand` собирает его обратно. Второй копии вердикта в базе
+    нет — значит, ей и не с чем расходиться
+    (`test_the_saved_document_carries_no_points_of_its_own`).
+    """
 
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
@@ -635,18 +674,66 @@ class AnalysesRepo:
         *,
         hand_id: int,
         result: AnalysisResult,
+        decision_points: Sequence[DecisionPoint],
         verdict_text: str | None = None,
         range_images: list[str] | None = None,
     ) -> int:
+        """Записать разбор: документ в `analyses`, точки — строками, в одной транзакции.
+
+        `decision_points` — точки решения движка из `hands.enriched` той же
+        руки; из них берётся обстановка (позиция, банк, доплата, стек, SPR),
+        которой в вердикте нет. Вердикт сопоставляется с обстановкой по
+        `dp_index`; вердикту, которому в руке ничего не соответствует, колонки
+        обстановки остаются пустыми, а не заполняются похожей точкой
+        (`test_a_verdict_without_its_decision_point_is_stored_without_context`).
+        """
         record = Analysis(
             hand_id=hand_id,
-            result=result.model_dump(mode="json"),
+            result=result.model_dump(mode="json", exclude={"points"}),
             verdict_text=verdict_text,
             range_images=range_images,
         )
         self.db.add(record)
         await self.db.flush()
+        await self._save_points(hand_id, result, decision_points)
         return record.id
+
+    async def _save_points(
+        self, hand_id: int, result: AnalysisResult, decision_points: Sequence[DecisionPoint]
+    ) -> None:
+        if not result.points:
+            return
+        address = (
+            await self.db.execute(
+                select(Hand.session_id, SessionRow.player_id)
+                .join(SessionRow, SessionRow.id == Hand.session_id)
+                .where(Hand.id == hand_id)
+            )
+        ).one()
+        context = {point.index: point for point in decision_points}
+        rows: list[dict[str, Any]] = []
+        for point_no, point in enumerate(result.points):
+            dumped = point.model_dump(mode="json")
+            row: dict[str, Any] = {
+                field_column: dumped[field] for field, field_column in _POINT_COLUMNS.items()
+            }
+            row |= {
+                "hand_id": hand_id,
+                "session_id": address.session_id,
+                "player_id": address.player_id,
+                "point_no": point_no,
+                # Единственная формулировка правила судимости на всю систему —
+                # `contracts.is_judged`; SQL после этого его не повторяет.
+                "judged": is_judged(point),
+            }
+            source = context.get(point.dp_index)
+            row |= {
+                name: None if source is None else getattr(source, name)
+                for name in _CONTEXT_COLUMNS
+            }
+            rows.append(row)
+        await self.db.execute(pg_insert(DecisionPointRow), rows)
+        await self.db.flush()
 
     async def set_explanation(
         self, *, hand_id: int, verdict_text: str | None = None, range_images: list[str]
@@ -671,13 +758,29 @@ class AnalysesRepo:
         )
 
     async def get_by_hand(self, hand_id: int) -> AnalysisRecord | None:
+        """Разбор руки целиком: документ из `analyses` плюс точки из строк.
+
+        Точки возвращаются в порядке `point_no` — в том же, в каком лежали в
+        массиве: `AnalysisResult.ranked` индексирует массив, и перестановка
+        сдвинула бы ранжирование на чужие точки
+        (`test_the_analysis_document_returns_from_the_rows_as_it_went_in`).
+        """
         record = await self.db.scalar(select(Analysis).where(Analysis.hand_id == hand_id))
         if record is None:
             return None
+        rows = await self.db.scalars(
+            select(DecisionPointRow)
+            .where(DecisionPointRow.hand_id == hand_id)
+            .order_by(DecisionPointRow.point_no)
+        )
+        points = [
+            {field: getattr(row, field_column) for field, field_column in _POINT_COLUMNS.items()}
+            for row in rows
+        ]
         return AnalysisRecord(
             id=record.id,
             hand_id=record.hand_id,
-            result=AnalysisResult.model_validate(record.result),
+            result=AnalysisResult.model_validate({**record.result, "points": points}),
             verdict_text=record.verdict_text,
             range_images=record.range_images,
         )
@@ -1032,32 +1135,26 @@ class EvalCasesRepo:
         return record.id
 
 
-# Откуда берутся точки решения для сквозных агрегатов «Моих ликов» и агрегата
-# сессии: каждая строка результата — ОДНА точка (`jsonb_array_elements` по
-# `analyses.result->'points'`), привязанная к игроку через руку и сессию.
-# Текстом, а не выражениями ORM: боковое соединение с разворотом jsonb-массива
-# в строки на языке SQLAlchemy пришлось бы собирать из `func.jsonb_array_elements`
-# и `.lateral()`, и читаемость запроса, который считает деньги игрока, важнее
-# единообразия с соседними методами.
-_POINTS_SOURCE = """
-    from analyses a
-    join hands h on h.id = a.hand_id
-    join sessions s on s.id = h.session_id
-    cross join lateral jsonb_array_elements(a.result -> 'points') as p
-    where s.player_id = :player_id
-"""
-
-# Условие «по этой точке есть вердикт» — то же правило, что у
-# `analysis.error_cost.is_judged` (спот из `JUDGED_SPOTS` и непустое
-# `best_action`), выраженное в SQL. Набор спотов приезжает параметром из
-# контрактов, а не переписан сюда строками: см. комментарий к `JUDGED_SPOTS`.
-_JUDGED_CONDITION = "p ->> 'spot' in :judged_spots and p ->> 'best_action' <> ''"
-
-_EV_DIFF = "(p ->> 'ev_diff_bb')::double precision"
+# Точки решения игрока — источник всех сквозных агрегатов («Мои лики», покрытие,
+# цена вечера). Одно выражение вместо текста запроса: до миграции 0008 точки
+# лежали массивом в `analyses.result`, разворачивались боковым соединением и
+# каждое условие писалось по jsonb руками; теперь фильтры складываются обычным
+# `where` и не требуют ни приведений типа, ни повторения правил на втором языке.
+def _points_of(player_id: int, session_id: int | None):
+    """Условие «точки этого игрока», при заданной сессии — «и этого вечера»."""
+    where = [DecisionPointRow.player_id == player_id]
+    if session_id is not None:
+        where.append(DecisionPointRow.session_id == session_id)
+    return where
 
 
-def _judged_spot_values() -> list[str]:
-    return [str(spot) for spot in JUDGED_SPOTS]
+# Сумма отрицательных расхождений — «столько ушло». Отдельным выражением,
+# потому что складывают её три места (лик по типу, цена вечера, и через них —
+# сводка сессии), а слагаемое во всех трёх одно и то же.
+def _negative_loss():
+    return func.coalesce(
+        func.sum(DecisionPointRow.ev_diff_bb).filter(DecisionPointRow.ev_diff_bb < 0.0), 0.0
+    )
 
 
 class LeaksRepo:
@@ -1095,18 +1192,14 @@ class LeaksRepo:
         список ликов читается как полная картина игры, хотя судится сегодня
         только префлоп-пуш-фолд (`JUDGED_SPOTS`).
         """
-        sql = text(
-            f"select count(*) as points_total, "
-            f"count(*) filter (where {_JUDGED_CONDITION}) as points_judged "
-            f"{_POINTS_SOURCE}{'and s.id = :session_id' if session_id is not None else ''}"
-        ).bindparams(bindparam("judged_spots", expanding=True))
-        params: dict[str, Any] = {
-            "player_id": player_id,
-            "judged_spots": _judged_spot_values(),
-        }
-        if session_id is not None:
-            params["session_id"] = session_id
-        row = (await self.db.execute(sql, params)).one()
+        row = (
+            await self.db.execute(
+                select(
+                    func.count().label("points_total"),
+                    func.count().filter(DecisionPointRow.judged).label("points_judged"),
+                ).where(*_points_of(player_id, session_id))
+            )
+        ).one()
         return int(row.points_judged), int(row.points_total)
 
     async def by_type(self, player_id: int, *, session_id: int | None = None) -> list[LeakStat]:
@@ -1117,20 +1210,25 @@ class LeaksRepo:
         сальдо (положительных расхождений у судимой точки не бывает по
         построению ядра, и полагаться на это правило здесь не нужно).
         """
-        sql = text(
-            f"select p ->> 'spot' as spot, p ->> 'action_taken' as action_taken, "
-            f"p ->> 'best_action' as best_action, count(*) as n, "
-            f"coalesce(sum({_EV_DIFF}) filter (where {_EV_DIFF} < 0), 0.0) as loss "
-            f"{_POINTS_SOURCE}{'and s.id = :session_id' if session_id is not None else ''} "
-            f"group by 1, 2, 3"
+        stmt = (
+            select(
+                DecisionPointRow.spot,
+                DecisionPointRow.action_taken,
+                DecisionPointRow.best_action,
+                func.count().label("n"),
+                _negative_loss().label("loss"),
+            )
+            .where(*_points_of(player_id, session_id))
+            .group_by(
+                DecisionPointRow.spot,
+                DecisionPointRow.action_taken,
+                DecisionPointRow.best_action,
+            )
         )
-        params: dict[str, Any] = {"player_id": player_id}
-        if session_id is not None:
-            params["session_id"] = session_id
         counts: dict[str, int] = {}
         losses: dict[str, float] = {}
         rules: dict[str, LeakRule] = {}
-        for row in (await self.db.execute(sql, params)).all():
+        for row in (await self.db.execute(stmt)).all():
             rule = leak_rule_for(row.spot, row.action_taken, row.best_action)
             if rule is None:
                 continue

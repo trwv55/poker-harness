@@ -41,6 +41,7 @@ __all__ = [
     "OpponentRecord",
     "SessionLine",
     "SessionSummary",
+    "is_judged",
     "leak_rule_for",
     "leak_rule_of_point",
 ]
@@ -66,8 +67,8 @@ class LeakRule(BaseModel, frozen=True):
 
 
 # Таксономия v1 — решение владельца 2026-09-07, выведенное из того, что разбор
-# умеет судить сегодня (`analysis/error_cost.py::is_judged`: только пуш-фолд в
-# неоткрытом банке и колл чужого шова).
+# умеет судить сегодня (`is_judged` ниже: только пуш-фолд в неоткрытом банке и
+# колл чужого шова).
 #
 # Последняя строка — ЗАРЕЗЕРВИРОВАНА под чарты открытия: спот `preflop_other`
 # сегодня не судится вовсе, поэтому правило не может совпасть ни с одной точкой,
@@ -113,16 +114,27 @@ LEAK_RULES: tuple[LeakRule, ...] = (
 )
 
 
-# Споты, по которым ядро вообще выносит вердикт (`analysis.error_cost.
-# _JUDGED_SPOTS`). Продублировано строкой, а не импортом приватного имени чужого
-# модуля, — тот же приём и та же причина, что у `_VALIDATOR_FIELD_BUTTON` в
-# `worker/pipeline.py`, плюс своя: `memory` считает покрытие в SQL и не имеет
-# права тянуть в образ бота расчётный стек (`test_bot_image_does_not_import_
-# calculation_stack`). Разойдутся — покраснеет
-# `test_the_judged_spots_of_history_agree_with_the_core`.
+# Споты, по которым ядро вообще выносит вердикт. Живёт здесь, а не в
+# `analysis.error_cost`, потому что читателей у правила трое по разные стороны
+# правила зависимостей: ядро (ранжирование), `memory` (колонка `judged`) и
+# `presentation` (строка покрытия). `memory` не имеет права тянуть в образ бота
+# расчётный стек (`test_bot_image_does_not_import_calculation_stack`), а
+# `contracts` не тянут ничего.
 JUDGED_SPOTS: frozenset[SpotKind] = frozenset(
     {SpotKind.PUSHFOLD_UNOPENED, SpotKind.PUSHFOLD_FACING_SHOVE}
 )
+
+
+def is_judged(point: PointVerdict) -> bool:
+    """Есть ли по точке вердикт: пустой `best_action` означает «не посчитано».
+
+    ЕДИНСТВЕННАЯ формулировка правила во всей системе. Ядро зовёт её же
+    (`analysis.error_cost.is_judged` — это она), память вызывает её при записи
+    точки и кладёт ответ в колонку `decision_points.judged`, а SQL читает
+    колонку и правила не повторяет
+    (`test_the_judged_column_is_written_by_the_one_predicate`).
+    """
+    return point.spot in JUDGED_SPOTS and point.best_action != ""
 
 
 def leak_rule_for(spot: SpotKind | str, action_taken: str, best_action: str) -> LeakRule | None:

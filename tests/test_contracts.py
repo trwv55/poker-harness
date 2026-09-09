@@ -245,28 +245,27 @@ def test_an_unjudged_point_matches_no_leak_rule():
 def test_the_reserved_open_raise_leak_matches_nothing_the_core_judges_today():
     """«Открывает слишком широко» зарезервирован под чарты и сегодня пуст.
 
-    Держится не намерением, а тем, что судимых спотов у ядра ровно два
-    (`analysis.error_cost._JUDGED_SPOTS`), и спот этого правила в них не входит:
-    вердикта с таким спотом ядро не выносит, значит и совпасть правилу не с чем.
+    Держится не намерением, а тем, что судимых спотов ровно два
+    (`JUDGED_SPOTS`), и спот этого правила в них не входит: вердикта с таким
+    спотом ядро не выносит, значит и совпасть правилу не с чем.
     """
-    from harness.analysis.error_cost import _JUDGED_SPOTS
-    from harness.contracts import LEAK_RULES
+    from harness.contracts import JUDGED_SPOTS, LEAK_RULES
 
     reserved = next(rule for rule in LEAK_RULES if rule.key == "open_too_wide")
-    assert reserved.spot not in _JUDGED_SPOTS
+    assert reserved.spot not in JUDGED_SPOTS
 
 
-def test_the_judged_spots_of_history_agree_with_the_core():
-    """Покрытие «Моих ликов» считается в SQL тем же набором спотов, что и в ядре.
+def test_the_core_judges_a_point_by_the_predicate_of_the_contracts():
+    """У правила «точка судима» одна формулировка, а не одна на каждого читателя.
 
-    Память не имеет права импортировать `analysis` (образ бота не тянет
-    расчётный стек), поэтому набор продублирован в контрактах. Этот тест —
-    единственное, что не даёт двум спискам разойтись молча.
+    Ядро ранжирует точки, память пишет колонку `decision_points.judged` —
+    и оба зовут ОДНУ функцию, а не две одинаковых. Проверяется тождеством
+    объектов: копия, сделанная «по образцу», этот тест не пройдёт.
     """
-    from harness.analysis.error_cost import _JUDGED_SPOTS
-    from harness.contracts import JUDGED_SPOTS
+    from harness.analysis import error_cost
+    from harness.contracts import is_judged
 
-    assert JUDGED_SPOTS == _JUDGED_SPOTS
+    assert error_cost.is_judged is is_judged
 
 
 def test_a_leak_rule_is_found_by_the_raw_strings_of_jsonb():

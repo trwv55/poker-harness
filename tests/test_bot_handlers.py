@@ -1902,7 +1902,9 @@ async def _seed_analysis(db_factory, *, session_id: int, hand_no: str, images: l
     result = AnalysisResult(hand_no=hand_no, points=[point], ranked=[0])
     hand_id = await _seed_hand(db_factory, session_id=session_id, hand_no=hand_no)
     async with db_factory() as session:
-        await AnalysesRepo(session).save(hand_id=hand_id, result=result, range_images=images)
+        await AnalysesRepo(session).save(
+            hand_id=hand_id, result=result, decision_points=[], range_images=images
+        )
         await session.commit()
     return hand_id, result
 

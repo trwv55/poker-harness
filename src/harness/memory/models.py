@@ -1,8 +1,8 @@
-"""ORM-модели БД: 12 таблиц спеки §6 плюс две таблицы оппонента.
+"""ORM-модели БД: 12 таблиц спеки §6, две таблицы оппонента и точки решения.
 
 Источник — `docs/superpowers/specs/2026-08-28-poker-harness-tech-spec-design.md`,
 раздел "6. Схема БД". Колонки — по табличным строкам спеки дословно; `?` у поля в
-спеке значит nullable, отсутствие `?` — `NOT NULL`. Пять отступлений от этого
+спеке значит nullable, отсутствие `?` — `NOT NULL`. Шесть отступлений от этого
 правила и почему они не нарушают "дословно":
 
 1. `llm_calls.started_at` — таблица §6 её не называет среди "ключевых полей", но §7
@@ -33,6 +33,13 @@
    Связь между метками утверждает владелец; кода, который догадывался бы о ней
    сам, в проекте нет. Заметка (§6, `notes`) ссылается на ту же строку
    `opponents`: личность оппонента в продукте одна (миграция 0007).
+6. `decision_points` (миграция 0008) — таблицы нет в §6: точки решения лежали
+   массивом внутри `analyses.result`. Правило §6 («jsonb — для версионированных
+   документов-контрактов; реляционные колонки — для всего, по чему ищем и
+   джойним») ими же и нарушалось: по точкам ищут и группируют — лики, покрытие,
+   цена вечера, — а каждое новое условие писалось выражением по jsonb руками.
+   Отступление здесь в том, что таблицы нет в §6, а не в том, что она спорит с
+   правилом.
 
 jsonb-колонки хранят `model_dump(mode="json")` пайплайн-контрактов (`RawHand`,
 `CanonicalHand`, `EnrichedHand`, `AnalysisResult`) — уже JSON-совместимые
@@ -52,6 +59,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    Double,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
@@ -128,6 +136,11 @@ class Session(Base):
     """«Сессия = вечер»: `sessions`. Закрывается `/new` (SESSIONS_UX.md), не таймером."""
 
     __tablename__ = "sessions"
+    __table_args__ = (
+        # Мишень составного внешнего ключа `decision_points(session_id,
+        # player_id)` — см. `uq_hands_id_session`.
+        UniqueConstraint("id", "player_id", name="uq_sessions_id_player"),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     player_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("players.id"), nullable=False)
@@ -160,6 +173,11 @@ class Hand(Base):
             "provenance IN ('hand_history', 'screenshot')", name="provenance_allowed"
         ),
         Index("ix_hands_session_id", "session_id"),
+        # Не «вторая уникальность» руки, а мишень составного внешнего ключа
+        # `decision_points(hand_id, session_id)`: без неё денормализованный
+        # `session_id` точки некому проверить (тот же приём, что у
+        # `uq_opponents_id_owner`).
+        UniqueConstraint("id", "session_id", name="uq_hands_id_session"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -187,6 +205,92 @@ class Analysis(Base):
     result: Mapped[Any] = mapped_column(JSONB, nullable=False)
     verdict_text: Mapped[str | None] = mapped_column(Text)
     range_images: Mapped[Any | None] = mapped_column(JSONB)
+
+
+class DecisionPointRow(Base):
+    """Точка решения строкой: `decision_points`. ЕДИНСТВЕННОЕ место, где она лежит.
+
+    До миграции 0008 массив точек жил в `analyses.result -> 'points'` и
+    разворачивался `jsonb_array_elements` на каждом запросе. Теперь `result`
+    хранит документ БЕЗ точек, а `AnalysesRepo` собирает его обратно из этих
+    строк: двух копий одного вердикта в базе нет
+    (`test_the_analysis_document_no_longer_carries_its_points`).
+
+    Имя класса — `...Row`, а не `DecisionPoint`: контракт с таким именем уже
+    есть (`contracts.enriched`), и строка не равна ему — она склеена из двух
+    контрактов сразу. Что откуда:
+
+    * `point_no`, `dp_index`, `street`, `spot`, `zone`, `action_taken`,
+      `best_action`, `ev_diff_bb`, `ev_interval`, `assumption`, `tools`,
+      `detail` — `PointVerdict` целиком, поле в поле
+      (`test_every_field_of_a_point_verdict_has_its_column`). Единственное
+      переименование — `interval` → `ev_interval`: `interval` в Postgres
+      зарезервировано, и колонка с таким именем требовала бы кавычек в каждом
+      запросе.
+    * `position`, `to_call`, `pot_before`, `eff_stack`, `eff_stack_bb`, `spr` —
+      обстановка точки из `DecisionPoint` (`hands.enriched`). Nullable: вердикт
+      сопоставляется с обстановкой по `dp_index`, и вердикт без своей точки
+      решения контракт не запрещает.
+    * `judged` — ответ `contracts.is_judged` на момент записи. Колонка, а не
+      выражение в SQL: иначе правило судимости существовало бы двумя текстами
+      на двух языках, обязанными совпадать.
+    * `hand_id`, `session_id`, `player_id` — адрес точки. Сессия и игрок
+      денормализованы (фильтры словаря расчётов складываются по игроку и по
+      вечеру), и оба закрыты составными внешними ключами на
+      `hands(id, session_id)` и `sessions(id, player_id)`: строка с чужой
+      сессией или чужим игроком не вставляется вовсе
+      (`test_a_point_cannot_claim_a_session_that_is_not_its_hands`).
+
+    `point_no` — МЕСТО В МАССИВЕ `AnalysisResult.points`, а не `dp_index`:
+    `AnalysisResult.ranked` индексирует именно массив, и порядок обязан
+    пережить запись. Равенство `point_no == dp_index` в разборах ядра
+    выполняется, но контракт его не требует, и ключом взято то, что нужно для
+    сборки документа обратно.
+    """
+
+    __tablename__ = "decision_points"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["hand_id", "session_id"],
+            ["hands.id", "hands.session_id"],
+            name="fk_decision_points_hand_id_hands",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["session_id", "player_id"],
+            ["sessions.id", "sessions.player_id"],
+            name="fk_decision_points_session_id_sessions",
+        ),
+        UniqueConstraint("hand_id", "point_no", name="uq_decision_points_hand_id_point_no"),
+        # Обе сквозные выборки идут по игроку: «Мои лики» — по всей истории,
+        # агрегат вечера — по нему же плюс сессия.
+        Index("ix_decision_points_player_id", "player_id"),
+        Index("ix_decision_points_session_id", "session_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    hand_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    session_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    player_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    point_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    dp_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    street: Mapped[str] = mapped_column(String(16), nullable=False)
+    spot: Mapped[str] = mapped_column(String(32), nullable=False)
+    zone: Mapped[str] = mapped_column(String(16), nullable=False)
+    action_taken: Mapped[str] = mapped_column(String, nullable=False)
+    best_action: Mapped[str] = mapped_column(String, nullable=False)
+    ev_diff_bb: Mapped[float] = mapped_column(Double, nullable=False)
+    judged: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    position: Mapped[str | None] = mapped_column(String(16))
+    to_call: Mapped[int | None] = mapped_column(BigInteger)
+    pot_before: Mapped[int | None] = mapped_column(BigInteger)
+    eff_stack: Mapped[int | None] = mapped_column(BigInteger)
+    eff_stack_bb: Mapped[float | None] = mapped_column(Double)
+    spr: Mapped[float | None] = mapped_column(Double)
+    ev_interval: Mapped[Any | None] = mapped_column(JSONB)
+    assumption: Mapped[Any | None] = mapped_column(JSONB)
+    tools: Mapped[Any] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    detail: Mapped[Any] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
 
 
 class Note(Base):

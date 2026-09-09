@@ -60,6 +60,7 @@ from harness.contracts.history import (
     OpponentRecord,
     SessionLine,
     SessionSummary,
+    is_judged,
     leak_rule_for,
     leak_rule_of_point,
 )
@@ -162,6 +163,7 @@ __all__ = [
     "Zone",
     "all_classes",
     "class_of",
+    "is_judged",
     "leak_rule_for",
     "leak_rule_of_point",
 ]

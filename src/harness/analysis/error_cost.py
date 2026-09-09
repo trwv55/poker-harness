@@ -5,20 +5,20 @@
 `ev_diff_bb = 0` — но ноль здесь означает «не посчитано», а не «сыграно верно».
 Пускать такие точки в ранжирование значило бы показывать игроку пробел как
 подтверждение правильной игры.
+
+Само правило «точка судима» живёт в `contracts.history.is_judged` и здесь только
+переэкспортировано: его читают ещё и память (колонка `decision_points.judged`), и
+изложение, а импортировать ради него расчётный пакет им нельзя
+(`test_bot_image_does_not_import_calculation_stack`).
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
-from harness.contracts import PointVerdict, SpotKind
+from harness.contracts import JUDGED_SPOTS, PointVerdict, is_judged
 
-_JUDGED_SPOTS = frozenset({SpotKind.PUSHFOLD_UNOPENED, SpotKind.PUSHFOLD_FACING_SHOVE})
-
-
-def is_judged(point: PointVerdict) -> bool:
-    """Есть ли по точке вердикт: пустой `best_action` означает «не посчитано»."""
-    return point.spot in _JUDGED_SPOTS and point.best_action != ""
+__all__ = ["JUDGED_SPOTS", "is_judged", "rank_points", "total_ev_loss_bb"]
 
 
 def rank_points(points: Sequence[PointVerdict]) -> list[int]:
