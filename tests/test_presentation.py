@@ -1727,10 +1727,10 @@ def test_ranges_msg_of_a_strict_hand_explains_why_there_is_no_picture():
     assert "не опирается на догадку" in msg.text
 
 
-def _alias(alias_id: int, nick: str, links: int = 0):
-    from harness.contracts import AliasRecord
+def _alias(opponent_id: int, nick: str, links: int = 0):
+    from harness.contracts import OpponentRecord
 
-    return AliasRecord(alias_id=alias_id, nick=nick, links=links)
+    return OpponentRecord(opponent_id=opponent_id, nick=nick, links=links)
 
 
 def test_aliases_msg_of_the_longest_names_still_fits_one_telegram_message():
@@ -1739,8 +1739,8 @@ def test_aliases_msg_of_the_longest_names_still_fits_one_telegram_message():
     """
     from harness.presentation import aliases_msg
 
-    # 64 — предел колонки `player_aliases.opponent_nick`, то же число, что у
-    # собственного ника игрока (`players.gg_nickname`).
+    # 64 — предел ника, который игрок печатает руками (`bot.handlers`); схема
+    # длину ника оппонента не ограничивает, но списку хватает и этой длины.
     long_list = [_alias(i, "я" * 64, links=99) for i in range(1, 201)]
 
     msg = aliases_msg(long_list)
@@ -1769,3 +1769,19 @@ def test_aliases_msg_says_how_many_tournaments_each_opponent_is_bound_in():
     from harness.presentation import aliases_msg
 
     assert "Vasya — турниров: 2" in aliases_msg([_alias(1, "Vasya", links=2)]).text
+
+
+def test_aliases_msg_marks_the_numbers_that_stand_on_a_stitching():
+    """Со второго турнира число держится словом владельца, а не данными.
+
+    Один турнир — метка участника в нём и есть данные, сшивать нечего; два и
+    больше — раздачи сложены утверждением «это один человек», и на экране это
+    выглядит просто как выборка побольше.
+    """
+    from harness.presentation import aliases_msg
+
+    one = aliases_msg([_alias(1, "Vasya", links=1)]).text
+    two = aliases_msg([_alias(1, "Vasya", links=2)]).text
+
+    assert "Vasya — турниров: 1" in one and "по вашей сшивке" not in one
+    assert "Vasya — турниров: 2 · по вашей сшивке" in two

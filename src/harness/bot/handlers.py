@@ -41,13 +41,13 @@ from harness.contracts import MAX_NOTE_TEXT_CHARS, NOTE_COLORS, CanonicalHand
 from harness.explanation.hand_replay import hand_replay
 from harness.memory.models import Job, Player
 from harness.memory.repos import (
-    AliasesRepo,
     AnalysesRepo,
     EvalCasesRepo,
     HandsRepo,
     InvitesRepo,
     JobsRepo,
     NotesRepo,
+    OpponentsRepo,
     PlayersRepo,
     QuotaCheck,
     QuotaRepo,
@@ -376,7 +376,7 @@ def _label_at_position(hand: CanonicalHand, position: str) -> str | None:
 async def handle_alias_command(deps: BotDeps, tg_user_id: int, args: str = "") -> Msg:
     """`/alias`: без слов — список оппонентов, со словами — привязать участника.
 
-    Минимальный вход в таблицу псевдонимов: без команды она мертва, а владелец
+    Минимальный вход в таблицу оппонентов: без команды она мертва, а владелец
     проверяет продукт каждый вечер (бриф задачи). Разговорный доступ появится
     позже и заменит эту команду — поэтому здесь нет ни экранов, ни кнопок.
     """
@@ -396,13 +396,14 @@ async def _alias_reply(db: AsyncSession, player: Player, args: str) -> Msg:
     Первое слово — место, остальное — ник: ник бывает из нескольких слов, место
     — никогда, и обратный порядок разбирался бы неоднозначно.
 
-    Ник длиннее колонки `players.gg_nickname` отвергается тем же текстом, что и
-    свой собственный: это один и тот же ник в руме, и второго предела на него в
-    продукте нет.
+    Ник длиннее `_MAX_NICKNAME` отвергается тем же текстом, что и свой
+    собственный: предел стоит на том, что игрок печатает РУКАМИ, и второго
+    такого числа в продукте нет. Ник, прочитанный со стола (заметки), этим
+    пределом не связан — схема его длину не ограничивает.
     """
-    aliases = AliasesRepo(db)
+    opponents = OpponentsRepo(db)
     if not args:
-        return aliases_msg(await aliases.list_for_player(player.id))
+        return aliases_msg(await opponents.list_for_player(player.id))
     position, _, nick = args.partition(" ")
     nick = nick.strip()
     if not nick:
@@ -419,20 +420,20 @@ async def _alias_reply(db: AsyncSession, player: Player, args: str) -> Msg:
     if label is None:
         return alias_position_unknown_msg([seat.position for seat in hand.players])
 
-    alias_id = await aliases.get_or_create(owner_player_id=player.id, nick=nick)
-    bound = (await aliases.links(alias_id, player.id)).get(hand.tournament_id)
+    opponent_id = await opponents.get_or_create(owner_player_id=player.id, nick=nick)
+    bound = (await opponents.links(opponent_id, player.id)).get(hand.tournament_id)
     if bound is not None and bound != label:
         return alias_tournament_taken_msg(nick, _position_of(hand, bound))
-    holder = await aliases.link(
+    holder = await opponents.link(
         owner_player_id=player.id,
-        alias_id=alias_id,
+        opponent_id=opponent_id,
         room_tournament_id=hand.tournament_id,
         participant_label=label,
     )
-    if holder is None:  # pragma: no cover — псевдоним заведён этим же вызовом строкой выше
-        raise LookupError(f"оппонент {alias_id} исчез между созданием и привязкой")
-    if holder != alias_id:
-        taken_by = await aliases.get(holder, player.id)
+    if holder is None:  # pragma: no cover — оппонент заведён этим же вызовом строкой выше
+        raise LookupError(f"оппонент {opponent_id} исчез между созданием и привязкой")
+    if holder != opponent_id:
+        taken_by = await opponents.get(holder, player.id)
         if taken_by is None:  # pragma: no cover — привязка есть, а её оппонента нет
             raise LookupError(f"привязка ведёт на оппонента {holder}, которого нет")
         return alias_taken_msg(position.strip().upper(), taken_by.nick)

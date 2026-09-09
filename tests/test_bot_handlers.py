@@ -1374,7 +1374,10 @@ async def test_a_note_typed_while_an_escalation_waits_lands_in_the_note(deps, db
     await handle_ui_callback(deps, _TG_USER_ID, f"note:{hand_no}:0")
     assert await handle_text(deps, _TG_USER_ID, "донкает флоп") == note_saved_msg("villain")
 
-    note = await fetch_one(db_factory, "select opponent_nick, text from notes")
+    note = await fetch_one(
+        db_factory,
+        "select o.opponent_nick, n.text from notes n join opponents o on o.id = n.opponent_id",
+    )
     assert (note["opponent_nick"], note["text"]) == ("villain", "донкает флоп")
     job = await fetch_one(db_factory, f"select status from jobs where id = {job_id}")
     assert job["status"] == "awaiting_user"
@@ -1665,7 +1668,11 @@ async def test_a_note_starts_from_the_hand_with_the_opponent_already_filled_in(
     saved = await handle_text(deps, _TG_USER_ID, "фолдит на опен")
 
     assert saved == note_saved_msg("villain")
-    note = await fetch_one(db_factory, "select opponent_nick, text, color from notes")
+    note = await fetch_one(
+        db_factory,
+        "select o.opponent_nick, n.text, n.color from notes n "
+        "join opponents o on o.id = n.opponent_id",
+    )
     assert (note["opponent_nick"], note["text"]) == ("villain", "фолдит на опен")
 
 
@@ -1731,7 +1738,10 @@ async def test_a_long_nick_in_a_note_button_still_opens_the_right_note(
     assert prompt is not None and long_nick in prompt.text
     assert await handle_text(deps, _TG_USER_ID, "донкает флоп") == note_saved_msg(long_nick)
 
-    note = await fetch_one(db_factory, "select opponent_nick from notes")
+    note = await fetch_one(
+        db_factory,
+        "select o.opponent_nick from notes n join opponents o on o.id = n.opponent_id",
+    )
     assert note["opponent_nick"] == long_nick
 
 
@@ -2056,10 +2066,10 @@ async def test_the_alias_command_names_the_participant_of_the_last_analysis(
     msg = await handle_alias_command(deps, _TG_USER_ID, "BTN Vasya")
 
     assert msg == alias_bound_msg("Vasya", "BTN")
-    link = await fetch_one(db_factory, "select * from player_alias_links")
-    alias = await fetch_one(db_factory, "select * from player_aliases")
+    link = await fetch_one(db_factory, "select * from opponent_links")
+    alias = await fetch_one(db_factory, "select * from opponents")
     assert link["room_tournament_id"] == tournament
-    assert link["alias_id"] == alias["id"]
+    assert link["opponent_id"] == alias["id"]
     assert alias["opponent_nick"] == "Vasya"
     # Метка — та, что стоит за местом BTN в сохранённой раздаче, а не само место.
     hand = await fetch_one(db_factory, "select canonical from hands")
@@ -2082,11 +2092,11 @@ async def test_a_second_tournament_joins_the_same_nick(deps, db_factory, invited
     await handle_alias_command(deps, _TG_USER_ID, "CO Vasya")
 
     assert first != second
-    aliases = await fetch_all(db_factory, "select * from player_aliases")
-    links = await fetch_all(db_factory, "select * from player_alias_links")
+    aliases = await fetch_all(db_factory, "select * from opponents")
+    links = await fetch_all(db_factory, "select * from opponent_links")
     assert len(aliases) == 1
     assert {row["room_tournament_id"] for row in links} == {first, second}
-    assert {row["alias_id"] for row in links} == {aliases[0]["id"]}
+    assert {row["opponent_id"] for row in links} == {aliases[0]["id"]}
 
 
 async def test_a_place_that_is_not_at_the_table_binds_nothing(deps, db_factory, invited):
@@ -2103,8 +2113,8 @@ async def test_a_place_that_is_not_at_the_table_binds_nothing(deps, db_factory, 
 
     assert msg is not None and "Такого места в последнем разборе нет" in msg.text
     assert "BTN" in msg.text
-    assert await fetch_all(db_factory, "select * from player_aliases") == []
-    assert await fetch_all(db_factory, "select * from player_alias_links") == []
+    assert await fetch_all(db_factory, "select * from opponents") == []
+    assert await fetch_all(db_factory, "select * from opponent_links") == []
 
 
 async def test_the_alias_command_without_words_lists_the_opponents(deps, db_factory, invited):
@@ -2132,11 +2142,11 @@ async def test_a_participant_already_named_keeps_his_first_nick(deps, db_factory
     msg = await handle_alias_command(deps, _TG_USER_ID, "BTN Petya")
 
     assert msg == alias_taken_msg("BTN", "Vasya")
-    link = await fetch_one(db_factory, "select * from player_alias_links")
+    link = await fetch_one(db_factory, "select * from opponent_links")
     vasya = await fetch_one(
-        db_factory, "select * from player_aliases where opponent_nick = 'Vasya'"
+        db_factory, "select * from opponents where opponent_nick = 'Vasya'"
     )
-    assert link["alias_id"] == vasya["id"]
+    assert link["opponent_id"] == vasya["id"]
 
 
 async def test_a_nick_cannot_take_a_second_place_in_one_tournament(deps, db_factory, invited):
@@ -2152,7 +2162,7 @@ async def test_a_nick_cannot_take_a_second_place_in_one_tournament(deps, db_fact
     msg = await handle_alias_command(deps, _TG_USER_ID, "CO Vasya")
 
     assert msg == alias_tournament_taken_msg("Vasya", "BTN")
-    assert len(await fetch_all(db_factory, "select * from player_alias_links")) == 1
+    assert len(await fetch_all(db_factory, "select * from opponent_links")) == 1
 
 
 async def test_a_command_without_a_nick_explains_the_two_words(deps, db_factory, invited):
@@ -2164,9 +2174,12 @@ async def test_a_command_without_a_nick_explains_the_two_words(deps, db_factory,
     assert await handle_alias_command(deps, _TG_USER_ID, "BTN") == alias_usage_msg()
 
 
-async def test_a_nick_longer_than_the_column_is_refused_in_words(deps, db_factory, invited):
-    """Тот же предел и тот же отказ, что у собственного ника в руме: это один и
-    тот же ник, и второго числа на него в продукте нет.
+async def test_a_typed_nick_longer_than_the_limit_is_refused_in_words(deps, db_factory, invited):
+    """Тот же предел и тот же отказ, что у собственного ника в руме: предел
+    стоит на том, что игрок печатает руками, и второго такого числа в продукте
+    нет. Ник, прочитанный со стола, этим пределом не связан — заметка на ник
+    длиннее пишется
+    (`test_a_long_nick_in_a_note_button_still_opens_the_right_note`).
     """
     from harness.bot.handlers import _MAX_NICKNAME, handle_alias_command
     from harness.presentation import gg_nickname_too_long_msg
@@ -2176,7 +2189,7 @@ async def test_a_nick_longer_than_the_column_is_refused_in_words(deps, db_factor
     msg = await handle_alias_command(deps, _TG_USER_ID, "BTN " + "я" * (_MAX_NICKNAME + 1))
 
     assert msg == gg_nickname_too_long_msg(_MAX_NICKNAME)
-    assert await fetch_all(db_factory, "select * from player_aliases") == []
+    assert await fetch_all(db_factory, "select * from opponents") == []
 
 
 async def test_without_any_analysis_there_is_nothing_to_bind(deps, db_factory, invited):

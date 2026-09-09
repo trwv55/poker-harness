@@ -93,10 +93,10 @@ from harness.contracts.explanation import TournamentTextOut, VerdictTextOut
 from harness.contracts.history import (
     MAX_NOTE_TEXT_CHARS,
     NOTE_COLORS,
-    AliasRecord,
     LeaksOverview,
     LeakStat,
     NoteRecord,
+    OpponentRecord,
     SessionLine,
     SessionSummary,
 )
@@ -1741,21 +1741,30 @@ def unknown_text_msg() -> Msg:
 # --- псевдонимы: оппонент по нику и его метки в турнирах ----------------------------
 
 
-def _alias_line(alias: AliasRecord) -> str:
-    return f"{alias.nick} — турниров: {alias.links}"
+def _alias_line(opponent: OpponentRecord) -> str:
+    """Оппонент, число его турниров и — со второго — чем это число держится.
+
+    Пометка стоит ровно там, где число перестаёт быть счётом одного турнира:
+    два турнира и больше сложены СЛОВОМ владельца, а не данными. Ошибочная
+    сшивка приписывает чужие раздачи одному человеку и оставляет неполным
+    другого, а на экране выглядит как выросшая выборка
+    (`test_aliases_msg_marks_the_numbers_that_stand_on_a_stitching`).
+    """
+    line = f"{opponent.nick} — турниров: {opponent.links}"
+    return f"{line} · по вашей сшивке" if opponent.links > 1 else line
 
 
 def _aliases_cut_line(shown: int, total: int) -> str:
     return f"Показаны {shown} из {total} — по алфавиту."
 
 
-def aliases_msg(aliases: Sequence[AliasRecord]) -> Msg:
+def aliases_msg(aliases: Sequence[OpponentRecord]) -> Msg:
     """Список оппонентов, которых игрок назвал по нику, и сколько турниров у каждого.
 
     Число турниров — единственный признак, что привязка состоялась: в файлах
     раздач участник обезличен, и увидеть за столом его ник негде.
 
-    Список приходит целиком (`AliasesRepo.list_for_player` без потолка), поэтому
+    Список приходит целиком (`OpponentsRepo.list_for_player` без потолка), поэтому
     знаменатель строки обрезки — сколько оппонентов у игрока НА САМОМ ДЕЛЕ, а не
     размер страницы (`test_aliases_msg_counts_everyone_not_only_the_shown`).
     Режется бюджетом `_TELEGRAM_TEXT_LIMIT`: список длиннее одного сообщения

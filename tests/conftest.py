@@ -53,11 +53,11 @@ requires_prompts = pytest.mark.skipif(
 )
 
 
-def _upgrade_head(sync_dsn: str) -> None:
-    """Прогоняет `alembic upgrade head` на переданном DSN тем же путём, что и деплой
-    (задача 20): `DATABASE_URL` в окружении, `migrations/env.py` читает его сам
-    (`get_url()`). Мутирует `os.environ` процесса pytest, не родительского шелла —
-    и переопределяется здесь же перед каждым использованием, так что даже если у
+def alembic_config(sync_dsn: str) -> Config:
+    """Конфиг alembic на переданном DSN — тем же путём, что и деплой (задача 20):
+    `DATABASE_URL` в окружении, `migrations/env.py` читает его сам (`get_url()`).
+    Мутирует `os.environ` процесса pytest, не родительского шелла — и
+    переопределяется здесь же перед каждым использованием, так что даже если у
     разработчика уже есть свой `DATABASE_URL` (локальный дев-Postgres), тесты на
     него не попадут.
     """
@@ -65,7 +65,11 @@ def _upgrade_head(sync_dsn: str) -> None:
     root = Path(__file__).parent.parent
     cfg = Config(str(root / "alembic.ini"))
     cfg.set_main_option("script_location", str(root / "migrations"))
-    command.upgrade(cfg, "head")
+    return cfg
+
+
+def _upgrade_head(sync_dsn: str) -> None:
+    command.upgrade(alembic_config(sync_dsn), "head")
 
 
 @pytest.fixture(scope="session")

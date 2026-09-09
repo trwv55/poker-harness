@@ -26,7 +26,6 @@ from harness.contracts import (
     LEAK_RULES,
     MAX_NOTE_TEXT_CHARS,
     NOTE_COLOR_NONE,
-    AliasRecord,
     AnalysisResult,
     CanonicalHand,
     EnrichedHand,
@@ -34,6 +33,7 @@ from harness.contracts import (
     LeaksOverview,
     LeakStat,
     NoteRecord,
+    OpponentRecord,
     Provenance,
     RawHand,
     ScanSummary,
@@ -49,9 +49,9 @@ from harness.memory.models import (
     Invite,
     Job,
     Note,
+    Opponent,
+    OpponentLink,
     Player,
-    PlayerAlias,
-    PlayerAliasLink,
     Tournament,
 )
 from harness.memory.models import Session as SessionRow
@@ -1151,12 +1151,17 @@ class LeaksRepo:
 
 
 class NotesRepo:
-    """`notes`: заметки на оппонентов — сквозные, одна на пару «игрок + ник».
+    """`notes`: заметки на оппонентов — сквозные, одна на оппонента.
 
     Живут только на vision-пути: в GG-HH оппоненты анонимизированы, и
     идентичность не переживает турнир (ARCHITECTURE §6, спека §5.2). Ник сюда
     приходит с экрана, поэтому все методы, кроме списка, сверяют владельца —
     номер заметки приезжает из `callback_data`, то есть из внешнего мира.
+
+    Личность оппонента общая с частотами: заметка ссылается на строку
+    `opponents` (`OpponentsRepo`), а не держит ник своей колонкой. Поэтому
+    регистр ника здесь не различается — ровно так же, как в сшивках турниров
+    (`test_a_note_and_a_link_on_the_same_nick_in_two_cases_meet_on_one_opponent`).
     """
 
     def __init__(self, db: AsyncSession) -> None:
@@ -1165,11 +1170,14 @@ class NotesRepo:
     async def upsert(
         self, *, owner_player_id: int, nick: str, text_: str, color: str | None = None
     ) -> int:
-        """Записать наблюдение об оппоненте; вторая запись на тот же ник — правка.
+        """Записать наблюдение об оппоненте; вторая запись на того же — правка.
 
         Заметка накапливается на оппоненте, а не на вечере (SESSIONS_UX), и
-        уникальный индекс `notes(owner_player_id, opponent_nick)` (миграция
-        0005) делает это структурной гарантией, а не соглашением вызывающего.
+        уникальный индекс `notes(opponent_id)` (миграция 0007) делает это
+        структурной гарантией, а не соглашением вызывающего. Оппонент по нику
+        заводится тем же `get_or_create`, что и для сшивок, поэтому заметка на
+        `Vasya` и заметка на `vasya` — одна заметка
+        (`test_a_note_is_one_per_opponent_and_editing_keeps_its_colour`).
 
         `color=None` означает «цвет не трогать»: цвет ставится отдельной
         кнопкой, и правка текста не имеет права его стирать
@@ -1183,10 +1191,13 @@ class NotesRepo:
             # `bot.handlers` до вызова, здесь стоит нижняя граница
             # (`test_a_note_longer_than_the_limit_is_refused_rather_than_cut`).
             raise ValueError(f"заметка длиннее {MAX_NOTE_TEXT_CHARS} символов")
+        opponent_id = await OpponentsRepo(self.db).get_or_create(
+            owner_player_id=owner_player_id, nick=nick
+        )
         now = datetime.now(UTC)
         insert = pg_insert(Note).values(
             owner_player_id=owner_player_id,
-            opponent_nick=nick.strip(),
+            opponent_id=opponent_id,
             color=color if color is not None else NOTE_COLOR_NONE,
             text=stripped,
             updated_at=now,
@@ -1195,7 +1206,7 @@ class NotesRepo:
         if color is not None:
             updates["color"] = color
         stmt = insert.on_conflict_do_update(
-            index_elements=["owner_player_id", "opponent_nick"], set_=updates
+            index_elements=["opponent_id"], set_=updates
         ).returning(Note.id)
         note_id = await self.db.scalar(stmt)
         await self.db.flush()
@@ -1215,7 +1226,13 @@ class NotesRepo:
         return result.first() is not None
 
     async def delete(self, note_id: int, owner_player_id: int) -> bool:
-        """Удалить заметку; `False` — её нет или она чужая."""
+        """Удалить заметку; `False` — её нет или она чужая.
+
+        Оппонент переживает свою заметку: сшивки турниров держатся на нём, и
+        удалять его вместе с текстом наблюдения означало бы стереть привязки,
+        о которых игрок не просил
+        (`test_deleting_a_note_leaves_the_opponent_and_his_links`).
+        """
         result = await self.db.execute(
             delete(Note)
             .where(Note.id == note_id, Note.owner_player_id == owner_player_id)
@@ -1225,19 +1242,28 @@ class NotesRepo:
         return result.first() is not None
 
     async def get(self, note_id: int, owner_player_id: int) -> NoteRecord | None:
-        record = await self.db.scalar(
-            select(Note).where(Note.id == note_id, Note.owner_player_id == owner_player_id)
-        )
-        return None if record is None else self._to_record(record)
+        row = (
+            await self.db.execute(
+                select(Note, Opponent.opponent_nick)
+                .join(Opponent, Note.opponent_id == Opponent.id)
+                .where(Note.id == note_id, Note.owner_player_id == owner_player_id)
+            )
+        ).first()
+        return None if row is None else self._to_record(row[0], row[1])
 
     async def find_by_nick(self, owner_player_id: int, nick: str) -> NoteRecord | None:
         """Заметка на этого оппонента, если она уже есть, — для показа перед правкой."""
-        record = await self.db.scalar(
-            select(Note).where(
-                Note.owner_player_id == owner_player_id, Note.opponent_nick == nick.strip()
+        row = (
+            await self.db.execute(
+                select(Note, Opponent.opponent_nick)
+                .join(Opponent, Note.opponent_id == Opponent.id)
+                .where(
+                    Note.owner_player_id == owner_player_id,
+                    func.lower(Opponent.opponent_nick) == func.lower(nick.strip()),
+                )
             )
-        )
-        return None if record is None else self._to_record(record)
+        ).first()
+        return None if row is None else self._to_record(row[0], row[1])
 
     async def count_for_player(self, owner_player_id: int) -> int:
         """Сколько заметок у игрока всего — знаменатель строки обрезки экрана.
@@ -1258,18 +1284,19 @@ class NotesRepo:
     async def list_for_player(self, owner_player_id: int, *, limit: int = 50) -> list[NoteRecord]:
         """Заметки игрока, свежие первыми."""
         stmt = (
-            select(Note)
+            select(Note, Opponent.opponent_nick)
+            .join(Opponent, Note.opponent_id == Opponent.id)
             .where(Note.owner_player_id == owner_player_id)
             .order_by(Note.updated_at.desc(), Note.id.desc())
             .limit(limit)
         )
-        return [self._to_record(row) for row in await self.db.scalars(stmt)]
+        return [self._to_record(note, nick) for note, nick in await self.db.execute(stmt)]
 
     @staticmethod
-    def _to_record(record: Note) -> NoteRecord:
+    def _to_record(record: Note, nick: str) -> NoteRecord:
         return NoteRecord(
             note_id=record.id,
-            nick=record.opponent_nick,
+            nick=nick,
             color=record.color,
             text=record.text,
             updated_at=record.updated_at,
@@ -1312,8 +1339,8 @@ class InvitesRepo:
         return result.first() is not None
 
 
-class AliasesRepo:
-    """`player_aliases` + `player_alias_links`: кто из участников турнира — какой ник.
+class OpponentsRepo:
+    """`opponents` + `opponent_links`: кто из участников турнира — какой оппонент.
 
     В файлах раздач участники обезличены, и метка участника сквозная только
     внутри турнира: между турнирами комната выдаёт новую. Связь между метками
@@ -1322,8 +1349,8 @@ class AliasesRepo:
     чего бы то ни было; методы ниже только записывают и читают сказанное
     владельцем.
 
-    Личность названа ником в руме — тем же ключом, что у заметки
-    (`NotesRepo`, колонка `notes.opponent_nick`), а не отдельным ярлыком.
+    Личность названа ником в руме и одна на весь продукт: на ту же строку
+    ссылается заметка (`NotesRepo`).
     """
 
     def __init__(self, db: AsyncSession) -> None:
@@ -1348,15 +1375,15 @@ class AliasesRepo:
         if found is not None:
             return found
         created_id = await self.db.scalar(
-            pg_insert(PlayerAlias)
+            pg_insert(Opponent)
             .values(owner_player_id=owner_player_id, opponent_nick=stripped)
             .on_conflict_do_nothing(
                 index_elements=[
-                    PlayerAlias.owner_player_id,
-                    func.lower(PlayerAlias.opponent_nick),
+                    Opponent.owner_player_id,
+                    func.lower(Opponent.opponent_nick),
                 ]
             )
-            .returning(PlayerAlias.id)
+            .returning(Opponent.id)
         )
         await self.db.flush()
         if created_id is not None:
@@ -1370,7 +1397,7 @@ class AliasesRepo:
         self,
         *,
         owner_player_id: int,
-        alias_id: int,
+        opponent_id: int,
         room_tournament_id: str,
         participant_label: str,
     ) -> int | None:
@@ -1384,62 +1411,62 @@ class AliasesRepo:
         такого оппонента у этого владельца нет.
 
         Один оператор, а не «прочитали — не нашли — вставили»: пара занимается
-        первичным ключом `player_alias_links`, и два одновременных вызова
-        физически не могут развести её по двум никам — проигравший ждёт коммита
+        первичным ключом `opponent_links`, и два одновременных вызова физически
+        не могут развести её по двум оппонентам — проигравший ждёт коммита
         победителя на самом конфликте и возвращает победителя
-        (`test_two_aliases_at_once_claim_one_participant_and_the_first_keeps_him`).
+        (`test_two_opponents_at_once_claim_one_participant_and_the_first_keeps_him`).
         `DO UPDATE`, а не `DO NOTHING`, именно ради этого: `DO NOTHING` вернул
         бы пустоту, неотличимую от «оппонента нет», а отдельным SELECT'ом после
         него чужую ещё не закоммиченную строку не увидеть.
 
-        Владелец сверяется тем же оператором: строка берётся из
-        `player_aliases`, и чужой номер просто не даёт ни одной строки на
-        вставку (`test_an_alias_of_another_player_takes_no_bindings`).
+        Владелец сверяется тем же оператором: строка берётся из `opponents`, и
+        чужой номер просто не даёт ни одной строки на вставку
+        (`test_an_opponent_of_another_player_takes_no_bindings`).
         """
         tournament = room_tournament_id.strip()
         label = participant_label.strip()
         if not tournament or not label:
             raise ValueError("турнир и метка участника не могут быть пустыми")
         taken = await self.db.scalar(
-            select(PlayerAliasLink.participant_label).where(
-                PlayerAliasLink.alias_id == alias_id,
-                PlayerAliasLink.room_tournament_id == tournament,
+            select(OpponentLink.participant_label).where(
+                OpponentLink.opponent_id == opponent_id,
+                OpponentLink.room_tournament_id == tournament,
             )
         )
         if taken is not None and taken != label:
             # Пол, ниже которого не пускает уникальный индекс
-            # `uq_player_alias_links_alias_tournament`; словами про это говорит
+            # `uq_opponent_links_opponent_tournament`; словами про это говорит
             # бот, до вызова
-            # (`test_one_alias_keeps_one_participant_per_tournament`). Проверка
-            # читает уже закоммиченное, поэтому ДВЕ одновременные привязки
-            # разных меток одного турнира к одному нику доходят до индекса, и
-            # проигравший получает `IntegrityError`, а не эти слова: у команды
-            # владельца такой одновременности не бывает, а тихо разойтись
-            # правило не имеет права.
+            # (`test_one_opponent_keeps_one_participant_per_tournament`).
+            # Проверка читает уже закоммиченное, поэтому ДВЕ одновременные
+            # привязки разных меток одного турнира к одному оппоненту доходят до
+            # индекса, и проигравший получает `IntegrityError`, а не эти слова:
+            # у команды владельца такой одновременности не бывает, а тихо
+            # разойтись правило не имеет права.
             raise ValueError("у этого оппонента в этом турнире уже есть метка")
         source = select(
             literal(owner_player_id),
             literal(tournament),
             literal(label),
-            PlayerAlias.id,
+            Opponent.id,
         ).where(
-            PlayerAlias.id == alias_id, PlayerAlias.owner_player_id == owner_player_id
+            Opponent.id == opponent_id, Opponent.owner_player_id == owner_player_id
         )
         holder = await self.db.scalar(
-            pg_insert(PlayerAliasLink)
+            pg_insert(OpponentLink)
             .from_select(
-                ["owner_player_id", "room_tournament_id", "participant_label", "alias_id"],
+                ["owner_player_id", "room_tournament_id", "participant_label", "opponent_id"],
                 source,
             )
             .on_conflict_do_update(
                 index_elements=[
-                    PlayerAliasLink.owner_player_id,
-                    PlayerAliasLink.room_tournament_id,
-                    PlayerAliasLink.participant_label,
+                    OpponentLink.owner_player_id,
+                    OpponentLink.room_tournament_id,
+                    OpponentLink.participant_label,
                 ],
-                set_={"alias_id": PlayerAliasLink.alias_id},
+                set_={"opponent_id": OpponentLink.opponent_id},
             )
-            .returning(PlayerAliasLink.alias_id)
+            .returning(OpponentLink.opponent_id)
         )
         await self.db.flush()
         return None if holder is None else int(holder)
@@ -1449,18 +1476,18 @@ class AliasesRepo:
     ) -> bool:
         """Снять привязку пары «турнир + метка»; `False` — её не было или она чужая."""
         result = await self.db.execute(
-            delete(PlayerAliasLink)
+            delete(OpponentLink)
             .where(
-                PlayerAliasLink.owner_player_id == owner_player_id,
-                PlayerAliasLink.room_tournament_id == room_tournament_id.strip(),
-                PlayerAliasLink.participant_label == participant_label.strip(),
+                OpponentLink.owner_player_id == owner_player_id,
+                OpponentLink.room_tournament_id == room_tournament_id.strip(),
+                OpponentLink.participant_label == participant_label.strip(),
             )
-            .returning(PlayerAliasLink.alias_id)
+            .returning(OpponentLink.opponent_id)
         )
         await self.db.flush()
         return result.first() is not None
 
-    async def list_for_player(self, owner_player_id: int) -> list[AliasRecord]:
+    async def list_for_player(self, owner_player_id: int) -> list[OpponentRecord]:
         """Все оппоненты владельца по алфавиту, с числом привязок у каждого.
 
         Без потолка запроса: страницу пришлось бы сопровождать вторым запросом
@@ -1471,50 +1498,50 @@ class AliasesRepo:
         """
         stmt = (
             select(
-                PlayerAlias.id,
-                PlayerAlias.opponent_nick,
-                func.count(PlayerAliasLink.alias_id),
+                Opponent.id,
+                Opponent.opponent_nick,
+                func.count(OpponentLink.opponent_id),
             )
-            .outerjoin(PlayerAliasLink, PlayerAliasLink.alias_id == PlayerAlias.id)
-            .where(PlayerAlias.owner_player_id == owner_player_id)
-            .group_by(PlayerAlias.id, PlayerAlias.opponent_nick)
-            .order_by(func.lower(PlayerAlias.opponent_nick), PlayerAlias.id)
+            .outerjoin(OpponentLink, OpponentLink.opponent_id == Opponent.id)
+            .where(Opponent.owner_player_id == owner_player_id)
+            .group_by(Opponent.id, Opponent.opponent_nick)
+            .order_by(func.lower(Opponent.opponent_nick), Opponent.id)
         )
         return [
-            AliasRecord(alias_id=alias_id, nick=nick, links=links)
-            for alias_id, nick, links in await self.db.execute(stmt)
+            OpponentRecord(opponent_id=opponent_id, nick=nick, links=links)
+            for opponent_id, nick, links in await self.db.execute(stmt)
         ]
 
-    async def get(self, alias_id: int, owner_player_id: int) -> AliasRecord | None:
+    async def get(self, opponent_id: int, owner_player_id: int) -> OpponentRecord | None:
         """Оппонент по номеру — только свой; `None`, если номер чужой или его нет."""
         found = [
             record
             for record in await self.list_for_player(owner_player_id)
-            if record.alias_id == alias_id
+            if record.opponent_id == opponent_id
         ]
         return found[0] if found else None
 
-    async def links(self, alias_id: int, owner_player_id: int) -> dict[str, str]:
+    async def links(self, opponent_id: int, owner_player_id: int) -> dict[str, str]:
         """Все привязки оппонента: турнир комнаты → метка участника в нём.
 
         Форма словаря, а не списка пар, — вход `player_stats_across_tournaments`
         (`analysis/player_stats.py`) один в один. Она не теряет строк: у одного
         оппонента в одном турнире метка не больше одной, и это держит уникальный
-        индекс `uq_player_alias_links_alias_tournament`, а не порядок обхода
-        (`test_one_alias_keeps_one_participant_per_tournament`).
+        индекс `uq_opponent_links_opponent_tournament`, а не порядок обхода
+        (`test_one_opponent_keeps_one_participant_per_tournament`).
         """
         stmt = select(
-            PlayerAliasLink.room_tournament_id, PlayerAliasLink.participant_label
+            OpponentLink.room_tournament_id, OpponentLink.participant_label
         ).where(
-            PlayerAliasLink.alias_id == alias_id,
-            PlayerAliasLink.owner_player_id == owner_player_id,
+            OpponentLink.opponent_id == opponent_id,
+            OpponentLink.owner_player_id == owner_player_id,
         )
         return {row[0]: row[1] for row in await self.db.execute(stmt)}
 
     async def _find_by_nick(self, owner_player_id: int, nick: str) -> int | None:
         return await self.db.scalar(
-            select(PlayerAlias.id).where(
-                PlayerAlias.owner_player_id == owner_player_id,
-                func.lower(PlayerAlias.opponent_nick) == func.lower(nick),
+            select(Opponent.id).where(
+                Opponent.owner_player_id == owner_player_id,
+                func.lower(Opponent.opponent_nick) == func.lower(nick),
             )
         )

@@ -33,12 +33,12 @@ __all__ = [
     "MAX_NOTE_TEXT_CHARS",
     "NOTE_COLORS",
     "NOTE_COLOR_NONE",
-    "AliasRecord",
     "LeakRule",
     "LeakStat",
     "LeaksOverview",
     "NoteColor",
     "NoteRecord",
+    "OpponentRecord",
     "SessionLine",
     "SessionSummary",
     "leak_rule_for",
@@ -249,7 +249,7 @@ class NoteRecord(BaseModel):
     updated_at: datetime
 
 
-class AliasRecord(BaseModel):
+class OpponentRecord(BaseModel):
     """Оппонент, которого владелец опознал по нику в руме, и его привязки.
 
     `nick` — ник в руме: тот же ключ личности, что у заметки
@@ -262,10 +262,10 @@ class AliasRecord(BaseModel):
     признака, что привязка состоялась, у владельца нет.
 
     Связь утверждает только владелец: ни одна привязка в этом проекте не
-    заводится по догадке — ни по стилю, ни по стеку, ни по совпадению чего бы
-    то ни было.
+    заводится по догадке системы — ни по стилю, ни по стеку, ни по совпадению
+    чего бы то ни было.
     """
 
-    alias_id: int
+    opponent_id: int
     nick: str
     links: int

@@ -862,6 +862,58 @@ async def test_a_note_of_another_player_is_neither_read_nor_deleted_by_its_numbe
     assert await notes.delete(foreign, theirs) is True
 
 
+async def test_a_note_and_a_link_on_the_same_nick_in_two_cases_meet_on_one_opponent(db):
+    """Заметка и сшивки турниров — про одного человека, и строка у него одна.
+
+    До миграции 0007 личность жила в двух местах с разными правилами регистра:
+    `Vasya` и `vasya` были одним оппонентом для сшивок и двумя для заметок.
+    """
+    from harness.memory.repos import NotesRepo, OpponentsRepo
+
+    owner, _session = await _player_with_session(db, tg_user_id=5019)
+    opponents = OpponentsRepo(db)
+    opponent_id = await opponents.get_or_create(owner_player_id=owner, nick="Vasya")
+    await opponents.link(
+        owner_player_id=owner,
+        opponent_id=opponent_id,
+        room_tournament_id="T1",
+        participant_label="p1",
+    )
+    notes = NotesRepo(db)
+    note_id = await notes.upsert(owner_player_id=owner, nick="vASYA", text_="фолдит на опен")
+
+    again = await notes.upsert(owner_player_id=owner, nick="  Vasya ", text_="донкает флоп")
+    found = await notes.find_by_nick(owner, "VASYA")
+
+    assert again == note_id
+    assert found is not None and found.note_id == note_id
+    # Написание — то, которым ника назвали первым: заметка второго не заводит.
+    assert found.nick == "Vasya"
+    assert [(o.nick, o.links) for o in await opponents.list_for_player(owner)] == [("Vasya", 1)]
+
+
+async def test_deleting_a_note_leaves_the_opponent_and_his_links(db):
+    """Удалена заметка — не человек: сшивки турниров о ней не знают."""
+    from harness.memory.repos import NotesRepo, OpponentsRepo
+
+    owner, _session = await _player_with_session(db, tg_user_id=5020)
+    opponents = OpponentsRepo(db)
+    opponent_id = await opponents.get_or_create(owner_player_id=owner, nick="Vasya")
+    await opponents.link(
+        owner_player_id=owner,
+        opponent_id=opponent_id,
+        room_tournament_id="T1",
+        participant_label="p1",
+    )
+    note_id = await NotesRepo(db).upsert(
+        owner_player_id=owner, nick="Vasya", text_="фолдит на опен"
+    )
+
+    assert await NotesRepo(db).delete(note_id, owner) is True
+    assert await opponents.links(opponent_id, owner) == {"T1": "p1"}
+    assert [(o.nick, o.links) for o in await opponents.list_for_player(owner)] == [("Vasya", 1)]
+
+
 async def test_an_invite_code_opens_the_door_exactly_once(db):
     """Инвайт гасится одним UPDATE: второй игрок с тем же кодом внутрь не попадает."""
     from harness.memory.repos import InvitesRepo
@@ -901,8 +953,10 @@ async def test_pending_input_is_remembered_and_cleared(db):
     assert player.pending_input is None
 
 
-async def test_migration_0005_adds_pending_input_and_the_note_uniqueness(pg):
-    """Миграция 0005 прокатана на живом Postgres — колонка и уникальный индекс."""
+async def test_the_note_column_and_uniqueness_are_in_the_live_schema(pg):
+    """Прокатано на живом Postgres: `players.pending_input` (0005) и одна
+    заметка на оппонента — уникальный индекс по `notes.opponent_id` (0007).
+    """
     engine = create_async_engine(pg.get_connection_url(driver="asyncpg"))
     try:
         async with engine.connect() as conn:
@@ -918,7 +972,7 @@ async def test_migration_0005_adds_pending_input_and_the_note_uniqueness(pg):
                 await conn.execute(
                     text(
                         "select indexdef from pg_indexes where tablename='notes' "
-                        "and indexname='uq_notes_owner_player_id_opponent_nick'"
+                        "and indexname='uq_notes_opponent_id'"
                     )
                 )
             ).first()
@@ -928,13 +982,13 @@ async def test_migration_0005_adds_pending_input_and_the_note_uniqueness(pg):
     assert index is not None and "UNIQUE" in index[0]
 
 
-# --- псевдонимы: оппонент по нику и его метки в турнирах ----------------------------
+# --- оппонент: ник в руме и его метки в турнирах ------------------------------------
 
 
 async def _opponent(db, owner_player_id: int, nick: str) -> int:
-    from harness.memory.repos import AliasesRepo
+    from harness.memory.repos import OpponentsRepo
 
-    return await AliasesRepo(db).get_or_create(owner_player_id=owner_player_id, nick=nick)
+    return await OpponentsRepo(db).get_or_create(owner_player_id=owner_player_id, nick=nick)
 
 
 async def test_the_same_nick_in_another_case_is_the_same_opponent(db):
@@ -943,14 +997,14 @@ async def test_the_same_nick_in_another_case_is_the_same_opponent(db):
     Иначе собственная опечатка в регистре развела бы одного человека на двоих, и
     его частоты посчитались бы по половине истории каждая.
     """
-    from harness.memory.repos import AliasesRepo
+    from harness.memory.repos import OpponentsRepo
 
     owner, _session = await _player_with_session(db, tg_user_id=6001)
     first = await _opponent(db, owner, "Vasya")
     again = await _opponent(db, owner, "  vASYA ")
 
     assert again == first
-    assert [(a.nick, a.links) for a in await AliasesRepo(db).list_for_player(owner)] == [
+    assert [(a.nick, a.links) for a in await OpponentsRepo(db).list_for_player(owner)] == [
         ("Vasya", 0)
     ]
 
@@ -967,108 +1021,108 @@ async def test_a_participant_already_bound_keeps_his_first_nick(db):
     Возвращается номер того ника, за которым метка закреплена: вызывающему надо
     сказать игроку, с чем именно спорит его команда.
     """
-    from harness.memory.repos import AliasesRepo
+    from harness.memory.repos import OpponentsRepo
 
     owner, _session = await _player_with_session(db, tg_user_id=6003)
     first = await _opponent(db, owner, "Vasya")
     second = await _opponent(db, owner, "Petya")
-    aliases = AliasesRepo(db)
+    opponents = OpponentsRepo(db)
 
-    mine = await aliases.link(
-        owner_player_id=owner, alias_id=first, room_tournament_id="T1", participant_label="p1"
+    mine = await opponents.link(
+        owner_player_id=owner, opponent_id=first, room_tournament_id="T1", participant_label="p1"
     )
-    stolen = await aliases.link(
-        owner_player_id=owner, alias_id=second, room_tournament_id="T1", participant_label="p1"
+    stolen = await opponents.link(
+        owner_player_id=owner, opponent_id=second, room_tournament_id="T1", participant_label="p1"
     )
 
     assert mine == first
     assert stolen == first
-    assert await aliases.links(second, owner) == {}
+    assert await opponents.links(second, owner) == {}
 
 
 async def test_binding_the_same_pair_again_changes_nothing(db):
-    from harness.memory.repos import AliasesRepo
+    from harness.memory.repos import OpponentsRepo
 
     owner, _session = await _player_with_session(db, tg_user_id=6004)
-    alias_id = await _opponent(db, owner, "Vasya")
-    aliases = AliasesRepo(db)
+    opponent_id = await _opponent(db, owner, "Vasya")
+    opponents = OpponentsRepo(db)
 
-    once = await aliases.link(
-        owner_player_id=owner, alias_id=alias_id, room_tournament_id="T1", participant_label="p1"
+    once = await opponents.link(
+        owner_player_id=owner, opponent_id=opponent_id, room_tournament_id="T1", participant_label="p1"
     )
-    twice = await aliases.link(
-        owner_player_id=owner, alias_id=alias_id, room_tournament_id="T1", participant_label="p1"
+    twice = await opponents.link(
+        owner_player_id=owner, opponent_id=opponent_id, room_tournament_id="T1", participant_label="p1"
     )
 
-    assert (once, twice) == (alias_id, alias_id)
-    assert await aliases.links(alias_id, owner) == {"T1": "p1"}
+    assert (once, twice) == (opponent_id, opponent_id)
+    assert await opponents.links(opponent_id, owner) == {"T1": "p1"}
 
 
-async def test_one_alias_keeps_one_participant_per_tournament(db):
+async def test_one_opponent_keeps_one_participant_per_tournament(db):
     """В турнире у участника один идентификатор, поэтому второй у того же ника —
     отказ: иначе в статистику одного человека сложились бы двое, и раздачи этого
     турнира посчитались бы дважды.
     """
-    from harness.memory.repos import AliasesRepo
+    from harness.memory.repos import OpponentsRepo
 
     owner, _session = await _player_with_session(db, tg_user_id=6005)
-    alias_id = await _opponent(db, owner, "Vasya")
-    aliases = AliasesRepo(db)
-    await aliases.link(
-        owner_player_id=owner, alias_id=alias_id, room_tournament_id="T1", participant_label="p1"
+    opponent_id = await _opponent(db, owner, "Vasya")
+    opponents = OpponentsRepo(db)
+    await opponents.link(
+        owner_player_id=owner, opponent_id=opponent_id, room_tournament_id="T1", participant_label="p1"
     )
 
     with pytest.raises(ValueError, match="уже есть метка"):
-        await aliases.link(
+        await opponents.link(
             owner_player_id=owner,
-            alias_id=alias_id,
+            opponent_id=opponent_id,
             room_tournament_id="T1",
             participant_label="p2",
         )
-    assert await aliases.links(alias_id, owner) == {"T1": "p1"}
+    assert await opponents.links(opponent_id, owner) == {"T1": "p1"}
 
 
 async def test_the_bindings_of_an_opponent_come_as_tournament_to_label(db):
     """Форма привязок — вход `player_stats_across_tournaments` один в один."""
-    from harness.memory.repos import AliasesRepo
+    from harness.memory.repos import OpponentsRepo
 
     owner, _session = await _player_with_session(db, tg_user_id=6006)
-    alias_id = await _opponent(db, owner, "Vasya")
-    aliases = AliasesRepo(db)
-    await aliases.link(
-        owner_player_id=owner, alias_id=alias_id, room_tournament_id="T1", participant_label="p1"
+    opponent_id = await _opponent(db, owner, "Vasya")
+    opponents = OpponentsRepo(db)
+    await opponents.link(
+        owner_player_id=owner, opponent_id=opponent_id, room_tournament_id="T1", participant_label="p1"
     )
-    await aliases.link(
-        owner_player_id=owner, alias_id=alias_id, room_tournament_id="T2", participant_label="zz"
+    await opponents.link(
+        owner_player_id=owner, opponent_id=opponent_id, room_tournament_id="T2", participant_label="zz"
     )
 
-    assert await aliases.links(alias_id, owner) == {"T1": "p1", "T2": "zz"}
-    assert [(a.nick, a.links) for a in await aliases.list_for_player(owner)] == [("Vasya", 2)]
+    assert await opponents.links(opponent_id, owner) == {"T1": "p1", "T2": "zz"}
+    assert [(a.nick, a.links) for a in await opponents.list_for_player(owner)] == [("Vasya", 2)]
 
 
-async def test_an_alias_of_another_player_takes_no_bindings(db):
+async def test_an_opponent_of_another_player_takes_no_bindings(db):
     """Номер оппонента приходит аргументом — владелец сверяется тем же оператором,
     который вставляет: составной внешний ключ не даёт записать чужого.
     """
-    from harness.memory.repos import AliasesRepo
+    from harness.memory.repos import OpponentsRepo
 
     mine, _my_session = await _player_with_session(db, tg_user_id=6007)
     theirs, _their_session = await _player_with_session(db, tg_user_id=6008)
     foreign = await _opponent(db, theirs, "Vasya")
-    aliases = AliasesRepo(db)
+    opponents = OpponentsRepo(db)
 
     assert (
-        await aliases.link(
+        await opponents.link(
             owner_player_id=mine,
-            alias_id=foreign,
+            opponent_id=foreign,
             room_tournament_id="T1",
             participant_label="p1",
         )
         is None
     )
-    assert await aliases.links(foreign, mine) == {}
-    assert await aliases.get(foreign, mine) is None
-    assert await aliases.list_for_player(mine) == []
+    assert await opponents.links(foreign, mine) == {}
+    assert await opponents.get(foreign, mine) is None
+    assert await opponents.list_for_player(mine) == []
 
 
 async def test_the_same_nick_of_two_players_is_two_opponents(db):
@@ -1081,52 +1135,52 @@ async def test_the_same_nick_of_two_players_is_two_opponents(db):
 
 async def test_unbinding_frees_the_participant_for_another_nick(db):
     """Ошибку владельца можно отменить: отвязали — метка свободна."""
-    from harness.memory.repos import AliasesRepo
+    from harness.memory.repos import OpponentsRepo
 
     owner, _session = await _player_with_session(db, tg_user_id=6011)
     wrong = await _opponent(db, owner, "Vasya")
     right = await _opponent(db, owner, "Petya")
-    aliases = AliasesRepo(db)
-    await aliases.link(
-        owner_player_id=owner, alias_id=wrong, room_tournament_id="T1", participant_label="p1"
+    opponents = OpponentsRepo(db)
+    await opponents.link(
+        owner_player_id=owner, opponent_id=wrong, room_tournament_id="T1", participant_label="p1"
     )
 
     assert (
-        await aliases.unlink(
+        await opponents.unlink(
             owner_player_id=owner, room_tournament_id="T1", participant_label="p1"
         )
         is True
     )
     assert (
-        await aliases.link(
+        await opponents.link(
             owner_player_id=owner,
-            alias_id=right,
+            opponent_id=right,
             room_tournament_id="T1",
             participant_label="p1",
         )
         == right
     )
-    assert await aliases.links(wrong, owner) == {}
+    assert await opponents.links(wrong, owner) == {}
 
 
 async def test_a_binding_of_another_player_is_not_removed_by_its_pair(db):
-    from harness.memory.repos import AliasesRepo
+    from harness.memory.repos import OpponentsRepo
 
     mine, _my_session = await _player_with_session(db, tg_user_id=6012)
     theirs, _their_session = await _player_with_session(db, tg_user_id=6013)
     foreign = await _opponent(db, theirs, "Vasya")
-    aliases = AliasesRepo(db)
-    await aliases.link(
-        owner_player_id=theirs, alias_id=foreign, room_tournament_id="T1", participant_label="p1"
+    opponents = OpponentsRepo(db)
+    await opponents.link(
+        owner_player_id=theirs, opponent_id=foreign, room_tournament_id="T1", participant_label="p1"
     )
 
     assert (
-        await aliases.unlink(
+        await opponents.unlink(
             owner_player_id=mine, room_tournament_id="T1", participant_label="p1"
         )
         is False
     )
-    assert await aliases.links(foreign, theirs) == {"T1": "p1"}
+    assert await opponents.links(foreign, theirs) == {"T1": "p1"}
 
 
 async def test_deleting_an_opponent_takes_his_bindings_with_him(db):
@@ -1136,19 +1190,19 @@ async def test_deleting_an_opponent_takes_his_bindings_with_him(db):
     from sqlalchemy import delete as sql_delete
     from sqlalchemy import select as sql_select
 
-    from harness.memory.models import PlayerAlias, PlayerAliasLink
-    from harness.memory.repos import AliasesRepo
+    from harness.memory.models import Opponent, OpponentLink
+    from harness.memory.repos import OpponentsRepo
 
     owner, _session = await _player_with_session(db, tg_user_id=6014)
-    alias_id = await _opponent(db, owner, "Vasya")
-    await AliasesRepo(db).link(
-        owner_player_id=owner, alias_id=alias_id, room_tournament_id="T1", participant_label="p1"
+    opponent_id = await _opponent(db, owner, "Vasya")
+    await OpponentsRepo(db).link(
+        owner_player_id=owner, opponent_id=opponent_id, room_tournament_id="T1", participant_label="p1"
     )
 
-    await db.execute(sql_delete(PlayerAlias).where(PlayerAlias.id == alias_id))
+    await db.execute(sql_delete(Opponent).where(Opponent.id == opponent_id))
     await db.flush()
 
-    left = (await db.execute(sql_select(PlayerAliasLink.alias_id))).all()
+    left = (await db.execute(sql_select(OpponentLink.opponent_id))).all()
     assert left == []
 
 
@@ -1163,7 +1217,7 @@ async def test_a_binding_outlives_the_tournament_row_it_came_from(db):
 
     from harness.memory.models import Hand as HandRow
     from harness.memory.models import Tournament as TournamentRow
-    from harness.memory.repos import AliasesRepo
+    from harness.memory.repos import OpponentsRepo
 
     owner, session_id = await _player_with_session(db, tg_user_id=6015)
     tournament_row = await TournamentsRepo(db).create(session_id=session_id, source_file="a.txt")
@@ -1172,10 +1226,10 @@ async def test_a_binding_outlives_the_tournament_row_it_came_from(db):
     )
     hand = await HandsRepo(db).get(hand_id)
     assert hand.canonical is not None
-    alias_id = await _opponent(db, owner, "Vasya")
-    await AliasesRepo(db).link(
+    opponent_id = await _opponent(db, owner, "Vasya")
+    await OpponentsRepo(db).link(
         owner_player_id=owner,
-        alias_id=alias_id,
+        opponent_id=opponent_id,
         room_tournament_id=hand.canonical.tournament_id,
         participant_label=hand.canonical.players[0].label,
     )
@@ -1184,37 +1238,37 @@ async def test_a_binding_outlives_the_tournament_row_it_came_from(db):
     await db.execute(sql_delete(TournamentRow).where(TournamentRow.id == tournament_row))
     await db.flush()
 
-    assert await AliasesRepo(db).links(alias_id, owner) == {
+    assert await OpponentsRepo(db).links(opponent_id, owner) == {
         hand.canonical.tournament_id: hand.canonical.players[0].label
     }
 
 
-async def test_two_aliases_at_once_claim_one_participant_and_the_first_keeps_him(db_factory):
+async def test_two_opponents_at_once_claim_one_participant_and_the_first_keeps_him(db_factory):
     """Две привязки одной пары, идущие ОДНОВРЕМЕННО, дают одну строку и один ответ.
 
     Барьер делает одновременность предусловием теста, а не следствием таймингов
     (тот же приём, что `_rendezvous` в `test_bot_handlers.py`): пока обе
     корутины не вошли, ни одна не доходит до своего оператора. Проигравший
     ждёт коммита победителя на самом первичном ключе и возвращает победителя —
-    «прочитали — не нашли — вставили» развело бы пару по двум никам.
+    «прочитали — не нашли — вставили» развело бы пару по двум оппонентам.
     """
-    from harness.memory.repos import AliasesRepo, PlayersRepo
+    from harness.memory.repos import OpponentsRepo, PlayersRepo
 
     async with db_factory() as session:
         owner = await PlayersRepo(session).get_or_create(tg_user_id=6016)
-        first = await AliasesRepo(session).get_or_create(owner_player_id=owner.id, nick="Vasya")
-        second = await AliasesRepo(session).get_or_create(owner_player_id=owner.id, nick="Petya")
+        first = await OpponentsRepo(session).get_or_create(owner_player_id=owner.id, nick="Vasya")
+        second = await OpponentsRepo(session).get_or_create(owner_player_id=owner.id, nick="Petya")
         owner_id = owner.id
         await session.commit()
 
     barrier = asyncio.Barrier(2)
 
-    async def bind(alias_id: int) -> int | None:
+    async def bind(opponent_id: int) -> int | None:
         async with db_factory() as session:
             await asyncio.wait_for(barrier.wait(), timeout=_RIVAL_TIMEOUT_S)
-            holder = await AliasesRepo(session).link(
+            holder = await OpponentsRepo(session).link(
                 owner_player_id=owner_id,
-                alias_id=alias_id,
+                opponent_id=opponent_id,
                 room_tournament_id="T1",
                 participant_label="p1",
             )
@@ -1226,7 +1280,7 @@ async def test_two_aliases_at_once_claim_one_participant_and_the_first_keeps_him
     assert len(set(answers)) == 1, f"одна пара досталась двум никам: {answers}"
     async with db_factory() as session:
         rows = (
-            await session.execute(text("select alias_id from player_alias_links"))
+            await session.execute(text("select opponent_id from opponent_links"))
         ).scalars().all()
     assert rows == [answers[0]]
 
@@ -1265,9 +1319,9 @@ async def test_the_last_analysis_of_another_player_is_not_mine(db):
     assert await HandsRepo(db).last_canonical(mine) is None
 
 
-async def test_migration_0006_holds_the_alias_rules_in_the_database(pg):
-    """Правила псевдонимов держит схема, а не код: индекс по `lower(ник)`,
-    первичный ключ пары и каскад по внешнему ключу — прокатаны на живом Postgres.
+async def test_the_opponent_rules_are_held_by_the_schema_not_by_the_code(pg):
+    """Индекс по `lower(ник)`, первичный ключ пары и каскад по внешнему ключу —
+    прокатаны на живом Postgres миграциями 0006 и 0007.
     """
     engine = create_async_engine(pg.get_connection_url(driver="asyncpg"))
     try:
@@ -1275,8 +1329,8 @@ async def test_migration_0006_holds_the_alias_rules_in_the_database(pg):
             nick_index = (
                 await conn.execute(
                     text(
-                        "select indexdef from pg_indexes where tablename='player_aliases' "
-                        "and indexname='uq_player_aliases_owner_player_id_lower_nick'"
+                        "select indexdef from pg_indexes where tablename='opponents' "
+                        "and indexname='uq_opponents_owner_player_id_lower_nick'"
                     )
                 )
             ).scalar()
@@ -1284,7 +1338,7 @@ async def test_migration_0006_holds_the_alias_rules_in_the_database(pg):
                 await conn.execute(
                     text(
                         "select pg_get_constraintdef(oid) from pg_constraint "
-                        "where conrelid='player_alias_links'::regclass and contype='p'"
+                        "where conrelid='opponent_links'::regclass and contype='p'"
                     )
                 )
             ).scalar()
@@ -1292,7 +1346,7 @@ async def test_migration_0006_holds_the_alias_rules_in_the_database(pg):
                 await conn.execute(
                     text(
                         "select pg_get_constraintdef(oid) from pg_constraint "
-                        "where conrelid='player_alias_links'::regclass and contype='f'"
+                        "where conrelid='opponent_links'::regclass and contype='f'"
                     )
                 )
             ).scalars().all()
@@ -1308,10 +1362,189 @@ async def test_migration_0006_holds_the_alias_rules_in_the_database(pg):
     # вовсе — привязка живёт номером турнира комнаты.
     assert foreign_keys == [
         (
-            "FOREIGN KEY (alias_id, owner_player_id) REFERENCES "
-            "player_aliases(id, owner_player_id) ON DELETE CASCADE"
+            "FOREIGN KEY (opponent_id, owner_player_id) REFERENCES "
+            "opponents(id, owner_player_id) ON DELETE CASCADE"
         )
     ]
+
+
+_PLANTED_NOTES = """
+insert into notes (owner_player_id, opponent_nick, color, text, updated_at)
+values (:owner, :nick, :color, :text, :moment)
+returning id
+"""
+
+
+def test_migration_0007_collapses_notes_of_one_nick_in_two_cases():
+    """Правило схлопывания и откат — прокатаны на базе С ДАННЫМИ, а не на пустой.
+
+    В живой базе на день миграции заметок нет вовсе, поэтому спорного случая в
+    переливке не будет ни одного. Правило всё равно обязано быть определённым:
+    миграция переживёт этот день, а на чужой копии две заметки на один ник в
+    разном регистре законны — их разрешал уникальный индекс 0005.
+
+    Свой контейнер, а не сессионный `pg`: тест катает схему вперёд и назад, и
+    делать это с базой, на которой стоят остальные тесты, нельзя.
+    """
+    from alembic import command
+    from sqlalchemy import create_engine
+    from testcontainers.community.postgres import PostgresContainer
+
+    from tests.conftest import alembic_config
+
+    earlier = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
+    later = datetime(2026, 9, 2, 12, 0, tzinfo=UTC)
+    with PostgresContainer("postgres:16-alpine") as container:
+        dsn = container.get_connection_url(driver="psycopg")
+        config = alembic_config(dsn)
+        command.upgrade(config, "0006")
+        engine = create_engine(dsn)
+        try:
+            with engine.begin() as conn:
+                mine = conn.execute(
+                    text("insert into players (tg_user_id) values (9001) returning id")
+                ).scalar_one()
+                theirs = conn.execute(
+                    text("insert into players (tg_user_id) values (9002) returning id")
+                ).scalar_one()
+                # Оппонент, который у владельца уже назван, — написание берётся
+                # отсюда, а не из заметки.
+                named = conn.execute(
+                    text(
+                        "insert into player_aliases (owner_player_id, opponent_nick) "
+                        "values (:owner, 'Vasya') returning id"
+                    ),
+                    {"owner": mine},
+                ).scalar_one()
+                conn.execute(
+                    text(
+                        "insert into player_alias_links (owner_player_id, room_tournament_id, "
+                        "participant_label, alias_id) values (:owner, 'T1', 'p1', :alias)"
+                    ),
+                    {"owner": mine, "alias": named},
+                )
+                old_note = conn.execute(
+                    text(_PLANTED_NOTES),
+                    {
+                        "owner": mine,
+                        "nick": "vasya",
+                        "color": "red",
+                        "text": "фолдит на опен",
+                        "moment": earlier,
+                    },
+                ).scalar_one()
+                fresh_note = conn.execute(
+                    text(_PLANTED_NOTES),
+                    {
+                        "owner": mine,
+                        "nick": "VASYA",
+                        "color": "green",
+                        "text": "донкает флоп",
+                        "moment": later,
+                    },
+                ).scalar_one()
+                # Ник, которого в `player_aliases` нет вовсе, — оппонент заводится
+                # миграцией; и тот же ник у ДРУГОГО владельца, который схлопнуться
+                # с чужим не имеет права.
+                lone_note = conn.execute(
+                    text(_PLANTED_NOTES),
+                    {
+                        "owner": mine,
+                        "nick": "Petya",
+                        "color": "none",
+                        "text": "лимпит",
+                        "moment": earlier,
+                    },
+                ).scalar_one()
+                foreign_note = conn.execute(
+                    text(_PLANTED_NOTES),
+                    {
+                        "owner": theirs,
+                        "nick": "vasya",
+                        "color": "none",
+                        "text": "их заметка",
+                        "moment": later,
+                    },
+                ).scalar_one()
+
+            command.upgrade(config, "head")
+
+            with engine.connect() as conn:
+                merged = conn.execute(
+                    text(
+                        "select n.id, n.text, n.color, o.opponent_nick "
+                        "from notes n join opponents o on o.id = n.opponent_id "
+                        "where n.owner_player_id = :owner order by n.id"
+                    ),
+                    {"owner": mine},
+                ).all()
+                foreign = conn.execute(
+                    text(
+                        "select n.id, n.text, o.opponent_nick, o.owner_player_id "
+                        "from notes n join opponents o on o.id = n.opponent_id "
+                        "where n.owner_player_id = :owner"
+                    ),
+                    {"owner": theirs},
+                ).one()
+
+            # Выжила свежая строка; её id остался, поэтому кнопки уже
+            # отправленных сообщений ведут к ней.
+            survivor = next(row for row in merged if row.opponent_nick == "Vasya")
+            assert survivor.id == fresh_note
+            assert old_note not in {row.id for row in merged}
+            # Ни один символ не потерян, порядок хронологический.
+            assert survivor.text == "фолдит на опен\nдонкает флоп"
+            # Цвет — от выжившей строки.
+            assert survivor.color == "green"
+            # Ник, которого не было в `opponents`, завёл оппонента своим написанием.
+            assert {(row.id, row.opponent_nick) for row in merged} == {
+                (fresh_note, "Vasya"),
+                (lone_note, "Petya"),
+            }
+            # Чужая заметка на тот же ник — чужой оппонент, схлопывания нет.
+            assert foreign.id == foreign_note
+            assert (foreign.opponent_nick, foreign.owner_player_id) == ("vasya", theirs)
+
+            command.downgrade(config, "-1")
+
+            with engine.connect() as conn:
+                back = conn.execute(
+                    text(
+                        "select id, opponent_nick, text from notes "
+                        "where owner_player_id = :owner order by id"
+                    ),
+                    {"owner": mine},
+                ).all()
+                links = conn.execute(
+                    text("select alias_id, room_tournament_id from player_alias_links")
+                ).all()
+
+            # Откат возвращает ник из связанного оппонента; схлопнутая СТРОКА не
+            # воскресает, но её текст остался в выжившей.
+            assert [(row.id, row.opponent_nick) for row in back] == [
+                (fresh_note, "Vasya"),
+                (lone_note, "Petya"),
+            ]
+            assert back[0].text == "фолдит на опен\nдонкает флоп"
+            assert links == [(named, "T1")]
+
+            command.upgrade(config, "head")
+
+            with engine.connect() as conn:
+                again = conn.execute(
+                    text(
+                        "select n.id, o.opponent_nick from notes n "
+                        "join opponents o on o.id = n.opponent_id "
+                        "where n.owner_player_id = :owner order by n.id"
+                    ),
+                    {"owner": mine},
+                ).all()
+            assert [(row.id, row.opponent_nick) for row in again] == [
+                (fresh_note, "Vasya"),
+                (lone_note, "Petya"),
+            ]
+        finally:
+            engine.dispose()
 
 
 def test_the_models_say_the_same_as_the_migrations(pg):
