@@ -271,7 +271,7 @@ def test_scan_summary_msg_total_loss_label_differs_from_items_sum():
     порога 0.1bb (докстринг `ScanSummary.total_loss_bb`) — на настоящем турнире
     первое обычно больше суммы вторых. Числа здесь НАРОЧНО не совпадают (единый
     видимый пункт −2.3bb против заголовочных −5.0bb), а подпись заголовка
-    обязана явно называть его «по всем точкам разбора», а не пересказывать
+    обязана называть множество, по которому число посчитано, а не пересказывать
     список ниже — иначе игрок видит два разных числа под одинаковой подписью
     и решает, что мы ошиблись в счёте (fix round 1, Important 2; докстринг
     `scan.py` — требование, которое бриф задачи 17 не унёс, ревью — унесло).
@@ -280,9 +280,34 @@ def test_scan_summary_msg_total_loss_label_differs_from_items_sum():
     s = ScanSummary(hands_total=20, hands_with_decision=15, items=items, total_loss_bb=-5.0)
     msg = scan_summary_msg(s, quota_left=1, quota_total=1)
 
-    assert "Суммарная потеря по всем точкам разбора: −5.0 bb." in msg.text
+    assert "Суммарная потеря в оценённых решениях: −5.0 bb." in msg.text
     assert "−2.3 bb" in msg.text  # цена одной показанной строки — другое число
     assert "Суммарная цена расхождений" not in msg.text  # старая (неточная) подпись
+
+
+def test_scan_summary_msg_scopes_the_loss_to_the_judged_points():
+    """Подпись суммы накрывает ровно то множество, по которому сумма посчитана.
+
+    `total_loss_bb` складывает только судимые точки (`analysis.error_cost.
+    total_ev_loss_bb` фильтрует по `is_judged`), поэтому подпись «по всем точкам
+    разбора» при `points_judged` меньше `points_total` утверждает больше, чем
+    покрывает: у точки без вердикта `ev_diff_bb` равен нулю потому, что не
+    посчитан, и накрытый такой подписью ноль читается как «потерь не было».
+    Числа взяты из живого прогона турнира: 38 судимых точек из 330.
+    """
+    s = ScanSummary(
+        hands_total=100,
+        hands_with_decision=38,
+        items=[],
+        total_loss_bb=0.0,
+        points_total=330,
+        points_judged=38,
+    )
+    msg = scan_summary_msg(s, quota_left=1, quota_total=1)
+
+    assert "Оценено решений: 38 из 330." in msg.text
+    assert "Суммарная потеря в оценённых решениях: 0.0 bb." in msg.text
+    assert "по всем точкам разбора" not in msg.text
 
 
 def test_scan_summary_msg_surfaces_hands_failed_when_nonzero():
@@ -1436,8 +1461,25 @@ def test_session_summary_msg_counts_the_evening_and_names_its_leak():
 
     assert "Турниров: 1 · разобрано раздач: 12." in msg.text
     assert "Оценено решений: 18 из 24 за этот вечер." in msg.text
-    assert "Суммарная потеря по всем точкам разбора: −6.3 bb." in msg.text
+    assert "Суммарная потеря в оценённых решениях: −6.3 bb." in msg.text
     assert "Сбрасывает против шова, где колл плюсовой — 3 раза, −4.1 bb" in msg.text
+
+
+def test_session_summary_msg_scopes_the_loss_to_the_judged_points():
+    """Сводка вечера подписывает сумму тем же множеством, что и сводка скана.
+
+    `SessionsRepo._session_loss_bb` складывает отрицательные `ev_diff_bb` только
+    по судимым точкам, поэтому «по всем точкам разбора» рядом со строкой
+    покрытия, которая сама говорит `18 из 24`, утверждало бы, что в сумму вошли
+    и шесть точек без вердикта.
+    """
+    from harness.presentation import session_summary_msg
+
+    msg = session_summary_msg(_summary(loss_bb=0.0, points_judged=18, points_total=24))
+
+    assert "Оценено решений: 18 из 24 за этот вечер." in msg.text
+    assert "Суммарная потеря в оценённых решениях: 0.0 bb." in msg.text
+    assert "по всем точкам разбора" not in msg.text
 
 
 def test_session_summary_msg_signs_the_leak_by_its_price_not_its_frequency():
