@@ -1581,3 +1581,663 @@ def test_the_models_say_the_same_as_the_migrations(pg):
             assert compare_metadata(context, Base.metadata) == []
     finally:
         engine.dispose()
+
+
+# --- задача 24: точки решения строками ----------------------------------------
+
+
+def _points_of_every_shape():
+    """Четыре точки, покрывающие все формы вердикта: судимая, судимая в зоне
+    «предполагая» с допущением, «около нуля» и вовсе не посчитанная.
+
+    `dp_index` идут НЕ по возрастанию: порядок в массиве задаёт `point_no`, а не
+    номер точки решения, и тест обязан их различать.
+    """
+    from harness.contracts import (
+        Assumption,
+        EvInterval,
+        PointVerdict,
+        Range,
+        SpotKind,
+        Street,
+        Zone,
+    )
+
+    return [
+        PointVerdict(
+            dp_index=2,
+            street=Street.PREFLOP,
+            spot=SpotKind.PUSHFOLD_UNOPENED,
+            zone=Zone.STRICT,
+            action_taken="fold",
+            best_action="shove",
+            ev_diff_bb=-2.0,
+            tools=["pushfold"],
+            detail={"lookup_depth_bb": 9.5},
+        ),
+        PointVerdict(
+            dp_index=0,
+            street=Street.PREFLOP,
+            spot=SpotKind.PUSHFOLD_FACING_SHOVE,
+            zone=Zone.ASSUMING,
+            action_taken="call",
+            best_action="fold",
+            ev_diff_bb=-5.0,
+            interval=EvInterval(point_bb=-5.0, low_bb=-6.0, high_bb=-1.0),
+            assumption=Assumption(
+                range=Range(weights={"AA": 1.0, "KK": 0.5}), source="model:test", note="шов с BTN"
+            ),
+        ),
+        PointVerdict(
+            dp_index=3,
+            street=Street.PREFLOP,
+            spot=SpotKind.PUSHFOLD_UNOPENED,
+            zone=Zone.STRICT,
+            action_taken="fold",
+            best_action="около нуля, оба варианта допустимы",
+            ev_diff_bb=0.0,
+            interval=EvInterval(point_bb=0.0, low_bb=-0.2, high_bb=0.3, near_zero=True),
+        ),
+        PointVerdict(
+            dp_index=1,
+            street=Street.FLOP,
+            spot=SpotKind.POSTFLOP,
+            zone=Zone.STRICT,
+            action_taken="call",
+            best_action="",
+            ev_diff_bb=0.0,
+        ),
+    ]
+
+
+def _result_of_every_shape(hand_no: str = "P1") -> AnalysisResult:
+    return AnalysisResult(
+        hand_no=hand_no, points=_points_of_every_shape(), ranked=[1, 0], total_ev_loss_bb=-7.0
+    )
+
+
+async def _hand_with_points(db, *, session_id: int, hand_no: str, decision_points=()) -> int:
+    raw = RawHand.model_validate(make_min_raw(hand_no=hand_no))
+    hand_id = await HandsRepo(db).save_raw(session_id=session_id, raw=raw)
+    await AnalysesRepo(db).save(
+        hand_id=hand_id,
+        result=_result_of_every_shape(hand_no),
+        decision_points=list(decision_points),
+    )
+    return hand_id
+
+
+def test_every_field_of_a_point_verdict_has_its_column():
+    """Ни одно поле вердикта не теряется при записи — и не потеряется потом.
+
+    Таблица — ЕДИНСТВЕННОЕ место, где точка хранится, поэтому новое поле
+    `PointVerdict` без колонки означало бы тихую потерю данных, которую
+    заметил бы только читатель разбора. Карта одна на запись и на чтение, и
+    этот тест не даёт ей отстать от контракта.
+    """
+    from harness.contracts import PointVerdict
+    from harness.memory.models import DecisionPointRow
+    from harness.memory.repos import _POINT_COLUMNS
+
+    assert set(PointVerdict.model_fields) == set(_POINT_COLUMNS)
+    assert set(_POINT_COLUMNS.values()) <= {c.name for c in DecisionPointRow.__table__.columns}
+
+
+def test_every_field_of_the_stored_context_belongs_to_a_decision_point():
+    """Обстановка точки берётся из контракта движка, а не придумывается памятью."""
+    from harness.contracts import DecisionPoint
+    from harness.memory.models import DecisionPointRow
+    from harness.memory.repos import _CONTEXT_COLUMNS
+
+    assert set(_CONTEXT_COLUMNS) <= set(DecisionPoint.model_fields)
+    assert set(_CONTEXT_COLUMNS) <= {c.name for c in DecisionPointRow.__table__.columns}
+
+
+async def test_the_analysis_document_returns_from_the_rows_as_it_went_in(db):
+    """Разбор, разложенный по строкам и собранный обратно, — тот же самый.
+
+    Включая порядок: `ranked` индексирует МАССИВ точек, поэтому перестановка
+    (например, сортировка по `dp_index`, которая здесь дала бы другой порядок)
+    увела бы ранжирование на чужие точки.
+    """
+    session_id = await _make_session(db)
+    result = _result_of_every_shape()
+    hand_id = await _hand_with_points(db, session_id=session_id, hand_no="P1")
+
+    got = await AnalysesRepo(db).get_by_hand(hand_id)
+
+    assert got is not None
+    assert got.result == result
+    assert [point.dp_index for point in got.result.points] == [2, 0, 3, 1]
+
+
+async def test_the_saved_document_carries_no_points_of_its_own(db):
+    """В `analyses.result` точек больше нет — второй копии вердикта не существует.
+
+    Это и есть ответ на «один источник или два»: разойтись нечему.
+    """
+    session_id = await _make_session(db)
+    hand_id = await _hand_with_points(db, session_id=session_id, hand_no="P2")
+
+    stored = await db.scalar(
+        text("select result from analyses where hand_id = :hand"), {"hand": hand_id}
+    )
+    rows = await db.scalar(
+        text("select count(*) from decision_points where hand_id = :hand"), {"hand": hand_id}
+    )
+
+    assert "points" not in stored
+    assert stored["ranked"] == [1, 0] and stored["hand_no"] == "P2"
+    assert rows == 4
+
+
+async def test_the_judged_column_is_written_by_the_one_predicate(db):
+    """Колонка `judged` — ответ `contracts.is_judged`, а не второе правило в SQL."""
+    from harness.contracts import is_judged
+
+    session_id = await _make_session(db)
+    hand_id = await _hand_with_points(db, session_id=session_id, hand_no="P3")
+
+    stored = (
+        await db.execute(
+            text("select judged from decision_points where hand_id = :hand order by point_no"),
+            {"hand": hand_id},
+        )
+    ).scalars()
+
+    written = list(stored)
+    # Обе половины названы: слева — что лежит в базе, справа — что говорит
+    # предикат, и отдельно то, чему оба равны, иначе тест сравнивал бы функцию
+    # с самой собой. Третья точка — «около нуля»: она СУДИМА (цена посчитана и
+    # равна нулю) и в покрытие входит, хотя ни одному лику не соответствует.
+    assert written == [is_judged(point) for point in _points_of_every_shape()]
+    assert written == [True, True, True, False]
+
+
+async def test_a_verdict_without_its_decision_point_is_stored_without_context(db):
+    """Обстановка сопоставляется по `dp_index`; чужую точку решения не подставляем."""
+    from harness.contracts import PointVerdict, SpotKind, Street, Zone
+
+    enriched = _make_enriched()
+    decision_points = enriched.report.decision_points
+    assert decision_points, "в фикстуре нет ни одной точки решения героя"
+    known = decision_points[0]
+
+    def _point(dp_index: int) -> PointVerdict:
+        return PointVerdict(
+            dp_index=dp_index,
+            street=Street.PREFLOP,
+            spot=SpotKind.PUSHFOLD_UNOPENED,
+            zone=Zone.STRICT,
+            action_taken="fold",
+            best_action="shove",
+            ev_diff_bb=-1.0,
+        )
+
+    session_id = await _make_session(db)
+    raw = RawHand.model_validate(make_min_raw(hand_no="P4"))
+    hand_id = await HandsRepo(db).save_raw(session_id=session_id, raw=raw)
+    await AnalysesRepo(db).save(
+        hand_id=hand_id,
+        # Совпадающая точка стоит ВТОРОЙ в массиве, а место в массиве у неё
+        # своё: сопоставление по `point_no` дало бы здесь обратный ответ.
+        result=AnalysisResult(hand_no="P4", points=[_point(9999), _point(known.index)]),
+        decision_points=decision_points,
+    )
+
+    rows = (
+        await db.execute(
+            text(
+                "select position, to_call, pot_before, eff_stack, eff_stack_bb, spr "
+                "from decision_points where hand_id = :hand order by point_no"
+            ),
+            {"hand": hand_id},
+        )
+    ).all()
+
+    assert tuple(rows[0]) == (None, None, None, None, None, None)
+    assert rows[1].position == known.position
+    assert (rows[1].to_call, rows[1].pot_before) == (known.to_call, known.pot_before)
+    assert (rows[1].eff_stack, rows[1].eff_stack_bb, rows[1].spr) == (
+        known.eff_stack,
+        known.eff_stack_bb,
+        known.spr,
+    )
+
+
+async def test_a_point_cannot_claim_a_session_that_is_not_its_hands(db):
+    """Денормализованная сессия закрыта ключом, а не аккуратностью вызывающего."""
+    player = await PlayersRepo(db).get_or_create(tg_user_id=8801)
+    mine = (await SessionsRepo(db).active_or_create(player.id)).id
+    await SessionsRepo(db).close_active(player.id)
+    other = (await SessionsRepo(db).active_or_create(player.id)).id
+    raw = RawHand.model_validate(make_min_raw(hand_no="P5"))
+    hand_id = await HandsRepo(db).save_raw(session_id=mine, raw=raw)
+
+    with pytest.raises(IntegrityError):
+        await db.execute(
+            text(
+                "insert into decision_points (hand_id, session_id, player_id, point_no, "
+                "dp_index, street, spot, zone, action_taken, best_action, ev_diff_bb, judged) "
+                "values (:hand, :session, :player, 0, 0, 'preflop', 'pushfold_unopened', "
+                "'strict', 'fold', 'shove', -1.0, true)"
+            ),
+            {"hand": hand_id, "session": other, "player": player.id},
+        )
+
+
+def test_the_judged_rule_is_pinned_because_the_column_freezes_it():
+    """Правило судимости выписано здесь ЦЕЛИКОМ — таблицей «спот × есть ли ответ».
+
+    `decision_points.judged` — снимок правила на момент записи, а не
+    вычисляемое свойство. Значит, в день, когда правило расширится (владелец
+    уже назвал следующий шаг — судить постфлоп), строки, записанные раньше,
+    останутся со старым ответом, и покрытие молча сложит две редакции правила:
+    внешне это выглядит как «покрытие подросло меньше ожидаемого», то есть как
+    данные, а не как дефект.
+
+    Поэтому таблица ниже переписывается ВМЕСТЕ с миграцией, которая пересчитает
+    колонку у уже записанных точек (образец переливки — 0008). Тест сравнивает
+    не текст функции, а её ответы: правку докстринга он переживёт, изменение
+    правила — нет.
+    """
+    from harness.contracts import PointVerdict, SpotKind, Street, Zone, is_judged
+
+    # Спот → судится ли точка с НЕПУСТЫМ `best_action`. С пустым не судится ни
+    # одна: пустая строка и означает «не посчитано».
+    pinned = {
+        SpotKind.PUSHFOLD_UNOPENED: True,
+        SpotKind.PUSHFOLD_FACING_SHOVE: True,
+        SpotKind.PREFLOP_OTHER: False,
+        SpotKind.POSTFLOP: False,
+    }
+    assert set(pinned) == set(SpotKind), (
+        "у спотов сменился состав, а `decision_points.judged` хранит ответ старого "
+        "правила: правку нужно сопровождать миграцией-переливкой колонки (образец — 0008)"
+    )
+
+    def _point(spot: SpotKind, best_action: str) -> PointVerdict:
+        return PointVerdict(
+            dp_index=0,
+            street=Street.PREFLOP,
+            spot=spot,
+            zone=Zone.STRICT,
+            action_taken="fold",
+            best_action=best_action,
+            ev_diff_bb=-1.0,
+        )
+
+    answers = {
+        (spot, best_action != ""): is_judged(_point(spot, best_action))
+        for spot in SpotKind
+        for best_action in ("", "shove")
+    }
+    assert answers == {
+        **{(spot, True): judged for spot, judged in pinned.items()},
+        **{(spot, False): False for spot in pinned},
+    }, (
+        "правило судимости изменилось, а `decision_points.judged` у записанных точек "
+        "хранит ответ прежнего: правку нужно сопровождать миграцией-переливкой колонки "
+        "(образец — 0008)"
+    )
+
+
+# Запрос, которым агрегаты считались ДО миграции 0008, — замороженной копией.
+# Он нужен, чтобы сравнить числа обоими путями на одних и тех же данных;
+# в рабочем коде его больше нет, и живым источником правды эта копия не
+# является: споты подставлены строками ровно теми, что были в `JUDGED_SPOTS`
+# на день миграции.
+_JSONB_POINTS = """
+    from analyses a
+    join hands h on h.id = a.hand_id
+    join sessions s on s.id = h.session_id
+    cross join lateral jsonb_array_elements(a.result -> 'points') as p
+    where s.player_id = :player_id
+"""
+_JSONB_JUDGED = (
+    "p ->> 'spot' in ('pushfold_unopened', 'pushfold_facing_shove') "
+    "and p ->> 'best_action' <> ''"
+)
+_JSONB_EV = "(p ->> 'ev_diff_bb')::double precision"
+
+
+def _aggregates_over_jsonb(conn, player_id: int, session_id: int | None = None) -> dict:
+    """Покрытие, лики по типам и цена вечера — посчитанные ПО jsonb, как раньше."""
+    from harness.contracts import LEAK_RULES, leak_rule_for
+
+    tail = " and s.id = :session_id" if session_id is not None else ""
+    params = {"player_id": player_id}
+    if session_id is not None:
+        params["session_id"] = session_id
+
+    coverage = conn.execute(
+        text(
+            f"select count(*) as total, count(*) filter (where {_JSONB_JUDGED}) as judged "
+            f"{_JSONB_POINTS}{tail}"
+        ),
+        params,
+    ).one()
+    grouped = conn.execute(
+        text(
+            f"select p ->> 'spot' as spot, p ->> 'action_taken' as action_taken, "
+            f"p ->> 'best_action' as best_action, count(*) as n, "
+            f"coalesce(sum({_JSONB_EV}) filter (where {_JSONB_EV} < 0), 0.0) as loss "
+            f"{_JSONB_POINTS}{tail} group by 1, 2, 3"
+        ),
+        params,
+    ).all()
+    loss = conn.execute(
+        text(
+            f"select coalesce(sum({_JSONB_EV}) filter "
+            f"(where {_JSONB_JUDGED} and {_JSONB_EV} < 0), 0.0) {_JSONB_POINTS}{tail}"
+        ),
+        params,
+    ).scalar()
+
+    counts: dict[str, int] = {}
+    losses: dict[str, float] = {}
+    for row in grouped:
+        rule = leak_rule_for(row.spot, row.action_taken, row.best_action)
+        if rule is None:
+            continue
+        counts[rule.key] = counts.get(rule.key, 0) + int(row.n)
+        losses[rule.key] = losses.get(rule.key, 0.0) + float(row.loss)
+    order = {rule.key: index for index, rule in enumerate(LEAK_RULES)}
+    leaks = sorted(
+        ((key, counts[key], -losses[key]) for key in counts),
+        key=lambda stat: (-stat[2], -stat[1], order[stat[0]]),
+    )
+    return {
+        "coverage": (int(coverage.judged), int(coverage.total)),
+        "leaks": leaks,
+        "loss_bb": -float(loss or 0.0),
+    }
+
+
+_PLANT_HAND = """
+insert into hands (session_id, provenance, raw, canonical, enriched, schema_version)
+values (:session, 'hand_history', :raw, null, :enriched, 1) returning id
+"""
+
+
+def _plant_before_0008(conn) -> dict:
+    """Разборы, сделанные ДО миграции: точки лежат массивом в `analyses.result`.
+
+    Одна рука с `enriched` (по ней переливка обязана поднять обстановку точки),
+    одна без него, вторая сессия того же игрока и чужой игрок рядом.
+    """
+    import json
+
+    from harness.contracts import PointVerdict, SpotKind, Street, Zone
+
+    def _leak(spot, taken: str, best: str, ev: float, dp_index: int) -> PointVerdict:
+        return PointVerdict(
+            dp_index=dp_index,
+            street=Street.PREFLOP,
+            spot=spot,
+            zone=Zone.STRICT,
+            action_taken=taken,
+            best_action=best,
+            ev_diff_bb=ev,
+        )
+
+    enriched = _make_enriched()
+    moment = datetime(2026, 9, 1, 20, 0, tzinfo=UTC)
+    planted: dict = {"analyses": {}, "enriched": enriched}
+
+    def _player(tg: int) -> int:
+        return conn.execute(
+            text("insert into players (tg_user_id) values (:tg) returning id"), {"tg": tg}
+        ).scalar_one()
+
+    def _session(player_id: int, title: str) -> int:
+        return conn.execute(
+            text(
+                "insert into sessions (player_id, started_at, title) "
+                "values (:player, :moment, :title) returning id"
+            ),
+            {"player": player_id, "moment": moment, "title": title},
+        ).scalar_one()
+
+    def _analysis(session_id: int, result: AnalysisResult, *, with_enriched: bool) -> int:
+        hand_id = conn.execute(
+            text(_PLANT_HAND),
+            {
+                "session": session_id,
+                "raw": json.dumps(make_min_raw(hand_no=result.hand_no)),
+                "enriched": enriched.model_dump_json() if with_enriched else None,
+            },
+        ).scalar_one()
+        document = result.model_dump(mode="json")
+        conn.execute(
+            text("insert into analyses (hand_id, result) values (:hand, :result)"),
+            {"hand": hand_id, "result": json.dumps(document)},
+        )
+        planted["analyses"][result.hand_no] = document
+        return hand_id
+
+    mine = _player(9101)
+    planted["player_id"] = mine
+    first = _session(mine, "вечер первый")
+    second = _session(mine, "вечер второй")
+    planted["session_id"] = first
+    planted["hand_with_context"] = _analysis(
+        first, _result_of_every_shape("H1"), with_enriched=True
+    )
+    _analysis(
+        first,
+        AnalysisResult(
+            hand_no="H2",
+            points=[
+                _leak(SpotKind.PUSHFOLD_UNOPENED, "fold", "shove", -1.0, 0),
+                _leak(SpotKind.PUSHFOLD_FACING_SHOVE, "fold", "call", -0.5, 1),
+                _leak(SpotKind.POSTFLOP, "call", "", 0.0, 2),
+            ],
+            ranked=[0, 1],
+            total_ev_loss_bb=-1.5,
+        ),
+        with_enriched=False,
+    )
+    _analysis(
+        second,
+        AnalysisResult(
+            hand_no="H3",
+            points=[
+                _leak(SpotKind.PUSHFOLD_FACING_SHOVE, "call", "fold", -3.0, 0),
+                _leak(SpotKind.PUSHFOLD_UNOPENED, "shove", "fold", -0.25, 1),
+            ],
+            ranked=[0, 1],
+            total_ev_loss_bb=-3.25,
+        ),
+        with_enriched=False,
+    )
+
+    theirs = _player(9102)
+    _analysis(_session(theirs, "чужой вечер"), _result_of_every_shape("F1"), with_enriched=False)
+    return planted
+
+
+@pytest.fixture
+def pg_before_0008():
+    """Свой контейнер на ревизии 0007 — базу сессионного `pg` катать нельзя.
+
+    Ревизия названа номером, а не `head`: тест про переход 0007 → 0008.
+    """
+    from alembic import command
+    from testcontainers.community.postgres import PostgresContainer
+
+    from tests.conftest import alembic_config
+
+    with PostgresContainer("postgres:16-alpine") as container:
+        command.upgrade(alembic_config(container.get_connection_url(driver="psycopg")), "0007")
+        yield container
+
+
+async def test_migration_0008_moves_points_without_changing_a_single_number(pg_before_0008):
+    """Главный критерий: агрегаты до переливки и после неё совпадают ТОЧНО.
+
+    Считается обоими путями на одних и тех же данных: слева — замороженный
+    запрос по `analyses.result` (`_aggregates_over_jsonb`), справа — сегодняшние
+    `LeaksRepo`/`SessionsRepo` по таблице. Сравниваются покрытие, лики по типам
+    с ценой и порядком и цена вечера.
+    """
+    from alembic import command
+    from sqlalchemy import create_engine
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from harness.memory.repos import LeaksRepo
+    from tests.conftest import alembic_config
+
+    dsn = pg_before_0008.get_connection_url(driver="psycopg")
+    engine = create_engine(dsn)
+    try:
+        with engine.begin() as conn:
+            planted = _plant_before_0008(conn)
+        with engine.connect() as conn:
+            before_all = _aggregates_over_jsonb(conn, planted["player_id"])
+            before_session = _aggregates_over_jsonb(
+                conn, planted["player_id"], planted["session_id"]
+            )
+        # Сравнение обязано быть не пустым: без этих двух строк тест прошёл бы
+        # и на базе, где переливка не перенесла ничего.
+        assert before_all["coverage"] == (7, 9)
+        assert len(before_all["leaks"]) == 4
+    finally:
+        engine.dispose()
+
+    command.upgrade(alembic_config(dsn), "0008")
+
+    engine = create_async_engine(pg_before_0008.get_connection_url(driver="asyncpg"))
+    try:
+        async with AsyncSession(engine) as session:
+            leaks = LeaksRepo(session)
+            after_all = {
+                "coverage": await leaks.coverage(planted["player_id"]),
+                "leaks": [
+                    (stat.rule.key, stat.count, stat.loss_bb)
+                    for stat in await leaks.by_type(planted["player_id"])
+                ],
+            }
+            summary = await SessionsRepo(session).summary(
+                planted["session_id"], planted["player_id"]
+            )
+            after_session = {
+                "coverage": await leaks.coverage(
+                    planted["player_id"], session_id=planted["session_id"]
+                ),
+                "leaks": [
+                    (stat.rule.key, stat.count, stat.loss_bb)
+                    for stat in await leaks.by_type(
+                        planted["player_id"], session_id=planted["session_id"]
+                    )
+                ],
+            }
+    finally:
+        await engine.dispose()
+
+    assert after_all["coverage"] == before_all["coverage"]
+    assert after_all["leaks"] == before_all["leaks"]
+    assert after_session["coverage"] == before_session["coverage"]
+    assert after_session["leaks"] == before_session["leaks"]
+    assert summary is not None
+    assert (summary.points_judged, summary.points_total) == before_session["coverage"]
+    assert summary.loss_bb == before_session["loss_bb"]
+    assert summary.top_leak is not None
+    assert summary.top_leak.rule.key == before_session["leaks"][0][0]
+
+
+async def test_migration_0008_carries_the_context_of_every_point_it_can_find(pg_before_0008):
+    """Переливка поднимает обстановку точки из `hands.enriched` по `dp_index`.
+
+    Там, где такой точки решения в руке нет (или руки нет до чекпоинта
+    `enriched`), колонки остаются пустыми — переливка не подставляет соседнюю.
+    """
+    from alembic import command
+    from sqlalchemy import create_engine
+
+    from tests.conftest import alembic_config
+
+    dsn = pg_before_0008.get_connection_url(driver="psycopg")
+    engine = create_engine(dsn)
+    try:
+        with engine.begin() as conn:
+            planted = _plant_before_0008(conn)
+        command.upgrade(alembic_config(dsn), "0008")
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "select point_no, dp_index, position, pot_before, to_call, eff_stack, "
+                    "eff_stack_bb, spr from decision_points where hand_id = :hand "
+                    "order by point_no"
+                ),
+                {"hand": planted["hand_with_context"]},
+            ).all()
+            without = conn.execute(
+                text(
+                    "select count(*) from decision_points "
+                    "where hand_id <> :hand and position is not null"
+                ),
+                {"hand": planted["hand_with_context"]},
+            ).scalar_one()
+    finally:
+        engine.dispose()
+
+    by_index = {point.index: point for point in planted["enriched"].report.decision_points}
+    assert by_index, "в фикстуре нет ни одной точки решения героя"
+    assert [row.point_no for row in rows] == [0, 1, 2, 3]
+    filled = 0
+    for row in rows:
+        source = by_index.get(row.dp_index)
+        if source is None:
+            assert row.position is None and row.pot_before is None
+            continue
+        filled += 1
+        assert (row.position, row.pot_before, row.to_call) == (
+            source.position,
+            source.pot_before,
+            source.to_call,
+        )
+        assert (row.eff_stack, row.eff_stack_bb, row.spr) == (
+            source.eff_stack,
+            source.eff_stack_bb,
+            source.spr,
+        )
+    assert filled, "ни одна точка не получила обстановку — сверять было нечего"
+    assert without == 0
+
+
+async def test_migration_0008_gives_the_document_back_on_downgrade(pg_before_0008):
+    """Откат возвращает массив точек в `analyses.result` тем же, каким он был."""
+    from alembic import command
+    from sqlalchemy import create_engine
+
+    from tests.conftest import alembic_config
+
+    dsn = pg_before_0008.get_connection_url(driver="psycopg")
+    engine = create_engine(dsn)
+    try:
+        with engine.begin() as conn:
+            planted = _plant_before_0008(conn)
+        config = alembic_config(dsn)
+        command.upgrade(config, "0008")
+        with engine.connect() as conn:
+            stripped = conn.execute(
+                text("select result from analyses where result ? 'points'")
+            ).all()
+        command.downgrade(config, "0007")
+        with engine.connect() as conn:
+            back = conn.execute(
+                text("select result from analyses order by id")
+            ).scalars().all()
+            tables = conn.execute(
+                text(
+                    "select count(*) from information_schema.tables "
+                    "where table_name = 'decision_points'"
+                )
+            ).scalar_one()
+    finally:
+        engine.dispose()
+
+    assert stripped == [], "после переливки документ всё ещё несёт свои точки"
+    assert {document["hand_no"]: document for document in back} == planted["analyses"]
+    assert tables == 0

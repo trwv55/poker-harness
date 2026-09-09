@@ -354,14 +354,9 @@ class SessionsRepo:
     async def _session_loss_bb(self, player_id: int, session_id: int) -> float:
         """Цена расхождений вечера — сумма отрицательных `ev_diff_bb` судимых точек."""
         loss = await self.db.scalar(
-            select(
-                func.coalesce(
-                    func.sum(DecisionPointRow.ev_diff_bb).filter(
-                        DecisionPointRow.judged, DecisionPointRow.ev_diff_bb < 0.0
-                    ),
-                    0.0,
-                )
-            ).where(*_points_of(player_id, session_id))
+            select(_negative_loss(DecisionPointRow.judged)).where(
+                *_points_of(player_id, session_id)
+            )
         )
         return -float(loss or 0.0)
 
@@ -1149,11 +1144,13 @@ def _points_of(player_id: int, session_id: int | None):
 
 
 # Сумма отрицательных расхождений — «столько ушло». Отдельным выражением,
-# потому что складывают её три места (лик по типу, цена вечера, и через них —
-# сводка сессии), а слагаемое во всех трёх одно и то же.
-def _negative_loss():
+# потому что складывают её два места (тип лика и цена вечера) и слагаемое у них
+# одно; расходятся они только тем, что цена вечера берёт ещё и судимость, —
+# отсюда `also`.
+def _negative_loss(*also: Any):
     return func.coalesce(
-        func.sum(DecisionPointRow.ev_diff_bb).filter(DecisionPointRow.ev_diff_bb < 0.0), 0.0
+        func.sum(DecisionPointRow.ev_diff_bb).filter(*also, DecisionPointRow.ev_diff_bb < 0.0),
+        0.0,
     )
 
 
@@ -1190,7 +1187,8 @@ class LeaksRepo:
 
         Пара, которую экран печатает строкой «оценено N из M решений»: без неё
         список ликов читается как полная картина игры, хотя судится сегодня
-        только префлоп-пуш-фолд (`JUDGED_SPOTS`).
+        только префлоп-пуш-фолд. Судимость читается колонкой `judged`, а не
+        условием: правило записано один раз, в `contracts.is_judged`.
         """
         row = (
             await self.db.execute(
