@@ -18,7 +18,7 @@ from sqlalchemy import insert, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from harness.contracts import AnalysisResult, RawHand, ScanSummary
+from harness.contracts import AnalysisResult, PointFilter, RawHand, ScanSummary, Window
 from harness.engine import enrich
 from harness.memory.models import EvalCase, Job
 from harness.memory.repos import (
@@ -42,6 +42,11 @@ from tests.test_hh_parser import SAMPLE
 # Ожидание конкурента после освобождения лока: обычные миллисекунды, потолок — на
 # случай, если сериализация сломается так, что вторая корутина не проснётся вовсе.
 _RIVAL_TIMEOUT_S = 10.0
+
+def _evening(session_id: int) -> PointFilter:
+    """Фильтр «точки этого вечера» — то, чем `session_id` был до словаря расчётов."""
+    return PointFilter(window=Window(session_id=session_id))
+
 
 _ALL_TABLES = {
     "players",
@@ -2123,12 +2128,12 @@ async def test_migration_0008_moves_points_without_changing_a_single_number(pg_b
             )
             after_session = {
                 "coverage": await leaks.coverage(
-                    planted["player_id"], session_id=planted["session_id"]
+                    planted["player_id"], _evening(planted["session_id"])
                 ),
                 "leaks": [
                     (stat.rule.key, stat.count, stat.loss_bb)
                     for stat in await leaks.by_type(
-                        planted["player_id"], session_id=planted["session_id"]
+                        planted["player_id"], _evening(planted["session_id"])
                     )
                 ],
             }

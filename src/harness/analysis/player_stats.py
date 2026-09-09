@@ -43,12 +43,27 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 
-from harness.contracts import ActionKind, CanonicalAction, CanonicalHand, PlayerStats, Street
+from harness.contracts import (
+    ActionKind,
+    CanonicalAction,
+    CanonicalHand,
+    FrequencyStat,
+    Measurement,
+    PlayerStats,
+    Street,
+)
 
-__all__ = ["player_stats", "player_stats_across_tournaments", "player_stats_by_label"]
+__all__ = [
+    "measurement_of",
+    "player_stats",
+    "player_stats_across_tournaments",
+    "player_stats_by_label",
+    "player_stats_of_seats",
+    "seat_position",
+]
 
 # Действия, которыми игрок добровольно кладёт фишки в банк. Пас и чек не кладут
 # ничего, посты сюда не попадают вовсе (см. докстринг модуля).
@@ -300,13 +315,9 @@ def player_stats(hands: Iterable[CanonicalHand], label: str | None = None) -> Pl
     турнира из 12 (`test_hands_from_several_tournaments_are_weighed_by_hands`).
     Усреднить готовые проценты по турнирам дало бы другое число.
     """
-    stats = PlayerStats()
-    for hand in hands:
-        seat = hand.hero_label if label is None else label
-        if not _seated(hand, seat):
-            continue
-        _accumulate(stats, _view(hand), seat)
-    return stats
+    return player_stats_of_seats(
+        hands, lambda hand: [hand.hero_label if label is None else label]
+    )
 
 
 def player_stats_by_label(hands: Iterable[CanonicalHand]) -> dict[str, PlayerStats]:
@@ -359,10 +370,82 @@ def player_stats_across_tournaments(
     раздача, в которой названной метки нет за столом, — то же правило и та же
     причина, что в `player_stats`.
     """
+    def seats(hand: CanonicalHand) -> list[str]:
+        label = labels.get(hand.tournament_id)
+        return [] if label is None else [label]
+
+    return player_stats_of_seats(hands, seats)
+
+
+def player_stats_of_seats(
+    hands: Iterable[CanonicalHand], seats_of: Callable[[CanonicalHand], Iterable[str]]
+) -> PlayerStats:
+    """Счётчики по местам, которые `seats_of` называет в каждой раздаче.
+
+    ОДИН накопитель на все входы пакета: `player_stats` и
+    `player_stats_across_tournaments` — это он же с разными `seats_of`, второй
+    реализации формул в модуле нет
+    (`test_every_entry_point_shares_one_accumulator`).
+
+    Ради чего заведено сверх них: словарь расчётов спрашивает частоту не только
+    одного места, но и ПОЛЯ — всех оппонентов героя, сложенных в одно число, — и
+    фильтрует места по позиции. И то и другое выражается выбором мест в раздаче,
+    а не новой формулой.
+
+    **Знаменатель — место-раздача, а не раздача.** Когда `seats_of` называет в
+    одной руке несколько мест, рука прибавляет к `hands` столько же
+    (`test_two_seats_in_one_hand_count_twice`). Для поля это и есть нужный
+    знаменатель: доля мест, добровольно вложивших фишки, а не доля раздач, где
+    это сделал хоть кто-то.
+
+    Место, которого в этой раздаче нет за столом, пропускается — то же правило и
+    та же причина, что в `player_stats`: метка тогда не указывает ни на одного
+    игрока.
+    """
     stats = PlayerStats()
     for hand in hands:
-        label = labels.get(hand.tournament_id)
-        if label is None or not _seated(hand, label):
-            continue
-        _accumulate(stats, _view(hand), label)
+        view = _view(hand)
+        for label in seats_of(hand):
+            if _seated(hand, label):
+                _accumulate(stats, view, label)
     return stats
+
+
+def seat_position(hand: CanonicalHand, label: str) -> str | None:
+    """Позиция места в этой раздаче или `None`, если места за столом нет.
+
+    Позиция вычислена нормализатором от кнопки (`PlayerState.position`) — здесь
+    она читается, а не выводится заново.
+    """
+    for player in hand.players:
+        if player.label == label:
+            return player.position
+    return None
+
+
+# Названная частота → пара «числитель, знаменатель» в `PlayerStats`. Таблица, а
+# не ветки: знаменатели у этих величин РАЗНЫЕ, и пара сходится с долей, которую
+# считает сам контракт, для каждого имени набора
+# (`test_every_named_frequency_matches_the_share_the_contract_computes`).
+_COUNTERS: dict[FrequencyStat, tuple[str, str]] = {
+    FrequencyStat.VPIP: ("vpip", "hands"),
+    FrequencyStat.PFR: ("pfr", "hands"),
+    FrequencyStat.RERAISE: ("reraise", "reraise_chances"),
+    FrequencyStat.FOLD_TO_CBET: ("fold_to_cbet", "cbet_faced"),
+    FrequencyStat.CBET_FLOP: ("cbet_flop", "cbet_flop_chances"),
+    FrequencyStat.BARREL_TURN: ("barrel_turn", "barrel_turn_chances"),
+    FrequencyStat.BARREL_RIVER: ("barrel_river", "barrel_river_chances"),
+    FrequencyStat.SHOWDOWN: ("showdowns", "flops_seen"),
+}
+
+
+def measurement_of(stats: PlayerStats, stat: FrequencyStat) -> Measurement:
+    """Названная частота как пара «числитель, знаменатель».
+
+    Доли здесь не считается вовсе: пара едет в результат расчёта целиком, и
+    именно она не даёт подписи разойтись со знаменателем.
+    """
+    numerator, denominator = _COUNTERS[stat]
+    return Measurement(
+        numerator=getattr(stats, numerator), denominator=getattr(stats, denominator)
+    )

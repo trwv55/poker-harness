@@ -90,7 +90,7 @@ def _raise_to(label: str, to: int, already: int, street: Street = Street.PREFLOP
     )
 
 
-def _hand(
+def _raw_hand(
     *,
     hero_position: str,
     actions: list[RawAction],
@@ -98,11 +98,16 @@ def _hand(
     hero_cards: tuple[str, str] = ("Ah", "Kd"),
     showdowns: list[ShowdownEntry] | None = None,
     tournament_id: str = "T1",
-) -> CanonicalHand:
+    hand_no: str = "SYN",
+) -> RawHand:
     """Рука 6-max, где место героя занимает метка `Hero`, а остальные названы позицией.
 
     Метка = имя позиции для всех, кроме героя, поэтому в тестах действия
     оппонентов пишутся прямо позицией («UTG»), а героя — «Hero».
+
+    Отдана в исходном виде, а не канонической: словарь расчётов кладёт в базу
+    обе формы одной руки (`tests/test_calcs.py`), и вторая рука, собранная
+    отдельно, могла бы разойтись с первой.
     """
     labels = {pos: ("Hero" if pos == hero_position else pos) for pos in _SIX_MAX}
     seats = [
@@ -112,10 +117,10 @@ def _hand(
         Post(label=labels["SB"], kind=PostKind.SMALL_BLIND, amount=_SB),
         Post(label=labels["BB"], kind=PostKind.BIG_BLIND, amount=_BB),
     ]
-    raw = RawHand(
+    return RawHand(
         provenance=Provenance.HAND_HISTORY,
         source_ref="synthetic",
-        hand_no="SYN",
+        hand_no=hand_no,
         tournament_id=tournament_id,
         tournament_name="synthetic",
         level=1,
@@ -133,7 +138,11 @@ def _hand(
         boards=boards or {},
         showdowns=showdowns or [],
     )
-    en = enrich(normalize(raw))
+
+
+def _hand(**kwargs) -> CanonicalHand:
+    """Та же рука, прогнанная через настоящий конвейер, — вход `player_stats`."""
+    en = enrich(normalize(_raw_hand(**kwargs)))
     assert en.verdict.status is not ValidationStatus.REJECT, en.verdict.reasons
     return en.hand
 

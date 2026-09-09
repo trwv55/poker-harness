@@ -26,19 +26,24 @@ from harness.contracts import (
     MAX_NOTE_TEXT_CHARS,
     NOTE_COLOR_NONE,
     AnalysisResult,
+    CalcName,
     CanonicalHand,
+    CoverageResult,
     DecisionPoint,
     EnrichedHand,
     LeakRule,
     LeaksOverview,
     LeakStat,
+    Measurement,
     NoteRecord,
     OpponentRecord,
+    PointFilter,
     Provenance,
     RawHand,
     ScanSummary,
     SessionLine,
     SessionSummary,
+    Window,
     is_judged,
     leak_rule_for,
 )
@@ -337,8 +342,9 @@ class SessionsRepo:
             or 0
         )
         leaks = LeaksRepo(self.db)
-        judged, total = await leaks.coverage(player_id, session_id=session_id)
-        by_type = await leaks.by_type(player_id, session_id=session_id)
+        evening = PointFilter(window=Window(session_id=session_id))
+        judged, total = await leaks.coverage(player_id, evening)
+        by_type = await leaks.by_type(player_id, evening)
         loss = await self._session_loss_bb(player_id, session_id)
         return SessionSummary(
             session_id=session_id,
@@ -355,7 +361,7 @@ class SessionsRepo:
         """Цена расхождений вечера — сумма отрицательных `ev_diff_bb` судимых точек."""
         loss = await self.db.scalar(
             select(_negative_loss(DecisionPointRow.judged)).where(
-                *_points_of(player_id, session_id)
+                *_points_of(player_id, PointFilter(window=Window(session_id=session_id)))
             )
         )
         return -float(loss or 0.0)
@@ -557,6 +563,43 @@ class HandsRepo:
                 CanonicalHand.model_validate(canonical)
             )
         return list(grouped.values())
+
+    async def player_canonical(
+        self, player_id: int, window: Window | None = None
+    ) -> list[CanonicalHand]:
+        """Канонические руки игрока в окне, плоским списком в порядке записи.
+
+        Вход частот словаря расчётов. Плоским, а не по турнирам, в отличие от
+        `player_hands_by_tournament`: там группы несут смысл (по их числу отчёт
+        решает, есть ли с чем сравнивать), здесь считается один знаменатель на
+        всё окно, и группировать нечего.
+
+        Руки без турнира (скриншоты) ВХОДЯТ, в отличие от того же соседа:
+        частота считается по действиям за столом, а они у скриншота такие же.
+        Отсекается только отсутствие чекпоинта `canonical` — пайплайн до состава
+        мест не дошёл, и считать по такой руке нечего.
+
+        Окно — те же две колонки `sessions`, что у `_points_of`, и по той же
+        причине (`contracts.calcs.Window`). Область всегда ограничена сессиями
+        этого игрока, как у `player_hands_by_tournament`: без этого условия в
+        знаменатель попали бы чужие раздачи.
+        """
+        window = window or Window()
+        where = [SessionRow.player_id == player_id, Hand.canonical.is_not(None)]
+        if window.session_id is not None:
+            where.append(Hand.session_id == window.session_id)
+        if window.since is not None:
+            where.append(SessionRow.started_at >= window.since)
+        stmt = (
+            select(Hand.canonical)
+            .join(SessionRow, SessionRow.id == Hand.session_id)
+            .where(*where)
+            .order_by(Hand.id)
+        )
+        return [
+            CanonicalHand.model_validate(canonical)
+            for canonical in await self.db.scalars(stmt)
+        ]
 
     async def last_canonical(self, player_id: int) -> CanonicalHand | None:
         """Свежайшая рука игрока, дошедшая до чекпоинта `canonical`, — «последний
@@ -1135,11 +1178,38 @@ class EvalCasesRepo:
 # лежали массивом в `analyses.result`, разворачивались боковым соединением и
 # каждое условие писалось по jsonb руками; теперь фильтры складываются обычным
 # `where` и не требуют ни приведений типа, ни повторения правил на втором языке.
-def _points_of(player_id: int, session_id: int | None):
-    """Условие «точки этого игрока», при заданной сессии — «и этого вечера»."""
+def _points_of(player_id: int, filters: PointFilter):
+    """Условие «точки этого игрока, подходящие под фильтр» — списком для `where`.
+
+    Каждый фильтр — обычное условие по колонке, и складываются они как угодно:
+    именно ради этого точки переехали из массива `analyses.result` в таблицу
+    (миграция 0008). Отдельного запроса на каждое сочетание фильтров нет
+    (`test_every_filter_narrows_the_same_query`).
+
+    Окно по времени выражено через `sessions.started_at`, а не через отметку
+    внутри руки: у таблицы `hands` собственного времени нет вовсе, а вечер и
+    есть единица времени продукта (`contracts.calcs.Window`). Условие игрока в
+    подзапросе повторено намеренно — без него окно захватило бы чужие вечера,
+    начавшиеся в те же дни.
+    """
     where = [DecisionPointRow.player_id == player_id]
-    if session_id is not None:
-        where.append(DecisionPointRow.session_id == session_id)
+    if filters.window.session_id is not None:
+        where.append(DecisionPointRow.session_id == filters.window.session_id)
+    if filters.window.since is not None:
+        where.append(
+            DecisionPointRow.session_id.in_(
+                select(SessionRow.id).where(
+                    SessionRow.player_id == player_id,
+                    SessionRow.started_at >= filters.window.since,
+                )
+            )
+        )
+    if filters.street is not None:
+        where.append(DecisionPointRow.street == filters.street)
+    if filters.spot is not None:
+        where.append(DecisionPointRow.spot == filters.spot)
+    if filters.position is not None:
+        where.append(DecisionPointRow.position == filters.position)
     return where
 
 
@@ -1182,25 +1252,63 @@ class LeaksRepo:
             leaks=await self.by_type(player_id),
         )
 
-    async def coverage(self, player_id: int, *, session_id: int | None = None) -> tuple[int, int]:
-        """Сколько точек решения оценено из скольких — за историю или за сессию.
+    async def coverage(
+        self, player_id: int, filters: PointFilter | None = None
+    ) -> tuple[int, int]:
+        """Сколько точек решения оценено из скольких — под заданным фильтром.
 
         Пара, которую экран печатает строкой «оценено N из M решений»: без неё
         список ликов читается как полная картина игры, хотя судится сегодня
         только префлоп-пуш-фолд. Судимость читается колонкой `judged`, а не
         условием: правило записано один раз, в `contracts.is_judged`.
+
+        Фильтр по умолчанию пуст — вся история игрока.
         """
         row = (
             await self.db.execute(
                 select(
                     func.count().label("points_total"),
                     func.count().filter(DecisionPointRow.judged).label("points_judged"),
-                ).where(*_points_of(player_id, session_id))
+                ).where(*_points_of(player_id, filters or PointFilter()))
             )
         ).one()
         return int(row.points_judged), int(row.points_total)
 
-    async def by_type(self, player_id: int, *, session_id: int | None = None) -> list[LeakStat]:
+    async def coverage_and_cost(
+        self, player_id: int, filters: PointFilter | None = None
+    ) -> CoverageResult:
+        """Покрытие и цена под фильтром — три величины с тремя знаменателями.
+
+        Сумма в bb складывается ТОЛЬКО с судимых точек и только с тех из них, где
+        расхождение отрицательно; `priced` называет, сколько их было. Точка
+        разобранная, но без посчитанной цены, входит в знаменатель покрытия и не
+        входит в сумму: сложить её ноль с ценами значило бы подать «здесь не
+        потеряно» там, где не считали (`CoverageResult`,
+        `test_points_without_a_price_do_not_enter_the_sum`).
+        """
+        where = _points_of(player_id, filters or PointFilter())
+        priced = (DecisionPointRow.judged, DecisionPointRow.ev_diff_bb < 0.0)
+        row = (
+            await self.db.execute(
+                select(
+                    func.count().label("total"),
+                    func.count().filter(DecisionPointRow.judged).label("judged"),
+                    func.count().filter(*priced).label("priced"),
+                    _negative_loss(DecisionPointRow.judged).label("loss"),
+                ).where(*where)
+            )
+        ).one()
+        return CoverageResult(
+            calc=CalcName.COVERAGE,
+            filter=filters or PointFilter(),
+            judged=Measurement(numerator=int(row.judged), denominator=int(row.total)),
+            priced=Measurement(numerator=int(row.priced), denominator=int(row.judged)),
+            loss_bb=-float(row.loss),
+        )
+
+    async def by_type(
+        self, player_id: int, filters: PointFilter | None = None
+    ) -> list[LeakStat]:
         """Типы ликов с частотой и ценой, самый дорогой первым.
 
         `loss_bb` положителен («столько ушло»), как в `EvSplit`: складываются
@@ -1216,7 +1324,7 @@ class LeaksRepo:
                 func.count().label("n"),
                 _negative_loss().label("loss"),
             )
-            .where(*_points_of(player_id, session_id))
+            .where(*_points_of(player_id, filters or PointFilter()))
             .group_by(
                 DecisionPointRow.spot,
                 DecisionPointRow.action_taken,
