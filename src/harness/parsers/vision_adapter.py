@@ -123,6 +123,11 @@ CHECK_TRUNCATION = "stacks"
 # Метка ступени каскада, вернувшей пустую схему (см. `VisionReadFailed`).
 _EMPTY_READING = "пустое чтение"
 
+# Ступень каскада, остановленная незавершённой рукой. Пишется в `VisionHop.error`
+# рядом с `_EMPTY_READING` и `not_a_hand`: все три означают «дальше по каскаду не
+# пошли», и трейс обязан показывать, по какой из трёх причин.
+_HAND_IN_PROGRESS = "рука ещё идёт"
+
 _SB_LABELS = {"sb", "мб", "мблайнд", "small blind"}
 _BB_LABELS = {"bb", "бб", "ббл", "big blind"}
 
@@ -187,7 +192,11 @@ class VisionLLM(Protocol):
 class VisionOutcome:
     """Что вернуло зрение: рука, ступени каскада и список непройденных проверок.
 
-    `raw is None` — читать было нечего (`not_a_hand` или отказ модели);
+    `raw is None` — разбирать нечего: модель отказалась (`not_a_hand`) либо рука
+    на экране ещё не доиграна (`hand_in_progress`). Причины разные, и вызывающий
+    их различает: у первой есть `refusal` словами модели, у второй показывать
+    нечего, потому что читать экран до конца мы и не стали.
+
     `escalate` — рука построена, но одной из проверок она не удовлетворила и на
     дорогой модели тоже: дальше вопрос игроку, а не молчаливое «разобрали».
     """
@@ -196,6 +205,8 @@ class VisionOutcome:
     checks: list[VisionCheck] = field(default_factory=list)
     hops: list[VisionHop] = field(default_factory=list)
     refusal: str | None = None
+    # Экран прочитан, но конца раздачи на нём не видно (`Completeness.STATE`).
+    hand_in_progress: bool = False
 
     @property
     def escalate(self) -> bool:
@@ -964,6 +975,13 @@ async def vision_extract(
 
     Отказ модели (`not_a_hand`) каскад НЕ запускает: честный отказ — это ответ, а
     не сбой, и платить за его повторение второй раз незачем (реестр C3).
+
+    **Незавершённая рука обрывает каскад там же, на первой ступени.** Решение
+    владельца 2026-09-09: экран, на котором не видно, чем раздача кончилась
+    (`Completeness.STATE`), не разбирается вовсе. Дорогая ступень читала бы тот
+    же экран, а вопрос игроку уточнял бы числа руки, которую мы всё равно
+    откажемся разбирать, — обе траты не окупаются ничем
+    (`test_a_hand_in_progress_stops_the_cascade_on_the_first_hop`).
     """
     prompt = read_prompt(prompt_path)
     hops: list[VisionHop] = []
@@ -1005,6 +1023,9 @@ async def vision_extract(
             source_ref=source_ref,
             image_hash=image_hash,
         )
+        if raw.completeness is Completeness.STATE:
+            hops.append(VisionHop(role=role, model=model, error=_HAND_IN_PROGRESS))
+            return VisionOutcome(raw=None, hops=hops, hand_in_progress=True)
         checks = run_checks(reading, raw, hero_check, built)
         failed = [check.name for check in checks if not check.passed]
         hops.append(VisionHop(role=role, model=model, failed_checks=failed))

@@ -580,6 +580,15 @@ def _score_case(case: dict[str, Any], outcome: Any) -> dict[str, Any]:
         row["refused"] = outcome.raw is None
         row["refusal_reason"] = outcome.refusal or ""
         return row
+    if outcome.hand_in_progress:
+        # Отдельная строка, а не общий отказ: `raw is None` тут означает не
+        # «модель не прочитала», а «станция чтения не взялась разбирать» —
+        # конец раздачи на экране не прочитан (`vision_adapter.vision_extract`).
+        # Свести две причины в одну строку значило бы записать пропуск
+        # результата в отказы модели
+        # (`test_a_screen_read_as_unfinished_is_scored_apart_from_a_refusal`).
+        row["error"] = "конец раздачи не прочитан: экран отвергнут как незавершённая рука"
+        return row
     if outcome.raw is None:
         row["error"] = f"модель отказалась читать раздачу: {outcome.refusal}"
         return row

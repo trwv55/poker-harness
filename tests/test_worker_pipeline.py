@@ -1565,10 +1565,16 @@ def _screenshot_raw():
     return raw
 
 
-def _outcome(raw=None, checks=(), refusal=None, hops=()):
+def _outcome(raw=None, checks=(), refusal=None, hops=(), hand_in_progress=False):
     from harness.parsers.vision_adapter import VisionOutcome
 
-    return VisionOutcome(raw=raw, checks=list(checks), hops=list(hops), refusal=refusal)
+    return VisionOutcome(
+        raw=raw,
+        checks=list(checks),
+        hops=list(hops),
+        refusal=refusal,
+        hand_in_progress=hand_in_progress,
+    )
 
 
 async def _enqueue_screenshot(queue, tmp_path, *, player_id: int, session_id: int) -> int:
@@ -1645,6 +1651,35 @@ async def test_a_screen_that_is_not_a_hand_is_refused_and_the_job_is_done(
     assert status == "done"
     assert hands == []
     assert any("лобби" in msg.text for msg in fake_sender.sent)
+
+
+async def test_a_hand_still_in_progress_never_reaches_the_analysis(
+    deps, queue, db_factory, fake_sender, tmp_path, monkeypatch
+):
+    """Живой стол останавливается на станции чтения, а не разбирается впустую.
+
+    Раньше такой экран проходил конвейер целиком и возвращался отказом по каждой
+    точке отдельно (`analysis.preflop.verdict_for`, ветка «решение ещё не
+    принято»). Проверяется, что не осталось ни следа: строки в `hands` нет
+    (значит, ни нормалайзер, ни движок, ни ядро её не видели), задача закрыта, а
+    не подвешена вопросом игроку, и игроку сказано, что прислать вместо этого.
+    """
+    player_id, session_id = await _make_scope(db_factory)
+    await _with_nickname(db_factory, player_id)
+    _stub_vision(monkeypatch, _outcome(hand_in_progress=True))
+    await _enqueue_screenshot(queue, tmp_path, player_id=player_id, session_id=session_id)
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    async with db_factory() as session:
+        status = (await session.get(Job, job.id)).status
+        hands = (await session.execute(text("select id from hands"))).all()
+    assert status == "done"
+    assert hands == []
+    assert any("ещё идёт" in msg.text for msg in fake_sender.sent)
+    assert not any(msg.buttons for msg in fake_sender.sent)
 
 
 async def test_a_failed_checksum_asks_the_player_and_frees_the_worker(

@@ -116,6 +116,7 @@ from harness.presentation import (
     deep_dive_msg,
     escalation_msg,
     failed_msg,
+    hand_in_progress_msg,
     not_a_hand_msg,
     note_nicks_for_hand,
     progress_text,
@@ -992,6 +993,23 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
             payload = await _ensure_progress(deps, session, job.id, worker_id, chat_id, "read")
             if hand_id is None:
                 outcome = await _read_screen(job, deps, trace, session, payload)
+                if outcome.hand_in_progress:
+                    # Рука ещё идёт — станция чтения и есть та станция, где такой
+                    # экран останавливается (решение владельца 2026-09-09). Ни
+                    # `hands.raw`, ни вопроса игроку: разбирать нечего, а всё
+                    # ниже по конвейеру считает по сыгранным действиям, которых
+                    # на этом экране ещё нет.
+                    await _send_idempotent(
+                        deps,
+                        session,
+                        job.id,
+                        worker_id,
+                        "result_message_id",
+                        chat_id,
+                        hand_in_progress_msg(),
+                    )
+                    await session.commit()
+                    return None
                 if outcome.raw is None:
                     # Отказ модели — это ответ, а не сбой: экран не был раздачей.
                     await _send_idempotent(

@@ -99,3 +99,22 @@ def test_amounts_are_compared_with_the_tolerance_the_screen_forces():
 def test_a_hand_read_from_a_screen_is_marked_as_a_whole_hand_before_comparison():
     """Сравнивать с текстом рума можно только руку целиком: у состояния итога нет."""
     assert _read().completeness is Completeness.HAND
+
+
+def test_a_screen_read_as_unfinished_is_scored_apart_from_a_refusal():
+    """Две причины пустого `raw` — разные, и в отчёте прогона обязаны различаться.
+
+    `hand_in_progress` означает, что станция чтения не взялась разбирать экран
+    (конца раздачи на нём не прочитано), а не что модель отказалась читать. С
+    общей строкой отказа такой кейс попал бы в отчёт как отказ модели — то есть
+    измерялся бы не тот класс ошибки.
+    """
+    from harness.parsers.vision_adapter import VisionOutcome
+    from harness.platform.eval_runner import _score_case
+
+    row = _score_case(
+        {"name": "case", "kind": "hand"}, VisionOutcome(raw=None, hand_in_progress=True)
+    )
+
+    assert "незавершённая рука" in row["error"]
+    assert "отказалась" not in row["error"]

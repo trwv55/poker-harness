@@ -511,6 +511,32 @@ async def test_a_screen_that_is_not_a_hand_is_refused_without_paying_twice(promp
     assert outcome.refusal == "это лобби турнира"
 
 
+async def test_a_hand_in_progress_stops_the_cascade_on_the_first_hop(prompt_file):
+    """Незавершённая рука видна после ПЕРВОГО чтения — дальше не платим.
+
+    Экран, на котором не видно конца раздачи (`Completeness.STATE`), не
+    разбирается вовсе (решение владельца 2026-09-09). Чтение здесь нарочно ещё и
+    проваливает сверку банка (`ante_pool_shown=None`): без раннего возврата это
+    та самая ситуация, в которой каскад зовёт дорогую модель и следом
+    спрашивает игрока — обе траты на руку, которую мы всё равно откажемся
+    разбирать. Второе чтение в очереди двойника лежит именно затем, чтобы
+    попытка его взять была видна как лишний вызов, а не как отсутствие данных.
+    """
+    live = export_reading(
+        showdown_seen=False, result_seen=False, winners=[], ante_pool_shown=None
+    )
+    llm = FakeLLM(live, export_reading())
+
+    outcome = await _extract(llm, prompt_file)
+
+    assert llm.purposes == ["vision_extract"]
+    assert outcome.hand_in_progress
+    assert outcome.raw is None  # в конвейер ничего не уезжает
+    assert not outcome.escalate  # и вопроса игроку тоже нет
+    assert outcome.refusal is None  # это не отказ модели: экран она прочитала
+    assert [hop.role for hop in outcome.hops] == ["primary"]
+
+
 async def test_every_hop_of_the_cascade_is_kept_with_the_hand(prompt_file):
     """Ступени едут в `hands.raw`: после эскалации видно, где расхождение возникло."""
     llm = FakeLLM(export_reading(ante_pool_shown=None), export_reading())

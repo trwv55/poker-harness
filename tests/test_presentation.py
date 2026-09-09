@@ -578,6 +578,21 @@ def test_start_msg_does_not_deny_the_menu_it_carries():
     assert "без меню" not in (start_msg.__doc__ or "")
 
 
+def test_hand_in_progress_msg_names_the_next_step_and_blames_nobody():
+    """Отказ без следующего шага оставляет игрока с той же картинкой в руках.
+
+    Слова про ошибку тут быть не может: экран прочитан, просто рука на нём ещё
+    не доиграна, и «пришлите позже» — единственное, что игроку остаётся сделать.
+    """
+    from harness.presentation import hand_in_progress_msg
+
+    msg = hand_in_progress_msg()
+
+    assert msg.buttons == []
+    assert "скриншот" in msg.text
+    assert "ошиб" not in msg.text
+
+
 def test_unknown_button_msg_does_not_promise_a_button_that_will_work_later():
     """Три кнопки под вердиктом разбираются по-настоящему с задачи 23.
 
