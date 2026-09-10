@@ -95,6 +95,46 @@ class EvInterval(BaseModel):
         return self
 
 
+# Ключ в `PointVerdict.detail`, под которым лежит разбор риверной точки, и его
+# содержимое. Ключ и тип живут здесь, а не рядом с расчётом
+# (`analysis/river.py`), по той же причине, что `ScanItem` (см. докстринг
+# модуля): читает их `presentation`, а импорт из `analysis` втянул бы в образ
+# бота `eval7` и `pokerkit`.
+RIVER_CALL_DETAIL = "river_call"
+
+
+class RiverCallDetail(BaseModel):
+    """Числа риверной точки: цена решения и требование к ставящему диапазону.
+
+    Лежит в `detail`, а не отдельным полем `PointVerdict`: поле означало бы
+    колонку в `decision_points` и миграцию, а `detail` — уже существующий
+    jsonb, поле в поле переносимый в базу и обратно
+    (`test_a_river_point_survives_the_round_trip_through_the_database`).
+
+    `bluffs_needed_min_value` и `min_value_combos` названы так же, как поля
+    `analysis.tools.river_call.RiverCallRequirement`, откуда и взяты:
+    требование посчитано на МИНИМАЛЬНОМ вэлью, и короткое имя `bluffs_needed`
+    здесь означало бы второе число того же инструмента.
+
+    `bluff_share` — доля блефов в ставящем диапазоне,
+    `bluffs / (min_value + bluffs)`, в долях единицы. Считается ядром, а не
+    изложением: это арифметика, а изложение округляет и печатает
+    (`test_the_bluff_share_is_computed_from_the_unrounded_numbers`).
+
+    `fold_proven` — требование к диапазону превышает число проигрывающих героя
+    комбо на борде; правило и его допущение — в докстринге
+    `analysis.tools.river_call`.
+    """
+
+    pot_before: int
+    to_call: int
+    required_equity: float
+    min_value_combos: int
+    bluffs_needed_min_value: float
+    bluff_share: float
+    fold_proven: bool
+
+
 # Машинный ключ причины, по которой точка осталась без вердикта. Нужен ровно
 # затем, чтобы `presentation` мог перевести причину в слова игрока, не разбирая
 # внутренние формулировки ядра: те написаны для разбора, а не для чтения вслух.
@@ -131,6 +171,20 @@ class PointVerdict(BaseModel):
                 f"зона {self.zone}, допущение {'есть' if self.assumption else 'нет'}"
             )
         return self
+
+
+def river_call_detail(point: PointVerdict) -> RiverCallDetail | None:
+    """Разбор риверной точки из `detail` — или `None`, если его там нет.
+
+    Ключ с чужим содержимым не проглатывается, а роняет разбор
+    (`test_a_foreign_shape_under_the_river_key_is_not_swallowed`): писать под
+    этот ключ, кроме ядра, некому, и тихо пропущенный блок вернул бы игроку то
+    самое молчание, ради которого разбор ривера и заведён.
+    """
+    raw = point.detail.get(RIVER_CALL_DETAIL)
+    if raw is None:
+        return None
+    return RiverCallDetail.model_validate(raw)
 
 
 class AnalysisResult(BaseModel):

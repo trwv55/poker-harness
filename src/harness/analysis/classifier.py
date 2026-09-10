@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from harness.contracts import (
@@ -26,8 +26,10 @@ from harness.contracts import (
     CanonicalHand,
     DecisionPoint,
     EnrichedHand,
+    PointVerdict,
     SpotKind,
     Street,
+    Zone,
 )
 from harness.engine.validation import forced_blind
 from harness.normalizer import POSITIONS_BY_COUNT
@@ -373,6 +375,57 @@ def unpriced_reason(dp: DecisionPoint, state: TableState) -> str:
             "а модель считает эквити против одного диапазона"
         )
     return "перед героем олл-ин, но сыгран не колл и не пас"
+
+
+# Что стоит в `action_taken` у точки, где герой ещё не ходил: строку видит
+# только разбор, игроку показывается формулировка `presentation`.
+_NOT_TAKEN = "не сыграно"
+
+
+def unjudged_point(
+    dp: DecisionPoint,
+    spot: SpotKind,
+    reason: str,
+    detail: Mapping[str, object] | None = None,
+    kind: str = "",
+    tools: Sequence[str] = (),
+) -> PointVerdict:
+    """Точка без вердикта: спот размечен, цена не посчитана.
+
+    Признак «вердикта нет» — пустой `best_action`; на такие точки не ссылается
+    ранжирование и не опирается изложение. Зона здесь `strict` не потому, что
+    вывод точен, а потому, что вывода нет вовсе: допущение не сделано, и
+    инвариант «assumption заполнено тогда и только тогда, когда зона assuming»
+    обязан выполняться и на таких точках.
+
+    `detail` — то, что успело посчитаться до отказа. Ранжирование и сумма его
+    не читают (`error_cost.is_judged`), а `ev_diff_bb` здесь ноль; показывается
+    ли что-то из него игроку, решает `presentation` по машинному ключу
+    (`RIVER_CALL_DETAIL`, `UNJUDGED_DECISION_NOT_TAKEN`).
+
+    `tools` — чем считали то, что легло в `detail`: у отказа, случившегося до
+    расчёта, список пуст, у точки с посчитанными числами — нет.
+
+    Живёт здесь, рядом с `unpriced_reason`: точку без вердикта строит не только
+    префлоп (`analysis.river` — второй вызывающий), а обе половины отказа —
+    причина и форма — обязаны оставаться в одном месте.
+    """
+    return PointVerdict(
+        dp_index=dp.index,
+        street=dp.street,
+        spot=spot,
+        zone=Zone.STRICT,
+        action_taken=action_name(dp) if dp.action is not None else _NOT_TAKEN,
+        best_action="",
+        ev_diff_bb=0.0,
+        assumption=None,
+        tools=list(tools),
+        detail={
+            **(detail or {}),
+            "unjudged": reason,
+            **({"unjudged_kind": kind} if kind else {}),
+        },
+    )
 
 
 def classify(dp: DecisionPoint, en: EnrichedHand) -> SpotKind:

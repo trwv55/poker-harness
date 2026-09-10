@@ -97,13 +97,14 @@ from harness.analysis.classifier import (
     SeatSnapshot,
     TableState,
     action_index,
-    action_name,
     in_action_order_after,
     spot_for,
     table_state,
     taken_action,
+    unjudged_point,
     unpriced_reason,
 )
+from harness.analysis.river import river_verdict
 from harness.analysis.tools.equity import equity_vs_ranges
 from harness.analysis.tools.multiway import (
     DidNotConverge,
@@ -672,7 +673,7 @@ def _too_wide_for_near_zero(interval: EvInterval) -> str:
     Пустая строка означает, что форма «около нуля» этой точке подходит. Иначе
     точка возвращается без вердикта: посчитанные числа остаются в `detail`, а
     игроку не показывается ничего — ровно то же, что делает любой другой отказ
-    (`_unjudged`). Это не возврат к прежнему поведению: прежде отказывались и
+    (`unjudged_point`). Это не возврат к прежнему поведению: прежде отказывались и
     узкие интервалы, у которых знак, порядок величины и потолок цены есть;
     здесь нет ни одного из трёх.
 
@@ -807,10 +808,8 @@ def _hero_class(hand: CanonicalHand) -> str | None:
     return class_of(*cards)
 
 
-# Что стоит в `action_taken` у точки, где герой ещё не ходил, и почему у неё
-# отказ: строки видит только разбор, игроку показывается формулировка
-# `presentation`.
-_NOT_TAKEN = "не сыграно"
+# Причина отказа на точке, где герой ещё не ходил: строку видит только разбор,
+# игроку показывается формулировка `presentation`.
 _DECISION_NOT_TAKEN = (
     "решение ещё не принято: на экране состояние в точке решения, "
     "сравнивать с лучшей линией нечего"
@@ -820,44 +819,6 @@ _DECISION_NOT_TAKEN = (
 def _spot_of_street(street: Street) -> SpotKind:
     """Спот по улице — грубая разметка для точки, которую судить не будут."""
     return SpotKind.POSTFLOP if street is not Street.PREFLOP else SpotKind.PREFLOP_OTHER
-
-
-def _unjudged(
-    dp: DecisionPoint,
-    spot: SpotKind,
-    reason: str,
-    detail: Mapping[str, object] | None = None,
-    kind: str = "",
-) -> PointVerdict:
-    """Точка без вердикта: спот размечен, цена не посчитана.
-
-    Признак «вердикта нет» — пустой `best_action`; на такие точки не ссылается
-    ранжирование и не опирается изложение. Зона здесь `strict` не потому, что
-    вывод точен, а потому, что вывода нет вовсе: допущение не сделано, и
-    инвариант «assumption заполнено тогда и только тогда, когда зона assuming»
-    обязан выполняться и на таких точках.
-
-    `detail` — то, что успело посчитаться до отказа. Оно остаётся в вердикте
-    ради разбора и будущего интервала вместо точки, но игроку не показывается
-    ничем: и ранжирование, и сводка смотрят на `best_action`
-    (`error_cost.is_judged`), а `ev_diff_bb` здесь ноль.
-    """
-    return PointVerdict(
-        dp_index=dp.index,
-        street=dp.street,
-        spot=spot,
-        zone=Zone.STRICT,
-        action_taken=action_name(dp) if dp.action is not None else _NOT_TAKEN,
-        best_action="",
-        ev_diff_bb=0.0,
-        assumption=None,
-        tools=[],
-        detail={
-            **(detail or {}),
-            "unjudged": reason,
-            **({"unjudged_kind": kind} if kind else {}),
-        },
-    )
 
 
 def _shover(state: TableState) -> SeatSnapshot | None:
@@ -1017,14 +978,14 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
     spot = SpotKind.PUSHFOLD_UNOPENED
     hero_cls = _hero_class(en.hand)
     if hero_cls is None:
-        return _unjudged(dp, spot, "карты героя неизвестны")
+        return unjudged_point(dp, spot, "карты героя неизвестны")
 
     bb = en.hand.bb
     ceiling = state.hero.stack
     behind = [s for s in state.behind_hero if s.behind > 0]
     all_in_behind = len(state.behind_hero) - len(behind)
     if all_in_behind:
-        return _unjudged(
+        return unjudged_point(
             dp,
             spot,
             f"в руке живых без фишек за спиной помимо героя — {all_in_behind}: "
@@ -1032,11 +993,13 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
             f"против неполного состава",
         )
     if not behind:
-        return _unjudged(dp, spot, "позади героя некому коллировать")
+        return unjudged_point(dp, spot, "позади героя некому коллировать")
     if len(behind) > _MAX_MODELLED_CALLERS:
-        return _unjudged(dp, spot, f"игроков позади {len(behind)} — перебор подмножеств ограничен")
+        return unjudged_point(
+            dp, spot, f"игроков позади {len(behind)} — перебор подмножеств ограничен"
+        )
     if state.hero.behind <= 0:
-        return _unjudged(dp, spot, "у героя не осталось фишек за спиной")
+        return unjudged_point(dp, spot, "у героя не осталось фишек за спиной")
 
     hero_behind_bb = state.hero.behind / bb
     hero_posted_bb = state.hero.contributed / bb
@@ -1070,7 +1033,7 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
     try:
         solution = _table_equilibrium(state, behind, bb)
     except DidNotConverge as failure:
-        return _unjudged(dp, spot, _NO_EQUILIBRIUM, {"solver_error": str(failure)})
+        return unjudged_point(dp, spot, _NO_EQUILIBRIUM, {"solver_error": str(failure)})
     model_ranges = list(solution.calls)
     model_callers = callers(model_ranges)
     ev_model = ev(model_ranges)
@@ -1151,7 +1114,7 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
     # это обещание неверно, и точка остаётся без вердикта (см.
     # `_NEAR_ZERO_MAX_WIDTH_BB`).
     if near_zero and (too_wide := _too_wide_for_near_zero(interval)):
-        return _unjudged(dp, spot, too_wide, detail)
+        return unjudged_point(dp, spot, too_wide, detail)
     return PointVerdict(
         dp_index=dp.index,
         street=dp.street,
@@ -1188,14 +1151,14 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
     spot = SpotKind.PUSHFOLD_FACING_SHOVE
     hero_cls = _hero_class(en.hand)
     if hero_cls is None:
-        return _unjudged(dp, spot, "карты героя неизвестны")
+        return unjudged_point(dp, spot, "карты героя неизвестны")
 
     shover = _shover(state)
     if shover is None:
-        return _unjudged(dp, spot, "не удалось определить, кто поставил")
+        return unjudged_point(dp, spot, "не удалось определить, кто поставил")
     bb = en.hand.bb
     if state.to_call <= 0 or state.hero.behind <= 0:
-        return _unjudged(dp, spot, "доплаты нет либо у героя не осталось фишек")
+        return unjudged_point(dp, spot, "доплаты нет либо у героя не осталось фишек")
 
     # Живой без фишек за спиной (`behind == 0`) в модельный набор коллеров не
     # входит: ось «войдёт или нет» для него пуста. Посчитать точку при этом
@@ -1211,7 +1174,7 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
     behind = [seat for seat in live_behind if seat.behind > 0]
     all_in_behind = len(live_behind) - len(behind)
     if all_in_behind:
-        return _unjudged(
+        return unjudged_point(
             dp,
             spot,
             f"в руке живых без фишек за спиной помимо героя и шовера — "
@@ -1222,16 +1185,16 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
     dead_bb = _table_dead_bb(state)
     rivals = _rivals_when_shoved(en.hand, dp, state, shover)
     if not rivals:
-        return _unjudged(dp, spot, "на момент шова отвечать на него было некому")
+        return unjudged_point(dp, spot, "на момент шова отвечать на него было некому")
     if len(rivals) > _MAX_MODELLED_CALLERS:
-        return _unjudged(
+        return unjudged_point(
             dp,
             spot,
             f"на момент шова позади шовера было {len(rivals)} игроков — больше, чем "
             f"решатель равновесия берёт, и приписать шоверу диапазон не из чего",
         )
     if any(seat.behind <= 0 for seat in rivals):
-        return _unjudged(
+        return unjudged_point(
             dp,
             spot,
             "на момент шова позади шовера было место без фишек за спиной: выбора "
@@ -1240,11 +1203,11 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         )
     shover_posted = _posted_before_shove(en.hand, dp, shover)
     if shover.stack <= shover_posted:
-        return _unjudged(dp, spot, "у шовера не было фишек за спиной — шовить ему было нечем")
+        return unjudged_point(dp, spot, "у шовера не было фишек за спиной — шовить ему было нечем")
     try:
         solution = _shover_equilibrium(state, shover, shover_posted, rivals, bb)
     except DidNotConverge as failure:
-        return _unjudged(dp, spot, _NO_EQUILIBRIUM, {"solver_error": str(failure)})
+        return unjudged_point(dp, spot, _NO_EQUILIBRIUM, {"solver_error": str(failure)})
 
     shover_depth_bb = (
         min(shover.stack_after_ante, max(seat.stack_after_ante for seat in rivals)) / bb
@@ -1390,7 +1353,7 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
     # То же правило, что и в неоткрытом банке: слишком широкий интервал через ноль
     # — это отсутствие ответа, а не «оба варианта допустимы».
     if near_zero and (too_wide := _too_wide_for_near_zero(interval)):
-        return _unjudged(dp, spot, too_wide, detail)
+        return unjudged_point(dp, spot, too_wide, detail)
     return PointVerdict(
         dp_index=dp.index,
         street=dp.street,
@@ -1626,10 +1589,14 @@ def cheap_fold_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | No
 def verdict_for(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict:
     """Вердикт по одной точке решения героя.
 
-    Постфлоп и прочий префлоп в v1 не оцениваются и возвращаются без вердикта:
-    инструмента, который посчитал бы их цену, у нас пока нет, а назвать
-    неизвестную цену нулём и промолчать — значит выдать пробел за отсутствие
-    ошибки.
+    Тёрн, флоп и прочий префлоп цены не получают и возвращаются без вердикта:
+    инструмента, который посчитал бы её, у нас пока нет, а назвать неизвестную
+    цену нулём и промолчать — значит выдать пробел за отсутствие ошибки.
+
+    **Ривер разбирается, но цены тоже не получает** (`analysis.river`): перебор
+    борда даёт требование к ставящему диапазону соперника и — когда борд
+    исчерпан — лучшее действие, но не EV решения. Такая точка не судима
+    (`SpotKind.POSTFLOP` вне `JUDGED_SPOTS`) и в сумму потерь не входит.
 
     **Точка без сыгранного действия — тоже отказ, и названный.** Такую точку
     строит `harness.engine.state` на входе, застающем героя ДО хода: вердикт
@@ -1639,14 +1606,17 @@ def verdict_for(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict:
     на станции чтения (`test_a_hand_still_in_progress_never_reaches_the_analysis`).
     """
     if dp.action is None:
-        return _unjudged(
+        return unjudged_point(
             dp,
             _spot_of_street(dp.street),
             _DECISION_NOT_TAKEN,
             kind=UNJUDGED_DECISION_NOT_TAKEN,
         )
     if dp.street is not Street.PREFLOP:
-        return _unjudged(dp, SpotKind.POSTFLOP, "постфлоп в v1 не оценивается")
+        river = river_verdict(dp, en)
+        if river is not None:
+            return river
+        return unjudged_point(dp, SpotKind.POSTFLOP, "тёрн и флоп в v1 не оцениваются")
 
     state = table_state(dp, en)
     spot = spot_for(dp, state)
@@ -1654,4 +1624,4 @@ def verdict_for(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict:
         return _unopened_verdict(dp, en, state)
     if spot is SpotKind.PUSHFOLD_FACING_SHOVE:
         return _facing_shove_verdict(dp, en, state)
-    return _unjudged(dp, spot, unpriced_reason(dp, state))
+    return unjudged_point(dp, spot, unpriced_reason(dp, state))

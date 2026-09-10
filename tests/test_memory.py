@@ -14,7 +14,7 @@ import asyncio
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import insert, text
+from sqlalchemy import insert, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -194,6 +194,63 @@ async def test_analyses_save_and_get_by_hand(db):
     assert got.result == result
     assert got.verdict_text == "норм"
     assert got.range_images == ["r1.png"]
+
+
+async def test_a_river_point_survives_the_round_trip_through_the_database(db):
+    """Числа риверной точки лежат в jsonb-колонке `detail` и возвращаются целыми.
+
+    Отдельного поля в `PointVerdict` под них нет намеренно — оно означало бы
+    колонку и миграцию, — поэтому проверяется именно то, что даёт `detail`:
+    запись и чтение без потерь, а `judged` при этом остаётся ложью (постфлоп не
+    судится, цены у точки нет).
+    """
+    from harness.contracts import (
+        RIVER_CALL_DETAIL,
+        PointVerdict,
+        SpotKind,
+        Street,
+        Zone,
+        river_call_detail,
+    )
+    from harness.memory.models import DecisionPointRow
+
+    session_id = await _make_session(db)
+    raw = RawHand.model_validate(make_min_raw())
+    hid = await HandsRepo(db).save_raw(session_id=session_id, raw=raw)
+    numbers = {
+        "pot_before": 398_000,
+        "to_call": 169_000,
+        "required_equity": 0.2980599647266314,
+        "min_value_combos": 94,
+        "bluffs_needed_min_value": 38.18844221105527,
+        "bluff_share": 0.28889395753739705,
+        "fold_proven": False,
+    }
+    point = PointVerdict(
+        dp_index=6,
+        street=Street.RIVER,
+        spot=SpotKind.POSTFLOP,
+        zone=Zone.STRICT,
+        action_taken="call",
+        best_action="",
+        ev_diff_bb=0.0,
+        tools=["river_call"],
+        detail={RIVER_CALL_DETAIL: numbers, "unjudged": "фолд не доказан"},
+    )
+    result = AnalysisResult(hand_no=raw.hand_no, points=[point], ranked=[])
+    await AnalysesRepo(db).save(hand_id=hid, result=result, decision_points=[])
+
+    got = await AnalysesRepo(db).get_by_hand(hid)
+    assert got is not None
+    restored = river_call_detail(got.result.points[0])
+    assert restored is not None
+    assert restored.model_dump() == numbers
+
+    row = await db.scalar(
+        select(DecisionPointRow).where(DecisionPointRow.hand_id == hid)
+    )
+    assert row is not None
+    assert row.judged is False
 
 
 async def test_set_explanation_without_text_keeps_the_saved_one(db):

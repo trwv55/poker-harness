@@ -278,3 +278,38 @@ def test_a_leak_rule_is_found_by_the_raw_strings_of_jsonb():
 
     rule = LEAK_RULES[0]
     assert leak_rule_for(str(rule.spot), rule.action_taken, rule.best_action) is rule
+
+
+# --- риверная точка в `detail` (задача «постфлоп перестаёт молчать») ------------------
+
+
+def test_a_river_point_without_the_key_has_no_river_numbers():
+    """Ключа нет — ответ `None`, и изложение печатает по этой точке ничего."""
+    from harness.contracts import SpotKind, river_call_detail
+
+    point = _leak_point(
+        spot=SpotKind.POSTFLOP, action_taken="call", best_action="", ev_diff_bb=0.0
+    )
+    assert river_call_detail(point) is None
+
+
+def test_a_foreign_shape_under_the_river_key_is_not_swallowed():
+    """Ключ с чужим содержимым — поломка, а не повод тихо промолчать.
+
+    Тихий `None` вернул бы игроку то самое молчание, ради которого разбор
+    ривера и заведён, и сделал бы это незаметно.
+    """
+    import pytest
+    from pydantic import ValidationError
+
+    from harness.contracts import RIVER_CALL_DETAIL, SpotKind, river_call_detail
+
+    point = _leak_point(
+        spot=SpotKind.POSTFLOP,
+        action_taken="call",
+        best_action="",
+        ev_diff_bb=0.0,
+        detail={RIVER_CALL_DETAIL: {"pot_before": 398_000}},
+    )
+    with pytest.raises(ValidationError):
+        river_call_detail(point)

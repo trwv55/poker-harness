@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from harness.contracts.analysis import (
+    RIVER_CALL_DETAIL,
     UNJUDGED_DECISION_NOT_TAKEN,
     AllInEvent,
     AnalysisResult,
@@ -19,12 +20,14 @@ from harness.contracts.analysis import (
     LevelLine,
     PlayerStats,
     PointVerdict,
+    RiverCallDetail,
     ScanItem,
     ScanSummary,
     SpotKind,
     StackTrajectory,
     TournamentReport,
     Zone,
+    river_call_detail,
 )
 from harness.contracts.calcs import (
     POSITIONS,
@@ -126,6 +129,7 @@ __all__ = [
     "NOTE_COLOR_NONE",
     "POSITIONS",
     "RANKS",
+    "RIVER_CALL_DETAIL",
     "UNJUDGED_DECISION_NOT_TAKEN",
     "ActionKind",
     "AllInEvent",
@@ -177,6 +181,7 @@ __all__ = [
     "Range",
     "RawAction",
     "RawHand",
+    "RiverCallDetail",
     "ScanItem",
     "ScanSummary",
     "SeatInfo",
@@ -216,4 +221,5 @@ __all__ = [
     "is_judged",
     "leak_rule_for",
     "leak_rule_of_point",
+    "river_call_detail",
 ]
