@@ -45,12 +45,14 @@
 не спорит с маркером и не требует знания, действительно ли сыгранное было
 ошибкой.
 
-**Риверная точка — числа без цены.** У неё нет ни `ev_diff_bb`, ни интервала:
+**Постфлоп-точка — числа без цены.** У неё нет ни `ev_diff_bb`, ни интервала:
 перебор борда отвечает на вопрос «сколько блефов нужно в его ставящем
 диапазоне», а не «сколько стоило решение». Поэтому её строки стоят отдельно от
 строк расхождений и не несут ни цены, ни слова «лучше» — кроме случая, когда
 ядро назвало лучшую линию (`PointVerdict.best_action`), и тогда рядом названо
-допущение, на котором она держится.
+допущение, на котором она держится. Ривер, тёрн и флоп печатаются одними
+словами и одной функцией (`_postflop_call_lines`): считают их разные
+инструменты, но подписи у чисел одни и те же.
 
 **Форма «около нуля» — вердикт, а не отказ.** У части точек интервал EV лежит
 по обе стороны нуля: при одних моделях поведения оппонентов лучше входить, при
@@ -76,7 +78,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from itertools import pairwise
 from math import ceil, floor
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from pydantic import BaseModel, model_validator
 
@@ -95,6 +97,7 @@ from harness.contracts.analysis import (
     TournamentReport,
     Zone,
     river_call_detail,
+    turn_flop_call_detail,
 )
 from harness.contracts.explanation import TournamentTextOut, VerdictTextOut
 from harness.contracts.history import (
@@ -532,18 +535,20 @@ _NOT_CHECKED_PREFIX = "Проверить на этом экране было н
 _NO_VERDICT_LINE = "По этой раздаче точек с вердиктом нет."
 
 
-# Слова про риверную точку. Требование к ставящему диапазону — число блефов на
-# заданное вэлью — печатается вместе с долей, которую эти блефы в диапазоне
-# занимают: одно число отвечает «сколько», второе — «насколько это много».
+# Слова про постфлоп-точку — одни и те же на всех трёх улицах. Требование к
+# ставящему диапазону — число блефов на заданное вэлью — печатается вместе с
+# долей, которую эти блефы в диапазоне занимают: одно число отвечает «сколько»,
+# второе — «насколько это много».
 #
 # Чего в этих строках НЕТ и почему (решение владельца):
 # * разложения борда по исходам (сколько комбо бьёт, проигрывает, делит) — это
 #   не диапазон соперника, а полный перебор возможного, и читается как чужой
 #   диапазон, которого мы не знаем;
-# * строки «доказать фолд не удалось» и оговорок про тёрн и флоп — продукт не
-#   рассказывает о том, чего не умеет (SESSIONS_UX).
-_RIVER_HEAD = "{street}: банк {pot}, доставить {to_call} — колл окупается от {equity} эквити."
-_RIVER_ASSUMPTION = "Допущение: сильнейшие руки он ставит."
+# * строки «доказать фолд не удалось» и оговорок про то, чем тёрн и флоп
+#   отличаются от ривера, — продукт не рассказывает о том, чего не умеет
+#   (SESSIONS_UX).
+_CALL_HEAD = "{street}: банк {pot}, доставить {to_call} — колл окупается от {equity} эквити."
+_CALL_ASSUMPTION = "Допущение: сильнейшие руки он ставит."
 
 
 def _rounded_bluffs(value: float) -> int:
@@ -556,55 +561,118 @@ def _rounded_bluffs(value: float) -> int:
     return int(value + 0.5)
 
 
-def _river_lines(point: PointVerdict) -> list[str]:
-    """Разбор риверной точки: цена решения, требование к диапазону, лучшая линия.
+class _CallNumbers(NamedTuple):
+    """Числа постфлоп-точки в форме, одинаковой для всех трёх улиц.
 
-    Пустой список — у точки нет риверных чисел (`river_call_detail`), и печатать
+    Ривер и пара «тёрн, флоп» приходят из разных расчётов и лежат в `detail`
+    под разными ключами, но показываются игроку одними словами. Общая форма
+    здесь — то место, где две редакции этих слов не разойдутся.
+
+    `bluffs` — `None`, когда требуемого числа блефов не существует (тёрн и
+    флоп: не хватает и всего борда); `share` — `None` там же.
+    `beyond_the_board` — требование превышает то, что борд вмещает.
+    """
+
+    pot_before: int
+    to_call: int
+    required_equity: float
+    min_value_combos: int
+    bluffs: float | None
+    share: float | None
+    beyond_the_board: bool
+
+
+def _call_numbers(point: PointVerdict) -> _CallNumbers | None:
+    """Числа постфлоп-точки из `detail` — или `None`, если их там нет."""
+    river = river_call_detail(point)
+    if river is not None:
+        return _CallNumbers(
+            pot_before=river.pot_before,
+            to_call=river.to_call,
+            required_equity=river.required_equity,
+            min_value_combos=river.min_value_combos,
+            bluffs=river.bluffs_needed_min_value,
+            share=river.bluff_share,
+            beyond_the_board=river.fold_proven,
+        )
+    early = turn_flop_call_detail(point)
+    if early is not None:
+        return _CallNumbers(
+            pot_before=early.pot_before,
+            to_call=early.to_call,
+            required_equity=early.required_equity,
+            min_value_combos=early.min_value_combos,
+            bluffs=early.bluffs_needed_min_value,
+            share=early.bluff_share,
+            beyond_the_board=early.bluffs_needed_min_value is None,
+        )
+    return None
+
+
+def _postflop_call_lines(point: PointVerdict) -> list[str]:
+    """Разбор постфлоп-точки: цена решения, требование к диапазону, лучшая линия.
+
+    Пустой список — у точки нет посчитанных чисел (`_call_numbers`), и печатать
     нечего. Строка про блефы пропускается, когда требования нет вовсе — вэлью
     старшего класса на борде не осталось или блефов нужно меньше одного:
     «нужно 0 блефов» не утверждение, а вырожденный случай
     (`test_a_degenerate_river_requirement_prints_only_the_price_of_the_call`).
 
+    Числа блефов может не существовать вовсе — тогда строка называет вэлью и
+    говорит, что столько блефов борд не вмещает
+    (`test_a_requirement_beyond_the_board_prints_no_number_of_bluffs`).
+
     Лучшая линия называется ровно тогда, когда её назвало ядро
     (`PointVerdict.best_action`), то есть когда борд исчерпан; вместе с ней
     называется и единственное допущение, на котором она стоит.
     """
-    detail = river_call_detail(point)
-    if detail is None:
+    numbers = _call_numbers(point)
+    if numbers is None:
         return []
     lines = [
-        _RIVER_HEAD.format(
-            street=_STREET_WORD[Street.RIVER],
-            pot=chips(detail.pot_before),
-            to_call=chips(detail.to_call),
-            equity=_fmt_pct(100.0 * detail.required_equity),
+        _CALL_HEAD.format(
+            street=_STREET_WORD.get(point.street, point.street.value),
+            pot=chips(numbers.pot_before),
+            to_call=chips(numbers.to_call),
+            equity=_fmt_pct(100.0 * numbers.required_equity),
         )
     ]
-    bluffs = _rounded_bluffs(detail.bluffs_needed_min_value)
-    if detail.min_value_combos > 0 and bluffs > 0:
-        combos_word = _plural_form(
-            detail.min_value_combos, "комбинацию", "комбинации", "комбинаций"
-        )
-        need_word = _plural_form(bluffs, "нужен", "нужно", "нужно")
-        bluffs_word = _plural_form(bluffs, "блеф", "блефа", "блефов")
-        tail = (
-            "больше, чем на этом борде существует"
-            if detail.fold_proven
-            else (
-                f"то есть блефом должно быть {_fmt_pct(100.0 * detail.bluff_share)} "
-                f"его ставящего диапазона"
-            )
-        )
-        lines.append(
-            f"    Чтобы колл вышел в ноль, на {detail.min_value_combos} {combos_word} "
-            f"несомненного вэлью ему {need_word} {bluffs} {bluffs_word} — {tail}."
-        )
+    lines.extend(_bluff_line(numbers))
     if point.best_action:
         # Вывод отдельной строкой, а не хвостом предыдущей: строка про блефы у
         # вырожденного требования не печатается вовсе, и лучшая линия ушла бы
         # вместе с ней (`test_a_proven_fold_names_the_line_even_without_the_bluff_line`).
-        lines.append(f"    Лучше: {_action_word(point.best_action)}. {_RIVER_ASSUMPTION}")
+        lines.append(f"    Лучше: {_action_word(point.best_action)}. {_CALL_ASSUMPTION}")
     return lines
+
+
+def _bluff_line(numbers: _CallNumbers) -> list[str]:
+    """Строка требования к ставящему диапазону — или пустой список, если его нет."""
+    if numbers.min_value_combos <= 0:
+        return []
+    combos_word = _plural_form(
+        numbers.min_value_combos, "комбинацию", "комбинации", "комбинаций"
+    )
+    head = (
+        f"    Чтобы колл вышел в ноль, на {numbers.min_value_combos} {combos_word} "
+        f"несомненного вэлью ему "
+    )
+    if numbers.bluffs is None or numbers.share is None:
+        return [f"{head}нужно больше блефов, чем на этом борде существует."]
+    bluffs = _rounded_bluffs(numbers.bluffs)
+    if bluffs <= 0:
+        return []
+    need_word = _plural_form(bluffs, "нужен", "нужно", "нужно")
+    bluffs_word = _plural_form(bluffs, "блеф", "блефа", "блефов")
+    tail = (
+        "больше, чем на этом борде существует"
+        if numbers.beyond_the_board
+        else (
+            f"то есть блефом должно быть {_fmt_pct(100.0 * numbers.share)} "
+            f"его ставящего диапазона"
+        )
+    )
+    return [f"{head}{need_word} {bluffs} {bluffs_word} — {tail}."]
 
 
 def deep_dive_msg(
@@ -625,12 +693,13 @@ def deep_dive_msg(
     уже отфильтрованный и отранжированный список судимых точек
     (`error_cost.py`), без точек-пробелов, которым нечего показать честно.
 
-    **Под ними — риверная точка, у которой цены нет** (`_river_lines`): её
-    числа посчитаны перебором борда, а не против диапазона, и в ранжирование
-    она не входит по построению (`SpotKind.POSTFLOP` вне `JUDGED_SPOTS`).
+    **Под ними — постфлоп-точки, у которых цены нет** (`_postflop_call_lines`):
+    их числа посчитаны перебором борда, а не против диапазона, и в ранжирование
+    они не входят по построению (`SpotKind.POSTFLOP` вне `JUDGED_SPOTS`).
     Порядок такой, а не по улицам: сначала то, что стоило денег, потом то, что
-    посчитано без цены. Строка «точек с вердиктом нет» печатается, только когда
-    нет ни одной из двух половин
+    посчитано без цены; внутри второй половины улицы идут в порядке раздачи —
+    том же, в каком лежат точки решения. Строка «точек с вердиктом нет»
+    печатается, только когда нет ни одной из двух половин
     (`test_a_river_point_alone_is_not_a_hand_without_a_verdict`).
 
     **`zone=None` — «зоны нет», и тогда её нет и в строке (round 5, Item H).**
@@ -667,9 +736,9 @@ def deep_dive_msg(
     lines = [f"Рука {res.hand_no}", ""]
 
     prose = {} if verdict is None else {point.dp_index: point.text for point in verdict.points}
-    river = [line for point in res.points for line in _river_lines(point)]
+    postflop = [line for point in res.points for line in _postflop_call_lines(point)]
 
-    if not res.ranked and not river:
+    if not res.ranked and not postflop:
         lines.append(_NO_VERDICT_LINE)
     elif res.ranked:
         for idx in res.ranked:
@@ -699,10 +768,10 @@ def deep_dive_msg(
             )
             lines.extend(_prose_lines(prose.get(point.dp_index)))
 
-    if river:
+    if postflop:
         if res.ranked:
             lines.append("")
-        lines.extend(river)
+        lines.extend(postflop)
 
     if verdict is not None and verdict.summary.strip():
         lines.append("")

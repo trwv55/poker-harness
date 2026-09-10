@@ -1340,7 +1340,8 @@ def _river_point(*, best_action: str = "", **over) -> PointVerdict:
     )
 
 
-def _river_msg(point: PointVerdict, zone: Zone | None = None) -> str:
+def _one_point_msg(point: PointVerdict, zone: Zone | None = None) -> str:
+    """Разбор из одной постфлоп-точки — ривера, тёрна или флопа."""
     return deep_dive_msg(
         AnalysisResult(hand_no="H7", points=[point], ranked=[]), 12, zone, 17, 50
     ).text
@@ -1348,7 +1349,7 @@ def _river_msg(point: PointVerdict, zone: Zone | None = None) -> str:
 
 def test_the_river_line_shows_the_price_of_the_call_and_the_bluff_requirement():
     """Форма, согласованная с владельцем, — дословно, включая слово «доставить»."""
-    text = _river_msg(_river_point())
+    text = _one_point_msg(_river_point())
     assert "Ривер: банк 398\u00a0000, доставить 169\u00a0000 — колл окупается от 29.8% эквити." in text
     assert (
         "    Чтобы колл вышел в ноль, на 94 комбинации несомненного вэлью ему нужно "
@@ -1359,14 +1360,14 @@ def test_the_river_line_shows_the_price_of_the_call_and_the_bluff_requirement():
 
 def test_a_river_point_alone_is_not_a_hand_without_a_verdict():
     """Точка без цены, но с числами, перестала быть молчанием."""
-    text = _river_msg(_river_point())
+    text = _one_point_msg(_river_point())
     assert "точек с вердиктом нет" not in text
     assert "Ривер:" in text
 
 
 def test_a_proven_fold_names_the_line_and_its_single_assumption():
     """Доказанный фолд: лучшая линия названа, и допущение под ней — тоже."""
-    text = _river_msg(_river_point(best_action="fold", fold_proven=True), Zone.STRICT)
+    text = _one_point_msg(_river_point(best_action="fold", fold_proven=True), Zone.STRICT)
     assert "больше, чем на этом борде существует." in text
     assert "    Лучше: фолд. Допущение: сильнейшие руки он ставит." in text
     assert "зона: строго" in text
@@ -1377,7 +1378,7 @@ def test_a_proven_fold_names_the_line_and_its_single_assumption():
 
 def test_a_proven_fold_names_the_line_even_without_the_bluff_line():
     """Вырожденное требование не должно уносить с собой вывод."""
-    text = _river_msg(
+    text = _one_point_msg(
         _river_point(
             best_action="fold", fold_proven=True, min_value_combos=0, bluffs_needed_min_value=0.0
         )
@@ -1388,22 +1389,22 @@ def test_a_proven_fold_names_the_line_even_without_the_bluff_line():
 
 def test_a_degenerate_river_requirement_prints_only_the_price_of_the_call():
     """Ни вэлью старшего класса, ни блефов — «нужно 0 блефов» не утверждение."""
-    text = _river_msg(_river_point(min_value_combos=0, bluffs_needed_min_value=0.0))
+    text = _one_point_msg(_river_point(min_value_combos=0, bluffs_needed_min_value=0.0))
     assert "Ривер: банк 398\u00a0000, доставить 169\u00a0000" in text
     assert "блеф" not in text
 
 
 def test_half_a_bluff_is_rounded_up_to_one():
     """Требование читается в штуках, и половина обязана дать один, а не ноль."""
-    text = _river_msg(_river_point(min_value_combos=1, bluffs_needed_min_value=0.5))
+    text = _one_point_msg(_river_point(min_value_combos=1, bluffs_needed_min_value=0.5))
     assert "на 1 комбинацию несомненного вэлью ему нужен 1 блеф" in text
 
 
 def test_the_bluff_count_agrees_with_its_own_plural_form():
     """Форма слова идёт за числом, а не за самым частым случаем."""
-    two = _river_msg(_river_point(min_value_combos=22, bluffs_needed_min_value=2.0))
+    two = _one_point_msg(_river_point(min_value_combos=22, bluffs_needed_min_value=2.0))
     assert "на 22 комбинации несомненного вэлью ему нужно 2 блефа" in two
-    many = _river_msg(_river_point(min_value_combos=15, bluffs_needed_min_value=11.0))
+    many = _one_point_msg(_river_point(min_value_combos=15, bluffs_needed_min_value=11.0))
     assert "на 15 комбинаций несомненного вэлью ему нужно 11 блефов" in many
 
 
@@ -1420,10 +1421,97 @@ def test_the_river_block_shows_neither_the_enumeration_nor_the_missing_proof():
     fields = set(RiverCallDetail.model_fields)
     assert not fields & {"combos_total", "combos_ahead", "combos_behind", "combos_tied"}
 
-    text = _river_msg(_river_point())
+    text = _one_point_msg(_river_point())
     for forbidden in ("доказать", "не удалось", "тёрн", "флоп", "990", "862"):
         assert forbidden not in text.lower()
     assert error_words_in(text) == []
+
+
+# --- точка тёрна и флопа: те же слова, что у ривера ----------------------------------
+
+# Живая рука на тёрне: борд `Jc 6d As 2h`, у героя `Jh Ts`. Числа посчитаны
+# инструментом и проверены в `test_turn_flop_call`/`test_turn_flop_analysis`;
+# здесь они заданы вручную, потому что проверяется РЕНДЕР, а не расчёт.
+_LIVE_TURN = {
+    "pot_before": 160_000,
+    "to_call": 69_000,
+    "required_equity": 0.30131004366812225,
+    "min_value_combos": 55,
+    "bluffs_needed_min_value": 18,
+    "bluff_share": 18 / 73,
+}
+
+
+def _turn_point(*, street: Street = Street.TURN, **over) -> PointVerdict:
+    """Точка тёрна или флопа с посчитанными числами: `best_action` всегда пуст."""
+    from harness.contracts import TURN_FLOP_CALL_DETAIL
+
+    return PointVerdict(
+        dp_index=4,
+        street=street,
+        spot=SpotKind.POSTFLOP,
+        zone=Zone.STRICT,
+        action_taken="call",
+        best_action="",
+        ev_diff_bb=0.0,
+        detail={TURN_FLOP_CALL_DETAIL: {**_LIVE_TURN, **over}},
+    )
+
+
+def test_the_turn_line_is_worded_exactly_like_the_river_line():
+    """Подписи у чисел одни и те же на обеих улицах — включая слово «доставить»."""
+    text = _one_point_msg(_turn_point())
+    assert "Тёрн: банк 160\u00a0000, доставить 69\u00a0000 — колл окупается от 30.1% эквити." in text
+    assert (
+        "    Чтобы колл вышел в ноль, на 55 комбинаций несомненного вэлью ему нужно "
+        "18 блефов — то есть блефом должно быть 24.7% его ставящего диапазона."
+    ) in text
+
+
+def test_the_flop_line_names_its_own_street():
+    """Улица берётся у точки, а не прибита к риверу."""
+    text = _one_point_msg(_turn_point(street=Street.FLOP))
+    assert "Флоп: банк 160\u00a0000, доставить 69\u00a0000" in text
+    assert "Ривер" not in text and "Тёрн" not in text
+
+
+def test_a_requirement_beyond_the_board_prints_no_number_of_bluffs():
+    """Числа блефов не существует — строка называет вэлью и говорит это словами."""
+    text = _one_point_msg(_turn_point(bluffs_needed_min_value=None, bluff_share=None))
+    assert (
+        "    Чтобы колл вышел в ноль, на 55 комбинаций несомненного вэлью ему нужно "
+        "больше блефов, чем на этом борде существует."
+    ) in text
+    assert "ставящего диапазона" not in text
+
+
+def test_a_turn_point_names_no_better_line_and_no_reservations():
+    """Лучшей линии на этих улицах нет, и рассказа о том, чего нет, — тоже."""
+    from harness.explanation.faithfulness import error_words_in
+
+    text = _one_point_msg(_turn_point())
+    assert "Лучше:" not in text
+    assert "Допущение" not in text
+    assert "точек с вердиктом нет" not in text
+    for forbidden in ("доказать", "не удалось", "ривер", "990", "1035"):
+        assert forbidden not in text.lower()
+    assert error_words_in(text) == []
+
+
+def test_the_streets_are_printed_in_the_order_they_were_dealt():
+    """Флоп, тёрн, ривер — в порядке раздачи, а не в порядке появления расчётов."""
+    text = deep_dive_msg(
+        AnalysisResult(
+            hand_no="H8",
+            points=[_turn_point(street=Street.FLOP), _turn_point(), _river_point()],
+            ranked=[],
+        ),
+        12,
+        None,
+        17,
+        50,
+    ).text
+    assert text.index("Флоп:") < text.index("Тёрн:") < text.index("Ривер:")
 
 
 # --- экраны нижнего меню (задача 23) -------------------------------------------------
