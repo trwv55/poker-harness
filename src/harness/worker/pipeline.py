@@ -82,6 +82,7 @@ from harness.contracts import (
     VerdictTextOut,
     VisionCheck,
     Zone,
+    is_judged,
 )
 from harness.engine import enrich
 from harness.explanation import (
@@ -765,21 +766,27 @@ def _render_ranges(data_dir: Path | None, hand_id: int, result: AnalysisResult) 
 
 
 def _hand_zone(result: AnalysisResult, not_checked: Sequence[str] = ()) -> Zone | None:
-    """Зона доверия ВСЕЙ руки — из всех судимых точек, консервативно (round 5, Item H).
+    """Зона доверия ВСЕЙ руки — из всех точек с названной линией, консервативно.
 
     Два правила, оба из CLAUDE.md («`strict` — только когда вывод не опирается на
     угаданный диапазон»):
 
-    * судить нечего (`ranked` пуст) — зоны нет вовсе, `None`. Раньше здесь стоял
-      `Zone.STRICT`, и игрок получал самую уверенную подпись продукта под
-      сообщением «по этой раздаче точек с вердиктом нет»: строгость там, где не
-      было вывода;
+    * вывода нет вовсе — зоны нет, `None`. Раньше здесь стоял `Zone.STRICT`, и
+      игрок получал самую уверенную подпись продукта под сообщением «по этой
+      раздаче точек с вердиктом нет»: строгость там, где не было вывода;
     * есть хоть одна точка `assuming` — вся рука `assuming`. Раньше зона бралась
       у ПЕРВОЙ точки `ranked`, поэтому шапка «зона: строго» могла стоять над
       строками, каждая из которых помечена «(по модели диапазонов)». Слабейшее
       звено определяет, чему можно верить, — не самое дорогое.
+
+    Считаются точки, чей вывод игрок ВИДИТ: судимые из `ranked` плюс те, что
+    цены не несут, но называют лучшую линию, — риверная точка с доказанным
+    фолдом (`test_a_proven_river_fold_puts_its_zone_in_the_status_line`).
+    Судимая точка вне `ranked` в расчёт не идёт: показывается ровно `ranked`.
     """
-    zones = {result.points[idx].zone for idx in result.ranked}
+    shown = [result.points[idx] for idx in result.ranked]
+    shown += [point for point in result.points if point.best_action and not is_judged(point)]
+    zones = {point.zone for point in shown}
     if not zones:
         return None
     if not_checked:

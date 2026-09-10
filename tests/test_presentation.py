@@ -1329,6 +1329,124 @@ def test_an_unjudged_point_without_a_known_reason_keeps_the_general_line():
     assert "перебор подмножеств" not in msg.text
 
 
+# --- риверная точка: числа без цены ---------------------------------------------------
+
+# Живая рука: борд `Jc 6d As 2h Ac`, у героя `Jh Ts`. Числа посчитаны
+# инструментом и проверены в `test_river_call`/`test_river_analysis`; здесь они
+# заданы вручную, потому что проверяется РЕНДЕР, а не расчёт.
+_LIVE_RIVER = {
+    "pot_before": 398_000,
+    "to_call": 169_000,
+    "required_equity": 0.2980599647266314,
+    "min_value_combos": 94,
+    "bluffs_needed_min_value": 38.18844221105527,
+    "bluff_share": 0.28889395753739705,
+    "fold_proven": False,
+}
+
+
+def _river_point(*, best_action: str = "", **over) -> PointVerdict:
+    """Точка ривера с посчитанными числами: `best_action` пуст, пока фолд не доказан."""
+    from harness.contracts import RIVER_CALL_DETAIL
+
+    return PointVerdict(
+        dp_index=6,
+        street=Street.RIVER,
+        spot=SpotKind.POSTFLOP,
+        zone=Zone.STRICT,
+        action_taken="call",
+        best_action=best_action,
+        ev_diff_bb=0.0,
+        detail={RIVER_CALL_DETAIL: {**_LIVE_RIVER, **over}},
+    )
+
+
+def _river_msg(point: PointVerdict, zone: Zone | None = None) -> str:
+    return deep_dive_msg(
+        AnalysisResult(hand_no="H7", points=[point], ranked=[]), 12, zone, 17, 50
+    ).text
+
+
+def test_the_river_line_shows_the_price_of_the_call_and_the_bluff_requirement():
+    """Форма, согласованная с владельцем, — дословно, включая слово «доставить»."""
+    text = _river_msg(_river_point())
+    assert "Ривер: банк 398\u00a0000, доставить 169\u00a0000 — колл окупается от 29.8% эквити." in text
+    assert (
+        "    Чтобы колл вышел в ноль, на 94 комбинации несомненного вэлью ему нужно "
+        "38 блефов — то есть блефом должно быть 28.9% его ставящего диапазона."
+    ) in text
+    assert "к оплате" not in text
+
+
+def test_a_river_point_alone_is_not_a_hand_without_a_verdict():
+    """Точка без цены, но с числами, перестала быть молчанием."""
+    text = _river_msg(_river_point())
+    assert "точек с вердиктом нет" not in text
+    assert "Ривер:" in text
+
+
+def test_a_proven_fold_names_the_line_and_its_single_assumption():
+    """Доказанный фолд: лучшая линия названа, и допущение под ней — тоже."""
+    text = _river_msg(_river_point(best_action="fold", fold_proven=True), Zone.STRICT)
+    assert "больше, чем на этом борде существует." in text
+    assert "    Лучше: фолд. Допущение: сильнейшие руки он ставит." in text
+    assert "зона: строго" in text
+    # Доля блефов в диапазоне на доказанном фолде не печатается: диапазона,
+    # в котором она бы считалась, на этом борде не существует.
+    assert "ставящего диапазона" not in text
+
+
+def test_a_proven_fold_names_the_line_even_without_the_bluff_line():
+    """Вырожденное требование не должно уносить с собой вывод."""
+    text = _river_msg(
+        _river_point(
+            best_action="fold", fold_proven=True, min_value_combos=0, bluffs_needed_min_value=0.0
+        )
+    )
+    assert "Чтобы колл вышел в ноль" not in text
+    assert "Лучше: фолд." in text
+
+
+def test_a_degenerate_river_requirement_prints_only_the_price_of_the_call():
+    """Ни вэлью старшего класса, ни блефов — «нужно 0 блефов» не утверждение."""
+    text = _river_msg(_river_point(min_value_combos=0, bluffs_needed_min_value=0.0))
+    assert "Ривер: банк 398\u00a0000, доставить 169\u00a0000" in text
+    assert "блеф" not in text
+
+
+def test_half_a_bluff_is_rounded_up_to_one():
+    """Требование читается в штуках, и половина обязана дать один, а не ноль."""
+    text = _river_msg(_river_point(min_value_combos=1, bluffs_needed_min_value=0.5))
+    assert "на 1 комбинацию несомненного вэлью ему нужен 1 блеф" in text
+
+
+def test_the_bluff_count_agrees_with_its_own_plural_form():
+    """Форма слова идёт за числом, а не за самым частым случаем."""
+    two = _river_msg(_river_point(min_value_combos=22, bluffs_needed_min_value=2.0))
+    assert "на 22 комбинации несомненного вэлью ему нужно 2 блефа" in two
+    many = _river_msg(_river_point(min_value_combos=15, bluffs_needed_min_value=11.0))
+    assert "на 15 комбинаций несомненного вэлью ему нужно 11 блефов" in many
+
+
+def test_the_river_block_shows_neither_the_enumeration_nor_the_missing_proof():
+    """Двух вещей в разборе ривера нет: перебора комбо и рассказа о недоказанном.
+
+    Перебор не показывается тем, что его НЕТ В КОНТРАКТЕ: числа исходов
+    (сколько комбо бьёт, проигрывает, делит) до изложения не доезжают вовсе, и
+    напечатать их ему не из чего.
+    """
+    from harness.contracts import RiverCallDetail
+    from harness.explanation.faithfulness import error_words_in
+
+    fields = set(RiverCallDetail.model_fields)
+    assert not fields & {"combos_total", "combos_ahead", "combos_behind", "combos_tied"}
+
+    text = _river_msg(_river_point())
+    for forbidden in ("доказать", "не удалось", "тёрн", "флоп", "990", "862"):
+        assert forbidden not in text.lower()
+    assert error_words_in(text) == []
+
+
 # --- экраны нижнего меню (задача 23) -------------------------------------------------
 
 

@@ -1168,6 +1168,42 @@ def test_hand_zone_is_the_weakest_of_all_judged_points_not_the_first():
     assert _hand_zone(unranked_assuming) is Zone.STRICT
 
 
+def test_a_proven_river_fold_puts_its_zone_in_the_status_line():
+    """Точка без цены, но с названной линией, подписывается зоной — иначе вывод
+    стоял бы под сообщением без единой пометки доверия, хотя он именно строгий:
+    перебор борда диапазона не угадывает.
+    """
+    from harness.contracts import RIVER_CALL_DETAIL
+
+    river = PointVerdict(
+        dp_index=1,
+        street=Street.RIVER,
+        spot=SpotKind.POSTFLOP,
+        zone=Zone.STRICT,
+        action_taken="call",
+        best_action="fold",
+        ev_diff_bb=0.0,
+        detail={
+            RIVER_CALL_DETAIL: {
+                "pot_before": 398_000,
+                "to_call": 169_000,
+                "required_equity": 0.298,
+                "min_value_combos": 701,
+                "bluffs_needed_min_value": 215.0,
+                "bluff_share": 0.234,
+                "fold_proven": True,
+            }
+        },
+    )
+    result = AnalysisResult(hand_no="TM1", points=[river], ranked=[])
+    assert _hand_zone(result) is Zone.STRICT
+    assert "зона: строго" in deep_dive_msg(result, 1, _hand_zone(result), 1, 5).text
+
+    # Та же точка без доказательства линии не называет — и зоне взяться неоткуда.
+    unproven = river.model_copy(update={"best_action": ""})
+    assert _hand_zone(AnalysisResult(hand_no="TM1", points=[unproven], ranked=[])) is None
+
+
 # --- станция отчёта по турниру (задача 23) -----------------------------------------
 
 

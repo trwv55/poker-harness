@@ -45,6 +45,13 @@
 не спорит с маркером и не требует знания, действительно ли сыгранное было
 ошибкой.
 
+**Риверная точка — числа без цены.** У неё нет ни `ev_diff_bb`, ни интервала:
+перебор борда отвечает на вопрос «сколько блефов нужно в его ставящем
+диапазоне», а не «сколько стоило решение». Поэтому её строки стоят отдельно от
+строк расхождений и не несут ни цены, ни слова «лучше» — кроме случая, когда
+ядро назвало лучшую линию (`PointVerdict.best_action`), и тогда рядом названо
+допущение, на котором она держится.
+
 **Форма «около нуля» — вердикт, а не отказ.** У части точек интервал EV лежит
 по обе стороны нуля: при одних моделях поведения оппонентов лучше входить, при
 других пасовать. Раньше такая точка до игрока не доходила вовсе — ядро
@@ -88,6 +95,7 @@ from harness.contracts.analysis import (
     StackTrajectory,
     TournamentReport,
     Zone,
+    river_call_detail,
 )
 from harness.contracts.explanation import TournamentTextOut, VerdictTextOut
 from harness.contracts.history import (
@@ -101,7 +109,7 @@ from harness.contracts.history import (
     SessionSummary,
 )
 from harness.contracts.raw import Street
-from harness.explanation.hand_replay import HandReplay
+from harness.explanation.hand_replay import HandReplay, chips
 from harness.presentation.keyboards import (
     MAIN_MENU,
     MENU_LEAKS,
@@ -546,6 +554,81 @@ def _no_verdict_line(res: AnalysisResult) -> str:
     return "По этой раздаче точек с вердиктом нет."
 
 
+# Слова про риверную точку. Требование к ставящему диапазону — число блефов на
+# заданное вэлью — печатается вместе с долей, которую эти блефы в диапазоне
+# занимают: одно число отвечает «сколько», второе — «насколько это много».
+#
+# Чего в этих строках НЕТ и почему (решение владельца):
+# * разложения борда по исходам (сколько комбо бьёт, проигрывает, делит) — это
+#   не диапазон соперника, а полный перебор возможного, и читается как чужой
+#   диапазон, которого мы не знаем;
+# * строки «доказать фолд не удалось» и оговорок про тёрн и флоп — продукт не
+#   рассказывает о том, чего не умеет (SESSIONS_UX).
+_RIVER_HEAD = "{street}: банк {pot}, доставить {to_call} — колл окупается от {equity} эквити."
+_RIVER_ASSUMPTION = "Допущение: сильнейшие руки он ставит."
+
+
+def _rounded_bluffs(value: float) -> int:
+    """Число блефов целым: к ближайшему, половина вверх.
+
+    Вверх, а не по правилу `round` (оно округляет половину к чётному): требование
+    к диапазону читается как «столько-то рук», и 0.5 обязана дать 1, а не 0
+    (`test_half_a_bluff_is_rounded_up_to_one`).
+    """
+    return int(value + 0.5)
+
+
+def _river_lines(point: PointVerdict) -> list[str]:
+    """Разбор риверной точки: цена решения, требование к диапазону, лучшая линия.
+
+    Пустой список — у точки нет риверных чисел (`river_call_detail`), и печатать
+    нечего. Строка про блефы пропускается, когда требования нет вовсе — вэлью
+    старшего класса на борде не осталось или блефов нужно меньше одного:
+    «нужно 0 блефов» не утверждение, а вырожденный случай
+    (`test_a_degenerate_river_requirement_prints_only_the_price_of_the_call`).
+
+    Лучшая линия называется ровно тогда, когда её назвало ядро
+    (`PointVerdict.best_action`), то есть когда борд исчерпан; вместе с ней
+    называется и единственное допущение, на котором она стоит.
+    """
+    detail = river_call_detail(point)
+    if detail is None:
+        return []
+    lines = [
+        _RIVER_HEAD.format(
+            street=_STREET_WORD[Street.RIVER],
+            pot=chips(detail.pot_before),
+            to_call=chips(detail.to_call),
+            equity=_fmt_pct(100.0 * detail.required_equity),
+        )
+    ]
+    bluffs = _rounded_bluffs(detail.bluffs_needed_min_value)
+    if detail.min_value_combos > 0 and bluffs > 0:
+        combos_word = _plural_form(
+            detail.min_value_combos, "комбинацию", "комбинации", "комбинаций"
+        )
+        need_word = _plural_form(bluffs, "нужен", "нужно", "нужно")
+        bluffs_word = _plural_form(bluffs, "блеф", "блефа", "блефов")
+        tail = (
+            "больше, чем на этом борде существует"
+            if detail.fold_proven
+            else (
+                f"то есть блефом должно быть {_fmt_pct(100.0 * detail.bluff_share)} "
+                f"его ставящего диапазона"
+            )
+        )
+        lines.append(
+            f"    Чтобы колл вышел в ноль, на {detail.min_value_combos} {combos_word} "
+            f"несомненного вэлью ему {need_word} {bluffs} {bluffs_word} — {tail}."
+        )
+    if point.best_action:
+        # Вывод отдельной строкой, а не хвостом предыдущей: строка про блефы у
+        # вырожденного требования не печатается вовсе, и лучшая линия ушла бы
+        # вместе с ней (`test_a_proven_fold_names_the_line_even_without_the_bluff_line`).
+        lines.append(f"    Лучше: {_action_word(point.best_action)}. {_RIVER_ASSUMPTION}")
+    return lines
+
+
 def deep_dive_msg(
     res: AnalysisResult,
     elapsed_s: int,
@@ -560,9 +643,17 @@ def deep_dive_msg(
     """Полный разбор раздачи: точки решения числами (текст LLM — задача 21) +
     статус-строка (⏱ время · зона доверия · остаток квоты) + три кнопки.
 
-    Точки берутся в порядке `res.ranked` (самая дорогая первой) — это уже
-    отфильтрованный и отранжированный список судимых точек (`error_cost.py`),
-    без точек-пробелов, которым нечего показать честно.
+    Точки с ценой берутся в порядке `res.ranked` (самая дорогая первой) — это
+    уже отфильтрованный и отранжированный список судимых точек
+    (`error_cost.py`), без точек-пробелов, которым нечего показать честно.
+
+    **Под ними — риверная точка, у которой цены нет** (`_river_lines`): её
+    числа посчитаны перебором борда, а не против диапазона, и в ранжирование
+    она не входит по построению (`SpotKind.POSTFLOP` вне `JUDGED_SPOTS`).
+    Порядок такой, а не по улицам: сначала то, что стоило денег, потом то, что
+    посчитано без цены. Строка «точек с вердиктом нет» печатается, только когда
+    нет ни одной из двух половин
+    (`test_a_river_point_alone_is_not_a_hand_without_a_verdict`).
 
     **`zone=None` — «зоны нет», и тогда её нет и в строке (round 5, Item H).**
     Прежняя сигнатура требовала `Zone`, и вызывающий, которому нечего было
@@ -598,10 +689,11 @@ def deep_dive_msg(
     lines = [f"Рука {res.hand_no}", ""]
 
     prose = {} if verdict is None else {point.dp_index: point.text for point in verdict.points}
+    river = [line for point in res.points for line in _river_lines(point)]
 
-    if not res.ranked:
+    if not res.ranked and not river:
         lines.append(_no_verdict_line(res))
-    else:
+    elif res.ranked:
         for idx in res.ranked:
             point = res.points[idx]
             marker = f" ({_ASSUMING_MARKER})" if point.zone is Zone.ASSUMING else ""
@@ -628,6 +720,11 @@ def deep_dive_msg(
                 f"(лучше: {_action_word(point.best_action)}) — {_fmt_bb(point.ev_diff_bb)}{marker}"
             )
             lines.extend(_prose_lines(prose.get(point.dp_index)))
+
+    if river:
+        if res.ranked:
+            lines.append("")
+        lines.extend(river)
 
     if verdict is not None and verdict.summary.strip():
         lines.append("")

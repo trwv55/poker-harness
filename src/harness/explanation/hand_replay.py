@@ -50,7 +50,7 @@ from harness.contracts import (
     Street,
 )
 
-__all__ = ["HandReplay", "ReplaySpan", "hand_replay"]
+__all__ = ["HandReplay", "ReplaySpan", "chips", "hand_replay"]
 
 # Неразрывный пробел разделяет разряды: «31 250» в русском тексте, но перенос
 # строки внутри числа невозможен. Запятая как разделитель разрядов исключена
@@ -119,7 +119,13 @@ class HandReplay(BaseModel):
         return "".join(span.text for span in self.spans)
 
 
-def _chips(amount: int) -> str:
+def chips(amount: int) -> str:
+    """Сумма в фишках: разряды через неразрывный пробел.
+
+    Публична ради второго читателя — `presentation.messages` печатает суммы
+    риверной точки в том же сообщении, что и реплей; две копии формата дали бы
+    два вида одного числа в двух соседних сообщениях.
+    """
     return f"{amount:,}".replace(",", _THIN)
 
 
@@ -175,7 +181,7 @@ def _action_text(hand: CanonicalHand, action: CanonicalAction, raise_ordinal: in
     show_amount = action.is_all_in or action.kind in _ACTIONS_WITH_AMOUNT
     if not show_amount:
         return f"{who} {word}"
-    amount = _chips(action.committed_after)
+    amount = chips(action.committed_after)
     if action.label != hand.hero_label:
         return f"{who} {word} {amount}"
     depth = _bb(action.committed_after / hand.bb)
@@ -300,16 +306,16 @@ def hand_replay(en: EnrichedHand) -> HandReplay:
         spans.append(ReplaySpan(text="\n"))
 
     ante_total = sum(post.amount for post in hand.posts if post.kind.value == "ante")
-    ante_part = f" анте {_chips(ante_total)}" if ante_total else ""
+    ante_part = f" анте {chips(ante_total)}" if ante_total else ""
     line(
         f"{hand.tournament_id} · ур. {hand.level} · "
-        f"{_chips(hand.sb)}/{_chips(hand.bb)}{ante_part}"
+        f"{chips(hand.sb)}/{chips(hand.bb)}{ante_part}"
     )
     newline()
     hero_cards = hand.dealt.get(hand.hero_label, [])
     cards_part = f" {_cards(hero_cards)}" if hero_cards else ""
     line(
-        f"Hero {hero.position}{cards_part} · {_chips(hero.stack)} ({_bb(hero.stack_bb)})"
+        f"Hero {hero.position}{cards_part} · {chips(hero.stack)} ({_bb(hero.stack_bb)})"
     )
 
     decisions = _hero_decision_indices(en)
@@ -332,13 +338,13 @@ def hand_replay(en: EnrichedHand) -> HandReplay:
             quiet.clear()
         newline()
         newline()
-        line(f"{head} · банк {_chips(pot_before)}")
+        line(f"{head} · банк {chips(pot_before)}")
         newline()
         spans.extend(_street_flow(hand, actions, decisions))
         pot_after = en.report.pot_by_street.get(street, pot_before)
         if street is last_active and pot_after >= pot_before * _MATERIAL_POT_GROWTH:
             newline()
-            line(f"банк {_chips(pot_after)}")
+            line(f"банк {chips(pot_after)}")
         pot_before = pot_after
 
     if quiet:
