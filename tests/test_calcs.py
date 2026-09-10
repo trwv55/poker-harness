@@ -20,8 +20,10 @@ import pytest
 from harness.analysis.frequency import wilson_interval
 from harness.calcs import run
 from harness.contracts import (
+    ActionKind,
     AnalysisResult,
     BetSizeThreshold,
+    CanonicalAction,
     CoverageParams,
     DecisionPoint,
     DefenseParams,
@@ -114,6 +116,13 @@ def _point(
             pot_before=3,
             eff_stack=200,
             eff_stack_bb=100.0,
+            action=CanonicalAction(
+                street=street,
+                label="Hero",
+                kind=ActionKind.FOLD,
+                committed_after=0,
+                raw_line="Hero: folds",
+            ),
         ),
     )
 

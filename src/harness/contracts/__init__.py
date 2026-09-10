@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from harness.contracts.analysis import (
     RIVER_CALL_DETAIL,
-    UNJUDGED_DECISION_NOT_TAKEN,
     AllInEvent,
     AnalysisResult,
     Assumption,
@@ -130,7 +129,6 @@ __all__ = [
     "POSITIONS",
     "RANKS",
     "RIVER_CALL_DETAIL",
-    "UNJUDGED_DECISION_NOT_TAKEN",
     "ActionKind",
     "AllInEvent",
     "AnalysisResult",

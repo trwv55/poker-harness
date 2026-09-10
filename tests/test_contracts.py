@@ -114,25 +114,25 @@ def test_a_state_hand_is_marked_as_such_and_survives_a_roundtrip():
     assert RawHand.model_validate_json(hand.model_dump_json()).completeness is Completeness.STATE
 
 
-def test_a_decision_point_may_have_no_action_taken_yet():
-    """Точка решения без действия — живой стол до хода героя.
+def test_a_decision_point_cannot_be_built_without_the_action_it_judges():
+    """Точка решения без сыгранного действия невыразима — так держит тип.
 
-    Судить там нечего, и `action` обязан быть необязательным: иначе состояние в
-    точке решения нельзя выразить, не придумав действие, которого игрок не делал.
+    Вердикт сравнивает сыгранное с лучшим, и точка без действия была бы точкой,
+    про которую разбору нечего сказать.
     """
     from harness.contracts import DecisionPoint, Street
 
-    dp = DecisionPoint(
-        index=0,
-        street=Street.PREFLOP,
-        label="Hero",
-        position="BB",
-        to_call=9000,
-        pot_before=14700,
-        eff_stack=36700,
-        eff_stack_bb=36.7,
-    )
-    assert dp.action is None
+    with pytest.raises(ValidationError):
+        DecisionPoint(
+            index=0,
+            street=Street.PREFLOP,
+            label="Hero",
+            position="BB",
+            to_call=9000,
+            pot_before=14700,
+            eff_stack=36700,
+            eff_stack_bb=36.7,
+        )  # pyright: ignore[reportCallIssue]
 
 
 def test_a_verdict_names_the_checks_it_could_not_run():

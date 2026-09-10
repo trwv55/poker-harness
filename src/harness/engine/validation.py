@@ -16,7 +16,6 @@ from __future__ import annotations
 from harness.contracts import (
     ActionKind,
     CanonicalHand,
-    Completeness,
     EngineReport,
     PlayerState,
     PostKind,
@@ -25,7 +24,6 @@ from harness.contracts import (
     ValidationStatus,
     Verdict,
 )
-from harness.engine.state import state_not_checked
 
 _FIELD_STACKS = "stacks"
 _FIELD_ACTIONS = "actions"
@@ -238,9 +236,7 @@ def _verdict_from(
 
     Скриншот — гипотеза: спорные поля возвращаются игроку вопросом. Hand history
     — факт рума: расхождение с ней означает баг нашего парсера, и уходит в лог
-    разработчику. Развилка одна на оба пути валидатора (полная рука и состояние),
-    и держать её в одном месте важнее, чем сэкономить функцию: разойдясь, они
-    начали бы по-разному отвечать на одно и то же расхождение.
+    разработчику.
     """
     if not reasons:
         return Verdict(status=ValidationStatus.PASS, not_checked=not_checked)
@@ -257,31 +253,6 @@ def _verdict_from(
     return Verdict(status=ValidationStatus.REJECT, reasons=reasons, not_checked=not_checked)
 
 
-def _validate_state(hand: CanonicalHand) -> Verdict:
-    """Вердикт по состоянию в точке решения — проверки, у которых есть вход.
-
-    Денежных сверок здесь нет ни одной, и это не пробел реализации: у скрина нет
-    ни `Total pot`, ни строк `collected`, ни порядка хода, который движок мог бы
-    воспроизвести (реестр D1). Всё, чего не проверили, названо поимённо в
-    `not_checked` — вход, на котором проверять нечем, не должен выглядеть как
-    проверенный.
-
-    Остаются две сверки, обе из двух независимых прочтений ОДНОГО экрана:
-    рассадка против блайндов (кнопка прочитана отдельно от фишек перед
-    игроками) и карты на дубли (одна карта не может лежать в двух местах).
-    """
-    reasons: list[str] = []
-    fields: list[str] = []
-    blinds = _blind_mismatch(hand)
-    if blinds is not None:
-        reasons.append(blinds)
-        fields.append(_FIELD_BUTTON)
-    if _has_duplicate_cards(hand):
-        reasons.append("duplicate cards")
-        fields.append(_FIELD_CARDS)
-    return _verdict_from(hand, reasons, fields, state_not_checked(hand))
-
-
 def validate(hand: CanonicalHand, report: EngineReport) -> Verdict:
     """Вынести вердикт по руке: `pass` / `escalate` / `reject`.
 
@@ -291,15 +262,7 @@ def validate(hand: CanonicalHand, report: EngineReport) -> Verdict:
     эта сильная, но не абсолютная — пересчёт независим от движка, но **не** от
     парсера: если парсер прочитал суммы неверно, обе стороны ошибутся
     одинаково и сверка промолчит.
-
-    **Неполный вход битым не считается.** Состояние в точке решения уходит в
-    `_validate_state`: денежных сверок там нет по построению, а не по недосмотру,
-    и требовать от него сошедшегося банка значило бы отказывать главному
-    сценарию продукта за то, что рум не написал того, чего на экране нет.
     """
-    if hand.completeness is Completeness.STATE:
-        return _validate_state(hand)
-
     reasons: list[str] = []
     fields: list[str] = []
     not_checked = _fabricated_showdown(hand)

@@ -100,7 +100,6 @@ from harness.analysis.classifier import (
     in_action_order_after,
     spot_for,
     table_state,
-    taken_action,
     unjudged_point,
     unpriced_reason,
 )
@@ -128,7 +127,6 @@ from harness.analysis.tools.pushfold import (
     shove_ev_bb as _shove_ev_bb,
 )
 from harness.contracts import (
-    UNJUDGED_DECISION_NOT_TAKEN,
     ActionKind,
     Assumption,
     CanonicalHand,
@@ -808,19 +806,6 @@ def _hero_class(hand: CanonicalHand) -> str | None:
     return class_of(*cards)
 
 
-# Причина отказа на точке, где герой ещё не ходил: строку видит только разбор,
-# игроку показывается формулировка `presentation`.
-_DECISION_NOT_TAKEN = (
-    "решение ещё не принято: на экране состояние в точке решения, "
-    "сравнивать с лучшей линией нечего"
-)
-
-
-def _spot_of_street(street: Street) -> SpotKind:
-    """Спот по улице — грубая разметка для точки, которую судить не будут."""
-    return SpotKind.POSTFLOP if street is not Street.PREFLOP else SpotKind.PREFLOP_OTHER
-
-
 def _shover(state: TableState) -> SeatSnapshot | None:
     """Кто поставил перед героем ставку, которую тот коллирует или сбрасывает."""
     if state.aggressor is not None and state.aggressor.live:
@@ -1314,7 +1299,7 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
             else ""
         ),
     )
-    taken = "call" if taken_action(dp).kind is ActionKind.CALL else "fold"
+    taken = "call" if dp.action.kind is ActionKind.CALL else "fold"
 
     detail: dict[str, object] = {
         "method": "call_ev",
@@ -1501,9 +1486,7 @@ def cheap_fold_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | No
     держит равновесие. Отсюда зона `strict` без допущения: вывода на догадке эта
     функция не производит.
     """
-    if dp.action is None or dp.street is not Street.PREFLOP:
-        return None
-    if dp.action.kind is not ActionKind.FOLD:
+    if dp.street is not Street.PREFLOP or dp.action.kind is not ActionKind.FOLD:
         return None
     state = table_state(dp, en)
     if spot_for(dp, state) is not SpotKind.PUSHFOLD_UNOPENED:
@@ -1598,20 +1581,7 @@ def verdict_for(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict:
     исчерпан — лучшее действие, но не EV решения. Такая точка не судима
     (`SpotKind.POSTFLOP` вне `JUDGED_SPOTS`) и в сумму потерь не входит.
 
-    **Точка без сыгранного действия — тоже отказ, и названный.** Такую точку
-    строит `harness.engine.state` на входе, застающем героя ДО хода: вердикт
-    этого пакета сравнивает сыгранное с лучшим, а сыгранного там ещё нет.
-    Ответить «ошибок нет» значило бы выдать несделанный ход за верный. Со скрина
-    такой вход больше не приходит — экран незавершённой раздачи останавливается
-    на станции чтения (`test_a_hand_still_in_progress_never_reaches_the_analysis`).
     """
-    if dp.action is None:
-        return unjudged_point(
-            dp,
-            _spot_of_street(dp.street),
-            _DECISION_NOT_TAKEN,
-            kind=UNJUDGED_DECISION_NOT_TAKEN,
-        )
     if dp.street is not Street.PREFLOP:
         river = river_verdict(dp, en)
         if river is not None:

@@ -69,12 +69,8 @@ _TOOL = "river_call"
 
 
 def river_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | None:
-    """Вердикт по риверной точке — или `None`, если точка не риверная.
-
-    `None` отдаётся и на точке без сыгранного действия: сравнивать там нечего, и
-    отказ по этому поводу формулирует общий вход разбора, а не этот модуль.
-    """
-    if dp.street is not Street.RIVER or dp.action is None:
+    """Вердикт по риверной точке — или `None`, если точка не риверная."""
+    if dp.street is not Street.RIVER:
         return None
 
     hero = en.hand.dealt.get(en.hand.hero_label, [])

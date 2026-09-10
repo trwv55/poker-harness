@@ -1296,27 +1296,6 @@ def test_what_could_not_be_checked_reaches_the_player_and_kills_the_strict_badge
     assert "зона: строго" not in caveated.text
 
 
-def test_a_decision_not_taken_is_explained_instead_of_the_generic_line():
-    """Главный сценарий продукта не должен отвечать строкой ни о чём.
-
-    Причина у ядра названа (`detail["unjudged_kind"]`), и до сообщения она не
-    доходила: игрок, приславший стол в момент хода, получал «точек с вердиктом
-    нет».
-    """
-    from harness.contracts import UNJUDGED_DECISION_NOT_TAKEN
-
-    pending = _point(
-        spot=SpotKind.PREFLOP_OTHER, ev_diff_bb=0.0, zone=Zone.STRICT
-    ).model_copy(
-        update={"best_action": "", "detail": {"unjudged_kind": UNJUDGED_DECISION_NOT_TAKEN}}
-    )
-    msg = deep_dive_msg(
-        AnalysisResult(hand_no="TM1", points=[pending], ranked=[]), 5, None, 17, 50
-    )
-    assert "Решение по этой раздаче ещё не принято" in msg.text
-    assert "точек с вердиктом нет" not in msg.text
-
-
 def test_an_unjudged_point_without_a_known_reason_keeps_the_general_line():
     """Пересказать игроку внутреннюю формулировку ядра хуже, чем промолчать."""
     unpriced = _point(

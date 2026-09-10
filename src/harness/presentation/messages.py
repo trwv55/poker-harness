@@ -81,7 +81,6 @@ from typing import Literal
 from pydantic import BaseModel, model_validator
 
 from harness.contracts.analysis import (
-    UNJUDGED_DECISION_NOT_TAKEN,
     AllInEvent,
     AnalysisResult,
     ChipMove,
@@ -528,30 +527,9 @@ def scan_summary_msg(s: ScanSummary, quota_left: int, quota_total: int) -> Msg:
 # сошлось», и разница обязана быть видна игроку, а не только в трейсе.
 _NOT_CHECKED_PREFIX = "Проверить на этом экране было нечем:"
 
-# Причины, по которым точка осталась без вердикта, переведённые в слова игрока.
-# Внутренние формулировки ядра написаны для разбора, а не для чтения вслух,
-# поэтому переводятся по машинному ключу (`detail["unjudged_kind"]`), а не по
-# тексту. Ключа нет — остаётся общая строка: сказать «не знаю почему» честнее,
-# чем пересказать игроку внутреннюю причину.
-_UNJUDGED_WORD: dict[str, str] = {
-    UNJUDGED_DECISION_NOT_TAKEN: (
-        "Решение по этой раздаче ещё не принято — на экране стол в момент хода."
-    ),
-}
-
-
-def _no_verdict_line(res: AnalysisResult) -> str:
-    """Почему вердикта нет — названной причиной, если она у ядра есть.
-
-    Общая строка была бы ответом ни о чём: причина у ядра названа
-    (`detail["unjudged_kind"]`), и до сообщения она не доходила.
-    """
-    kinds = {
-        str(point.detail.get("unjudged_kind", "")) for point in res.points
-    } & _UNJUDGED_WORD.keys()
-    if len(kinds) == 1:
-        return _UNJUDGED_WORD[next(iter(kinds))]
-    return "По этой раздаче точек с вердиктом нет."
+# Вердикта нет ни по одной точке. Внутренние формулировки ядра написаны для
+# разбора, а не для чтения вслух, и игроку не пересказываются.
+_NO_VERDICT_LINE = "По этой раздаче точек с вердиктом нет."
 
 
 # Слова про риверную точку. Требование к ставящему диапазону — число блефов на
@@ -692,7 +670,7 @@ def deep_dive_msg(
     river = [line for point in res.points for line in _river_lines(point)]
 
     if not res.ranked and not river:
-        lines.append(_no_verdict_line(res))
+        lines.append(_NO_VERDICT_LINE)
     elif res.ranked:
         for idx in res.ranked:
             point = res.points[idx]
@@ -924,9 +902,6 @@ def hand_in_progress_msg() -> Msg:
     """Раздача на экране ещё идёт — отказ ДО разбора, а не пустой разбор после.
 
     Решение владельца 2026-09-09: скрин незавершённой руки не разбирается вовсе.
-    Раньше такой экран проходил конвейер целиком и возвращался отказом по каждой
-    точке отдельно («решение по этой раздаче ещё не принято»,
-    `_UNJUDGED_WORD`) — игрок получал разбор, в котором нечего разбирать.
 
     Текст называет, что прислать вместо этого: отказ без следующего шага
     оставляет игрока с той же картинкой в руках.

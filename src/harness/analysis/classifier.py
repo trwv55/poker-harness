@@ -22,7 +22,6 @@ from dataclasses import dataclass
 
 from harness.contracts import (
     ActionKind,
-    CanonicalAction,
     CanonicalHand,
     DecisionPoint,
     EnrichedHand,
@@ -33,16 +32,6 @@ from harness.contracts import (
 )
 from harness.engine.validation import forced_blind
 from harness.normalizer import POSITIONS_BY_COUNT
-
-
-class DecisionNotTaken(ValueError):
-    """У точки решения нет сыгранного действия — состояние в точке решения.
-
-    Отдельный тип, а не голый `ValueError`: ядро обязано отличать «судить нечего,
-    потому что игрок ещё не сходил» от расхождения в восстановленном столе, за
-    которое `table_state` бросает тот же базовый класс.
-    """
-
 
 # Порог пуш-фолд парадигмы (спека §5.5): глубже решение перестаёт сводиться к
 # «шов или фолд», и модель к нему неприменима.
@@ -204,22 +193,6 @@ class TableState:
         return bool(self.voluntary_actors) and self.aggressor.label == self.voluntary_actors[0]
 
 
-def taken_action(dp: DecisionPoint) -> CanonicalAction:
-    """Сыгранное героем действие точки — или отказ, если его ещё не было.
-
-    `DecisionPoint.action` необязателен с задачи 22: на скриншоте живого стола
-    экран застаёт героя ДО хода, и судить там нечего (`harness.engine.state`).
-    Каждая функция этого пакета, которой нужно сыгранное действие, берёт его
-    здесь, а не разыменовывает поле напрямую: тогда отсутствие действия — один
-    названный отказ, а не пять разных `AttributeError` в глубине расчёта.
-    """
-    if dp.action is None:
-        raise DecisionNotTaken(
-            f"точка {dp.index}: решение ещё не принято — сыгранного действия нет"
-        )
-    return dp.action
-
-
 def action_index(hand: CanonicalHand, dp: DecisionPoint) -> int:
     """Позиция действия точки решения в списке действий руки.
 
@@ -228,7 +201,7 @@ def action_index(hand: CanonicalHand, dp: DecisionPoint) -> int:
     герою пас при нулевом стеке (движок исполняет такой пас без точки решения).
     Поэтому номер проверяется сверкой самого действия, а не принимается на веру.
     """
-    taken = taken_action(dp)
+    taken = dp.action
     hero_actions = [i for i, action in enumerate(hand.actions) if action.label == hand.hero_label]
     for i in hero_actions[dp.index :]:
         if hand.actions[i] == taken:
@@ -300,7 +273,7 @@ def table_state(dp: DecisionPoint, en: EnrichedHand) -> TableState:
     to_call = min(
         max(s.street_committed for s in seats) - hero_seat.street_committed, hero_seat.behind
     )
-    taken = taken_action(dp)
+    taken = dp.action
     hero_after = hero_seat.behind - (taken.committed_after - hero_seat.street_committed)
 
     state = TableState(
@@ -336,7 +309,7 @@ def _cross_check(state: TableState, dp: DecisionPoint) -> None:
 
 def action_name(dp: DecisionPoint) -> str:
     """Человекочитаемое имя сыгранного действия — то, что показывается игроку."""
-    taken = taken_action(dp)
+    taken = dp.action
     if taken.kind in (ActionKind.BET, ActionKind.RAISE) and taken.is_all_in:
         return "shove"
     return str(taken.kind)
@@ -377,17 +350,11 @@ def unpriced_reason(dp: DecisionPoint, state: TableState) -> str:
     return "перед героем олл-ин, но сыгран не колл и не пас"
 
 
-# Что стоит в `action_taken` у точки, где герой ещё не ходил: строку видит
-# только разбор, игроку показывается формулировка `presentation`.
-_NOT_TAKEN = "не сыграно"
-
-
 def unjudged_point(
     dp: DecisionPoint,
     spot: SpotKind,
     reason: str,
     detail: Mapping[str, object] | None = None,
-    kind: str = "",
     tools: Sequence[str] = (),
 ) -> PointVerdict:
     """Точка без вердикта: спот размечен, цена не посчитана.
@@ -401,7 +368,7 @@ def unjudged_point(
     `detail` — то, что успело посчитаться до отказа. Ранжирование и сумма его
     не читают (`error_cost.is_judged`), а `ev_diff_bb` здесь ноль; показывается
     ли что-то из него игроку, решает `presentation` по машинному ключу
-    (`RIVER_CALL_DETAIL`, `UNJUDGED_DECISION_NOT_TAKEN`).
+    (`RIVER_CALL_DETAIL`).
 
     `tools` — чем считали то, что легло в `detail`: у отказа, случившегося до
     расчёта, список пуст, у точки с посчитанными числами — нет.
@@ -415,16 +382,12 @@ def unjudged_point(
         street=dp.street,
         spot=spot,
         zone=Zone.STRICT,
-        action_taken=action_name(dp) if dp.action is not None else _NOT_TAKEN,
+        action_taken=action_name(dp),
         best_action="",
         ev_diff_bb=0.0,
         assumption=None,
         tools=list(tools),
-        detail={
-            **(detail or {}),
-            "unjudged": reason,
-            **({"unjudged_kind": kind} if kind else {}),
-        },
+        detail={**(detail or {}), "unjudged": reason},
     )
 
 
@@ -458,7 +421,7 @@ def spot_for(dp: DecisionPoint, state: TableState) -> SpotKind:
     if state.hero.acted:
         return SpotKind.PREFLOP_OTHER
 
-    taken = taken_action(dp)
+    taken = dp.action
     folded = taken.kind is ActionKind.FOLD
 
     if state.opened_voluntarily:

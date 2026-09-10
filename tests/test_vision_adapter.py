@@ -786,22 +786,6 @@ def test_confirming_the_shown_pot_does_not_close_a_dispute_it_does_not_settle():
     assert [c.passed for c in agreeing.vision.checks] == [True]
 
 
-def test_on_a_state_the_shown_pot_is_the_answer_and_closes_the_dispute():
-    """На состоянии банк берётся именно из показанного — там ответ и есть данные."""
-    from harness.parsers.vision_adapter import apply_vision_answer
-
-    reading = export_reading(showdown_seen=False, result_seen=False, winners=[])
-    raw, _ = reading_to_raw(reading, hero_nickname=HERO_NICK, source_ref="s")
-    raw.vision = (raw.vision or VisionMeta()).model_copy(
-        update={"checks": [VisionCheck(name=CHECK_POT, passed=False, options=["31.95", "30.74"])]}
-    )
-    assert raw.completeness is Completeness.STATE
-
-    answered = apply_vision_answer(raw, "pot", "31.95")
-    assert answered is not None and answered.vision is not None
-    assert [c.passed for c in answered.vision.checks] == [True]
-
-
 def test_a_position_label_that_cannot_occur_in_this_ring_is_reported_not_failed():
     """Метка, которой в круге этого стола не бывает, ничего не доказывает (F3).
 

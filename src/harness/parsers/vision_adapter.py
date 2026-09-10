@@ -615,7 +615,7 @@ def _folds_of_absent_cards(
 
     Единственный видимый признак «не в руке» на живом столе — отсутствие карт
     перед игроком; пас и есть «не в руке», никакой суммы и никакого намерения он
-    не несёт. Подробнее — `harness.engine.state`.
+    не несёт.
     """
     return [
         RawAction(
@@ -689,12 +689,9 @@ def contributions_bb(raw: RawHand) -> float:
     они дали бы «сошлось» на одном пути и «не сошлось» на другом.
     """
     total = raw.ante * len(raw.seats)
-    if raw.completeness is Completeness.STATE:
-        total += sum(raw.visible_bets.values())
-    else:
-        commits = _street_commits(raw.actions, raw.posts)
-        total += sum(sum(street.values()) for street in commits.values())
-        total -= sum(entry.amount for entry in raw.uncalled)
+    commits = _street_commits(raw.actions, raw.posts)
+    total += sum(sum(street.values()) for street in commits.values())
+    total -= sum(entry.amount for entry in raw.uncalled)
     return total / raw.bb if raw.bb else 0.0
 
 
@@ -865,8 +862,7 @@ def apply_vision_answer(
     Патчатся ровно те поля, у которых ответ игрока однозначно ложится в контракт
     (`ANSWERABLE_FIELDS`):
 
-    * `pot` — показанный банк (`VisionMeta.displayed_pot`), он же вход банка на
-      состоянии в точке решения;
+    * `pot` — показанный банк (`VisionMeta.displayed_pot`);
     * `button` — кнопка переставляется на место названного игрока;
     * `hero` — герой переименовывается в названного игрока;
     * `cards` — карты названного игрока (`subject` — его ник) ставятся и в
@@ -891,9 +887,7 @@ def apply_vision_answer(
         # показанный банк, проверка «закрылась» — и разбор уезжал игроку по руке
         # с анте, равным нулю (ревью раунда 2, F1).
         agrees = within_tolerance(abs(shown - contributions_bb(raw)), POT_TOLERANCE_BB)
-        meta = _resolved(raw, field) if agrees or raw.completeness is Completeness.STATE else (
-            raw.vision or VisionMeta()
-        )
+        meta = _resolved(raw, field) if agrees else raw.vision or VisionMeta()
         return raw.model_copy(
             update={"vision": meta.model_copy(update={"displayed_pot": round(shown * raw.bb)})}
         )
