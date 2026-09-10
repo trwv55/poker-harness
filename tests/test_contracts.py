@@ -313,3 +313,58 @@ def test_a_foreign_shape_under_the_river_key_is_not_swallowed():
     )
     with pytest.raises(ValidationError):
         river_call_detail(point)
+
+
+# --- точка тёрна и флопа в `detail` --------------------------------------------------
+
+
+def test_a_turn_flop_point_without_the_key_has_no_numbers():
+    """Ключа нет — ответ `None`, и изложение печатает по этой точке ничего."""
+    from harness.contracts import SpotKind, turn_flop_call_detail
+
+    point = _leak_point(
+        spot=SpotKind.POSTFLOP, action_taken="call", best_action="", ev_diff_bb=0.0
+    )
+    assert turn_flop_call_detail(point) is None
+
+
+def test_a_foreign_shape_under_the_turn_flop_key_is_not_swallowed():
+    """Ключ с чужим содержимым — поломка, а не повод тихо промолчать."""
+    import pytest
+    from pydantic import ValidationError
+
+    from harness.contracts import TURN_FLOP_CALL_DETAIL, SpotKind, turn_flop_call_detail
+
+    point = _leak_point(
+        spot=SpotKind.POSTFLOP,
+        action_taken="call",
+        best_action="",
+        ev_diff_bb=0.0,
+        detail={TURN_FLOP_CALL_DETAIL: {"pot_before": 160_000}},
+    )
+    with pytest.raises(ValidationError):
+        turn_flop_call_detail(point)
+
+
+def test_the_share_of_bluffs_and_their_count_are_filled_together():
+    """Доля без числа (или число без доли) — половина ответа, выданная за целый."""
+    import pytest
+    from pydantic import ValidationError
+
+    from harness.contracts import TurnFlopCallDetail
+
+    whole = {
+        "pot_before": 160_000,
+        "to_call": 69_000,
+        "required_equity": 0.3013,
+        "min_value_combos": 55,
+        "bluffs_needed_min_value": 18,
+        "bluff_share": 18 / 73,
+    }
+    assert TurnFlopCallDetail.model_validate(whole).bluffs_needed_min_value == 18
+    assert TurnFlopCallDetail.model_validate(
+        {**whole, "bluffs_needed_min_value": None, "bluff_share": None}
+    ).bluff_share is None
+    for half in ({"bluffs_needed_min_value": None}, {"bluff_share": None}):
+        with pytest.raises(ValidationError):
+            TurnFlopCallDetail.model_validate({**whole, **half})

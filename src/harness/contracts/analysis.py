@@ -135,6 +135,54 @@ class RiverCallDetail(BaseModel):
     fold_proven: bool
 
 
+# Ключ и тип разбора точки тёрна или флопа — рядом с риверными и по той же
+# причине (см. `RIVER_CALL_DETAIL`): читает их `presentation`. Ключ отдельный, а
+# не общий с ривером: под ним лежат числа ДРУГОГО инструмента
+# (`analysis.tools.turn_flop_call`), и один ключ на два расчёта означал бы, что
+# прочитавший не знает, чей ответ у него в руках.
+TURN_FLOP_CALL_DETAIL = "turn_flop_call"
+
+
+class TurnFlopCallDetail(BaseModel):
+    """Числа точки тёрна или флопа: цена решения и требование к диапазону.
+
+    Поля названы как у `RiverCallDetail` и означают то же самое: игроку эти две
+    точки показываются одними словами (`presentation.messages`), и разные имена
+    под одинаковыми подписями развели бы расчёт с текстом.
+
+    `bluffs_needed_min_value` — `None`, когда требуемой эквити не даёт ни один
+    ставящий диапазон, содержащий минимальное вэлью (правило — докстринг
+    `analysis.tools.turn_flop_call`). Ноль и `None` — разные ответы: ноль
+    означает «блефов не нужно вовсе», `None` — «столько блефов не существует».
+
+    `bluff_share` — доля блефов в ставящем диапазоне,
+    `bluffs / (min_value + bluffs)`, в долях единицы; `None` ровно там, где
+    `None` число блефов, потому что доли в несуществующем диапазоне нет.
+    """
+
+    pot_before: int
+    to_call: int
+    required_equity: float
+    min_value_combos: int
+    bluffs_needed_min_value: int | None
+    bluff_share: float | None
+
+    @model_validator(mode="after")
+    def _share_follows_the_count(self) -> TurnFlopCallDetail:
+        """Доля заполнена ровно тогда, когда заполнено число блефов.
+
+        Обе величины — один ответ, посчитанный один раз: доля при отсутствующем
+        числе (или наоборот) означала бы, что одно из полей взято не из того
+        расчёта.
+        """
+        if (self.bluff_share is None) != (self.bluffs_needed_min_value is None):
+            raise ValueError(
+                f"доля блефов и их число заполняются вместе: число "
+                f"{self.bluffs_needed_min_value}, доля {self.bluff_share}"
+            )
+        return self
+
+
 class PointVerdict(BaseModel):
     dp_index: int
     street: Street
@@ -179,6 +227,19 @@ def river_call_detail(point: PointVerdict) -> RiverCallDetail | None:
     if raw is None:
         return None
     return RiverCallDetail.model_validate(raw)
+
+
+def turn_flop_call_detail(point: PointVerdict) -> TurnFlopCallDetail | None:
+    """Разбор точки тёрна или флопа из `detail` — или `None`, если его там нет.
+
+    Чужое содержимое под ключом роняет разбор — то же правило и та же причина,
+    что у `river_call_detail`
+    (`test_a_foreign_shape_under_the_turn_flop_key_is_not_swallowed`).
+    """
+    raw = point.detail.get(TURN_FLOP_CALL_DETAIL)
+    if raw is None:
+        return None
+    return TurnFlopCallDetail.model_validate(raw)
 
 
 class AnalysisResult(BaseModel):

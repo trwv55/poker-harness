@@ -32,6 +32,7 @@ from harness.contracts import (
     is_judged,
     leak_rule_of_point,
     river_call_detail,
+    turn_flop_call_detail,
 )
 from harness.engine import enrich
 from harness.normalizer import normalize
@@ -291,8 +292,13 @@ def test_a_three_handed_river_is_out_of_the_shape():
     assert "живых в руке 3" in point.detail["unjudged"]
 
 
-def test_the_turn_and_the_flop_stay_without_numbers():
-    """Этот кусок — только ривер: на тёрне и флопе не появилось ни одного числа."""
+def test_the_turn_and_the_flop_are_counted_by_their_own_tool():
+    """Ранние улицы считает `analysis.turn_flop`, и риверных чисел у них нет.
+
+    Ключ разный не для порядка: под ним лежат числа другого инструмента, и
+    прочитавший обязан знать, чей ответ у него в руках. Лучшего действия на
+    этих улицах не называется ни в каком случае (`test_turn_flop_analysis`).
+    """
     res = analyze_hand(_river_hand())
     earlier = [p for p in res.points if p.street in (Street.FLOP, Street.TURN)]
     assert earlier
@@ -300,6 +306,8 @@ def test_the_turn_and_the_flop_stay_without_numbers():
         assert river_call_detail(point) is None
         assert RIVER_CALL_DETAIL not in point.detail
         assert point.best_action == ""
+    facing_a_bet = [p for p in earlier if turn_flop_call_detail(p) is not None]
+    assert len(facing_a_bet) == 2  # ставка перед героем и на флопе, и на тёрне
 
 
 def test_hero_cards_unknown_leave_the_river_without_numbers():

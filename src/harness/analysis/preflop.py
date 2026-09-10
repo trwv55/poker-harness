@@ -126,6 +126,7 @@ from harness.analysis.tools.pushfold import (
 from harness.analysis.tools.pushfold import (
     shove_ev_bb as _shove_ev_bb,
 )
+from harness.analysis.turn_flop import turn_flop_verdict
 from harness.contracts import (
     ActionKind,
     Assumption,
@@ -1572,21 +1573,22 @@ def cheap_fold_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | No
 def verdict_for(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict:
     """Вердикт по одной точке решения героя.
 
-    Тёрн, флоп и прочий префлоп цены не получают и возвращаются без вердикта:
-    инструмента, который посчитал бы её, у нас пока нет, а назвать неизвестную
-    цену нулём и промолчать — значит выдать пробел за отсутствие ошибки.
+    Прочий префлоп цены не получает и возвращается без вердикта: инструмента,
+    который посчитал бы её, у нас пока нет, а назвать неизвестную цену нулём и
+    промолчать — значит выдать пробел за отсутствие ошибки.
 
-    **Ривер разбирается, но цены тоже не получает** (`analysis.river`): перебор
-    борда даёт требование к ставящему диапазону соперника и — когда борд
-    исчерпан — лучшее действие, но не EV решения. Такая точка не судима
-    (`SpotKind.POSTFLOP` вне `JUDGED_SPOTS`) и в сумму потерь не входит.
+    **Постфлоп разбирается, но цены тоже не получает** (`analysis.river`,
+    `analysis.turn_flop`): перебор борда даёт требование к ставящему диапазону
+    соперника и — на исчерпанном борде — лучшее действие, но не EV решения.
+    Такая точка не судима (`SpotKind.POSTFLOP` вне `JUDGED_SPOTS`) и в сумму
+    потерь не входит.
 
     """
     if dp.street is not Street.PREFLOP:
-        river = river_verdict(dp, en)
-        if river is not None:
-            return river
-        return unjudged_point(dp, SpotKind.POSTFLOP, "тёрн и флоп в v1 не оцениваются")
+        for postflop in (river_verdict(dp, en), turn_flop_verdict(dp, en)):
+            if postflop is not None:
+                return postflop
+        return unjudged_point(dp, SpotKind.POSTFLOP, f"улица {dp.street} не разбирается")
 
     state = table_state(dp, en)
     spot = spot_for(dp, state)

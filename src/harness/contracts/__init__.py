@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from harness.contracts.analysis import (
     RIVER_CALL_DETAIL,
+    TURN_FLOP_CALL_DETAIL,
     AllInEvent,
     AnalysisResult,
     Assumption,
@@ -25,8 +26,10 @@ from harness.contracts.analysis import (
     SpotKind,
     StackTrajectory,
     TournamentReport,
+    TurnFlopCallDetail,
     Zone,
     river_call_detail,
+    turn_flop_call_detail,
 )
 from harness.contracts.calcs import (
     POSITIONS,
@@ -129,6 +132,7 @@ __all__ = [
     "POSITIONS",
     "RANKS",
     "RIVER_CALL_DETAIL",
+    "TURN_FLOP_CALL_DETAIL",
     "ActionKind",
     "AllInEvent",
     "AnalysisResult",
@@ -202,6 +206,7 @@ __all__ = [
     "ThresholdSide",
     "TournamentReport",
     "TournamentTextOut",
+    "TurnFlopCallDetail",
     "Uncalled",
     "Unit",
     "ValidationStatus",
@@ -220,4 +225,5 @@ __all__ = [
     "leak_rule_for",
     "leak_rule_of_point",
     "river_call_detail",
+    "turn_flop_call_detail",
 ]
