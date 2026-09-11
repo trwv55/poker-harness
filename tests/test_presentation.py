@@ -73,7 +73,15 @@ from harness.presentation import (
 # --- progress_text -----------------------------------------------------------------
 
 
-def test_progress_text_covers_all_four_stations():
+def test_progress_text_covers_every_station():
+    """Каждая станция конвейера (`worker.pipeline._Station`) имеет свою строку.
+
+    Станций шесть, строк пять: `read` (скрин) и `parse` (файл раздач) говорят
+    игроку одно и то же — он в обоих случаях ждёт чтения стола. Станции без
+    строки не бывает: `progress_text` брал бы по ключу, которого нет.
+    """
+    assert progress_text("ask") == "Считаю по вашим раздачам…"
+    assert progress_text("read") == "Читаю стол…"
     assert progress_text("parse") == "Читаю стол…"
     assert progress_text("validate") == "Проверяю руку…"
     assert progress_text("analyze") == "Считаю эквити…"
