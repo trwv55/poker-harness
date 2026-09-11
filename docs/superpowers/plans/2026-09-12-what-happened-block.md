@@ -185,28 +185,28 @@ def test_analyze_hand_fills_the_spot_context_on_every_point():
             assert point.board == []
 ```
 
-`tests/test_memory.py`, рядом с `test_every_field_of_a_point_verdict_has_its_column` (у файла есть фикстуры `db_factory` и фабрики точек — использовать те же, что в соседнем тесте записи/чтения `AnalysesRepo`):
+`tests/test_memory.py`, рядом с `test_every_field_of_a_point_verdict_has_its_column`. Фикстура файла — `db` (сессия), не `db_factory`; фабрики — `_player_with_session(db, tg_user_id)` (строка 421), `_save_hand_in(db, *, session_id, tournament_id, hand_no)` (427), `_verdict(spot, taken, best, ev_diff_bb, **over)` (651). Образец использования — тест на строке ~674.
 
 ```python
-async def test_spot_context_survives_the_round_trip_through_decision_points(db_factory):
+async def test_spot_context_survives_the_round_trip_through_decision_points(db):
     """Путь повтора после падения читает `existing.result` из базы: без колонок
     карты пропали бы молча, и модель на ретрае получила бы слепую выжимку."""
-    hand_id = await _seed_hand(db_factory)  # существующая фабрика файла
-    point = _point_verdict().model_copy(
-        update={"hero_cards": ["Jh", "9h"], "board": ["Kh", "Jd", "2c"], "hero_position": "SB"}
+    _player_id, session_id = await _player_with_session(db, tg_user_id=7001)
+    hand_id = await _save_hand_in(db, session_id=session_id, tournament_id=1, hand_no="TM1")
+    point = _verdict(
+        SpotKind.PUSHFOLD_UNOPENED, "fold", "shove", -1.0,
+        hero_cards=["Jh", "9h"], board=["Kh", "Jd", "2c"], hero_position="SB",
     )
     res = AnalysisResult(hand_no="TM1", points=[point], ranked=[0], total_ev_loss_bb=-1.0)
-    async with db_factory() as session:
-        await AnalysesRepo(session).save(hand_id=hand_id, result=res, decision_points=[])
-        await session.commit()
-    async with db_factory() as session:
-        record = await AnalysesRepo(session).get_by_hand(hand_id)
+    await AnalysesRepo(db).save(hand_id=hand_id, result=res, decision_points=[])
+    await db.commit()
+    record = await AnalysesRepo(db).get_by_hand(hand_id)
     assert record is not None
     back = record.result.points[0]
     assert (back.hero_cards, back.board, back.hero_position) == (["Jh", "9h"], ["Kh", "Jd", "2c"], "SB")
 ```
 
-Имена `_seed_hand`/`_point_verdict` — заменить на реальные фабрики файла `tests/test_memory.py`, которыми уже пользуется тест `AnalysesRepo` рядом (открыть файл и взять их имена; не выдумывать).
+Если `_save_hand_in` требует существующий `tournament_id` — завести турнир той же фабрикой, что тест на строке 674 (открыть и повторить его подготовку; не выдумывать).
 
 - [ ] **Step 2: Запустить и убедиться, что падают**
 
@@ -955,12 +955,20 @@ def test_the_model_prose_is_cut_before_the_replay_is():
 `tests/test_memory.py`:
 
 ```python
-async def test_canonical_by_tournament_reads_only_hands_with_a_canonical_checkpoint(db_factory):
+async def test_canonical_by_tournament_reads_only_hands_with_a_canonical_checkpoint(db):
     """Одна колонка, как у `player_hands_by_tournament`: `raw` и `enriched`
     весят кратно больше, а частотам нужен только `canonical`."""
-    # использовать фабрики турнира/рук этого файла (те же, что в тесте
-    # `player_hands_by_tournament`); одна рука без `canonical` — пропускается
+    _player_id, session_id = await _player_with_session(db, tg_user_id=7002)
+    with_canon = await _save_hand_in(db, session_id=session_id, tournament_id=1, hand_no="C1")
+    raw_only = await _save_hand_in(db, session_id=session_id, tournament_id=1, hand_no="C2")
+    # `_save_hand_in` пишет и canonical — у второй руки его снять: открыть
+    # фабрику (строка 427) и повторить её без `save_canonical`, либо обнулить
+    # колонку прямым UPDATE; не выдумывать метод, которого нет.
+    hands = await HandsRepo(db).canonical_by_tournament(1)
+    assert [h.hand_no for h in hands] == ["C1"]
 ```
+
+Подготовка фикстуры (турнир, руки) — той же, что у теста `player_hands_by_tournament` в этом файле (найти по имени, повторить).
 
 `tests/test_worker_pipeline.py` — в `test_deep_dive_saves_the_model_text_and_shows_it_to_the_player` (строки ~1399-1407) заменить две последние проверки:
 
@@ -994,7 +1002,15 @@ def _payload(msg: Msg, **fields: object) -> dict[str, object]:
     return body
 ```
 
-Тест — в файле, где уже тестируется `_payload`/`_keyboard` воркера (найти `grep -rn "_payload" tests/`): `Msg(text="x", parse_mode="HTML")` → `"parse_mode" in body`; `Msg(text="x")` → `"parse_mode" not in body`.
+Тестов на `_payload` в репозитории НЕТ (проверено `grep -rn "_payload\|parse_mode" tests/` — пусто). Добавить в `tests/test_worker_pipeline.py`, импортировав `from harness.worker.main import _payload`:
+
+```python
+def test_the_payload_carries_parse_mode_when_the_message_has_markup():
+    """Разбор с блоком «Что было» едет в HTML; без этого поля Bot API показал
+    бы `<b>` и `&amp;` буквально. Без разметки поля нет — как и раньше."""
+    assert _payload(Msg(text="x", parse_mode="HTML"), chat_id=1)["parse_mode"] == "HTML"
+    assert "parse_mode" not in _payload(Msg(text="x"), chat_id=1)
+```
 
 - [ ] **Step 4: `_shrink_prose` и `deep_dive_msg`**
 
@@ -1128,7 +1144,13 @@ git commit -m "Блок «Что было» первым: HTML доезжает 
 - Modify: `src/harness/presentation/messages.py` (`replay_msg`, `replay_unavailable_msg` — удалить; `_html_escape` ОСТАЁТСЯ, его зовёт `deep_dive_msg`)
 - Modify: `src/harness/bot/handlers.py:61` (импорт), `:167-179` (`UI_CALLBACK_PREFIXES` — убрать `DETAIL_PREFIX`), `:1050-1051` (ветка), `:1132-1143` (`_replay_reply`)
 - Modify: `.claude/SESSIONS_UX.md`, раздел «Под вердиктом — инлайн-кнопки»
-- Test: `tests/test_presentation.py` (тесты `replay_msg` — удалить; кнопки), `tests/test_bot_handlers.py` (ветка `detail:`)
+- Test — точные места, где `detail:` или `replay_msg` живут сейчас (проверено grep):
+  - `tests/test_presentation.py:65` — импорт `replay_msg`, убрать;
+  - `tests/test_presentation.py:485` — `["ranges:H99", "detail:H99", "disagree:H99"]` → две;
+  - `tests/test_presentation.py:1139` — `any(... startswith("detail:") ...)` под `deep_dive_msg`, убрать утверждение;
+  - `tests/test_presentation.py:1142-1160` — `test_replay_msg_marks_the_hero_decision_in_bold`, `test_replay_msg_escapes_a_nickname_that_looks_like_a_tag`: перенести в тесты `deep_dive_msg` с `replay=` (жирный и экранирование теперь там), сами тесты `replay_msg` удалить;
+  - `tests/test_bot_handlers.py:945, 972` — докстринги перечисляют три префикса, поправить на два;
+  - `tests/test_bot_handlers.py:1953` — `handle_ui_callback(deps, ..., "detail:RC1234")`: заменить на проверку, что `detail:` теперь попадает в общий ответ «Эта кнопка не работает.» (`messages.py:855`) — это и есть закреплённый побочный эффект для старых сообщений.
 
 **Interfaces:**
 - Consumes: Task 7 (блок уже в разборе)
