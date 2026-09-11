@@ -368,3 +368,69 @@ def test_the_share_of_bluffs_and_their_count_are_filled_together():
     for half in ({"bluffs_needed_min_value": None}, {"bluff_share": None}):
         with pytest.raises(ValidationError):
             TurnFlopCallDetail.model_validate({**whole, **half})
+
+
+# --- вывод модели: конверт вокруг полезной нагрузки --------------------------
+#
+# Измеренный класс сбоя, а не гипотеза: Sonnet кладёт заполненную схему внутрь
+# одного контейнерного ключа вместо раскладки по корню. Имя ключа плавает
+# (`params`, `$PARAMETER_NAME`), поэтому сравнивать с конкретной строкой нельзя.
+# Схемы вывода состоят из необязательных полей — без разворота такой ответ
+# валиден, пуст и от честного «ничего не вижу» неотличим ничем.
+
+
+def _full_reading_payload() -> dict:
+    return {
+        "hand_no": "TM1",
+        "board": ["6s", "4h", "Jc"],
+        "players": [{"nickname": "N1", "seat": 1}],
+    }
+
+
+@pytest.mark.parametrize("envelope", ["params", "$PARAMETER_NAME", "properties"])
+def test_an_output_wrapped_in_one_container_key_is_unwrapped(envelope: str):
+    from harness.contracts import VisionReading
+
+    reading = VisionReading.model_validate({envelope: _full_reading_payload()})
+
+    assert reading.hand_no == "TM1"
+    assert len(reading.players) == 1
+    assert reading.board == ["6s", "4h", "Jc"]
+
+
+def test_an_unknown_key_is_an_error_and_not_a_silently_empty_output():
+    """Тихая потеря становится громкой: неизвестное поле — отказ валидации.
+
+    Без этого структурно неверный ответ неотличим от пустого чтения, а повтор
+    на той же модели даёт тот же результат и ту же цену (`llm_calls`: два
+    вызова по 1400 выходных токенов, оба выброшены).
+    """
+    from harness.contracts import VisionReading
+
+    with pytest.raises(ValidationError):
+        VisionReading.model_validate({**_full_reading_payload(), "лишнее": 1})
+
+
+@pytest.mark.parametrize(
+    ("schema_path", "payload"),
+    [
+        ("harness.contracts:VisionReading", {"hand_no": "TM1"}),
+        ("harness.contracts:TournamentTextOut", {"paragraphs": ["а", "б"]}),
+        ("harness.explanation.verdict_text:VerdictDraft", {"points": [], "summary": "с"}),
+        ("harness.explanation.question:QuestionDraft", {"answer": "о"}),
+    ],
+)
+def test_every_schema_the_model_fills_survives_the_container_key(schema_path: str, payload: dict):
+    """Разворот конверта — на всех четырёх местах LLM, а не только на зрении.
+
+    Конверт — свойство транспорта, а не одной схемы: он приходит от того, КАК
+    модель заполняет вызов инструмента. У трёх схем поля обязательные, и конверт
+    там не теряется молча, а падает валидацией — но падает он оплаченным
+    вызовом, и схема-ретрай фасада платит второй раз за то же самое.
+    """
+    import importlib
+
+    module_name, class_name = schema_path.split(":")
+    schema = getattr(importlib.import_module(module_name), class_name)
+
+    assert schema.model_validate({"params": payload}) == schema.model_validate(payload)

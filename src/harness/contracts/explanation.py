@@ -21,6 +21,8 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from harness.contracts.model_output import ModelOutput
+
 VerdictLabel = Literal["ok", "mistake", "marginal"]
 
 
@@ -43,7 +45,7 @@ class VerdictTextOut(BaseModel):
     summary: str
 
 
-class TournamentTextOut(BaseModel):
+class TournamentTextOut(ModelOutput, BaseModel):
     """Текст отчёта по турниру — абзацами, в порядке следования в сообщении.
 
     Абзацами, а не одной строкой: `presentation` расставляет между ними пустые

@@ -95,6 +95,7 @@ from harness.contracts.history import (
     leak_rule_for,
     leak_rule_of_point,
 )
+from harness.contracts.model_output import ModelOutput
 from harness.contracts.ranges import RANKS, Range, all_classes, class_of
 from harness.contracts.raw import (
     ActionKind,
@@ -168,6 +169,7 @@ __all__ = [
     "LeaksResult",
     "LevelLine",
     "Measurement",
+    "ModelOutput",
     "NoteColor",
     "NoteRecord",
     "OpponentFrequencyParams",

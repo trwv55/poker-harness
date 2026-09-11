@@ -34,6 +34,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel
 
+from harness.contracts.model_output import ModelOutput
 from harness.contracts.raw import ActionKind, Street
 
 
@@ -128,7 +129,7 @@ class SeenWin(BaseModel):
     unit: Unit | None = None
 
 
-class VisionReading(BaseModel):
+class VisionReading(ModelOutput, BaseModel):
     """Полное наблюдение по одному экрану — выходная схема vision-вызова.
 
     `not_a_hand` с причиной — честный отказ на экране, который рукой не является

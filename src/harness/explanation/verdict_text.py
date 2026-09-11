@@ -39,6 +39,7 @@ from pydantic import BaseModel
 
 from harness.contracts import (
     AnalysisResult,
+    ModelOutput,
     PointText,
     PointVerdict,
     SpotKind,
@@ -181,7 +182,7 @@ class PointDraft(BaseModel):
     text: str
 
 
-class VerdictDraft(BaseModel):
+class VerdictDraft(ModelOutput, BaseModel):
     """Сырой ответ модели до проверок — то, что видит eval-прогон.
 
     Публичный тип (в отличие от прежнего приватного) ровно потому, что у него
