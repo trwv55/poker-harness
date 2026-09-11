@@ -713,7 +713,12 @@ def _board_at_all_in(raw: RawHand) -> list[str]:
 
 
 def _showdown_pair(raw: RawHand) -> tuple[list[str], list[str]]:
-    """Две первые вскрытые руки — вход проверки эквити (она считает один на один)."""
+    """Две первые вскрытые руки — ЗАПАСНОЙ вход проверки эквити.
+
+    Основной вход — игроки, чью долю подписал экран (`run_checks`): их бывает и
+    трое. Пара из вскрытия остаётся для экранов, где процент напечатан, а карты
+    читаются только из вскрытия, и там участников ровно двое.
+    """
     hands = [entry.cards for entry in raw.showdowns if len(entry.cards) == 2]
     return (hands[0], hands[1]) if len(hands) >= 2 else ([], [])
 
