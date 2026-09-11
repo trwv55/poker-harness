@@ -220,7 +220,11 @@ class LLM:
     async def __call__(
         self,
         purpose: Literal[
-            "vision_extract", "vision_extract_fallback", "verdict_text", "question_answer"
+            "vision_extract",
+            "vision_extract_fallback",
+            "verdict_text",
+            "tournament_text",
+            "question_answer",
         ],
         schema: type[T],
         *,

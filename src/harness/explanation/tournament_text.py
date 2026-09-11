@@ -24,8 +24,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from itertools import pairwise
 from pathlib import Path
+from typing import Any, Literal, Protocol, TypeVar
+
+from pydantic import BaseModel
 
 from harness.contracts import (
     TournamentReport,
@@ -40,11 +44,34 @@ from harness.explanation.verdict_text import (
     _STREET_BRIEF,
     Digest,
     UnfaithfulText,
-    VerdictLLM,
     read_prompt,
 )
 
-__all__ = ["tournament_digest", "tournament_draft", "tournament_text"]
+__all__ = ["TournamentLLM", "tournament_digest", "tournament_draft", "tournament_text"]
+
+_T = TypeVar("_T", bound=BaseModel)
+
+
+class TournamentLLM(Protocol):
+    """Та часть фасада `platform.llm.LLM`, которой пользуется рассказ по турниру.
+
+    Свой протокол, а не `VerdictLLM`, ровно из-за одного слова — назначения
+    вызова. Назначение `tournament_text` отдельное, хотя модель у рассказа и у
+    вердикта одна (`platform/llm.py`, `_resolve_model`): `llm_calls.purpose` —
+    то, по чему считается себестоимость каждого входа продукта, и один ключ на
+    два входа сделал бы этот счёт невычислимым (то же решение и то же
+    обоснование, что у `question_answer`, миграция 0009).
+    """
+
+    async def __call__(
+        self,
+        purpose: Literal["tournament_text"],
+        schema: type[_T],
+        *,
+        prompt: str,
+        images: Sequence[bytes] = (),
+        trace_id: int,
+    ) -> tuple[_T, Any]: ...
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "tournament.md"
 
@@ -223,7 +250,7 @@ def tournament_digest(report: TournamentReport) -> Digest:
 
 
 async def tournament_draft(
-    llm: VerdictLLM, report: TournamentReport, *, trace_id: int
+    llm: TournamentLLM, report: TournamentReport, *, trace_id: int
 ) -> tuple[TournamentTextOut, Digest]:
     """Один вызов модели: сырой рассказ и выжимка, по которой его положено проверять.
 
@@ -232,12 +259,14 @@ async def tournament_draft(
     """
     digest = tournament_digest(report)
     prompt = read_prompt(_PROMPT_PATH).replace("{digest}", digest.text)
-    draft, _meta = await llm("verdict_text", TournamentTextOut, prompt=prompt, trace_id=trace_id)
+    draft, _meta = await llm(
+        "tournament_text", TournamentTextOut, prompt=prompt, trace_id=trace_id
+    )
     return draft, digest
 
 
 async def tournament_text(
-    llm: VerdictLLM, report: TournamentReport, *, trace_id: int
+    llm: TournamentLLM, report: TournamentReport, *, trace_id: int
 ) -> TournamentTextOut:
     """Рассказ по отчёту турнира. Один вызов модели, те же правила верности.
 
