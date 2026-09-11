@@ -4,108 +4,110 @@
 
 **Goal:** Ход раздачи прозой в ББ встаёт первым в сообщении разбора, а модель перестаёт быть слепой — получает карты, борд, позицию и состав допущенного диапазона.
 
-**Architecture:** Реплей остаётся чистым кодом (`explanation/hand_replay.py`, ноль токенов) и меняет только формат: проза вместо строк по улицам, ББ вместо фишек, метка и частоты оппонента, цена решения в конце. Контекст спота едет к модели не сменой сигнатуры `verdict_text`, а тремя необязательными полями `PointVerdict`, которые заполняет `analyze_hand`: так eval-кейсы и все три места вызова остаются рабочими, а свойство «`verdict_text` физически не видит раздачу» сохраняется.
+**Architecture:** Реплей остаётся чистым кодом (`explanation/hand_replay.py`, ноль токенов) и меняет формат: проза вместо строк по улицам, ББ вместо фишек, метка и частоты оппонента, цена решения в конце. Контекст спота едет к модели тремя необязательными полями `PointVerdict`, которые заполняет `analyze_hand`; точки хранятся колонками таблицы `decision_points` (карта `_POINT_COLUMNS`, тест-страж), поэтому поля требуют миграции 0011. Так eval-кейсы и все три места вызова `verdict_text` остаются рабочими, путь повтора после падения (`existing.result`) отдаёт модели точки с картами, а свойство «`verdict_text` физически не видит раздачу» сохраняется.
 
-**Tech Stack:** Python 3.12, pydantic 2, pytest, aiogram-совместимый слой `presentation` (чистые функции, возвращают `Msg`).
+**Tech Stack:** Python 3.12, pydantic 2, SQLAlchemy 2 async + Alembic (Postgres, jsonb), pytest; слой `presentation` — чистые функции, возвращающие `Msg`.
 
 **Spec:** [docs/superpowers/specs/2026-08-28-poker-harness-tech-spec-design.md](../specs/2026-08-28-poker-harness-tech-spec-design.md), §5.6 «Блок „Что было“ — реплей руки, собранный кодом»
 
+**История плана.** Первая редакция прошла ревью и получила шесть блокирующих находок; все они были утверждениями о коде, написанными по памяти. Эта редакция сверена с кодом построчно. Имплементатор: **не доверяй ни одному утверждению плана о коде, которого не видишь в открытом файле** — открой и сверь.
+
 ## Global Constraints
 
-Требования ниже действуют в КАЖДОЙ задаче плана.
+Действуют в КАЖДОЙ задаче.
 
-- **Правило зависимостей (CLAUDE.md).** `contracts`, `parsers`, `normalizer`, `engine`, `analysis`, `explanation`, `presentation` не импортируют Телеграм, БД и `harness.platform`. Данные приходят аргументами, результат возвращается значением. Про инфраструктуру знают только `bot`, `worker`, `memory`, `platform`.
-- **Никогда не выдумывать числа о деньгах (CLAUDE.md).** Расхождение — эскалация или отказ с логом, но не «подправить, чтобы сошлось».
-- **Судить решение против диапазона, а не против вскрытой карты (CLAUDE.md).** Правильный вход, проигравший по случайности, ошибкой не считается.
-- **Все суммы блока — в ББ, с одним знаком после точки** (спека §5.6). Фишек в блоке нет. Приблизительности нет: «~5.5» обещало бы неуверенность, которой у кода нет.
-- **Масти — символом, никогда буквами** (спека §5.6). За каждым символом стоит селектор эмодзи-презентации U+FE0F (`️`).
-- **К игроку обращаются на «вы»** — так же, как во всех трёх промптах изложения.
-- **Бюджет сообщения — 4096 символов**, `sendMessage` длиннее не отправляет вовсе. При нехватке места режется проза модели, а не блок «Что было» и не числа. Обрезка называется вслух.
-- **Частот ровно две — VPIP и PFR.** Частота с нулевым знаменателем не печатается; пустая скобка не печатается вовсе.
-- **Команды проверки:** `uv run pytest -q -ra` (флаг `-ra` обязателен — показывает пропуски), затем `uv run ruff check . && uv run pyright`.
-- **Докстринг утверждает только то, что закреплено тестом.** Не писать в прозе обещаний, которых тест не проверяет.
+- **Правило зависимостей (CLAUDE.md).** `contracts`, `parsers`, `normalizer`, `engine`, `analysis`, `explanation`, `presentation` не импортируют Телеграм, БД и `harness.platform`. Данные — аргументами, результат — значением. Про инфраструктуру знают только `bot`, `worker`, `memory`, `platform`.
+- **Никогда не выдумывать числа о деньгах (CLAUDE.md).** В том числе — не ослаблять проверку `unsupported_numbers`: она и есть механизм этого правила для текста модели.
+- **Судить решение против диапазона, а не против вскрытой карты (CLAUDE.md).**
+- **Все суммы блока — в ББ, с одним знаком после точки** (спека §5.6). Фишек в блоке нет. Приблизительности («~») нет.
+- **Масти — символом, никогда буквами**, за символом селектор эмодзи-презентации U+FE0F.
+- **К игроку обращаются на «вы»** — в блоке и во всех трёх промптах.
+- **Бюджет сообщения — 4096 символов**, `sendMessage` длиннее не отправляет. При нехватке режется проза модели, не блок и не числа. Обрезка называется вслух маркером `_fitted`.
+- **Частот ровно две — VPIP и PFR**, у них общий знаменатель `PlayerStats.hands`: появляются и исчезают вместе. Измеренный ноль печатается.
+- **Улицы без ходов — прогон борда, печатается только борд.** Чек — действие движка (`ActionKind.CHECK`); «чек-чек» без действий в руке — выдумка.
+- **Точка хранится ТОЛЬКО в `decision_points`** (`memory/repos._POINT_COLUMNS`, тест `test_every_field_of_a_point_verdict_has_its_column`). Новое поле `PointVerdict` без колонки и миграции — тихая потеря данных.
+- **Промпты не пушатся** (CLAUDE.md, «Прежде чем что-либо публиковать»); тесты, читающие промпт, гейтятся `@requires_prompts` из `tests/conftest.py`.
+- **Команды проверки:** `uv run pytest -q -ra` (смотреть строку `skipped`: без фикстур и промптов пропуски есть, их число не должно расти), затем `uv run ruff check . && uv run pyright`.
+- **Докстринг утверждает только закреплённое тестом.** Докстринги, которые задача делает ложью, правятся той же задачей — список в каждой задаче.
 
 ---
 
-### Task 1: Нотация карт перестаёт читаться как число
+### Task 1: Нотация карт перестаёт читаться как число — без дыры для двузначных сумм
 
-Проверка верности читает `A5s` как число 5, `99` как 99, `T9o` как 9. Пока это так, ни карты, ни состав диапазона в выжимку отдать нельзя: модель процитирует нас же и будет за это отбракована. Гнать карты через `NumberBook.token` нельзя — это разрешило бы модели писать «теряет 5 bb» свободно.
+Проверка верности читает `A5s` как 5, `J♥️` — как ничего (буква), `99` — как 99. Пока так, карты и состав диапазона в выжимку отдавать нельзя: модель процитирует нас и будет отбракована.
+
+**Решение, принятое здесь, а не регэкспом.** Чисто цифровые пары (`22`…`99`) неотличимы от величин никаким шаблоном: «теряет 33 bb» и класс `33` — одна и та же строка. Регэксп вырезает только ОДНОЗНАЧНУЮ нотацию — карту с мастью и класс с суффиксом `s`/`o`. Цифровые пары выжимка регистрирует через `NumberBook.token` ровно тогда, когда печатает их в составе диапазона (Task 3): утечка ограничена парами, которые реально названы, и «99 bb» как сумма неправдоподобна. Это осознанный компромисс, и он записан в докстринге `numbers_in`.
 
 **Files:**
-- Modify: `src/harness/explanation/faithfulness.py` (рядом с `_NUMBER_RE`, строка 48, и `numbers_in`, строка 112)
+- Modify: `src/harness/explanation/faithfulness.py` (`_NUMBER_RE` — строка 48; `numbers_in` — строка 112)
 - Test: `tests/test_faithfulness.py`
 
 **Interfaces:**
-- Consumes: ничего из предыдущих задач (первая)
-- Produces: `numbers_in(text: str) -> list[float]` с прежней сигнатурой и новым поведением; приватная `_CARD_RE` для тестов не нужна
+- Consumes: —
+- Produces: `numbers_in(text: str) -> list[float]` — сигнатура прежняя, поведение новое.
 
 - [ ] **Step 1: Написать падающие тесты**
 
 ```python
-def test_a_hand_class_is_not_a_number():
-    """`A5s`, `T9o`, `99` — имена рук, а не величины: иначе модель наказана за
-    то, что процитировала состав диапазона, который мы сами ей показали."""
-    assert numbers_in("отвечает только AA, KK и 99") == []
+def test_a_suited_or_offsuit_class_is_not_a_number():
+    """`A5s`, `T9o` — имена рук, а не величины: иначе модель наказана за то,
+    что процитировала состав диапазона, который мы сами ей показали."""
     assert numbers_in("в диапазоне есть A5s и T9o") == []
+    assert numbers_in("с 75s вы теряете 1.2 bb") == [1.2]
 
 
-def test_a_card_is_not_a_number():
+def test_a_card_with_a_suit_is_not_a_number():
     """Карта и борд — факты руки. Масть пишется символом с селектором U+FE0F."""
     assert numbers_in("у вас J♥️9♥️") == []
-    assert numbers_in("борд K♥️ J♦️ 2♣️") == []
+    assert numbers_in("борд K♥️ J♦️ 2♣️, потеря 3.9 bb") == [3.9]
 
 
-def test_a_real_quantity_next_to_a_card_is_still_read():
-    """Вырезание карт не имеет права глотать соседнюю величину — иначе проверка
-    перестанет ловить выдуманные числа в той же фразе."""
-    assert numbers_in("с A5s вы теряете 1.2 bb") == [1.2]
-    assert numbers_in("борд K♥️, потеря 3.9 bb") == [3.9]
+def test_a_two_digit_amount_is_still_read_as_a_number():
+    """Дыра, закрытая на ревью: пара `33` и сумма 33 bb — одна строка. Регэксп
+    НЕ вырезает цифровые пары; их регистрирует выжимка, когда печатает.
+    Иначе любая сумма от 22 до 99 bb уходила бы без отбраковки."""
+    assert numbers_in("теряет 33 bb") == [33.0]
+    assert numbers_in("банк 225") == [225.0]
+    assert numbers_in("1.25 bb") == [1.25]
+    assert unsupported_numbers("теряет 55 bb", allowed=[1.2]) == [55.0]
 
 
-def test_a_bare_number_that_looks_like_a_rank_is_still_read():
-    """«9 bb» — величина, а не карта: вырезается нотация, а не цифра вообще."""
+def test_a_bare_rank_digit_is_still_read():
+    """«9 bb» — величина: вырезается нотация, а не цифра вообще."""
     assert numbers_in("теряет 9 bb") == [9.0]
-    assert unsupported_numbers("теряет 5 bb", allowed=[1.2]) == [5.0]
 ```
 
 - [ ] **Step 2: Запустить и убедиться, что падают**
 
-Run: `uv run pytest tests/test_faithfulness.py -k "card or hand_class or rank" -v`
-Expected: FAIL — `numbers_in("отвечает только AA, KK и 99")` вернёт `[99.0]`, остальные тоже вернут лишние числа.
+Run: `uv run pytest tests/test_faithfulness.py -k "suited or suit_is_not or two_digit or bare_rank" -v`
+Expected: FAIL на первых двух (`[5.0]`, `[9.0, 9.0]`…); третий и четвёртый ПРОХОДЯТ уже сейчас — они страхуют от регрессии, и это нормально.
 
-- [ ] **Step 3: Реализовать вырезание нотации**
+- [ ] **Step 3: Реализовать**
 
-В `src/harness/explanation/faithfulness.py`, рядом с `_NUMBER_RE`:
+В `src/harness/explanation/faithfulness.py`, после `_NUMBER_RE`:
 
 ```python
-# Нотация карт и классов рук — НЕ величины, и до счёта чисел она вырезается
-# (задача 1 плана 2026-09-12). Иначе состав диапазона в выжимке (`A5s`, `99`)
-# и карты руки (`J♥️9♥️`) прочтутся как выдуманные числа, и текст, честно
-# процитировавший наш же промпт, будет отбракован целиком.
-#
-# Через `NumberBook.token` их гнать нельзя: это зарегистрировало бы 5 и 9 как
-# разрешённые величины, и «теряет 5 bb» прошло бы проверку на любом разборе.
-#
-# Порядок в чередовании значим: класс руки (две карты подряд) идёт ПЕРВЫМ,
-# иначе одиночная карта съест его первую половину и оставит хвост.
-_RANK = "[2-9TJQKA]"
-_SUIT_SYMBOL_CLASS = "[♠♡♢♣♤♥♦♧]️?"
+# Нотация карт — НЕ величина, и до счёта чисел вырезается (план 2026-09-12,
+# задача 1). Вырезается только ОДНОЗНАЧНАЯ: карта с мастью (`J♥️`) и класс с
+# суффиксом (`A5s`, `T9o`). Чисто цифровые пары (`22`…`99`) не вырезаются —
+# они неотличимы от сумм («теряет 33 bb»), и шаблон, съедающий их, открыл бы
+# модели любую двузначную сумму без отбраковки
+# (`test_a_two_digit_amount_is_still_read_as_a_number`). Такие пары
+# регистрирует выжимка через `NumberBook.token` ровно тогда, когда печатает их
+# в составе диапазона (`verdict_text._range_text`).
 _CARD_NOTATION_RE = re.compile(
-    rf"{_RANK}{_RANK}[so]\b"           # класс руки: A5s, T9o
-    rf"|{_RANK}{_RANK}\b"              # пара: AA, 99
-    rf"|{_RANK}{_SUIT_SYMBOL_CLASS}",  # карта с мастью: J♥️
+    r"\b[2-9TJQKA]{2}[so]\b"          # класс руки с суффиксом: A5s, T9o
+    r"|[2-9TJQKA][♠♥♦♣]️?"      # карта с мастью: J♥️, 2♣
 )
 ```
-
-И в `numbers_in`:
 
 ```python
 def numbers_in(text: str) -> list[float]:
     """Все числа текста в порядке появления, с учётом разрядов и запятой-дроби.
 
-    Нотация карт вырезается до счёта (`_CARD_NOTATION_RE`): карта — не
-    количество. Закреплено `test_a_hand_class_is_not_a_number` и
-    `test_a_real_quantity_next_to_a_card_is_still_read`.
+    Однозначная нотация карт вырезается до счёта (`_CARD_NOTATION_RE`):
+    карта — не количество. Цифровые пары НЕ вырезаются — см. комментарий у
+    шаблона и `test_a_two_digit_amount_is_still_read_as_a_number`.
     """
     joined = _THOUSANDS_RE.sub("", text)
     joined = _CARD_NOTATION_RE.sub(" ", joined)
@@ -115,111 +117,138 @@ def numbers_in(text: str) -> list[float]:
     ]
 ```
 
-- [ ] **Step 4: Запустить тесты**
+- [ ] **Step 4: Запустить тесты файла, затем весь набор**
 
-Run: `uv run pytest tests/test_faithfulness.py -q -ra`
-Expected: PASS, включая все прежние тесты файла.
+Run: `uv run pytest tests/test_faithfulness.py -q -ra` → PASS.
+Run: `uv run pytest -q -ra` → PASS, число `skipped` прежнее.
 
-- [ ] **Step 5: Прогнать весь набор — проверка верности общая для трёх промптов**
-
-Run: `uv run pytest -q -ra`
-Expected: PASS. Смотреть на строку `skipped`: без фикстур пропускается 5 тестов, это норма; больше — регрессия.
-
-- [ ] **Step 6: Коммит**
+- [ ] **Step 5: Коммит**
 
 ```bash
 git add src/harness/explanation/faithfulness.py tests/test_faithfulness.py
-git commit -m "Карта — не количество: нотация перестала читаться как число"
+git commit -m "Карта с мастью и класс с суффиксом — не число; цифровые пары остаются суммами"
 ```
 
 ---
 
-### Task 2: Контекст спота едет в `PointVerdict`, а не в сигнатуру
+### Task 2: Контекст спота — три поля `PointVerdict`, колонки и миграция 0011
 
-Модель слепа: выжимка знает улицу и вид спота, но не знает ни карт, ни борда, ни позиции. Отдать их сменой сигнатуры `verdict_text` нельзя дёшево — eval-кейсы хранят только `AnalysisResult` (`platform/eval_runner.py`, `_cases_from_dir`), и раздачи у них нет. Поэтому три необязательных поля едут в `PointVerdict`, а заполняет их `analyze_hand`, у которого есть и рука, и точки.
+Модель не знает ни карт, ни борда, ни позиции. Отдать их сменой сигнатуры `verdict_text` нельзя: eval-кейсы хранят только `AnalysisResult` (`platform/eval_runner._cases_from_dir`, строки 129-137). Поэтому поля едут в `PointVerdict`, заполняет их `analyze_hand`.
 
-Умолчания обязательны: `AnalysisResult` лежит в таблице `analyses` и в eval-кейсах, и старый JSON обязан читаться тем же типом.
+**Точка хранится строкой `decision_points`, а не в `analyses.result`** (`AnalysesRepo.save` пишет документ с `exclude={"points"}`, `repos.py:730`; `get_by_hand` собирает точки ТОЛЬКО по карте `_POINT_COLUMNS`, `repos.py:814-821`). Тест-страж `tests/test_memory.py:1732-1745` требует `set(PointVerdict.model_fields) == set(_POINT_COLUMNS)`. Значит: три новых поля = три колонки = миграция, иначе на пути повтора после падения (`existing.result`, `pipeline.py:1118-1120, 1196-1198`) модель получит точки без карт.
+
+**Имя поля позиции — `hero_position`, не `position`:** колонка `position` в `decision_points` УЖЕ есть, это обстановка из `DecisionPoint` (`_CONTEXT_COLUMNS`, `repos.py:688`), и одноимённое поле вердикта столкнулось бы с ней в `row |=` (`repos.py:765-768`).
 
 **Files:**
-- Modify: `src/harness/contracts/analysis.py:186-197` (класс `PointVerdict`)
+- Modify: `src/harness/contracts/analysis.py:186-197` (`PointVerdict`)
 - Modify: `src/harness/analysis/__init__.py:37-44` (`analyze_hand`)
-- Test: `tests/test_contracts.py`, `tests/test_preflop_analysis.py`
+- Modify: `src/harness/memory/models.py` (класс `DecisionPointRow`, строки колонок 86-89 по счёту внутри класса; докстринг класса — список полей `PointVerdict`)
+- Modify: `src/harness/memory/repos.py:669-681` (`_POINT_COLUMNS`)
+- Create: `migrations/versions/0011_decision_point_spot_context.py`
+- Test: `tests/test_contracts.py`, `tests/test_preflop_analysis.py`, `tests/test_memory.py`
 
 **Interfaces:**
-- Consumes: ничего из Task 1
-- Produces: `PointVerdict.hero_cards: list[str]`, `PointVerdict.board: list[str]`, `PointVerdict.position: str` — все с умолчаниями. Формат карты — как в `CanonicalHand.dealt`: двухсимвольная строка ранга и масти буквой (`"Jh"`), символ рисует изложение.
+- Consumes: —
+- Produces: `PointVerdict.hero_cards: list[str] = []`, `PointVerdict.board: list[str] = []`, `PointVerdict.hero_position: str = ""`. Формат карты — как в `CanonicalHand.dealt`: `"Jh"` (ранг, масть буквой); символ рисует изложение. Колонки `decision_points.hero_cards jsonb NOT NULL DEFAULT '[]'`, `board jsonb NOT NULL DEFAULT '[]'`, `hero_position varchar(16) NOT NULL DEFAULT ''`.
 
 - [ ] **Step 1: Написать падающие тесты**
 
-В `tests/test_contracts.py`:
+`tests/test_contracts.py`:
 
 ```python
 def test_a_point_without_spot_context_still_loads():
-    """Разборы, записанные до появления полей, читаются тем же типом: они лежат
-    в `analyses` и в eval-кейсах, и миграции у jsonb нет."""
+    """Точки, записанные до появления полей, читаются тем же типом: они лежат
+    в `decision_points` и в eval-кейсах, и умолчание колонки — пустое."""
     old = {
         "dp_index": 0, "street": "preflop", "spot": "pushfold_unopened",
         "zone": "strict", "action_taken": "fold", "best_action": "shove",
         "ev_diff_bb": -3.9,
     }
     point = PointVerdict.model_validate(old)
-    assert point.hero_cards == []
-    assert point.board == []
-    assert point.position == ""
+    assert point.hero_cards == [] and point.board == [] and point.hero_position == ""
 ```
 
-В `tests/test_preflop_analysis.py` (рядом с прочими тестами `analyze_hand`):
+`tests/test_preflop_analysis.py` (образец и импорты `enrich`, `normalize`, `parse_hand`, `SAMPLE` уже есть в файле — см. строку 357):
 
 ```python
 def test_analyze_hand_fills_the_spot_context_on_every_point():
     """Карты, борд и позиция приходят к изложению через разбор, а не через
     смену сигнатуры: eval-кейсы хранят только `AnalysisResult`."""
-    en = enrich(normalize(parse_hand(SAMPLE, source_ref="x")))  # приём файла, строка 357
+    en = enrich(normalize(parse_hand(SAMPLE, source_ref="x")))
     res = analyze_hand(en)
     assert res.points, "образец обязан дать хотя бы одну точку"
+    hero = next(p for p in en.hand.players if p.label == en.hand.hero_label)
     for point in res.points:
         assert point.hero_cards == en.hand.dealt[en.hand.hero_label]
-        assert point.position != ""
+        assert point.hero_position == hero.position
+        if point.street is Street.PREFLOP:
+            assert point.board == []
 ```
+
+`tests/test_memory.py`, рядом с `test_every_field_of_a_point_verdict_has_its_column` (у файла есть фикстуры `db_factory` и фабрики точек — использовать те же, что в соседнем тесте записи/чтения `AnalysesRepo`):
+
+```python
+async def test_spot_context_survives_the_round_trip_through_decision_points(db_factory):
+    """Путь повтора после падения читает `existing.result` из базы: без колонок
+    карты пропали бы молча, и модель на ретрае получила бы слепую выжимку."""
+    hand_id = await _seed_hand(db_factory)  # существующая фабрика файла
+    point = _point_verdict().model_copy(
+        update={"hero_cards": ["Jh", "9h"], "board": ["Kh", "Jd", "2c"], "hero_position": "SB"}
+    )
+    res = AnalysisResult(hand_no="TM1", points=[point], ranked=[0], total_ev_loss_bb=-1.0)
+    async with db_factory() as session:
+        await AnalysesRepo(session).save(hand_id=hand_id, result=res, decision_points=[])
+        await session.commit()
+    async with db_factory() as session:
+        record = await AnalysesRepo(session).get_by_hand(hand_id)
+    assert record is not None
+    back = record.result.points[0]
+    assert (back.hero_cards, back.board, back.hero_position) == (["Jh", "9h"], ["Kh", "Jd", "2c"], "SB")
+```
+
+Имена `_seed_hand`/`_point_verdict` — заменить на реальные фабрики файла `tests/test_memory.py`, которыми уже пользуется тест `AnalysesRepo` рядом (открыть файл и взять их имена; не выдумывать).
 
 - [ ] **Step 2: Запустить и убедиться, что падают**
 
-Run: `uv run pytest tests/test_contracts.py::test_a_point_without_spot_context_still_loads tests/test_preflop_analysis.py -k spot_context -v`
-Expected: FAIL с `AttributeError: 'PointVerdict' object has no attribute 'hero_cards'`.
+Run: `uv run pytest tests/test_contracts.py -k spot_context tests/test_preflop_analysis.py -k spot_context -v`
+Expected: FAIL, `AttributeError: 'PointVerdict' object has no attribute 'hero_cards'`.
 
-- [ ] **Step 3: Добавить поля в контракт**
+- [ ] **Step 3: Контракт**
 
-В `src/harness/contracts/analysis.py`, в `PointVerdict`, после `detail`:
+В `PointVerdict`, после `detail`:
 
 ```python
     # Контекст спота для изложения (план 2026-09-12, задача 2): карты героя,
     # борд на момент решения и позиция героя. Это ФАКТЫ руки, а не величины
-    # расчёта, и на границу «точное считает код» они не посягают — модель
-    # получает их, чтобы объяснить решение, а не чтобы что-то посчитать.
+    # расчёта: модель получает их, чтобы объяснить решение, а не считать.
     #
     # Поля здесь, а не аргументом `verdict_text`: eval-кейсы хранят только
-    # `AnalysisResult` (`platform/eval_runner._cases_from_dir`), и раздачи у
-    # них нет. Умолчания обязательны — тот же тип читает jsonb, записанный до
-    # появления полей (`test_a_point_without_spot_context_still_loads`).
+    # `AnalysisResult` (`platform/eval_runner._cases_from_dir`). Умолчания
+    # обязательны — тот же тип читает строки `decision_points`, записанные до
+    # миграции 0011 (`test_a_point_without_spot_context_still_loads`).
     #
-    # Формат карты — как в `CanonicalHand.dealt`: ранг и масть буквой (`"Jh"`).
-    # Символ масти рисует изложение, контракт хранит источник.
+    # `hero_position`, а не `position`: колонка `position` в `decision_points`
+    # уже занята обстановкой из `DecisionPoint` (`repos._CONTEXT_COLUMNS`).
+    #
+    # Формат карты — как в `CanonicalHand.dealt` (`"Jh"`); символ масти рисует
+    # изложение, контракт хранит источник.
     hero_cards: list[str] = []
     board: list[str] = []
-    position: str = ""
+    hero_position: str = ""
 ```
 
-- [ ] **Step 4: Заполнить их в одном месте**
+- [ ] **Step 4: Заполнение в одном месте**
 
-В `src/harness/analysis/__init__.py`:
+`src/harness/analysis/__init__.py` — в импорт `from harness.contracts import ...` добавить `PointVerdict, Street`:
 
 ```python
 def _with_spot_context(point: PointVerdict, en: EnrichedHand) -> PointVerdict:
     """Карты, борд и позицию дописывает разбор, а не каждый строитель вердикта.
 
     Одно место, а не пять: `PointVerdict` конструируют `preflop` (трижды),
-    `river` и `classifier`, и пятикратное повторение развело бы формат при
-    первой же правке. Борд берётся по улице точки — на префлопе его нет.
+    `river` и `classifier`. Борд — накопленный до улицы точки включительно; на
+    префлопе его нет. `model_copy` валидаторов не гоняет, и это безопасно:
+    `zone`/`assumption` здесь не меняются.
     """
     hand = en.hand
     board: list[str] = []
@@ -231,7 +260,7 @@ def _with_spot_context(point: PointVerdict, en: EnrichedHand) -> PointVerdict:
         update={
             "hero_cards": list(hand.dealt.get(hand.hero_label, [])),
             "board": board,
-            "position": next(
+            "hero_position": next(
                 (p.position for p in hand.players if p.label == hand.hero_label), ""
             ),
         }
@@ -244,40 +273,110 @@ def analyze_hand(en: EnrichedHand) -> AnalysisResult:
     return AnalysisResult(
 ```
 
-Импорты в шапке файла: добавить `PointVerdict` и `Street` к существующему `from harness.contracts import ...`.
+- [ ] **Step 5: Запустить — контракт и разбор зелёные, страж хранения КРАСНЫЙ**
 
-- [ ] **Step 5: Запустить тесты**
+Run: `uv run pytest tests/test_contracts.py tests/test_preflop_analysis.py tests/test_memory.py -q -ra`
+Expected: `test_every_field_of_a_point_verdict_has_its_column` FAIL — поля есть, колонок нет. Это и есть страж; дальше — колонки.
 
-Run: `uv run pytest tests/test_contracts.py tests/test_preflop_analysis.py tests/test_river_analysis.py -q -ra`
-Expected: PASS.
+- [ ] **Step 6: Колонки в модели, карта, миграция**
 
-- [ ] **Step 6: Прогнать весь набор**
+`src/harness/memory/models.py`, `DecisionPointRow`, после `detail`:
 
-Run: `uv run pytest -q -ra`
-Expected: PASS, `skipped` не вырос.
+```python
+    # Контекст спота из `PointVerdict` (миграция 0011): карты и борд — списки,
+    # как `tools`; позиция героя — `hero_position`, потому что `position` уже
+    # занята обстановкой из `DecisionPoint`.
+    hero_cards: Mapped[Any] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    board: Mapped[Any] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    hero_position: Mapped[str] = mapped_column(String(16), nullable=False, server_default="")
+```
 
-- [ ] **Step 7: Коммит**
+В докстринге класса, в списке «`PointVerdict` целиком, поле в поле», дописать `hero_cards`, `board`, `hero_position`.
+
+`src/harness/memory/repos.py`, `_POINT_COLUMNS`:
+
+```python
+    "detail": "detail",
+    "hero_cards": "hero_cards",
+    "board": "board",
+    "hero_position": "hero_position",
+}
+```
+
+`migrations/versions/0011_decision_point_spot_context.py` — по образцу 0010:
+
+```python
+"""контекст спота в строке точки решения
+
+Карты героя, борд и позиция едут к изложению полями `PointVerdict` (план
+2026-09-12, задача 2). Точка хранится ТОЛЬКО в `decision_points`, поле в
+поле, — значит, у каждого поля обязана быть колонка, иначе путь повтора
+после падения (`existing.result`) читает точки без карт.
+
+Уже записанные строки получают пустые умолчания: карты для них не
+восстанавливаются задним числом — они есть в `hands.enriched`, и переливка
+была бы отдельным решением, не миграцией схемы.
+
+Revision ID: 0011
+Revises: 0010
+Create Date: 2026-09-12 12:00:00.000000
+
+"""
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from alembic import op
+from sqlalchemy.dialects import postgresql
+
+revision: str = '0011'
+down_revision: str | Sequence[str] | None = '0010'
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+
+def upgrade() -> None:
+    """Upgrade schema."""
+    op.add_column('decision_points', sa.Column(
+        'hero_cards', postgresql.JSONB(astext_type=sa.Text()),
+        nullable=False, server_default=sa.text("'[]'::jsonb")))
+    op.add_column('decision_points', sa.Column(
+        'board', postgresql.JSONB(astext_type=sa.Text()),
+        nullable=False, server_default=sa.text("'[]'::jsonb")))
+    op.add_column('decision_points', sa.Column(
+        'hero_position', sa.String(length=16), nullable=False, server_default=''))
+
+
+def downgrade() -> None:
+    """Downgrade schema."""
+    op.drop_column('decision_points', 'hero_position')
+    op.drop_column('decision_points', 'board')
+    op.drop_column('decision_points', 'hero_cards')
+```
+
+- [ ] **Step 7: Запустить тесты хранения и весь набор**
+
+Run: `uv run pytest tests/test_memory.py -q -ra` → PASS, включая страж и round-trip (тесты БД поднимают Postgres через `alembic_config` из `conftest.py` — миграция накатывается там же).
+Run: `uv run pytest -q -ra` → PASS.
+
+- [ ] **Step 8: Коммит**
 
 ```bash
-git add src/harness/contracts/analysis.py src/harness/analysis/__init__.py tests/test_contracts.py tests/test_preflop_analysis.py
-git commit -m "Карты, борд и позиция едут к изложению через разбор"
+git add src/harness/contracts/analysis.py src/harness/analysis/__init__.py src/harness/memory/models.py src/harness/memory/repos.py migrations/versions/0011_decision_point_spot_context.py tests/test_contracts.py tests/test_preflop_analysis.py tests/test_memory.py
+git commit -m "Карты, борд и позиция едут к изложению через разбор и хранятся колонками"
 ```
 
 ---
 
-### Task 3: Выжимка называет карты, борд и состав допущенного диапазона
-
-Текст выходил пересказом собственных цифр, потому что кроме цифр модель ничего не знала. Теперь у точки есть контекст спота, а у допущения — диапазон, из которого выжимка печатала только долю в процентах. «Предполагая, что он отвечает только тузами и половиной королей» и есть существо пуш-фолд вердикта.
+### Task 3: Выжимка называет карты, борд, позицию и состав допущенного диапазона
 
 **Files:**
-- Modify: `src/harness/explanation/verdict_text.py` (`_point_lines`, строка 228; `_detail_lines`, строка 204)
+- Modify: `src/harness/explanation/hand_replay.py` — только переименование `_cards` → `cards_text`, `_board` → `board_text` (и ВСЕ их вызовы внутри файла: `hand_replay.py:284, 316` и рядом; проверить `grep -n '_cards\|_board' src/harness/explanation/hand_replay.py`), добавить оба в `__all__`
+- Modify: `src/harness/explanation/verdict_text.py` (`_point_lines` — строка 230; `_detail_lines` — строка 206; импорты)
 - Test: `tests/test_verdict_text.py`
 
 **Interfaces:**
-- Consumes: `PointVerdict.hero_cards`, `.board`, `.position` из Task 2; `numbers_in` из Task 1
-- Produces: `verdict_digest(res: AnalysisResult) -> Digest` — сигнатура НЕ меняется. Публикует
-  `hand_replay.cards_text` и `hand_replay.board_text` (переименование приватных `_cards`/`_board`),
-  которыми Task 5 пользуется дальше: формат карты обязан быть один на оба выхода изложения.
+- Consumes: `PointVerdict.hero_cards/.board/.hero_position` (Task 2); `numbers_in` (Task 1)
+- Produces: `verdict_digest(res) -> Digest` — сигнатура прежняя; публичные `hand_replay.cards_text(cards: list[str]) -> str`, `hand_replay.board_text(cards: list[str]) -> str`, которыми пользуется Task 5.
 
 - [ ] **Step 1: Написать падающие тесты**
 
@@ -286,129 +385,152 @@ def test_the_digest_names_the_cards_and_the_position():
     """Модель обязана знать, чем и откуда сыграно, иначе объяснять ей нечем."""
     res = _result([_point(dp_index=0, ev_diff_bb=-3.9)])
     res.points[0] = res.points[0].model_copy(
-        update={"hero_cards": ["Jh", "9h"], "position": "SB", "board": []}
+        update={"hero_cards": ["Jh", "9h"], "hero_position": "SB"}
     )
     text = verdict_digest(res).text
-    assert "J♥️9♥️" in text
-    assert "SB" in text
+    assert "J♥️9♥️" in text and "SB" in text
+
+
+def test_the_digest_names_the_board_for_a_postflop_point():
+    res = _result([_point(dp_index=0, ev_diff_bb=-1.0, spot=SpotKind.POSTFLOP)])
+    res.points[0] = res.points[0].model_copy(update={"board": ["Kh", "Jd", "2c"]})
+    assert "K♥️ J♦️ 2♣️" in verdict_digest(res).text
 
 
 def test_the_digest_names_the_assumed_range_not_only_its_share():
     """Доля в процентах не объясняет ничего: «0.7% всех рук» нельзя пересказать
-    словами, а «только тузы и половина королей» — можно."""
+    словами, а «AA, KK наполовину» — можно."""
     res = _result([_point(dp_index=0, ev_diff_bb=-3.9, zone=Zone.ASSUMING)])
     text = verdict_digest(res).text
-    assert "AA" in text and "KK" in text
+    assert "AA" in text and "KK наполовину" in text
 
 
-def test_the_cards_in_the_digest_add_no_allowed_numbers():
-    """Карта не величина: показав `99`, мы не имеем права разрешить модели
-    писать «99 bb». Держится вырезанием нотации (задача 1), а не реестром."""
-    res = _result([_point(dp_index=0, ev_diff_bb=-3.9)])
-    res.points[0] = res.points[0].model_copy(update={"hero_cards": ["9h", "9s"]})
+def test_the_range_listing_is_stable():
+    """Два прогона одной руки обязаны дать одну выжимку: порядок — по весу,
+    затем по имени, а не по порядку ключей словаря."""
+    a = Range(weights={"KK": 1.0, "AA": 1.0, "QQ": 0.5})
+    b = Range(weights={"QQ": 0.5, "AA": 1.0, "KK": 1.0})
+    book = NumberBook()
+    assert _range_text(a, book) == _range_text(b, book) == "AA, KK, QQ наполовину"
+
+
+def test_a_digit_pair_in_the_range_is_registered_but_a_suited_class_is_not():
+    """Компромисс задачи 1: `99` регистрируется как разрешённое (иначе цитата
+    состава отбракуется), `A5s` — нет (его вырезает нотация)."""
+    res = _result([_point(dp_index=0, ev_diff_bb=-3.9, zone=Zone.ASSUMING)])
+    res.points[0] = res.points[0].model_copy(update={
+        "assumption": res.points[0].assumption.model_copy(
+            update={"range": Range(weights={"99": 1.0, "A5s": 1.0})})
+    })
     digest = verdict_digest(res)
-    assert 9.0 not in digest.allowed
+    assert 99.0 in digest.allowed and 5.0 not in digest.allowed
 
 
-def test_the_digest_registers_every_number_it_prints_with_cards():
-    """Прежний инвариант файла обязан держаться и с картами в выжимке: числа
-    промпта минус разрешённые дают пустоту."""
+def test_the_digest_registers_every_number_it_prints_with_context():
+    """Прежний инвариант файла держится и с картами, бордом и составом."""
     res = _result([_point(dp_index=0, ev_diff_bb=-3.9, zone=Zone.ASSUMING)])
     res.points[0] = res.points[0].model_copy(
-        update={"hero_cards": ["Jh", "9h"], "board": ["Kh", "Jd", "2c"], "position": "SB"}
+        update={"hero_cards": ["Jh", "9h"], "board": ["Kh", "Jd", "2c"], "hero_position": "SB"}
     )
     digest = verdict_digest(res)
     assert unsupported_numbers(digest.text, digest.allowed) == []
 ```
 
+Импорты в тесте: `Range`, `NumberBook` (из `harness.explanation.digest`), `_range_text` через `verdict_text_module` (модуль импортируется в файле под этим именем, строка ~40).
+
 - [ ] **Step 2: Запустить и убедиться, что падают**
 
-Run: `uv run pytest tests/test_verdict_text.py -k "cards or assumed_range" -v`
-Expected: FAIL — в выжимке нет ни карт, ни состава диапазона.
+Run: `uv run pytest tests/test_verdict_text.py -k "names_the or range_listing or digit_pair or with_context" -v`
+Expected: FAIL (нет карт в выжимке; `_range_text` не существует).
 
 - [ ] **Step 3: Реализовать**
 
-Сначала — в `src/harness/explanation/hand_replay.py` — сделать рисование карт публичным, без правки
-тела: `_cards` → `cards_text`, `_board` → `board_text`, оба в `__all__`. Формат карты обязан быть
-один на оба выхода изложения, а Task 5 перепишет вокруг них всё остальное.
+`hand_replay.py`: переименовать `_cards` → `cards_text`, `_board` → `board_text`, поправить вызовы, добавить в `__all__`.
 
-Затем в `src/harness/explanation/verdict_text.py`:
+`verdict_text.py`, импорты:
 
 ```python
-from harness.contracts import Range
+from harness.contracts import Range  # к существующему списку из harness.contracts
+from harness.explanation.digest import NumberBook  # уже импортирован — проверить
 from harness.explanation.hand_replay import board_text, cards_text
 ```
 
-Потолок на состав диапазона и его печать:
-
 ```python
-# Сколько классов диапазона называется поимённо. Потолок, а не весь состав:
-# широкий диапазон занял бы половину промпта списком, который модель всё равно
-# не перескажет. Порядок — по весу, потом по имени: два прогона одной руки
-# обязаны дать одну выжимку (`test_the_range_listing_is_stable`).
-_MAX_NAMED_CLASSES = 8
+# Сколько классов диапазона называется поимённо. Порядок — по весу, потом по
+# имени (`test_the_range_listing_is_stable`). Потолок, а не весь состав: для
+# широкого диапазона список занял бы половину промпта; хвост называется числом.
+_MAX_NAMED_CLASSES = 12
 
 
-def _range_text(rng: Range) -> str:
-    """Состав диапазона словами: классы по убыванию веса, половинные — с долей."""
+def _range_text(rng: Range, book: NumberBook) -> str:
+    """Состав диапазона словами. Цифровые пары (`99`) — через `book.token`:
+    нотация их не вырезает (задача 1), и без регистрации цитата состава была бы
+    отбракована. Классы с суффиксом и буквенные пары не регистрируются — у них
+    либо нет цифр, либо их вырезает `_CARD_NOTATION_RE`."""
     ordered = sorted(rng.weights.items(), key=lambda kv: (-kv[1], kv[0]))
-    named = [
-        name if weight >= 1.0 else f"{name} наполовину"
-        for name, weight in ordered[:_MAX_NAMED_CLASSES]
-    ]
-    tail = "" if len(ordered) <= _MAX_NAMED_CLASSES else " и другие"
+    named: list[str] = []
+    for name, weight in ordered[:_MAX_NAMED_CLASSES]:
+        shown = book.token(name) if name.isdigit() else name
+        named.append(shown if weight >= 1.0 else f"{shown} наполовину")
+    rest = len(ordered) - _MAX_NAMED_CLASSES
+    tail = f" и ещё {book.count(rest)} классов" if rest > 0 else ""
     return ", ".join(named) + tail
 ```
 
-В `_point_lines`, первой строкой точки, после заголовка — контекст спота:
+В `_point_lines`, сразу после строки-заголовка точки:
 
 ```python
-    if point.position or point.hero_cards:
-        where = f"позиция {point.position}" if point.position else ""
-        what = f"карты {cards_text(point.hero_cards)}" if point.hero_cards else ""
-        lines.append("  " + "; ".join(part for part in (where, what) if part) + ".")
+    context: list[str] = []
+    if point.hero_position:
+        context.append(f"позиция {point.hero_position}")
+    if point.hero_cards:
+        context.append(f"карты {cards_text(point.hero_cards)}")
+    if context:
+        lines.append("  " + "; ".join(context) + ".")
     if point.board:
         lines.append(f"  борд: {board_text(point.board)}.")
 ```
 
-В блоке допущения (`_point_lines`, где печатается `share`) — дописать состав:
+В блоке допущения — дописать состав:
 
 ```python
         lines.append(
             f"  допущение о диапазоне оппонента{note}; в нём {share}% всех рук: "
-            f"{_range_text(assumption.range)}."
+            f"{_range_text(assumption.range, book)}."
         )
 ```
 
-- [ ] **Step 4: Запустить тесты**
+Докстринг `_detail_lines` (строки ~215-217) — фраза «Глубины САМОГО героя, банка и позиции здесь нет намеренно» теперь неверна про позицию: убрать слово «позиции», оставить банк и глубину героя.
 
-Run: `uv run pytest tests/test_verdict_text.py -q -ra`
-Expected: PASS, включая прежний `test_the_digest_registers_every_number_it_prints`.
+- [ ] **Step 4: Запустить**
+
+Run: `uv run pytest tests/test_verdict_text.py tests/test_hand_replay.py -q -ra` → PASS.
 
 - [ ] **Step 5: Коммит**
 
 ```bash
-git add src/harness/explanation/verdict_text.py tests/test_verdict_text.py
-git commit -m "Выжимка называет карты, борд и состав допущенного диапазона"
+git add src/harness/explanation/verdict_text.py src/harness/explanation/hand_replay.py tests/test_verdict_text.py
+git commit -m "Выжимка называет карты, борд, позицию и состав допущенного диапазона"
 ```
 
 ---
 
-### Task 4: Промпт вердикта снимает запрет на карты и требует назвать диапазон
-
-Пункт 5 промпта запрещает называть карты числом, потому что их не было в выжимке. Теперь они там есть, и запрет надо переписать, иначе модель промолчит о том, что мы ей показали.
+### Task 4: Промпт вердикта — карты разрешены, диапазон обязателен
 
 **Files:**
-- Modify: `src/harness/explanation/prompts/verdict.md` (пункт 5 раздела «Что нельзя», раздел «Что обязательно»)
-- Test: `tests/test_verdict_text.py` (тест на связность промпта и выжимки)
+- Modify: `src/harness/explanation/prompts/verdict.md` (строка 4; пункт 5 «Что нельзя», строки 20-22; раздел «Что обязательно»)
+- Test: `tests/test_verdict_text.py`
 
 **Interfaces:**
 - Consumes: выжимку из Task 3
-- Produces: ничего программного — промпт читается `read_prompt(_PROMPT_PATH)`
+- Produces: —
 
-- [ ] **Step 1: Переписать пункт 5**
+- [ ] **Step 1: Правки промпта**
 
-Было:
+Строка 4, было: `Ход раздачи игрок видит отдельно, пересказывать его не надо.`
+Стало: `Ход раздачи игрок видит в блоке «Что было» над твоим текстом, пересказывать его не надо.`
+
+Пункт 5, было (дословно, `verdict.md:20-22`):
 
 ```
 5. **Банк, позицию, стек и карты игрок видит в реплее над твоим текстом —
@@ -421,155 +543,141 @@ git commit -m "Выжимка называет карты, борд и сост�
 ```
 5. **Банк и стек не называй числом.** В выжимке их нет, и любая такая цифра
    будет твоей выдумкой, даже если ты угадаешь. Карты, борд и позицию называть
-   МОЖНО и нужно — они в выжимке есть.
+   можно и нужно — они в выжимке есть.
 ```
 
-- [ ] **Step 2: Дописать обязательство про диапазон**
-
-В раздел «Что обязательно», после пункта про зону «предполагая»:
+Раздел «Что обязательно», после пункта про зону «предполагая»:
 
 ```
-* Если у точки есть состав диапазона — назови его руками, а не долей.
+* Если у точки назван состав диапазона — пересказывай его руками, а не долей.
   «Если он отвечает только тузами и половиной королей» объясняет решение;
   «в его диапазоне 0.7% рук» не объясняет ничего.
 ```
 
-- [ ] **Step 3: Проверить связность промпта и выжимки**
+- [ ] **Step 2: Тест связности (под гейтом — промпт есть не в каждом клоне)**
 
 ```python
+@requires_prompts
 def test_the_prompt_no_longer_forbids_naming_cards():
     """Промпт и выжимка обязаны говорить одно: карты показаны — значит разрешены."""
-    prompt = read_prompt(_PROMPT_PATH)
+    prompt = verdict_text_module.read_prompt(verdict_text_module._PROMPT_PATH)
     assert "Карты, борд и позицию называть" in prompt
+    assert "видит отдельно" not in prompt
 ```
 
-Run: `uv run pytest tests/test_verdict_text.py -q -ra`
-Expected: PASS.
+Run: `uv run pytest tests/test_verdict_text.py -q -ra` → PASS (или skip в клоне без промптов — тогда строка `skipped` это покажет).
 
-- [ ] **Step 4: Коммит**
+- [ ] **Step 3: Коммит**
 
 ```bash
 git add src/harness/explanation/prompts/verdict.md tests/test_verdict_text.py
-git commit -m "Промпт вердикта снимает запрет на карты и требует назвать диапазон"
+git commit -m "Промпт вердикта: карты и борд разрешены, состав диапазона обязателен"
 ```
 
-**Внимание:** каталог промптов не пушится (CLAUDE.md, «Прежде чем что-либо публиковать»). Коммит локальный; решение о публикации принимается на пуше хуком `.githooks/pre-push`.
+Промпты не пушатся; решение о публикации — на пуше, хуком.
 
 ---
 
-### Task 5: Реплей — проза, ББ, цена решения
+### Task 5: Реплей — проза, ББ, «вы», цена решения; прогон борда без выдуманных чеков
 
-Формат меняется целиком, поэтому тесты файла переписываются вместе с ним. Прежние `_lines(...) <= 5` и `<= 8` уходят: строк теперь две-три, и меряется длина прозы, а не число строк.
+Формат меняется целиком, тесты файла переписываются вместе с ним.
 
 **Files:**
-- Modify: `src/harness/explanation/hand_replay.py` (весь модуль)
+- Modify: `src/harness/explanation/hand_replay.py` (весь модуль, включая модульный докстринг — строки 19-22 «Вердиктов и цен в bb здесь нет» становятся ложью)
 - Test: `tests/test_hand_replay.py`
 
 **Interfaces:**
-- Consumes: ничего из предыдущих задач
-- Produces: `hand_replay(en: EnrichedHand, *, ev_loss_bb: float | None = None) -> HandReplay`; `cards_text(cards: list[str]) -> str` и `board_text(cards: list[str]) -> str` — публичные, их зовёт Task 3; `chips()` остаётся ради `presentation` риверной точки
+- Consumes: `cards_text`, `board_text` (Task 3)
+- Produces: `hand_replay(en: EnrichedHand, *, ev_loss_bb: float | None = None) -> HandReplay`; `bb(value_chips: int, big_blind: int) -> str`; `chips()` ОСТАЁТСЯ (его зовёт `presentation/messages.py:656-657, 2201` для риверной точки). `ReplaySpan.emphasis` остаётся — Task 7 рисует его `<b>`.
 
-- [ ] **Step 1: Написать падающие тесты**
+- [ ] **Step 1: Переписать тесты файла**
+
+Оставить (с правками) из прежнего файла:
+
+- `test_hero_decision_is_emphasised_inside_the_flow_not_on_its_own_line` — оставить как есть: выделение внутри потока сохраняется.
+- `test_the_replay_prints_no_number_the_hand_does_not_contain` (строки 355-383) — расширить `allowed` величинами в ББ, которые печатает новый формат:
+
+```python
+    allowed |= {round(v / hand.bb, 1) for v in en.report.pot_by_street.values()}
+    allowed |= {round(sum(post.amount for post in hand.posts) / hand.bb, 1)}
+    allowed |= {round(p.stack / hand.bb, 1) for p in hand.players}
+```
+
+- `test_showdown_line_shows_the_cards_that_were_actually_shown` (строки 386-392) — заменить `assert "Hero" in line` на `assert "вы J♥️9♥️" in line`.
+- тест на селектор U+FE0F, на слипание фолдов (`UTG/HJ фолд`), на отсутствие комбинаций — оставить.
+- Удалить: тесты на число строк `<= 5`/`<= 8`, на «итоговый банк отдельной строкой», на капс `ПРЕФЛОП`/`ТЁРН` в строке.
+
+Добавить:
 
 ```python
 def test_the_replay_speaks_in_big_blinds_not_chips():
-    """Вердикт ниже говорит в ББ, и два масштаба в одном сообщении заставляют
-    читателя пересчитывать."""
     text = hand_replay(_postflop_hand()).plain
-    assert "250" not in text, "фишки остались в тексте"
+    assert "250" not in text and "300" not in text, "фишки остались в тексте"
     assert "ББ" in text
 
 
-def test_the_replay_is_prose_not_one_line_per_street():
+def test_the_replay_is_a_short_paragraph():
     """Построчный формат и был причиной, по которой блок прятали под кнопку."""
-    assert len(_lines(hand_replay(_postflop_hand()).plain)) <= 4
+    assert len(_lines(hand_replay(_postflop_hand()).plain)) <= 3
 
 
-def test_the_replay_ends_with_the_cost_when_it_is_known():
-    """Цена — число ядра, а не суждение: спека §5.6 требовала её с первой редакции."""
-    text = hand_replay(_postflop_hand(), ev_loss_bb=-3.9).plain
-    assert "Потеря 3.9 ББ" in text
-
-
-def test_the_replay_without_a_cost_says_nothing_about_it():
-    """Рука без судимых точек не получает строки «потеря 0.0»: нуля расчёт
-    не выносил, он просто ничего не судил."""
-    assert "Потеря" not in hand_replay(_postflop_hand()).plain
+def test_the_replay_addresses_the_player_as_you_everywhere():
+    """Блок и текст под ним не имеют права говорить с игроком по-разному —
+    включая строку вскрытия (`_preflop_shove_hand` её имеет)."""
+    for en in (_postflop_hand(), _preflop_shove_hand()):
+        text = hand_replay(en).plain
+        assert "Hero" not in text
+        assert "вы" in text.lower()
 
 
 def test_a_printed_amount_is_the_whole_bet_not_the_increment():
-    """Спека §5.6: `бет 1.9` значит 1.9 ББ в банке от этого игрока на этой
-    улице. Берётся `committed_after` — накопленное, а не разница с предыдущим
-    действием, иначе рейз после бета показал бы добавку и читался бы вдвое дешевле."""
+    """Спека §5.6: `бет 1.9` — 1.9 ББ от этого игрока на этой улице целиком.
+    Берётся `committed_after`, а не разница с предыдущим действием."""
     en = _postflop_hand()
     raise_action = next(a for a in en.hand.actions if a.kind is ActionKind.RAISE)
-    assert f"{raise_action.committed_after / en.hand.bb:.1f}" in hand_replay(en).plain
+    assert f"опен {raise_action.committed_after / en.hand.bb:.1f}" in hand_replay(en).plain
 
 
-def test_the_replay_addresses_the_player_as_you():
-    """Блок и текст под ним не имеют права говорить с игроком по-разному."""
-    text = hand_replay(_postflop_hand()).plain
-    assert "Hero" not in text
-    assert "вы" in text.lower()
+def test_a_run_out_street_prints_only_its_board():
+    """После олл-ина никто не ходит. Печатается борд — и НИКАКИХ «чек-чек»:
+    приписать игрокам действия, которых не было, значит выдумать ход руки."""
+    text = hand_replay(_preflop_shove_hand()).plain
+    assert "чек" not in text.lower()
+    assert "Флоп 6♠️ J♦️ Q♦️ · Тёрн 7♥️ · Ривер A♥️." in text
+
+
+def test_the_replay_ends_with_the_cost_when_it_is_known():
+    text = hand_replay(_postflop_hand(), ev_loss_bb=-3.9).plain
+    assert text.rstrip().endswith("Потеря 3.9 ББ.")
+
+
+def test_a_measured_zero_cost_is_printed():
+    """`ranked` непустой при сумме 0.0 — измеренный ноль, и он печатается."""
+    assert "Потеря 0.0 ББ." in hand_replay(_postflop_hand(), ev_loss_bb=0.0).plain
+
+
+def test_the_replay_without_a_cost_says_nothing_about_it():
+    assert "Потеря" not in hand_replay(_postflop_hand()).plain
 ```
 
-Плюс сохранить из прежнего файла: `test_the_replay_prints_no_number_the_hand_does_not_contain`, тест на слипание фолдов, тест на вскрытие без комбинаций, тест на селектор U+FE0F.
+Ожидаемый вид `_postflop_hand()` после правки (для сверки глазами): фикстура — Hero SB с J♥️9♥️ и стеком 1000 при bb 100, CO (P5) рейзит до 250, Hero коллирует, BB (P2) фолдит, на флопе Hero чек, CO бет 300, Hero фолд:
+
+```
+Вы на SB, J♥️9♥️, 10.0 ББ.
+UTG/HJ фолд → CO опен 2.5 → BTN фолд → вы колл → BB фолд. Флоп 6♠️ J♦️ Q♦️, банк 6.6. вы чек → CO бет 3.0 → вы фолд.
+```
+
+(Слово «вы» внутри потока — со строчной; предложение улицы начинается с борда.)
 
 - [ ] **Step 2: Запустить и убедиться, что падают**
 
-Run: `uv run pytest tests/test_hand_replay.py -q -ra`
-Expected: FAIL — формат прежний.
+Run: `uv run pytest tests/test_hand_replay.py -q -ra` → FAIL (старый формат).
 
 - [ ] **Step 3: Переписать модуль**
 
-Ключевые изменения, по одному:
+Модульный докстринг: абзац «Вердиктов и цен в bb здесь нет» заменить на: «Вердиктов словами здесь нет; цена решения в ББ печатается последней фразой — это число ядра (`AnalysisResult.total_ev_loss_bb`), а не суждение (`test_the_replay_ends_with_the_cost_when_it_is_known`)». Абзац про «строки по улицам» заменить на прозу: одна шапка, один абзац.
 
-```python
-def bb(value_chips: int, big_blind: int) -> str:
-    """Сумма в ББ, одним знаком. Единственный формат величин блока (спека §5.6).
-
-    Приблизительности нет: движок считает банк точно, и «~5.5» обещало бы
-    неуверенность, которой у кода нет.
-    """
-    return f"{value_chips / big_blind:.1f}"
-
-
-def cards_text(cards: list[str]) -> str:
-    """Карманные карты подряд: `J♥️9♥️` — так одномастность видна разом.
-
-    Публична: тот же формат печатает выжимка вердикта (`explanation.verdict_text`),
-    и две копии дали бы два вида одной карты в одном сообщении.
-    """
-    return "".join(_card(card) for card in cards)
-
-
-def board_text(cards: list[str]) -> str:
-    """Борд через пробел: это три отдельные карты, а не рука. Публична — см. `cards_text`."""
-    return " ".join(_card(card) for card in cards)
-```
-
-`_action_text` — «вы» вместо `Hero`, суммы в ББ, без скобок с глубиной:
-
-```python
-    who = "вы" if action.label == hand.hero_label else _position(hand, action.label)
-    if not show_amount:
-        return f"{who} {word}"
-    return f"{who} {word} {bb(action.committed_after, hand.bb)}"
-```
-
-`hand_replay` — шапка одной строкой, улицы через точку внутри абзаца:
-
-```python
-def hand_replay(en: EnrichedHand, *, ev_loss_bb: float | None = None) -> HandReplay:
-    """Реплей одной руки: шапка строкой, ход раздачи прозой, цена в конце.
-
-    `ev_loss_bb` — суммарная цена расхождений (`AnalysisResult.total_ev_loss_bb`).
-    `None` значит «судимых точек нет», и строки о потере не будет вовсе: нуля
-    расчёт не выносил (`test_the_replay_without_a_cost_says_nothing_about_it`).
-    """
-```
-
-Названия улиц в прозе идут с прописной, а не капсом: капс был заголовком строки, внутри фразы он кричит.
+Названия улиц — с прописной, не капсом; первый рейз префлопа — «опен»:
 
 ```python
 _STREET_TITLE: dict[Street, str] = {
@@ -579,13 +687,48 @@ _STREET_TITLE: dict[Street, str] = {
     Street.RIVER: "Ривер",
 }
 
+# Порядковые имена рейзов префлопа: первый — «опен» (слово владельца, спека
+# §5.6), дальше 3-бет, 4-бет. Счёт уже записанных действий, не новая величина.
+_RERAISE_WORD: dict[int, str] = {1: "опен", 2: "3-бет", 3: "4-бет", 4: "5-бет"}
 
+
+def bb(value_chips: int, big_blind: int) -> str:
+    """Сумма в ББ, одним знаком — единственный формат величин блока (спека §5.6).
+    Приблизительности нет: движок считает точно, «~5.5» обещало бы неуверенность."""
+    return f"{value_chips / big_blind:.1f}"
+```
+
+`_action_word`: в ветке `RAISE and PREFLOP` — `_RERAISE_WORD.get(raise_ordinal, "рейз")` (теперь и ordinal 1 даёт «опен»).
+
+`_action_text` — «вы» вместо `Hero`, суммы в ББ, без скобок глубины:
+
+```python
+def _action_text(hand: CanonicalHand, action: CanonicalAction, raise_ordinal: int) -> str:
+    """Один ход: кто (позицией; герой — «вы»), что сделал и — у ставок — на сколько в ББ."""
+    word = _action_word(action, raise_ordinal)
+    who = "вы" if action.label == hand.hero_label else _position(hand, action.label)
+    show_amount = action.is_all_in or action.kind in _ACTIONS_WITH_AMOUNT
+    if not show_amount:
+        return f"{who} {word}"
+    return f"{who} {word} {bb(action.committed_after, hand.bb)}"
+```
+
+`_showdown_line` — `'вы' if entry.label == hand.hero_label else _position(...)`.
+
+Удалить: `_MATERIAL_POT_GROWTH`, `_last_street_with_actions`, `_bb`, `_THIN` оставить (нужен `chips`).
+
+```python
 def hand_replay(en: EnrichedHand, *, ev_loss_bb: float | None = None) -> HandReplay:
-    """Реплей одной руки: шапка строкой, ход раздачи прозой, цена в конце.
+    """Реплей одной руки: шапка строкой, ход раздачи прозой одним абзацем.
 
-    `ev_loss_bb` — суммарная цена расхождений (`AnalysisResult.total_ev_loss_bb`).
-    `None` значит «судимых точек нет», и строки о потере не будет вовсе: нуля
-    расчёт не выносил (`test_the_replay_without_a_cost_says_nothing_about_it`).
+    `ev_loss_bb` — `AnalysisResult.total_ev_loss_bb`; `None` значит «судимых
+    точек нет», и фразы о потере не будет: нуля расчёт не выносил
+    (`test_the_replay_without_a_cost_says_nothing_about_it`). Ноль при
+    непустом `ranked` — измеренный и печатается.
+
+    Улица без ходов — прогон борда после олл-ина: печатается только борд, через
+    ` · ` с соседними такими же (`test_a_run_out_street_prints_only_its_board`).
+    Чек — действие движка и печатается как ход, «чек-чек» здесь не выдумывается.
     """
     hand = en.hand
     hero = _hero(hand)
@@ -593,183 +736,267 @@ def hand_replay(en: EnrichedHand, *, ev_loss_bb: float | None = None) -> HandRep
 
     hero_cards = hand.dealt.get(hand.hero_label, [])
     cards_part = f", {cards_text(hero_cards)}" if hero_cards else ""
-    spans.append(
-        ReplaySpan(text=f"Вы на {hero.position}{cards_part}, {bb(hero.stack, hand.bb)} ББ.\n")
-    )
+    spans.append(ReplaySpan(text=f"Вы на {hero.position}{cards_part}, {bb(hero.stack, hand.bb)} ББ.\n"))
 
     decisions = _hero_decision_indices(en)
     pot_before = _dead_before_deal(hand)
+    quiet: list[str] = []
     first = True
+
+    def sep() -> str:
+        nonlocal first
+        s = "" if first else " "
+        first = False
+        return s
+
+    def flush_quiet() -> None:
+        if quiet:
+            spans.append(ReplaySpan(text=f"{sep()}{' · '.join(quiet)}."))
+            quiet.clear()
+
     for street in Street:
         actions = _street_actions(hand, street)
         board = hand.boards.get(street, [])
         if not actions:
-            # Улица без ходов: либо её не было вовсе, либо все чекнули.
             if street is not Street.PREFLOP and board:
-                spans.append(
-                    ReplaySpan(text=f"{'' if first else ' '}{_STREET_TITLE[street]} "
-                                    f"{board_text(board)} чек-чек.")
-                )
-                first = False
+                quiet.append(f"{_STREET_TITLE[street]} {board_text(board)}")
             continue
-        head = "" if street is Street.PREFLOP else (
-            f"{_STREET_TITLE[street]} {board_text(board)}, банк {bb(pot_before, hand.bb)}. "
-        )
-        spans.append(ReplaySpan(text=f"{'' if first else ' '}{head}"))
+        flush_quiet()
+        if street is not Street.PREFLOP:
+            spans.append(ReplaySpan(
+                text=f"{sep()}{_STREET_TITLE[street]} {board_text(board)}, банк {bb(pot_before, hand.bb)}. "
+            ))
+        else:
+            spans.append(ReplaySpan(text=sep()))
         spans.extend(_street_flow(hand, actions, decisions))
         spans.append(ReplaySpan(text="."))
-        first = False
         pot_before = en.report.pot_by_street.get(street, pot_before)
-
-    if ev_loss_bb is not None:
-        spans.append(ReplaySpan(text=f" Потеря {abs(ev_loss_bb):.1f} ББ."))
+    flush_quiet()
 
     showdown = _showdown_line(hand)
     if showdown is not None:
-        spans.append(ReplaySpan(text=f" {showdown}"))
-
+        spans.append(ReplaySpan(text=f" {showdown}."))
+    if ev_loss_bb is not None:
+        spans.append(ReplaySpan(text=f" Потеря {abs(ev_loss_bb):.1f} ББ."))
     return HandReplay(spans=spans)
 ```
 
-Итоговый банк отдельной строкой больше не печатается: `_MATERIAL_POT_GROWTH` и `_last_street_with_actions` уходят вместе с построчным форматом — банк каждой улицы и так стоит в начале её фразы.
+Вскрытие идёт ДО цены: спека — «завершает абзац цена решения».
 
-- [ ] **Step 4: Запустить тесты**
+- [ ] **Step 4: Запустить**
 
-Run: `uv run pytest tests/test_hand_replay.py -q -ra`
-Expected: PASS.
+Run: `uv run pytest tests/test_hand_replay.py tests/test_verdict_text.py -q -ra` → PASS.
 
 - [ ] **Step 5: Коммит**
 
 ```bash
 git add src/harness/explanation/hand_replay.py tests/test_hand_replay.py
-git commit -m "Реплей говорит прозой, в ББ и называет цену решения"
+git commit -m "Реплей говорит прозой, в ББ, на «вы» и называет цену; прогон борда без выдуманных чеков"
 ```
 
 ---
 
 ### Task 6: Метка и частоты оппонента в реплее
 
-`explanation` не имеет права импортировать `memory` (правило зависимостей). Статистика приходит аргументом, добывает её вызывающий.
+`explanation` не импортирует `memory`: статистика приходит аргументом. Метка — `PlayerState.label` (`contracts/canonical.py`), регистр как в источнике (`P5`, не `p5`). Ставится один раз — при первом ходе оппонента, который дошёл до `_action_text`; слипшиеся фолды туда не доходят, и это правильно: у пасующего сказать нечего.
 
 **Files:**
-- Modify: `src/harness/explanation/hand_replay.py`
+- Modify: `src/harness/explanation/hand_replay.py` (`hand_replay`, `_street_flow`, `_action_text`)
 - Test: `tests/test_hand_replay.py`
 
 **Interfaces:**
-- Consumes: `hand_replay` из Task 5
-- Produces: `hand_replay(en, *, ev_loss_bb=None, stats: Mapping[str, PlayerStats] | None = None)` — ключ словаря это `CanonicalPlayer.label`, тот же, что у `player_stats_by_label`
+- Consumes: `hand_replay` (Task 5); `PlayerStats` из `harness.contracts`
+- Produces: `hand_replay(en, *, ev_loss_bb=None, stats: Mapping[str, PlayerStats] | None = None)`; ключ словаря — `PlayerState.label`, тот же, что у `analysis.player_stats.player_stats_by_label`.
 
 - [ ] **Step 1: Написать падающие тесты**
 
+Активный оппонент `_postflop_hand` — `P5` (CO; `_SEATS` в файле, строка ~40; `P2` — BB, который только фолдит и в поток не попадает).
+
 ```python
-def test_an_opponent_carries_its_label_and_two_frequencies():
-    stats = {"p2": PlayerStats(hands=40, vpip=10, pfr=7)}
+def test_an_opponent_carries_its_label_and_both_frequencies_once():
+    stats = {"P5": PlayerStats(hands=40, vpip=10, pfr=7)}
     text = hand_replay(_postflop_hand(), stats=stats).plain
-    assert "VPIP 25%" in text and "PFR 18%" in text
+    assert "CO (P5, VPIP 25%, PFR 18%) опен 2.5" in text
+    assert text.count("P5") == 1, "метка ставится один раз, не у каждого хода"
 
 
 def test_an_opponent_without_a_sample_carries_no_brackets():
-    """Скрин даёт одну руку, знаменателя нет. «VPIP 0%» — утверждение, которого
-    никто не измерял; пустая скобка не печатается вовсе."""
-    text = hand_replay(_postflop_hand(), stats={"p2": PlayerStats()}).plain
-    assert "VPIP" not in text and "()" not in text
+    """Скрин даёт одну руку, знаменателя нет. «VPIP 0%» никто не измерял;
+    пустая скобка не печатается вовсе."""
+    text = hand_replay(_postflop_hand(), stats={"P5": PlayerStats()}).plain
+    assert "VPIP" not in text and "(" not in text
 
 
 def test_a_measured_zero_is_printed_because_it_was_measured():
-    """У VPIP и PFR знаменатель ОБЩИЙ (`PlayerStats.hands`), поэтому они
-    появляются и исчезают вместе, а случая «в скобке одна из двух» нет.
-    Ноль при непустом знаменателе — измеренный ноль: сорок раздач без единого
-    рейза говорят об игроке ровно то, что должны."""
-    stats = {"p2": PlayerStats(hands=40, vpip=10, pfr=0)}
-    text = hand_replay(_postflop_hand(), stats=stats).plain
-    assert "VPIP 25%" in text and "PFR 0%" in text
+    """У VPIP и PFR знаменатель ОБЩИЙ (`PlayerStats.hands`): появляются и
+    исчезают вместе. Ноль по сорока раздачам — измеренный."""
+    stats = {"P5": PlayerStats(hands=40, vpip=10, pfr=0)}
+    assert "VPIP 25%, PFR 0%" in hand_replay(_postflop_hand(), stats=stats).plain
+
+
+def test_a_folding_opponent_gets_no_label():
+    """Слипшиеся фолды (`UTG/HJ фолд`) не несут ни метки, ни частот."""
+    stats = {"P3": PlayerStats(hands=40, vpip=10, pfr=7)}
+    assert "P3" not in hand_replay(_postflop_hand(), stats=stats).plain
 ```
 
 - [ ] **Step 2: Запустить и убедиться, что падают**
 
-Run: `uv run pytest tests/test_hand_replay.py -k opponent -v`
-Expected: FAIL — аргумента `stats` нет.
+Run: `uv run pytest tests/test_hand_replay.py -k opponent -v` → FAIL (нет аргумента `stats`).
 
 - [ ] **Step 3: Реализовать**
 
 ```python
 def _opponent_mark(label: str, stats: Mapping[str, PlayerStats] | None) -> str:
-    """Метка оппонента и две префлоп-частоты — те, у которых есть знаменатель.
+    """` (P5, VPIP 25%, PFR 18%)` — или пустая строка.
 
-    `PlayerStats._share` возвращает `None` при нулевом знаменателе, и это
-    единственно честное поведение: «VPIP 0%» по нулю раздач никто не измерял.
-    Пустая скобка не печатается вовсе (`test_an_opponent_without_a_sample_...`).
+    `vpip_pct`/`pfr_pct` возвращают `None` при `hands == 0`, и это единственно
+    честное поведение: «VPIP 0%» по нулю раздач никто не измерял. Знаменатель
+    у них общий, поэтому либо обе, либо ни одной; отдельной ветки «одна из
+    двух» нет — её не существует.
     """
     if stats is None or label not in stats:
         return ""
     row = stats[label]
-    parts = [
-        f"{name} {value:.0f}%"
-        for name, value in (("VPIP", row.vpip_pct), ("PFR", row.pfr_pct))
-        if value is not None
-    ]
-    return f" ({label}, {', '.join(parts)})" if parts else ""
+    if row.vpip_pct is None or row.pfr_pct is None:
+        return ""
+    return f" ({label}, VPIP {row.vpip_pct:.0f}%, PFR {row.pfr_pct:.0f}%)"
 ```
 
-Зовётся из `_action_text` для первого действия оппонента в руке — метка ставится один раз, а не у каждого хода.
+Состояние «кому метка уже поставлена» живёт в `hand_replay` (тот зовётся один раз на руку) и передаётся вниз:
 
-- [ ] **Step 4: Запустить тесты**
+- `hand_replay(..., stats=None)`: `marked: set[str] = set()`; в цикле — `_street_flow(hand, actions, decisions, stats, marked)`.
+- `_street_flow(hand, actions, hero_decisions, stats, marked)`: передаёт оба в `_action_text`.
+- `_action_text(hand, action, raise_ordinal, stats, marked)`: для оппонента —
 
-Run: `uv run pytest tests/test_hand_replay.py -q -ra`
-Expected: PASS.
+```python
+    who = _position(hand, action.label)
+    if action.label not in marked:
+        who += _opponent_mark(action.label, stats)
+        marked.add(action.label)
+```
+
+(герой — «вы», без метки; `marked.add` только для оппонентов.)
+
+- [ ] **Step 4: Запустить**
+
+Run: `uv run pytest tests/test_hand_replay.py -q -ra` → PASS.
 
 - [ ] **Step 5: Коммит**
 
 ```bash
 git add src/harness/explanation/hand_replay.py tests/test_hand_replay.py
-git commit -m "Рядом с оппонентом — метка и две частоты, если есть знаменатель"
+git commit -m "Рядом с оппонентом — метка и обе частоты, один раз, если есть знаменатель"
 ```
 
 ---
 
-### Task 7: Блок встаёт первым в сообщении разбора, с бюджетом
+### Task 7: Блок первым в сообщении, HTML до воркера, бюджет по итоговому тексту, статистика одной колонкой
 
-Реплей возвращается в основное сообщение, откуда его увёл лимит 4096. Прозаический формат укладывается с запасом, но запас не гарантия: при нехватке места режется проза модели, а не блок и не числа.
+Реплей возвращается в основное сообщение, откуда его увёл лимит 4096 (`deep_dive_msg`, докстринг строк 746-751). Три вещи, которых первая редакция плана не знала:
+
+1. **Разбор отправляет воркер, а его `_payload` (`worker/main.py:128-136`) не передаёт `parse_mode`.** `parse_mode` пробрасывает только `bot/router.py:104`. Без правки воркера игрок увидит `<b>` и `&amp;` буквально.
+2. **Бюджет меряется по ИТОГОВОМУ `msg.text`** — после экранирования (`&`→`&amp;` ×5) и `<b></b>` (+7 на span), иначе 4096 пробивается.
+3. **`HandsRepo.list_by_tournament` десериализует `raw`, `canonical` И `enriched`** (`_to_record`, `repos.py:627-646`). Для частот нужна одна колонка — образец `player_hands_by_tournament` (`repos.py:525-565`).
 
 **Files:**
-- Modify: `src/harness/presentation/messages.py` (`deep_dive_msg`, строка 699)
-- Modify: `src/harness/worker/pipeline.py` (два места вызова `deep_dive_msg`: около строк 1138 и 1225)
-- Test: `tests/test_presentation.py`, `tests/test_worker_pipeline.py`
+- Modify: `src/harness/presentation/messages.py` (`deep_dive_msg`, строка 699 и докстринг 746-751; новая `_shrink_prose`)
+- Modify: `src/harness/worker/main.py:128-136` (`_payload`)
+- Modify: `src/harness/memory/repos.py` (`HandsRepo` — новый `canonical_by_tournament`)
+- Modify: `src/harness/worker/pipeline.py` (скриншотный путь ~1146-1156: переменные `enriched`, `record`; путь разбора ~1225-1248: переменные `hand`)
+- Test: `tests/test_presentation.py`, `tests/test_worker_pipeline.py`, `tests/test_memory.py`
 
 **Interfaces:**
-- Consumes: `hand_replay` из Task 5 и 6
-- Produces: `deep_dive_msg(..., replay: HandReplay | None = None)` — новый необязательный аргумент, первым печатается его текст
+- Consumes: `hand_replay` (Tasks 5-6), `player_stats_by_label` (существует, `analysis/player_stats.py:323`)
+- Produces: `deep_dive_msg(..., replay: HandReplay | None = None) -> Msg` с `parse_mode="HTML"` при `replay is not None`; `HandsRepo.canonical_by_tournament(tournament_id: int) -> list[CanonicalHand]`; `worker.pipeline._tournament_stats(session, tournament_id: int | None) -> dict[str, PlayerStats] | None`.
 
 - [ ] **Step 1: Написать падающие тесты**
 
+`tests/test_presentation.py` (фабрики файла: `_prose_result()` — строка 1062, `_replay()` — 1093; `_replay` вернуть в новом виде спанов, с `emphasis=True` на одном):
+
 ```python
-def test_the_deep_dive_opens_with_what_happened():
-    msg = deep_dive_msg(_res(), elapsed_s=12, zone=Zone.STRICT, quota_left=17,
-                        quota_total=50, replay=_replay())
-    assert msg.text.startswith("Что было")
+def _replay() -> HandReplay:
+    return HandReplay(spans=[
+        ReplaySpan(text="Вы на SB, J♥️9♥️, 10.0 ББ.\nUTG фолд → "),
+        ReplaySpan(text="вы олл-ин 9.9", emphasis=True),
+        ReplaySpan(text=" → BB & CO фолд."),
+    ])
+
+
+def test_the_deep_dive_opens_with_what_happened_in_html():
+    msg = deep_dive_msg(_prose_result(), 12, Zone.STRICT, 17, 50, replay=_replay())
+    assert msg.parse_mode == "HTML"
+    assert msg.text.startswith("Что было\n")
+    assert "<b>вы олл-ин 9.9</b>" in msg.text
+    assert "BB &amp; CO" in msg.text, "остальной текст экранируется"
+
+
+def test_without_a_replay_the_deep_dive_stays_plain():
+    msg = deep_dive_msg(_prose_result(), 12, Zone.STRICT, 17, 50)
+    assert msg.parse_mode is None and "Что было" not in msg.text
 
 
 def test_the_model_prose_is_cut_before_the_replay_is():
-    """Слова необязательны, числа обязательны: в тесноте режется проза."""
+    """Слова необязательны, числа обязательны: в тесноте режется проза, и
+    инвариант меряется по ИТОГОВОМУ тексту — после экранирования и разметки."""
+    res = _prose_result()
     long_prose = VerdictTextOut(
-        points=[PointText(dp_index=0, verdict_label="mistake", text="я" * 4000)],
-        summary="",
+        points=[PointText(dp_index=p.dp_index, verdict_label="mistake", text="&" * 3000)
+                for p in res.points],
+        summary="я" * 2000,
     )
-    msg = deep_dive_msg(_res(), elapsed_s=12, zone=Zone.STRICT, quota_left=17,
-                        quota_total=50, replay=_replay(), verdict=long_prose)
+    msg = deep_dive_msg(res, 12, Zone.STRICT, 17, 50, replay=_replay(), verdict=long_prose)
     assert len(msg.text) <= 4096
-    assert "Что было" in msg.text
+    assert msg.text.startswith("Что было\n") and "<b>вы олл-ин 9.9</b>" in msg.text
     assert "показано не целиком" in msg.text
+    assert "разборов 17/50" in msg.text, "статус-строка не режется"
 ```
+
+`tests/test_memory.py`:
+
+```python
+async def test_canonical_by_tournament_reads_only_hands_with_a_canonical_checkpoint(db_factory):
+    """Одна колонка, как у `player_hands_by_tournament`: `raw` и `enriched`
+    весят кратно больше, а частотам нужен только `canonical`."""
+    # использовать фабрики турнира/рук этого файла (те же, что в тесте
+    # `player_hands_by_tournament`); одна рука без `canonical` — пропускается
+```
+
+`tests/test_worker_pipeline.py` — в `test_deep_dive_saves_the_model_text_and_shows_it_to_the_player` (строки ~1399-1407) заменить две последние проверки:
+
+```python
+    # Ход раздачи — блоком «Что было» первым в самом разборе (план 2026-09-12).
+    assert any(text.startswith("Что было\n") for text in texts)
+    assert not any("ПРЕФЛОП" in text for text in texts)
+```
+
+(Проверку кнопки `detail:` — удалить здесь, а не в Task 8: после этой задачи кнопка ещё есть, но утверждение о ней уже не про этот тест.)
 
 - [ ] **Step 2: Запустить и убедиться, что падают**
 
-Run: `uv run pytest tests/test_presentation.py -k deep_dive -v`
-Expected: FAIL — аргумента `replay` нет.
+Run: `uv run pytest tests/test_presentation.py -k "deep_dive or prose_is_cut" -v` → FAIL (нет аргумента `replay`).
 
-- [ ] **Step 3: Реализовать**
+- [ ] **Step 3: `_payload` в воркере**
 
-Строки собираются парами «текст, это ли проза модели», и при нехватке бюджета режется только проза.
+```python
+def _payload(msg: Msg, **fields: object) -> dict[str, object]:
+    """Тело запроса к Bot API: обязательные поля, `reply_markup` — когда кнопки
+    есть, `parse_mode` — когда сообщение несёт разметку (`Msg.parse_mode`).
+    Без последнего разбор с блоком «Что было» ушёл бы игроку с `<b>` буквально
+    (`test_the_payload_carries_parse_mode_when_the_message_has_markup`).
+    """
+    body: dict[str, object] = {**fields, "text": msg.text}
+    if msg.parse_mode is not None:
+        body["parse_mode"] = msg.parse_mode
+    markup = _keyboard(msg.buttons)
+    if markup is not None:
+        body["reply_markup"] = markup
+    return body
+```
+
+Тест — в файле, где уже тестируется `_payload`/`_keyboard` воркера (найти `grep -rn "_payload" tests/`): `Msg(text="x", parse_mode="HTML")` → `"parse_mode" in body`; `Msg(text="x")` → `"parse_mode" not in body`.
+
+- [ ] **Step 4: `_shrink_prose` и `deep_dive_msg`**
 
 ```python
 def _shrink_prose(rows: list[tuple[str, bool]], budget: int) -> list[tuple[str, bool]]:
@@ -777,155 +1004,168 @@ def _shrink_prose(rows: list[tuple[str, bool]], budget: int) -> list[tuple[str, 
 
     Слова необязательны, числа обязательны — то же правило, по которому
     `worker.pipeline` отдаёт разбор без прозы, когда модель не ответила.
-    Блок «Что было» и строки с числами не трогаются вовсе. Обрезка называется
-    вслух маркером `_fitted` (`test_the_model_prose_is_cut_before_the_replay_is`).
+    Строки приходят УЖЕ экранированными: бюджет — это длина итогового текста.
+    Строка, которой не хватает места даже на маркер `_fitted`, пропадает целиком —
+    иначе `_fitted` вернул бы маркер и пробил бюджет на его длину.
     """
+    marker_len = len(" […показано не целиком]")
     fixed = sum(len(text) + 1 for text, is_prose in rows if not is_prose)
     left = budget - fixed
     out: list[tuple[str, bool]] = []
     for text, is_prose in rows:
         if not is_prose:
-            out.append((text, is_prose))
+            out.append((text, False))
             continue
-        if left <= 1:
-            continue  # места не осталось совсем — строка пропадает целиком
-        out.append((_fitted(text, left - 1), True))
-        left -= len(out[-1][0]) + 1
+        if left <= marker_len + 1:
+            continue
+        cut = _fitted(text, left - 1)
+        out.append((cut, True))
+        left -= len(cut) + 1
     return out
 ```
 
-В самом `deep_dive_msg`: блок печатается первым, выделение точки решения — тем же `<b>` при
-`parse_mode="HTML"`, что было в `replay_msg`, с экранированием остального текста через
-`_html_escape`. Прежний абзац докстринга «**Реплея здесь нет — он под кнопкой «Подробнее»**» теперь
-ложь и обязан уйти вместе с кодом; на его место — почему блок вернулся и что режется в тесноте.
+В `deep_dive_msg(..., replay: HandReplay | None = None)`:
+
+- если `replay is None` — прежнее поведение, `parse_mode=None`, текст не экранируется;
+- иначе: `parse_mode="HTML"`, ВСЕ строки экранируются `_html_escape` (проза модели может содержать `<`), блок — первым:
 
 ```python
     head = "Что было\n" + "".join(
-        f"<b>{_html_escape(span.text)}</b>" if span.emphasis else _html_escape(span.text)
-        for span in replay.spans
-    ) if replay is not None else ""
+        f"<b>{_html_escape(s.text)}</b>" if s.emphasis else _html_escape(s.text)
+        for s in replay.spans
+    )
+    rows: list[tuple[str, bool]] = [(head, False), ("", False)]
 ```
 
-В `worker/pipeline.py` — оба места: посчитать реплей и передать.
+- дальше прежняя сборка `lines`, но в `rows` с флагом: строки из `_prose_lines(...)` и `verdict.summary` — `True`, всё остальное — `False`; статус-строка и кнопки — как были;
+- `text = "\n".join(t for t, _ in rows)`; если `len(text) > _TELEGRAM_TEXT_LIMIT` — `rows = _shrink_prose(rows, _TELEGRAM_TEXT_LIMIT)` и пересобрать.
+
+Докстринг `deep_dive_msg`: абзац 746-751 («Реплея здесь нет…») заменить на: «Блок «Что было» — первым (спека §5.6, план 2026-09-12): проза короче построчного реплея, ради которого его когда-то прятали за кнопку; в тесноте режется проза модели, не блок (`_shrink_prose`). `parse_mode="HTML"` только при наличии блока — иначе экранировать пришлось бы весь текст всюду».
+
+- [ ] **Step 5: `canonical_by_tournament` и воркер**
+
+`HandsRepo`:
 
 ```python
-                verdict = await _verdict_prose(deps, trace, result)
-                replay = hand_replay(
-                    hand.enriched,
-                    ev_loss_bb=result.total_ev_loss_bb if result.ranked else None,
-                    stats=await _tournament_stats(session, hand),
-                )
+    async def canonical_by_tournament(self, tournament_id: int) -> list[CanonicalHand]:
+        """Канонические руки одного турнира — одной колонкой.
+
+        Вход частот оппонентов для блока «Что было» (план 2026-09-12). Читается
+        только `canonical`, как в `player_hands_by_tournament`: `raw` и
+        `enriched` весят кратно больше, а `player_stats_by_label` нужен лишь
+        канон. Руки без чекпоинта пропускаются
+        (`test_canonical_by_tournament_reads_only_hands_with_a_canonical_checkpoint`).
+        """
+        stmt = (
+            select(Hand.canonical)
+            .where(Hand.tournament_id == tournament_id, Hand.canonical.is_not(None))
+            .order_by(Hand.id)
+        )
+        return [CanonicalHand.model_validate(row) for row in await self.db.scalars(stmt)]
 ```
 
-`_tournament_stats` — новая приватная функция воркера. Она живёт именно здесь, а не в `explanation`:
-правило зависимостей запрещает изложению знать про БД (Global Constraints).
+`worker/pipeline.py`:
 
 ```python
 async def _tournament_stats(
-    session: AsyncSession, hand: HandRecord
+    session: AsyncSession, tournament_id: int | None
 ) -> dict[str, PlayerStats] | None:
     """Частоты соседей по столу — или `None`, если считать их не по чему.
 
-    Провенанс решает (спека §5.6): метка участника сквозная только внутри
-    турнира, поэтому на HH-входе частоты набираются по рукам турнира, а на
-    скриншоте их нет вовсе — одна рука не даёт знаменателя. `None`, а не пустой
-    словарь: «не считали» и «посчитали, вышло пусто» — разные вещи, и реплей
-    печатает скобку только по первому.
+    Провенанс решает (спека §5.6): метка участника сквозная внутри турнира,
+    поэтому на HH-входе частоты набираются по рукам турнира, а у скриншота
+    `tournament_id` нет — и частот нет. `None`, не пустой словарь: «не считали»
+    и «посчитали, вышло пусто» — разные вещи.
     """
-    if hand.tournament_id is None:
+    if tournament_id is None:
         return None
-    records = await HandsRepo(session).list_by_tournament(hand.tournament_id)
-    hands = [record.canonical for record in records if record.canonical is not None]
+    hands = await HandsRepo(session).canonical_by_tournament(tournament_id)
     return player_stats_by_label(hands) if hands else None
 ```
 
-Цена вопроса: один запрос на разбор, по индексу `tournament_id`, и разбор канонических рук турнира
-в памяти. Турнир — сотни рук, не миллионы; если это когда-нибудь станет заметно, кэш считается по
-`tournaments`, а не по каждому разбору (SCALING.md: сначала телеметрия, потом кэш).
+Скриншотный путь (`~1146`, переменные `enriched`, `record`):
 
-- [ ] **Step 4: Запустить тесты**
+```python
+        replay = hand_replay(
+            enriched,
+            ev_loss_bb=result.total_ev_loss_bb if result.ranked else None,
+            stats=None,  # скрин: одна рука, знаменателя нет
+        )
+        msg = deep_dive_msg(result, ..., verdict=verdict, replay=replay, ...)
+```
 
-Run: `uv run pytest tests/test_presentation.py tests/test_worker_pipeline.py -q -ra`
-Expected: PASS.
+Путь разбора (`~1225`, переменная `hand: HandRecord`):
 
-- [ ] **Step 5: Прогнать весь набор**
+```python
+        replay = hand_replay(
+            hand.enriched,
+            ev_loss_bb=result.total_ev_loss_bb if result.ranked else None,
+            stats=await _tournament_stats(session, hand.tournament_id),
+        )
+```
 
-Run: `uv run pytest -q -ra`
-Expected: PASS, `skipped` не вырос.
+(`hand.enriched` может быть `None` по контракту `HandRecord` — на этом пути он уже проверен выше; если нет, `replay=None`.)
 
-- [ ] **Step 6: Коммит**
+- [ ] **Step 6: Запустить и весь набор**
+
+Run: `uv run pytest tests/test_presentation.py tests/test_worker_pipeline.py tests/test_memory.py -q -ra` → PASS.
+Run: `uv run pytest -q -ra` → PASS, `skipped` прежний. Тест воркера гейтится фикстурами — без них он пропущен, и это надо ВИДЕТЬ в сводке.
+
+- [ ] **Step 7: Коммит**
 
 ```bash
-git add src/harness/presentation/messages.py src/harness/worker/pipeline.py tests/test_presentation.py tests/test_worker_pipeline.py
-git commit -m "Блок «Что было» встаёт первым, а в тесноте режется проза"
+git add src/harness/presentation/messages.py src/harness/worker/main.py src/harness/worker/pipeline.py src/harness/memory/repos.py tests/test_presentation.py tests/test_worker_pipeline.py tests/test_memory.py
+git commit -m "Блок «Что было» первым: HTML доезжает через воркер, в тесноте режется проза"
 ```
 
 ---
 
-### Task 8: «Подробнее» уходит из клавиатуры
-
-Реплей теперь в основном сообщении, и показывать его второй раз незачем. Кнопки, не показывающей ничего, в интерфейсе быть не может, поэтому она уходит; слот остаётся за владельцем.
+### Task 8: «Подробнее» уходит из клавиатуры — полный перечень мест
 
 **Files:**
-- Modify: `src/harness/presentation/keyboards.py:79` (строка кнопки внутри `verdict_buttons`), `:61` и `:201` (`DETAIL_PREFIX`). **Не трогать `deep_dive_button` (строка 65)** — это кнопка «разобрать» под строкой скана, другой путь.
-- Modify: `src/harness/bot/handlers.py:1051` (ветка роутера), `:1132-1143` (`_replay_reply`)
-- Modify: `src/harness/presentation/messages.py` (`replay_msg`, `replay_unavailable_msg`)
+- Modify: `src/harness/presentation/keyboards.py:79` (строка кнопки в `verdict_buttons`), `:61` и `:201` (`DETAIL_PREFIX`). **Не трогать `deep_dive_button` (строка 65)** — «разобрать» под строкой скана, другой путь.
+- Modify: `src/harness/presentation/__init__.py:11, 85-86, 107, 178-179` (реэкспорт `DETAIL_PREFIX`, `replay_msg`, `replay_unavailable_msg`)
+- Modify: `src/harness/presentation/messages.py` (`replay_msg`, `replay_unavailable_msg` — удалить; `_html_escape` ОСТАЁТСЯ, его зовёт `deep_dive_msg`)
+- Modify: `src/harness/bot/handlers.py:61` (импорт), `:167-179` (`UI_CALLBACK_PREFIXES` — убрать `DETAIL_PREFIX`), `:1050-1051` (ветка), `:1132-1143` (`_replay_reply`)
 - Modify: `.claude/SESSIONS_UX.md`, раздел «Под вердиктом — инлайн-кнопки»
-- Test: `tests/test_presentation.py`, `tests/test_bot_handlers.py`
+- Test: `tests/test_presentation.py` (тесты `replay_msg` — удалить; кнопки), `tests/test_bot_handlers.py` (ветка `detail:`)
 
 **Interfaces:**
-- Consumes: Task 7 (блок уже в основном сообщении — иначе кнопку убирать нельзя)
-- Produces: клавиатура из двух кнопок
+- Consumes: Task 7 (блок уже в разборе)
+- Produces: `verdict_buttons(hand_no) -> list[Btn]` из двух кнопок.
 
-- [ ] **Step 1: Написать падающий тест**
+- [ ] **Step 1: Падающий тест**
 
 ```python
 def test_the_verdict_buttons_are_two():
-    """Реплей переехал в основное сообщение (план 2026-09-12, задача 7), и
-    кнопка, показывающая его второй раз, осталась бы без содержания.
-
-    Трогается ТОЛЬКО `verdict_buttons`. Однонамённая `deep_dive_button`
-    («разобрать» под строкой скана) — другая кнопка и другой путь, её этот
-    план не касается."""
-    labels = [btn.text for btn in verdict_buttons("TM99")]
-    assert labels == ["🎯 Диапазоны", "✋ Не согласен"]
+    """Реплей переехал в разбор (задача 7); кнопка, показывающая его второй раз,
+    осталась бы без содержания. `deep_dive_button` («разобрать» под сканом) —
+    другая кнопка, её план не касается."""
+    assert [b.text for b in verdict_buttons("TM99")] == ["🎯 Диапазоны", "✋ Не согласен"]
 ```
 
-- [ ] **Step 2: Запустить и убедиться, что падает**
+- [ ] **Step 2: Запустить** → FAIL (три кнопки).
 
-Run: `uv run pytest tests/test_presentation.py -k keyboard -v`
-Expected: FAIL — кнопок три.
+- [ ] **Step 3: Удалить кнопку и мёртвый путь** — по списку файлов выше. Побочный эффект, который надо назвать в докстринге `verdict_buttons`: кнопка «Подробнее» в УЖЕ отправленных сообщениях остаётся и теперь попадает в `on_unhandled_callback` → «Эта кнопка не работает.» (`messages.py:855`). Это ожидаемо и дешевле переписывания старых сообщений.
 
-- [ ] **Step 3: Убрать кнопку и мёртвый путь**
+- [ ] **Step 4: SESSIONS_UX**
 
-Удалить: строку кнопки в `keyboards.py`, `DETAIL_PREFIX` из констант и `__all__`, ветку `DETAIL_PREFIX` в роутере `handlers.py`, `_replay_reply`, `replay_msg`, `replay_unavailable_msg` и их тесты.
-
-Проверить, что `_html_escape`-разметка выделения не потерялась: она нужна в `deep_dive_msg` (Task 7), туда и переехала.
-
-- [ ] **Step 4: Привести SESSIONS_UX в соответствие**
-
-В `.claude/SESSIONS_UX.md`, раздел «Под вердиктом — инлайн-кнопки»:
+Раздел «Под вердиктом — инлайн-кнопки»:
 
 ```
 🎯 Диапазоны     ✋ Не согласен
 ```
 
-Убрать строку про «Подробнее». Дописать: ход раздачи печатается блоком «Что было» в самом разборе, первым; слот третьей кнопки зарезервирован.
+Убрать строку «**Подробнее** — развёрнутый разбор…». Дописать: ход раздачи печатается блоком «Что было» первым в самом разборе (спека §5.6); слот третьей кнопки зарезервирован, содержания у него пока нет (решение владельца 2026-09-12). В таблице станций прогресса строку `подробнее:` убрать.
 
-- [ ] **Step 5: Запустить весь набор**
+- [ ] **Step 5: Весь набор, линтеры, типы**
 
-Run: `uv run pytest -q -ra`
-Expected: PASS. `skipped` не вырос.
+Run: `uv run pytest -q -ra` → PASS. Run: `uv run ruff check . && uv run pyright` → чисто (мёртвые импорты после удаления — частая находка здесь).
 
-- [ ] **Step 6: Линтеры и типы**
-
-Run: `uv run ruff check . && uv run pyright`
-Expected: чисто. Мёртвые импорты после удаления `replay_msg` — частая находка именно здесь.
-
-- [ ] **Step 7: Коммит**
+- [ ] **Step 6: Коммит**
 
 ```bash
-git add src/harness/presentation/keyboards.py src/harness/presentation/messages.py src/harness/bot/handlers.py .claude/SESSIONS_UX.md tests/test_presentation.py tests/test_bot_handlers.py
+git add src/harness/presentation/keyboards.py src/harness/presentation/__init__.py src/harness/presentation/messages.py src/harness/bot/handlers.py .claude/SESSIONS_UX.md tests/test_presentation.py tests/test_bot_handlers.py
 git commit -m "«Подробнее» уходит: реплей теперь в самом разборе"
 ```
 
@@ -933,7 +1173,9 @@ git commit -m "«Подробнее» уходит: реплей теперь в
 
 ## Приёмка плана целиком
 
-- [ ] `uv run pytest -q -ra` — зелено, `skipped` равен пяти (без фикстур). **Зелёный прогон без фикстур не означает, что конвейер проверен** (CLAUDE.md): регрессионная сетка на 318 руках — главный приёмочный гейт, и без реальных HH она пропускается.
+- [ ] `uv run pytest -q -ra` — зелено; число `skipped` равно исходному (без фикстур и промптов). **Зелёный прогон без фикстур не означает, что конвейер проверен** (CLAUDE.md): регрессионная сетка на 318 руках и тест воркера с блоком «Что было» без реальных HH пропускаются.
 - [ ] `uv run ruff check . && uv run pyright` — чисто.
-- [ ] Глазами: разбор одной руки со скрина (без частот) и из HH (с частотами) укладывается в 4096 символов и открывается блоком «Что было».
-- [ ] Спека §5.6 и `.claude/SESSIONS_UX.md` описывают то, что в коде. Расхождение, найденное на этом шаге, правится документом, а не забывается — именно так разошлась первая редакция раздела.
+- [ ] `alembic upgrade head` на локальной базе — 0011 накатывается и откатывается.
+- [ ] **Eval-кейсы вердикта перегенерировать** (`evals/verdict/cases/`, вне репозитория, делает владелец): в них `AnalysisResult` без `hero_cards`/`board`/`hero_position`, и eval-прогон промпта «называй карты и диапазон» на них проверял бы не то. Перегенерация — тем же `analyze_hand` через `eval_runner --hh` (EVALS.md: eval модели — отдельный этаж от тестов кода).
+- [ ] Глазами: разбор со скрина (без частот) и из HH (с частотами) открывается блоком «Что было», укладывается в 4096, `<b>` не виден буквально.
+- [ ] Спека §5.6 и `.claude/SESSIONS_UX.md` описывают то, что в коде. Расхождение, найденное здесь, правится документом той же задачей.
