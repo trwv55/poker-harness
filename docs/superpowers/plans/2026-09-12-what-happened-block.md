@@ -80,7 +80,7 @@ def test_a_bare_rank_digit_is_still_read():
 - [ ] **Step 2: Запустить и убедиться, что падают**
 
 Run: `uv run pytest tests/test_faithfulness.py -k "suited or suit_is_not or two_digit or bare_rank" -v`
-Expected: FAIL на первых двух (`[5.0]`, `[9.0, 9.0]`…); третий и четвёртый ПРОХОДЯТ уже сейчас — они страхуют от регрессии, и это нормально.
+Expected: FAIL на первых двух (`A5s` даст `[5.0]`; `J♥️9♥️` даст `[9.0]`; строка с бордом — `[2.0, 3.9]`); третий и четвёртый ПРОХОДЯТ уже сейчас — они страхуют от регрессии, и это нормально.
 
 - [ ] **Step 3: Реализовать**
 
@@ -153,7 +153,7 @@ git commit -m "Карта с мастью и класс с суффиксом �
 
 - [ ] **Step 1: Написать падающие тесты**
 
-`tests/test_contracts.py`:
+`tests/test_contracts.py` (`PointVerdict` на уровне модуля НЕ импортирован — добавить `from harness.contracts import PointVerdict` к импортам файла):
 
 ```python
 def test_a_point_without_spot_context_still_loads():
@@ -192,7 +192,10 @@ async def test_spot_context_survives_the_round_trip_through_decision_points(db):
     """Путь повтора после падения читает `existing.result` из базы: без колонок
     карты пропали бы молча, и модель на ретрае получила бы слепую выжимку."""
     _player_id, session_id = await _player_with_session(db, tg_user_id=7001)
-    hand_id = await _save_hand_in(db, session_id=session_id, tournament_id=1, hand_no="TM1")
+    # `hands.tournament_id` — FK на `tournaments.id`: турнир создаётся первым,
+    # как в `test_player_hands_come_grouped_by_tournament` (строка ~441).
+    tournament_id = await TournamentsRepo(db).create(session_id=session_id, source_file="t.txt")
+    hand_id = await _save_hand_in(db, session_id=session_id, tournament_id=tournament_id, hand_no="TM1")
     point = _verdict(
         SpotKind.PUSHFOLD_UNOPENED, "fold", "shove", -1.0,
         hero_cards=["Jh", "9h"], board=["Kh", "Jd", "2c"], hero_position="SB",
@@ -206,7 +209,7 @@ async def test_spot_context_survives_the_round_trip_through_decision_points(db):
     assert (back.hero_cards, back.board, back.hero_position) == (["Jh", "9h"], ["Kh", "Jd", "2c"], "SB")
 ```
 
-Если `_save_hand_in` требует существующий `tournament_id` — завести турнир той же фабрикой, что тест на строке 674 (открыть и повторить его подготовку; не выдумывать).
+`TournamentsRepo.create(*, session_id, source_file) -> int` — `repos.py:839`.
 
 - [ ] **Step 2: Запустить и убедиться, что падают**
 
@@ -369,10 +372,17 @@ git commit -m "Карты, борд и позиция едут к изложен
 
 ### Task 3: Выжимка называет карты, борд, позицию и состав допущенного диапазона
 
+**Порядок классов — по силе, и это решение ревью.** Ключ `(-weight, name)` при равных весах сортирует по ASCII: цифры раньше букв, и для любого диапазона шире дюжины классов выжимка печатала бы `22, 33, …, 99, A2o, …` — низ диапазона вместо его верха, и регистрировала бы все восемь цифровых пар (компромисс Task 1 превращался в дыру: «теряет 55 bb» проходило бы). Готового статического порядка по силе в проекте нет; `analysis.tools.pushfold.classes_by_equity_against` — расчёт, и звать его из изложения нельзя. Поэтому в `contracts/ranges.py` заводится **детерминированный порядок для показа** по формуле Чена (высшая карта, пара ×2, +2 за одномастность, штраф за разрыв, бонус за коннектор). Это не оценка EV и не претензия на точность — только воспроизводимый порядок «сильнее раньше», закреплённый тестами на СВОЙСТВА (AA первый, пары выше своих коннекторов, suited выше offsuit тех же рангов, 72o в хвосте), а не на числа.
+
+**Доля веса печатается как доля, а не как «наполовину».** Веса бывают любыми (`multiway._range_of` округляет до 6 знаков, `_average_range` усредняет): класс с весом 0.33, названный «наполовину», — выдуманная величина в самой выжимке. Печатается `на {book.pct(100*w)}%`, число регистрируется как любое число выжимки.
+
+**Хвост — без числа.** `book.count(rest)` регистрировал бы малое целое (3, 5, 7) как разрешённое — ровно тот дефект, от которого файл защищён (`test_a_small_round_number_is_not_allowed_by_the_point_numbering`). Хвост — словами: «и другие, слабее».
+
 **Files:**
+- Modify: `src/harness/contracts/ranges.py` — новая `strength_order() -> tuple[str, ...]` и `chen_score(cls: str) -> float`
 - Modify: `src/harness/explanation/hand_replay.py` — только переименование `_cards` → `cards_text`, `_board` → `board_text` (и ВСЕ их вызовы внутри файла: `hand_replay.py:284, 316` и рядом; проверить `grep -n '_cards\|_board' src/harness/explanation/hand_replay.py`), добавить оба в `__all__`
 - Modify: `src/harness/explanation/verdict_text.py` (`_point_lines` — строка 230; `_detail_lines` — строка 206; импорты)
-- Test: `tests/test_verdict_text.py`
+- Test: `tests/test_contracts.py`, `tests/test_verdict_text.py`
 
 **Interfaces:**
 - Consumes: `PointVerdict.hero_cards/.board/.hero_position` (Task 2); `numbers_in` (Task 1)
@@ -405,13 +415,32 @@ def test_the_digest_names_the_assumed_range_not_only_its_share():
     assert "AA" in text and "KK наполовину" in text
 
 
-def test_the_range_listing_is_stable():
-    """Два прогона одной руки обязаны дать одну выжимку: порядок — по весу,
-    затем по имени, а не по порядку ключей словаря."""
-    a = Range(weights={"KK": 1.0, "AA": 1.0, "QQ": 0.5})
-    b = Range(weights={"QQ": 0.5, "AA": 1.0, "KK": 1.0})
+def test_the_range_listing_is_stable_and_ordered_by_strength():
+    """Два прогона одной руки обязаны дать одну выжимку, и порядок — по силе
+    (`contracts.ranges.strength_order`), а не по порядку ключей и не по ASCII."""
+    a = Range(weights={"KK": 1.0, "AA": 1.0, "QQ": 0.5, "22": 1.0})
+    b = Range(weights={"22": 1.0, "QQ": 0.5, "AA": 1.0, "KK": 1.0})
     book = NumberBook()
-    assert _range_text(a, book) == _range_text(b, book) == "AA, KK, QQ наполовину"
+    assert _range_text(a, book) == _range_text(b, book) == "AA, KK, QQ на 50.0%, 22"
+
+
+def test_a_partial_weight_is_printed_as_its_share_not_as_a_half():
+    """Вес 0.33 — не «наполовину»: доля печатается числом и регистрируется."""
+    book = NumberBook()
+    assert _range_text(Range(weights={"AA": 0.33}), book) == "AA на 33.0%"
+    assert 33.0 in book.allowed
+
+
+def test_a_wide_range_shows_its_top_and_names_the_tail_without_a_number():
+    """Широкий диапазон: верх по силе, хвост словами. Ни одного малого целого
+    в реестре от хвоста — иначе «теряет 5 bb» прошло бы проверку."""
+    wide = Range(weights=dict.fromkeys(all_classes()[:40], 1.0))
+    book = NumberBook()
+    text = _range_text(wide, book)
+    assert text.startswith("AA, KK, QQ") and text.endswith(" и другие, слабее")
+    assert not {float(k) for k in range(2, 13)} & book.allowed
+    digit_pairs_named = [t for t in text.replace(",", " ").split() if t.isdigit()]
+    assert len(digit_pairs_named) <= 2, f"утечка цифровых пар: {digit_pairs_named}"
 
 
 def test_a_digit_pair_in_the_range_is_registered_but_a_suited_class_is_not():
@@ -436,44 +465,101 @@ def test_the_digest_registers_every_number_it_prints_with_context():
     assert unsupported_numbers(digest.text, digest.allowed) == []
 ```
 
-Импорты в тесте: `Range`, `NumberBook` (из `harness.explanation.digest`), `_range_text` через `verdict_text_module` (модуль импортируется в файле под этим именем, строка ~40).
+Импорты в тесте: `Range`, `all_classes` (из `harness.contracts`), `NumberBook` (из `harness.explanation.digest`), `_range_text` через `verdict_text_module` (модуль импортируется в файле под этим именем, строка 43).
+
+`tests/test_contracts.py` — свойства порядка, не числа:
+
+```python
+def test_strength_order_has_the_properties_a_display_order_needs():
+    """Порядок для показа состава диапазона: воспроизводим, «сильнее раньше».
+    Проверяются свойства, а не значения формулы — это не оценка EV."""
+    order = strength_order()
+    assert len(order) == 169 and len(set(order)) == 169
+    assert order[0] == "AA"
+    pos = {cls: i for i, cls in enumerate(order)}
+    assert pos["KK"] < pos["AKs"] < pos["AKo"]          # пара выше своих коннекторов
+    assert pos["QJs"] < pos["QJo"]                        # suited выше offsuit
+    assert pos["TT"] < pos["99"] < pos["22"]              # пары по рангу
+    assert pos["72o"] > 150                                # худшие — в хвосте
+    assert order == strength_order()                       # детерминизм
+```
 
 - [ ] **Step 2: Запустить и убедиться, что падают**
 
-Run: `uv run pytest tests/test_verdict_text.py -k "names_the or range_listing or digit_pair or with_context" -v`
-Expected: FAIL (нет карт в выжимке; `_range_text` не существует).
+Run: `uv run pytest tests/test_contracts.py -k strength_order tests/test_verdict_text.py -k "names_the or range_listing or partial_weight or wide_range or digit_pair or with_context" -v`
+Expected: FAIL (нет `strength_order`; нет карт в выжимке; `_range_text` не существует).
 
 - [ ] **Step 3: Реализовать**
 
 `hand_replay.py`: переименовать `_cards` → `cards_text`, `_board` → `board_text`, поправить вызовы, добавить в `__all__`.
 
+`contracts/ranges.py`:
+
+```python
+_CHEN_HIGH = {"A": 10.0, "K": 8.0, "Q": 7.0, "J": 6.0}
+
+
+def chen_score(cls: str) -> float:
+    """Формула Чена — порядок ДЛЯ ПОКАЗА, не оценка EV (план 2026-09-12, Task 3).
+
+    Высшая карта (A=10, K=8, Q=7, J=6, иначе ранг/2), пара — удвоить (не меньше
+    5), одномастность +2, штраф за разрыв (1→−1, 2→−2, 3→−4, ≥4→−5), коннектор
+    ниже Q +1. Свойства закреплены
+    `test_strength_order_has_the_properties_a_display_order_needs`; точные
+    значения нигде не утверждаются и ничего в расчёте не решают.
+    """
+    hi, lo = cls[0], cls[1]
+    value = lambda r: _CHEN_HIGH.get(r, (RANKS[::-1].index(r) + 2) / 2)  # noqa: E731
+    score = value(hi)
+    if hi == lo:
+        return max(score * 2, 5.0)
+    gap = RANKS.index(lo) - RANKS.index(hi) - 1
+    score -= {0: 0.0, 1: 1.0, 2: 2.0, 3: 4.0}.get(gap, 5.0)
+    if gap <= 1 and RANKS.index(hi) > RANKS.index("Q"):
+        score += 1.0
+    if cls.endswith("s"):
+        score += 2.0
+    return score
+
+
+def strength_order() -> tuple[str, ...]:
+    """169 классов, сильнее раньше, по `chen_score`; имя — вторичный ключ."""
+    return tuple(sorted(all_classes(), key=lambda c: (-chen_score(c), c)))
+```
+
 `verdict_text.py`, импорты:
 
 ```python
-from harness.contracts import Range  # к существующему списку из harness.contracts
+from harness.contracts import Range, strength_order  # к существующему списку
 from harness.explanation.digest import NumberBook  # уже импортирован — проверить
 from harness.explanation.hand_replay import board_text, cards_text
 ```
 
 ```python
-# Сколько классов диапазона называется поимённо. Порядок — по весу, потом по
-# имени (`test_the_range_listing_is_stable`). Потолок, а не весь состав: для
-# широкого диапазона список занял бы половину промпта; хвост называется числом.
+# Сколько классов диапазона называется поимённо. Порядок — по силе
+# (`contracts.ranges.strength_order`), затем по имени. Потолок, а не весь
+# состав: широкий диапазон занял бы половину промпта; хвост — словами, БЕЗ
+# числа: `book.count` зарегистрировал бы малое целое как разрешённое
+# (`test_a_small_round_number_is_not_allowed_by_the_point_numbering`).
 _MAX_NAMED_CLASSES = 12
+_RANK_OF = {cls: i for i, cls in enumerate(strength_order())}
 
 
 def _range_text(rng: Range, book: NumberBook) -> str:
-    """Состав диапазона словами. Цифровые пары (`99`) — через `book.token`:
-    нотация их не вырезает (задача 1), и без регистрации цитата состава была бы
-    отбракована. Классы с суффиксом и буквенные пары не регистрируются — у них
-    либо нет цифр, либо их вырезает `_CARD_NOTATION_RE`."""
-    ordered = sorted(rng.weights.items(), key=lambda kv: (-kv[1], kv[0]))
+    """Состав диапазона словами: верх по силе, доли весом, хвост без числа.
+
+    Цифровые пары (`99`) — через `book.token`: нотация их не вырезает (Task 1),
+    и без регистрации цитата состава была бы отбракована. Утечка реестра —
+    до двух-трёх старших пар в широком диапазоне (порядок по силе держит
+    младшие за потолком; `test_a_wide_range_shows_its_top_...`). Доля веса —
+    числом через `book.pct`: «наполовину» при весе 0.33 было бы выдумкой.
+    """
+    ordered = sorted(rng.weights.items(), key=lambda kv: (_RANK_OF[kv[0]], kv[0]))
     named: list[str] = []
     for name, weight in ordered[:_MAX_NAMED_CLASSES]:
         shown = book.token(name) if name.isdigit() else name
-        named.append(shown if weight >= 1.0 else f"{shown} наполовину")
-    rest = len(ordered) - _MAX_NAMED_CLASSES
-    tail = f" и ещё {book.count(rest)} классов" if rest > 0 else ""
+        named.append(shown if weight >= 1.0 else f"{shown} на {book.pct(100.0 * weight)}%")
+    tail = " и другие, слабее" if len(ordered) > _MAX_NAMED_CLASSES else ""
     return ", ".join(named) + tail
 ```
 
@@ -509,8 +595,8 @@ Run: `uv run pytest tests/test_verdict_text.py tests/test_hand_replay.py -q -ra`
 - [ ] **Step 5: Коммит**
 
 ```bash
-git add src/harness/explanation/verdict_text.py src/harness/explanation/hand_replay.py tests/test_verdict_text.py
-git commit -m "Выжимка называет карты, борд, позицию и состав допущенного диапазона"
+git add src/harness/contracts/ranges.py src/harness/explanation/verdict_text.py src/harness/explanation/hand_replay.py tests/test_contracts.py tests/test_verdict_text.py
+git commit -m "Выжимка называет карты, борд, позицию и состав диапазона — по силе, долями, без чисел в хвосте"
 ```
 
 ---
@@ -594,7 +680,9 @@ git commit -m "Промпт вердикта: карты и борд разре�
 
 Оставить (с правками) из прежнего файла:
 
-- `test_hero_decision_is_emphasised_inside_the_flow_not_on_its_own_line` — оставить как есть: выделение внутри потока сохраняется.
+- `test_hero_decision_is_emphasised_inside_the_flow_not_on_its_own_line` (строки 267-274) — выделение внутри потока сохраняется, но тест утверждает `"Hero" in span` — заменить на `"вы" in span.lower()`.
+- `test_header_is_two_lines_with_level_blinds_and_hero` (223-232, `startswith("TSYN")`, `"Hero SB"`) — переписать в `test_header_is_one_line_with_position_cards_and_stack`: `startswith("Вы на SB, J♥️9♥️, 10.0 ББ.\n")`.
+- `test_raise_over_a_raise_is_called_a_3bet_preflop` (298-328, `"рейз 250"`, `"3-бет 700"`) — суммы в ББ и «опен»: `"опен 2.5"`, `"3-бет 7.0"`.
 - `test_the_replay_prints_no_number_the_hand_does_not_contain` (строки 355-383) — расширить `allowed` величинами в ББ, которые печатает новый формат:
 
 ```python
@@ -664,10 +752,16 @@ def test_the_replay_without_a_cost_says_nothing_about_it():
 
 ```
 Вы на SB, J♥️9♥️, 10.0 ББ.
-UTG/HJ фолд → CO опен 2.5 → BTN фолд → вы колл → BB фолд. Флоп 6♠️ J♦️ Q♦️, банк 6.6. вы чек → CO бет 3.0 → вы фолд.
+UTG/HJ фолд → CO опен 2.5 → BTN фолд → вы колл → BB фолд. Флоп 6♠️ J♦️ Q♦️, банк 6.6. Вы чек → CO бет 3.0 → вы фолд.
 ```
 
-(Слово «вы» внутри потока — со строчной; предложение улицы начинается с борда.)
+Первый шаг потока каждой улицы начинает предложение — с прописной («Вы чек»); внутри потока «вы» строчное. Закрепить:
+
+```python
+def test_a_street_sentence_starts_with_a_capital_even_when_it_is_you():
+    text = hand_replay(_postflop_hand()).plain
+    assert "банк 6.6. Вы чек" in text and "→ вы фолд" in text
+```
 
 - [ ] **Step 2: Запустить и убедиться, что падают**
 
@@ -715,7 +809,9 @@ def _action_text(hand: CanonicalHand, action: CanonicalAction, raise_ordinal: in
 
 `_showdown_line` — `'вы' if entry.label == hand.hero_label else _position(...)`.
 
-Удалить: `_MATERIAL_POT_GROWTH`, `_last_street_with_actions`, `_bb`, `_THIN` оставить (нужен `chips`).
+Удалить: `_MATERIAL_POT_GROWTH`, `_last_street_with_actions`, `_bb`; `_THIN` оставить (нужен `chips`). В `__all__` добавить `bb`.
+
+Известное умолчание, не дефект: у руки, закончившейся олл-ином на префлопе, итоговый банк в блоке не печатается (банк стоит в начале фразы улицы с ходами, а постфлоп-ходов нет). Спека этого не требует; если владелец захочет — отдельная фраза «Банк N ББ.» после префлопа, когда дальше ходов нет.
 
 ```python
 def hand_replay(en: EnrichedHand, *, ev_loss_bb: float | None = None) -> HandReplay:
@@ -768,7 +864,10 @@ def hand_replay(en: EnrichedHand, *, ev_loss_bb: float | None = None) -> HandRep
             ))
         else:
             spans.append(ReplaySpan(text=sep()))
-        spans.extend(_street_flow(hand, actions, decisions))
+        flow = _street_flow(hand, actions, decisions)
+        first_step = flow[0]
+        flow[0] = first_step.model_copy(update={"text": first_step.text[:1].upper() + first_step.text[1:]})
+        spans.extend(flow)
         spans.append(ReplaySpan(text="."))
         pot_before = en.report.pot_by_street.get(street, pot_before)
     flush_quiet()
@@ -834,6 +933,11 @@ def test_a_measured_zero_is_printed_because_it_was_measured():
     assert "VPIP 25%, PFR 0%" in hand_replay(_postflop_hand(), stats=stats).plain
 
 
+def test_a_frequency_rounds_half_up():
+    stats = {"P5": PlayerStats(hands=8, vpip=1, pfr=1)}  # 12.5%
+    assert "VPIP 13%, PFR 13%" in hand_replay(_postflop_hand(), stats=stats).plain
+
+
 def test_a_folding_opponent_gets_no_label():
     """Слипшиеся фолды (`UTG/HJ фолд`) не несут ни метки, ни частот."""
     stats = {"P3": PlayerStats(hands=40, vpip=10, pfr=7)}
@@ -860,7 +964,13 @@ def _opponent_mark(label: str, stats: Mapping[str, PlayerStats] | None) -> str:
     row = stats[label]
     if row.vpip_pct is None or row.pfr_pct is None:
         return ""
-    return f" ({label}, VPIP {row.vpip_pct:.0f}%, PFR {row.pfr_pct:.0f}%)"
+    return f" ({label}, VPIP {_half_up(row.vpip_pct)}%, PFR {_half_up(row.pfr_pct)}%)"
+
+
+def _half_up(pct: float) -> int:
+    """Половина — вверх: `:.0f` и `round` округляют банковски (12.5 → 12), и
+    правило нигде не было закреплено (`test_a_frequency_rounds_half_up`)."""
+    return int(pct + 0.5)
 ```
 
 Состояние «кому метка уже поставлена» живёт в `hand_replay` (тот зовётся один раз на руку) и передаётся вниз:
@@ -959,12 +1069,13 @@ async def test_canonical_by_tournament_reads_only_hands_with_a_canonical_checkpo
     """Одна колонка, как у `player_hands_by_tournament`: `raw` и `enriched`
     весят кратно больше, а частотам нужен только `canonical`."""
     _player_id, session_id = await _player_with_session(db, tg_user_id=7002)
-    with_canon = await _save_hand_in(db, session_id=session_id, tournament_id=1, hand_no="C1")
-    raw_only = await _save_hand_in(db, session_id=session_id, tournament_id=1, hand_no="C2")
+    tid = await TournamentsRepo(db).create(session_id=session_id, source_file="t.txt")  # FK
+    with_canon = await _save_hand_in(db, session_id=session_id, tournament_id=tid, hand_no="C1")
+    raw_only = await _save_hand_in(db, session_id=session_id, tournament_id=tid, hand_no="C2")
     # `_save_hand_in` пишет и canonical — у второй руки его снять: открыть
     # фабрику (строка 427) и повторить её без `save_canonical`, либо обнулить
     # колонку прямым UPDATE; не выдумывать метод, которого нет.
-    hands = await HandsRepo(db).canonical_by_tournament(1)
+    hands = await HandsRepo(db).canonical_by_tournament(tid)
     assert [h.hand_no for h in hands] == ["C1"]
 ```
 
@@ -1014,17 +1125,21 @@ def test_the_payload_carries_parse_mode_when_the_message_has_markup():
 
 - [ ] **Step 4: `_shrink_prose` и `deep_dive_msg`**
 
+Резать надо СЫРОЙ текст, а экранировать после: разрез по экранированному с вероятностью 4/5 попал бы внутрь `&amp;`, и что Telegram сделает с `&am […]` — неизвестно. Поэтому усадка идёт по сырым строкам с бюджетом, а итог меряется после рендера; если экранирование раздуло текст за предел — бюджет уменьшается на перелёт и усадка повторяется (сходится за считанные итерации: перелёт монотонно убывает).
+
 ```python
+_MARKER = " […показано не целиком]"
+
+
 def _shrink_prose(rows: list[tuple[str, bool]], budget: int) -> list[tuple[str, bool]]:
-    """Уместить сообщение в бюджет, срезая ТОЛЬКО прозу модели.
+    """Уместить строки в бюджет, срезая ТОЛЬКО прозу модели (сырую, до экранирования).
 
     Слова необязательны, числа обязательны — то же правило, по которому
     `worker.pipeline` отдаёт разбор без прозы, когда модель не ответила.
-    Строки приходят УЖЕ экранированными: бюджет — это длина итогового текста.
-    Строка, которой не хватает места даже на маркер `_fitted`, пропадает целиком —
-    иначе `_fitted` вернул бы маркер и пробил бюджет на его длину.
+    Строка, которая влезает целиком, не трогается; которой не хватает места
+    даже на маркер — пропадает целиком (иначе `_fitted` вернул бы один маркер
+    и пробил бюджет на его длину).
     """
-    marker_len = len(" […показано не целиком]")
     fixed = sum(len(text) + 1 for text, is_prose in rows if not is_prose)
     left = budget - fixed
     out: list[tuple[str, bool]] = []
@@ -1032,29 +1147,51 @@ def _shrink_prose(rows: list[tuple[str, bool]], budget: int) -> list[tuple[str, 
         if not is_prose:
             out.append((text, False))
             continue
-        if left <= marker_len + 1:
+        if len(text) + 1 <= left:
+            out.append((text, True))
+            left -= len(text) + 1
+            continue
+        if left <= len(_MARKER) + 1:
             continue
         cut = _fitted(text, left - 1)
         out.append((cut, True))
         left -= len(cut) + 1
     return out
+
+
+def _render_html(head: str, rows: list[tuple[str, bool]]) -> str:
+    """Блок уже с разметкой; остальные строки экранируются здесь, ПОСЛЕ усадки."""
+    return "\n".join([head, *(_html_escape(text) for text, _ in rows)])
+
+
+def _fit_html(head: str, rows: list[tuple[str, bool]], limit: int) -> str:
+    budget = limit - len(head) - 1
+    text = _render_html(head, rows)
+    for _ in range(8):
+        if len(text) <= limit:
+            return text
+        budget -= len(text) - limit
+        text = _render_html(head, _shrink_prose(rows, budget))
+    return _render_html(head, [(t, p) for t, p in rows if not p])  # крайний случай: без прозы
 ```
+
+Тест плана с прозой из `"&"` — ровно худший случай: закрепить, что в итоге нет разорванной сущности: `assert "&am" not in msg.text.replace("&amp;", "")`.
 
 В `deep_dive_msg(..., replay: HandReplay | None = None)`:
 
 - если `replay is None` — прежнее поведение, `parse_mode=None`, текст не экранируется;
-- иначе: `parse_mode="HTML"`, ВСЕ строки экранируются `_html_escape` (проза модели может содержать `<`), блок — первым:
+- иначе: `parse_mode="HTML"`, блок — первым, остальные строки собираются СЫРЫМИ парами `(text, is_prose)` и экранируются внутри `_fit_html` после усадки:
 
 ```python
     head = "Что было\n" + "".join(
         f"<b>{_html_escape(s.text)}</b>" if s.emphasis else _html_escape(s.text)
         for s in replay.spans
     )
-    rows: list[tuple[str, bool]] = [(head, False), ("", False)]
+    rows: list[tuple[str, bool]] = [("", False)]  # пустая строка после блока; сам блок — `head`
 ```
 
 - дальше прежняя сборка `lines`, но в `rows` с флагом: строки из `_prose_lines(...)` и `verdict.summary` — `True`, всё остальное — `False`; статус-строка и кнопки — как были;
-- `text = "\n".join(t for t, _ in rows)`; если `len(text) > _TELEGRAM_TEXT_LIMIT` — `rows = _shrink_prose(rows, _TELEGRAM_TEXT_LIMIT)` и пересобрать.
+- `text = _fit_html(head, rows, _TELEGRAM_TEXT_LIMIT)`.
 
 Докстринг `deep_dive_msg`: абзац 746-751 («Реплея здесь нет…») заменить на: «Блок «Что было» — первым (спека §5.6, план 2026-09-12): проза короче построчного реплея, ради которого его когда-то прятали за кнопку; в тесноте режется проза модели, не блок (`_shrink_prose`). `parse_mode="HTML"` только при наличии блока — иначе экранировать пришлось бы весь текст всюду».
 
@@ -1150,7 +1287,8 @@ git commit -m "Блок «Что было» первым: HTML доезжает 
   - `tests/test_presentation.py:1139` — `any(... startswith("detail:") ...)` под `deep_dive_msg`, убрать утверждение;
   - `tests/test_presentation.py:1142-1160` — `test_replay_msg_marks_the_hero_decision_in_bold`, `test_replay_msg_escapes_a_nickname_that_looks_like_a_tag`: перенести в тесты `deep_dive_msg` с `replay=` (жирный и экранирование теперь там), сами тесты `replay_msg` удалить;
   - `tests/test_bot_handlers.py:945, 972` — докстринги перечисляют три префикса, поправить на два;
-  - `tests/test_bot_handlers.py:1953` — `handle_ui_callback(deps, ..., "detail:RC1234")`: заменить на проверку, что `detail:` теперь попадает в общий ответ «Эта кнопка не работает.» (`messages.py:855`) — это и есть закреплённый побочный эффект для старых сообщений.
+  - `tests/test_bot_handlers.py:1953` — `handle_ui_callback(deps, ..., "detail:RC1234")`: `handle_ui_callback` на неизвестный префикс возвращает `None` (`handlers.py:1053`), а «Эта кнопка не работает.» отдаёт `on_unhandled_callback` в `router.py:293`. Заменить на `assert await handle_ui_callback(deps, _TG_USER_ID, "detail:RC1234") is None` с докстрингом про старые сообщения; сквозной путь до текста уже закреплён `test_a_button_without_a_handler_still_gets_an_answer_not_a_spinner` (`:942`).
+  - `tests/test_bot_handlers.py:1960-1971` — `test_the_details_button_of_an_unfinished_hand_says_so` импортирует `replay_unavailable_msg` — удалить целиком: сценария «рука без хода» у кнопки больше нет.
 
 **Interfaces:**
 - Consumes: Task 7 (блок уже в разборе)
@@ -1178,7 +1316,7 @@ def test_the_verdict_buttons_are_two():
 🎯 Диапазоны     ✋ Не согласен
 ```
 
-Убрать строку «**Подробнее** — развёрнутый разбор…». Дописать: ход раздачи печатается блоком «Что было» первым в самом разборе (спека §5.6); слот третьей кнопки зарезервирован, содержания у него пока нет (решение владельца 2026-09-12). В таблице станций прогресса строку `подробнее:` убрать.
+Убрать строку «**Подробнее** — развёрнутый разбор…». Дописать: ход раздачи печатается блоком «Что было» первым в самом разборе (спека §5.6); слот третьей кнопки зарезервирован, содержания у него пока нет (решение владельца 2026-09-12). **Таблицу станций прогресса (строки 119-123) НЕ трогать:** строка `подробнее: Считаю эквити… → Формулирую…` — это станции задачи `deep_dive` (кнопка «разобрать» под строкой скана), а не кнопка под вердиктом.
 
 - [ ] **Step 5: Весь набор, линтеры, типы**
 
@@ -1199,5 +1337,5 @@ git commit -m "«Подробнее» уходит: реплей теперь в
 - [ ] `uv run ruff check . && uv run pyright` — чисто.
 - [ ] `alembic upgrade head` на локальной базе — 0011 накатывается и откатывается.
 - [ ] **Eval-кейсы вердикта перегенерировать** (`evals/verdict/cases/`, вне репозитория, делает владелец): в них `AnalysisResult` без `hero_cards`/`board`/`hero_position`, и eval-прогон промпта «называй карты и диапазон» на них проверял бы не то. Перегенерация — тем же `analyze_hand` через `eval_runner --hh` (EVALS.md: eval модели — отдельный этаж от тестов кода).
-- [ ] Глазами: разбор со скрина (без частот) и из HH (с частотами) открывается блоком «Что было», укладывается в 4096, `<b>` не виден буквально.
+- [ ] Глазами, на живом Telegram: разбор со скрина (без частот) и из HH (с частотами) открывается блоком «Что было», укладывается в 4096, `<b>` не виден буквально; разбор с намеренно длинной прозой (заглушка модели) приходит с маркером обрезки и без обрывков `&am`.
 - [ ] Спека §5.6 и `.claude/SESSIONS_UX.md` описывают то, что в коде. Расхождение, найденное здесь, правится документом той же задачей.
