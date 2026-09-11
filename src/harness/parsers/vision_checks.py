@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 from harness.contracts import VisionCheck
 
@@ -169,7 +170,7 @@ def cards_check(at_seat: dict[str, list[str]], in_log: dict[str, list[str]]) -> 
 
 
 def equity_check(
-    shown_pct: float | None, hero: list[str], villain: list[str], board: list[str]
+    hands: Sequence[tuple[list[str], float | None]], board: list[str]
 ) -> VisionCheck:
     """Напечатанный GG процент против посчитанного нами (реестр, «Эквити — оракул»).
 
@@ -190,21 +191,34 @@ def equity_check(
     (`test_bot_image_does_not_import_calculation_stack`). Считает эквити воркер,
     и грузит его тоже он.
     """
-    from harness.analysis.tools.equity import equity_hand_vs_hand
+    from harness.analysis.tools.equity import equity_multiway
 
-    if shown_pct is None or len(hero) != 2 or len(villain) != 2:
+    known = [(cards, shown) for cards, shown in hands if len(cards) == 2]
+    printed = [shown for _, shown in known if shown is not None]
+    if len(known) < 2 or not printed:
         return VisionCheck(
             name=CHECK_EQUITY, passed=True, detail="эквити на экране не напечатано"
         )
-    if len(set(hero) | set(villain) | set(board)) != len(hero) + len(villain) + len(board):
+
+    cards_flat = [card for pair, _ in known for card in pair]
+    if len(set(cards_flat) | set(board)) != len(cards_flat) + len(board):
         return VisionCheck(
             name=CHECK_EQUITY,
             passed=False,
-            detail=f"карта названа дважды: {hero} против {villain} на борде {board}",
-            options=[f"{shown_pct:.2f}", "—"],
+            detail=f"карта названа дважды: {[pair for pair, _ in known]} на борде {board}",
+            options=[f"{printed[0]:.2f}", "—"],
         )
-    computed_pct = 100.0 * equity_hand_vs_hand((hero[0], hero[1]), (villain[0], villain[1]), board)
-    delta = abs(shown_pct - computed_pct)
+
+    computed = equity_multiway([(pair[0], pair[1]) for pair, _ in known], board)
+    worst = max(
+        (
+            (abs(shown - 100.0 * value), shown, 100.0 * value)
+            for (_, shown), value in zip(known, computed, strict=True)
+            if shown is not None
+        ),
+        key=lambda item: item[0],
+    )
+    delta, shown_pct, computed_pct = worst
     return VisionCheck(
         name=CHECK_EQUITY,
         passed=within_tolerance(delta, EQUITY_TOLERANCE_PP),

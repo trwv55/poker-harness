@@ -769,18 +769,23 @@ def run_checks(
     at_seat = {p.nickname or "": p.cards_at_seat for p in reading.players if p.cards_at_seat}
     in_log = {p.nickname or "": p.cards_in_log for p in reading.players if p.cards_in_log}
     hero_cards, villain_cards = _showdown_pair(raw)
-    shown_pct = next(
-        (p.equity_shown_pct for p in reading.players if p.equity_shown_pct is not None), None
-    )
-    equity_hero = next(
-        (
-            _cards(p)
-            for p in reading.players
-            if p.equity_shown_pct is not None and len(_cards(p)) == 2
-        ),
-        hero_cards,
-    )
-    other = villain_cards if equity_hero == hero_cards else hero_cards
+    # Участники олл-ина для оракула эквити — ВСЕ, чью долю экран подписал, а не
+    # первый из них: GG печатает долю каждого, и посчитанная на двоих доля
+    # трёхстороннего олл-ина расходится с экраном на десяток процентных единиц.
+    # Пара из вскрытия остаётся запасным входом для экранов, где процент
+    # напечатан, а карты читаются только из вскрытия.
+    equity_hands: list[tuple[list[str], float | None]] = [
+        (_cards(p), p.equity_shown_pct)
+        for p in reading.players
+        if p.equity_shown_pct is not None and len(_cards(p)) == 2
+    ]
+    if len(equity_hands) < 2:
+        shown_pct = next(
+            (p.equity_shown_pct for p in reading.players if p.equity_shown_pct is not None), None
+        )
+        equity_hero = equity_hands[0][0] if equity_hands else hero_cards
+        other = villain_cards if equity_hero == hero_cards else hero_cards
+        equity_hands = [(equity_hero, shown_pct), (other, None)]
     printed = {
         nick: _aliased_position(pos, len(raw.seats))
         for nick, pos in _printed_positions(reading).items()
@@ -795,7 +800,7 @@ def run_checks(
             (reading.pot_shown if reading.pot_unit is not Unit.CHIPS else None),
             contributions_bb(raw),
         ),
-        equity_check(shown_pct, equity_hero, other, _board_at_all_in(raw)),
+        equity_check(equity_hands, _board_at_all_in(raw)),
     ]
 
 

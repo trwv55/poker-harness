@@ -309,11 +309,13 @@ def test_an_equity_off_by_exactly_the_tolerance_still_passes(monkeypatch: pytest
     не расчёт эквити (его проверяют якорные тесты `test_equity.py`).
     """
     monkeypatch.setattr(
-        "harness.analysis.tools.equity.equity_hand_vs_hand",
-        lambda hero, villain, board: 0.6351,
+        "harness.analysis.tools.equity.equity_multiway",
+        lambda hands, board: [0.6351, 0.3649],
     )
     assert 64.51 - 63.51 > EQUITY_TOLERANCE_PP  # причина отказа, а не описка в числах
-    check = equity_check(64.51, ["Ad", "Ks"], ["Tc", "Th"], ["2c", "7d", "9s"])
+    check = equity_check(
+        [(["Ad", "Ks"], 64.51), (["Tc", "Th"], None)], ["2c", "7d", "9s"]
+    )
     assert check.passed, check.detail
     assert "расхождение 1.00 п.п." in check.detail
 
@@ -321,10 +323,12 @@ def test_an_equity_off_by_exactly_the_tolerance_still_passes(monkeypatch: pytest
 def test_an_equity_off_by_more_than_the_tolerance_still_fails(monkeypatch: pytest.MonkeyPatch):
     """Допуск остался допуском: расхождение масти (порядка двух п.п.) не проходит."""
     monkeypatch.setattr(
-        "harness.analysis.tools.equity.equity_hand_vs_hand",
-        lambda hero, villain, board: 0.6351,
+        "harness.analysis.tools.equity.equity_multiway",
+        lambda hands, board: [0.6351, 0.3649],
     )
-    check = equity_check(65.56, ["Ad", "Ks"], ["Tc", "Th"], ["2c", "7d", "9s"])
+    check = equity_check(
+        [(["Ad", "Ks"], 65.56), (["Tc", "Th"], None)], ["2c", "7d", "9s"]
+    )
     assert not check.passed
 
 
@@ -846,3 +850,102 @@ def test_an_answer_off_by_exactly_the_tolerance_closes_the_dispute():
         settled = apply_vision_answer(raw, "pot", answer)
         assert settled is not None and settled.vision is not None
         assert [c.passed for c in settled.vision.checks] == [True], answer
+
+
+def test_a_three_way_all_in_is_checked_against_every_printed_equity():
+    """Мультивей-олл-ин: экран печатает долю КАЖДОГО, и сверять надо каждую.
+
+    Числа и карты — с руки, на которой продукт отказался разбирать верно
+    прочитанный экран (догфудинг 2026-09-11). GG печатает доли трёх участников
+    олл-ина; посчитанные вдвоём, они не сходятся ни с одной из них (A♦K♦ против
+    одного A♥K♣ — 52.5%, а на экране 38.18%), и проверка объявляла ошибкой
+    чтения свою собственную неполноту.
+    """
+    from harness.parsers.vision_adapter import run_checks
+
+    three_way = _three_way_all_in()
+    raw, extra = reading_to_raw(three_way, hero_nickname=HERO_NICK, source_ref="s")
+    _hero, hero_check = match_hero(HERO_NICK, _nicknames(three_way))
+    equity = next(c for c in run_checks(three_way, raw, hero_check, extra) if c.name == CHECK_EQUITY)
+    assert equity.passed, equity.detail
+
+
+def _three_way_all_in(**over) -> VisionReading:
+    """Экспорт с олл-ином на троих: доля КАЖДОГО подписана на экране."""
+    return export_reading(
+        board=["6s", "4h", "Jc", "Qh", "8d"],
+        players=over.pop("players", None) or [
+            _player("N3", 0.0, cards_in_log=["Ad", "Kd"], equity_shown_pct=38.18),
+            _player("N4", 14.89),
+            _player("N5", 0.0, cards_in_log=["Ah", "Kc"], equity_shown_pct=34.67),
+            _player("N6", 33.09),
+            _player("N7", 0.0, cards_in_log=["As", "7d"], equity_shown_pct=27.14),
+            _player("N8", 2.66, has_button=True),
+            _player("N1", 11.58),
+            _player(HERO_NICK, 12.52, cards_at_seat=["8c", "3h"]),
+        ],
+        actions=[
+            SeenAction(
+                street=Street.PREFLOP,
+                nickname="N3",
+                position="UTG",
+                kind=ActionKind.RAISE,
+                to_amount=32.14,
+                is_all_in=True,
+            ),
+            SeenAction(
+                street=Street.PREFLOP, nickname="N4", position="UTG+1", kind=ActionKind.FOLD
+            ),
+            SeenAction(
+                street=Street.PREFLOP,
+                nickname="N5",
+                position="MP",
+                kind=ActionKind.CALL,
+                amount=32.14,
+                is_all_in=True,
+            ),
+            SeenAction(
+                street=Street.PREFLOP, nickname="N6", position="MP+1", kind=ActionKind.FOLD
+            ),
+            SeenAction(
+                street=Street.PREFLOP,
+                nickname="N7",
+                position="CO",
+                kind=ActionKind.CALL,
+                amount=32.14,
+                is_all_in=True,
+            ),
+            SeenAction(street=Street.PREFLOP, nickname="N8", position="BTN", kind=ActionKind.FOLD),
+            SeenAction(street=Street.PREFLOP, nickname="N1", position="SB", kind=ActionKind.FOLD),
+            SeenAction(street=Street.PREFLOP, kind=ActionKind.FOLD),
+        ],
+        winners=[SeenWin(nickname="N3", amount=98.62, unit=Unit.BB)],
+        **over,
+    )
+
+
+def test_a_suit_misread_in_a_three_way_all_in_is_still_caught():
+    """Обобщение на троих не должно стоить проверке зубов.
+
+    Та же рука, но у N3 прочитана масть короля (K♦ вместо K♣ у второго туза —
+    одномастность двигает доли на единицы процентов). Все три напечатанных
+    процента перестают сходиться с расчётом, и экран обязан быть отвергнут.
+    """
+    from harness.parsers.vision_adapter import run_checks
+
+    misread = _three_way_all_in(
+        players=[
+            _player("N3", 0.0, cards_in_log=["Ad", "Kd"], equity_shown_pct=38.18),
+            _player("N4", 14.89),
+            _player("N5", 0.0, cards_in_log=["Ah", "Kd"], equity_shown_pct=34.67),
+            _player("N6", 33.09),
+            _player("N7", 0.0, cards_in_log=["As", "7d"], equity_shown_pct=27.14),
+            _player("N8", 2.66, has_button=True),
+            _player("N1", 11.58),
+            _player(HERO_NICK, 12.52, cards_at_seat=["8c", "3h"]),
+        ]
+    )
+    raw, extra = reading_to_raw(misread, hero_nickname=HERO_NICK, source_ref="s")
+    _hero, hero_check = match_hero(HERO_NICK, _nicknames(misread))
+    equity = next(c for c in run_checks(misread, raw, hero_check, extra) if c.name == CHECK_EQUITY)
+    assert not equity.passed
