@@ -28,6 +28,7 @@ SRC = Path(__file__).parent.parent / "src" / "harness"
 PROMPTS = SRC / "explanation" / "prompts"
 PROMPT_VERDICT = PROMPTS / "verdict.md"
 PROMPT_TOURNAMENT = PROMPTS / "tournament.md"
+PROMPT_QUESTION = PROMPTS / "question.md"
 PROMPT_VISION = SRC / "parsers" / "prompts" / "vision.md"
 
 # Промпты изложения закрыты политикой публикации — тем же решением владельца, что
@@ -45,7 +46,10 @@ PROMPT_VISION = SRC / "parsers" / "prompts" / "vision.md"
 # ли в этом клоне промпты вообще», и клона с половиной промптов не бывает — они
 # лежат рядом и приезжают вместе.
 PROMPTS_PRESENT = (
-    PROMPT_VERDICT.exists() and PROMPT_TOURNAMENT.exists() and PROMPT_VISION.exists()
+    PROMPT_VERDICT.exists()
+    and PROMPT_TOURNAMENT.exists()
+    and PROMPT_QUESTION.exists()
+    and PROMPT_VISION.exists()
 )
 requires_prompts = pytest.mark.skipif(
     not PROMPTS_PRESENT,
