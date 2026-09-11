@@ -14,6 +14,7 @@ Hand history — это факт, записанный самим румом: р
 from __future__ import annotations
 
 from harness.contracts import (
+    ActionKind,
     CanonicalHand,
     EngineReport,
     PlayerState,
@@ -157,6 +158,37 @@ def _source_stacks_end(hand: CanonicalHand) -> dict[str, int]:
     return ends
 
 
+# Допуск сверки выплат — только для скриншота и только в размере обрезки экрана.
+# Экспорт печатает суммы с двумя знаками и ОБРЕЗАЕТ их (сверено с текстом рума),
+# поэтому «Победа 31.95» против восстановленных 31.94 — свойство отображения, а
+# не расхождение. У hand history допуск нулевой: там числа записал сам рум.
+_PAYOUT_TOLERANCE_BB = 0.1
+
+
+def _payout_mismatch(hand: CanonicalHand, report: EngineReport) -> str | None:
+    """Сверить, кому и сколько досталось, — по строкам источника, а не по движку.
+
+    Правильный по размеру банк, уехавший не тому игроку, все остальные проверки
+    проходит насквозь: фишки сохранены, банк сошёлся, недопустимых ходов нет.
+    Ловит это только пересчёт выплат, и на скрин-входе он же ловит шоудаун,
+    решённый на доукомплектованных картах (`_fabricated_showdown`).
+    """
+    if not hand.collected:
+        return None
+    expected = _source_stacks_end(hand)
+    tolerance = (
+        round(_PAYOUT_TOLERANCE_BB * hand.bb)
+        if hand.provenance is Provenance.SCREENSHOT
+        else 0
+    )
+    wrong = [
+        f"{label}: движок {report.stacks_end.get(label, 0)}, источник {amount}"
+        for label, amount in sorted(expected.items())
+        if abs(report.stacks_end.get(label, 0) - amount) > tolerance
+    ]
+    return "payout mismatch: " + "; ".join(wrong) if wrong else None
+
+
 def _question_for(field: str, hand: CanonicalHand) -> str:
     """Короткий человеческий вопрос по полю — без покерного жаргона."""
     if field == _FIELD_STACKS:
@@ -165,6 +197,60 @@ def _question_for(field: str, hand: CanonicalHand) -> str:
             return f"Стек героя {hero.stack_bb:.1f}bb — верно?"
         return "Стеки игроков распознаны верно?"
     return _QUESTIONS.get(field, f"Поле «{field}» распознано верно?")
+
+
+_FABRICATED_SHOWDOWN = (
+    "шоудаун решён на доукомплектованных картах — спот не подаётся как точный расчёт"
+)
+
+
+def _fabricated_showdown(hand: CanonicalHand) -> list[str]:
+    """Дошёл ли до вскрытия игрок, чьих карт источник не назвал.
+
+    Движок доукомплектовывает неизвестные карты из остатка колоды, и на hand
+    history это безопасно: измерено, что 0 из 111 оспариваемых шоудаунов
+    решались на фабрикованных картах — рум показывает карты всех дошедших. На
+    скрине не так: карта соперника бывает не прочитана, и тогда банк может
+    «выиграть» рука, которой не было.
+
+    Сверка получателей на скрине РАБОТАЕТ и такой случай ловит: экспорт истории
+    печатает «Победа N» у победителя, и это пятое независимое чтение
+    (`SeenWin` → `hand.collected`). Пометка её не заменяет, а дополняет: строка
+    «Победа» видна не на каждом экране, а живой стол, по реестру, её не печатает.
+    Молчание сделало бы фабрикацию неотличимой от прочитанного вскрытия.
+    """
+    if hand.provenance is not Provenance.SCREENSHOT or not hand.showdowns:
+        return []
+    folded = {a.label for a in hand.actions if a.kind is ActionKind.FOLD}
+    known = {entry.label for entry in hand.showdowns} | {
+        label for label, cards in hand.dealt.items() if len(cards) == 2
+    }
+    unknown = [p.label for p in hand.players if p.label not in folded and p.label not in known]
+    return [_FABRICATED_SHOWDOWN] if unknown else []
+
+
+def _verdict_from(
+    hand: CanonicalHand, reasons: list[str], fields: list[str], not_checked: list[str]
+) -> Verdict:
+    """Собрать вердикт по накопленным расхождениям — маршрутизация по провенансу.
+
+    Скриншот — гипотеза: спорные поля возвращаются игроку вопросом. Hand history
+    — факт рума: расхождение с ней означает баг нашего парсера, и уходит в лог
+    разработчику.
+    """
+    if not reasons:
+        return Verdict(status=ValidationStatus.PASS, not_checked=not_checked)
+    if hand.provenance == Provenance.SCREENSHOT:
+        asked = sorted(set(fields))
+        return Verdict(
+            status=ValidationStatus.ESCALATE,
+            fields=asked,
+            questions=[_question_for(field, hand) for field in asked],
+            reasons=reasons,
+            not_checked=not_checked,
+        )
+    # Hand history — факт рума: чинить надо парсер, а не данные и не игрока.
+    return Verdict(status=ValidationStatus.REJECT, reasons=reasons, not_checked=not_checked)
 
 
 def validate(hand: CanonicalHand, report: EngineReport) -> Verdict:
@@ -179,6 +265,7 @@ def validate(hand: CanonicalHand, report: EngineReport) -> Verdict:
     """
     reasons: list[str] = []
     fields: list[str] = []
+    not_checked = _fabricated_showdown(hand)
 
     # Первой: неверная кнопка проявляется каскадом денежных расхождений ниже,
     # но причина у него одна, и назвать её должна отдельная проверка.
@@ -197,10 +284,11 @@ def validate(hand: CanonicalHand, report: EngineReport) -> Verdict:
     if _has_duplicate_cards(hand):
         reasons.append("duplicate cards")
         fields.append(_FIELD_CARDS)
-    # Только если источник вообще пишет выплаты: у скриншота строк `collected`
-    # нет, и выдумывать по их отсутствию расхождение нельзя.
-    if hand.collected and report.stacks_end != _source_stacks_end(hand):
-        reasons.append("payout mismatch: stacks_end vs collected/uncalled")
+    # Только если источник вообще пишет выплаты: сумму, которую никто не назвал,
+    # не с чем сравнивать, и выдумывать по её отсутствию расхождение нельзя.
+    payout = _payout_mismatch(hand, report)
+    if payout is not None:
+        reasons.append(payout)
         fields.append(_FIELD_STACKS)
 
     # Реплей играет руку до рейка: PokerKit раздаёт банк целиком, ничего не
@@ -214,15 +302,4 @@ def validate(hand: CanonicalHand, report: EngineReport) -> Verdict:
         )
         fields.append(_FIELD_STACKS)
 
-    if not reasons:
-        return Verdict(status=ValidationStatus.PASS)
-    if hand.provenance == Provenance.SCREENSHOT:
-        asked = sorted(set(fields))
-        return Verdict(
-            status=ValidationStatus.ESCALATE,
-            fields=asked,
-            questions=[_question_for(field, hand) for field in asked],
-            reasons=reasons,
-        )
-    # Hand history — факт рума: чинить надо парсер, а не данные и не игрока.
-    return Verdict(status=ValidationStatus.REJECT, reasons=reasons)
+    return _verdict_from(hand, reasons, fields, not_checked)

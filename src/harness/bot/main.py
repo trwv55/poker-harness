@@ -32,11 +32,11 @@ from aiogram import Bot, Dispatcher
 from harness.bot.handlers import BotDeps
 from harness.bot.router import build_router
 from harness.memory.models import async_session_factory
-from harness.platform.config import Config, EnvVarError, optional_env
+from harness.platform.config import Config, EnvVarError, optional_env, optional_int_or_none
 from harness.platform.logs import configure_logging
 from harness.platform.queue import JobsQueue
 
-__all__ = ["data_dir", "main"]
+__all__ = ["data_dir", "main", "owner_tg_user_id"]
 
 _DEFAULT_DATA_DIR = "/data"
 
@@ -53,13 +53,38 @@ def data_dir() -> Path:
     return Path(optional_env("DATA_DIR", _DEFAULT_DATA_DIR))
 
 
+def owner_tg_user_id() -> int | None:
+    """Id владельца в Телеграме — одноразовый вход на ЧИСТУЮ базу, либо `None`.
+
+    Зачем переменная вообще есть. Вход в продукт закрыт инвайтом, коды выпускает
+    `/invite`, а он отвечает только игроку с `players.is_dev`. На пустой базе
+    такого игрока нет ни одного, поэтому без этой переменной развёрнутый продукт
+    недостижим никому, включая владельца. `handle_start` (`bot/handlers.py`)
+    заводит по ней первого игрока — и только пока таблица пуста.
+
+    Не в `Config`: это не провайдер-слой (спека §7), а разовое обстоятельство
+    одного процесса — та же причина, по которой здесь живут `DATA_DIR` и
+    `WORKER_CONCURRENCY`. Не задана — `None`, и бот отказывает всем, как отказывал
+    до этой переменной (`test_without_the_owner_variable_the_door_stays_shut`);
+    задана мусором — процесс не стартует и называет её
+    (`test_owner_tg_user_id_rejects_garbage_by_naming_the_variable`).
+    """
+    return optional_int_or_none("OWNER_TG_USER_ID")
+
+
 async def main() -> None:
     configure_logging()
     cfg = Config.from_env()
     deps_data_dir = data_dir()
+    owner = owner_tg_user_id()
 
     db_factory = async_session_factory(cfg.database_url)
-    deps = BotDeps(db_factory=db_factory, queue=JobsQueue(db_factory), data_dir=deps_data_dir)
+    deps = BotDeps(
+        db_factory=db_factory,
+        queue=JobsQueue(db_factory),
+        data_dir=deps_data_dir,
+        owner_tg_user_id=owner,
+    )
 
     bot = Bot(cfg.telegram_token)
     dispatcher = Dispatcher()

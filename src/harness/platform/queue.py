@@ -30,7 +30,8 @@ status='running'`) — вторая линия защиты и настояща�
 Приоритеты типов задач (спека §8.1: `screenshot_analyze`/`deep_dive` — 100,
 `hh_scan` — 200 не срочен, `eval_run` — 900 самый терпеливый) `enqueue`
 подставляет сама по `type`, если вызывающий явно не передал `priority`.
-CHECK-констрейнт `jobs.type_allowed` ограничивает `type` этими же четырьмя
+`question` — вопрос игрока о своей игре — тоже 100: игрок ждёт ответа так же,
+как разбора. CHECK-констрейнт `jobs.type_allowed` ограничивает `type` этими же
 значениями, поэтому на сегодня таблица покрывает все возможные типы. Дефолт
 `.get(type, 100)` в `enqueue` — не признание неполноты, а решение о том, что
 делать с ПЯТЫМ типом, когда его добавят: пятый тип задачи почти наверняка
@@ -67,6 +68,7 @@ class JobPreconditionFailed(Exception):
 _DEFAULT_PRIORITY_BY_TYPE: dict[str, int] = {
     "screenshot_analyze": 100,
     "deep_dive": 100,
+    "question": 100,
     "hh_scan": 200,
     "eval_run": 900,
 }

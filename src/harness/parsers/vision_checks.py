@@ -1,0 +1,321 @@
+"""Контрольные суммы прочитанного экрана — четыре штуки, все из реестра.
+
+Проверить скриншот нечем извне: у него нет ни `Total pot`, ни строк `collected`,
+ни порядка хода, который движок обязан воспроизвести (реестр D1). Всё, чем он
+проверяется, — избыточность внутри самого экрана: одно и то же напечатано на нём
+дважды, и два прочтения обязаны сойтись.
+
+| проверка | два независимых прочтения |
+|---|---|
+| `pot` | показанный банк против суммы видимых вкладов (реестр D2) |
+| `button` | фишка дилера против рассадки, восстановленной по логу (реестр D3) |
+| `cards` | карты у места против карт в колонке улицы («отрисованы дважды») |
+| `equity` | напечатанный процент против посчитанного нашим эквити (оракул) |
+| `hero` | ник из профиля против ников, прочитанных на экране |
+
+Провал любой — сигнал каскада (повтор на дорогой модели), а не тихая правка:
+подогнать число значило бы соврать про деньги игрока (CLAUDE.md).
+
+**Общая слабость всех пяти названа в реестре (D4) и никуда не делась:**
+контрольная сумма ловит расхождение двух прочтений, но не случай, когда оба
+неверны согласованно. Насколько велик этот угол, покажет только размеченный
+датасет — проверок для этого недостаточно по построению.
+"""
+
+from __future__ import annotations
+
+import math
+
+from harness.contracts import VisionCheck
+
+__all__ = [
+    "CHECK_BUTTON",
+    "CHECK_CARDS",
+    "CHECK_EQUITY",
+    "CHECK_HERO",
+    "CHECK_POSITIONS",
+    "CHECK_POT",
+    "CHECK_SEATS",
+    "EQUITY_TOLERANCE_PP",
+    "POT_TOLERANCE_BB",
+    "button_check",
+    "cards_check",
+    "equity_check",
+    "match_hero",
+    "positions_check",
+    "pot_check",
+    "seats_check",
+    "within_tolerance",
+]
+
+CHECK_POT = "pot"
+CHECK_BUTTON = "button"
+CHECK_CARDS = "cards"
+CHECK_EQUITY = "equity"
+CHECK_HERO = "hero"
+CHECK_POSITIONS = "positions"
+CHECK_SEATS = "seats"
+
+# Допуск сверки банка — в больших блайндах. Экспорт печатает стеки и суммы с
+# двумя знаками и ОБРЕЗАЕТ, а не округляет (сверено с текстом рума на двух
+# руках фикстуры: 87 589 фишек при bb 5 000 напечатаны как 17.51, а не 17.52).
+# На восьмерых накопленная обрезка не превышает 0.08 ББ, поэтому допуск взят с
+# запасом; расхождение из-за пропущенного анте — величины блайнда и больше, то
+# есть отличается от обрезки на порядок.
+POT_TOLERANCE_BB = 0.1
+
+# Допуск сверки эквити — в процентных пунктах. Порог стоит между расхождением на
+# ВЕРНО прочитанных картах и расхождением на неверно прочитанной масти (числа —
+# реестр, «Эквити с экрана GG»), а не у нуля: наш расчёт — Монте-Карло на
+# 200 000 раздач (`equity_hand_vs_hand`), его собственный разброс порядка
+# 0.1 п.п., и порог 0.1 п.п. загорался бы от собственного шума. Эта проверка —
+# третья по силе: первой идёт сверка карт у места с картами в логе, она работает
+# без вскрытия и без напечатанных процентов.
+EQUITY_TOLERANCE_PP = 1.0
+
+
+def within_tolerance(delta: float, tolerance: float) -> bool:
+    """Расхождение, равное допуску, проходит.
+
+    Обе сверки вычитают одну прочитанную с экрана десятичную величину из другой,
+    а в двоичной плавающей точке такая разность бывает чуть больше своего
+    десятичного значения — голое `delta <= tolerance` отвергает тогда ровно
+    граничный случай, который допуск обязан пропускать. Запас здесь
+    относительный (`math.isclose`), а не приписанный к допуску слагаемым:
+    он не зависит от того, каким числом записан сам допуск, и не расширяет его
+    до следующего печатаемого знака.
+
+    Закреплено тестами `test_a_pot_off_by_exactly_the_tolerance_still_passes` и
+    `test_an_equity_off_by_exactly_the_tolerance_still_passes`; что расхождение
+    заведомо больше допуска по-прежнему не проходит — тестами
+    `test_a_pot_off_by_more_than_the_tolerance_still_fails` и
+    `test_an_equity_off_by_more_than_the_tolerance_still_fails`.
+    """
+    return delta <= tolerance or math.isclose(delta, tolerance)
+
+
+def pot_check(pot_shown_bb: float | None, contributions_bb: float) -> VisionCheck:
+    """Показанный банк против суммы видимых вкладов (реестр D2).
+
+    Именно этой суммой было доказано пропущенное обеими моделями анте: банк не
+    сходился ровно на пул анте. Проверка молчит, когда банка на экране нет —
+    выдумывать расхождение из отсутствия данных нельзя (тот же принцип, что у
+    сверки выплат в валидаторе).
+    """
+    if pot_shown_bb is None:
+        return VisionCheck(name=CHECK_POT, passed=True, detail="банк на экране не показан")
+    delta = abs(pot_shown_bb - contributions_bb)
+    return VisionCheck(
+        name=CHECK_POT,
+        passed=within_tolerance(delta, POT_TOLERANCE_BB),
+        detail=(
+            f"банк на экране {pot_shown_bb:.2f} ББ, сумма видимых вкладов "
+            f"{contributions_bb:.2f} ББ, расхождение {delta:.2f} ББ"
+        ),
+        options=[f"{pot_shown_bb:.2f}", f"{contributions_bb:.2f}"],
+    )
+
+
+def button_check(marked: str | None, derived: str | None) -> VisionCheck:
+    """Фишка дилера против рассадки, восстановленной из порядка хода (реестр D3).
+
+    Два прочтения одной рассадки: кружок с буквой `D` за столом и последний
+    ходивший до блайндов в логе префлопа. Ошибка в кнопке сдвигает раскладку
+    позиций целиком и меняет вердикт, не меняя ни одного числа на экране (A3),
+    поэтому она вынесена в отдельную проверку, а не выводится из каскада
+    денежных расхождений.
+
+    Молчит, когда сверять нечего: на живом столе лога нет, и второго прочтения
+    не существует — там кнопку проверяет валидатор против блайндов.
+    """
+    if marked is None or derived is None:
+        return VisionCheck(
+            name=CHECK_BUTTON, passed=True, detail="второго прочтения рассадки на экране нет"
+        )
+    return VisionCheck(
+        name=CHECK_BUTTON,
+        passed=marked == derived,
+        detail=f"фишка дилера у {marked!r}, по порядку хода кнопка у {derived!r}",
+        options=[marked, derived],
+    )
+
+
+def cards_check(at_seat: dict[str, list[str]], in_log: dict[str, list[str]]) -> VisionCheck:
+    """Карты у места против карт в колонке улицы — сильнейшая из проверок карт.
+
+    Два независимых прочтения одних и тех же карт: у места их перекрывает баннер
+    выигрыша, в колонке лога они нарисованы чисто. Почему одного прочтения мало —
+    реестр, «Карты отрисованы дважды», и отчёт прогона датасета.
+
+    Работает без вскрытия и без напечатанных процентов, то есть на любой руке с
+    олл-ином, а не только там, где GG показал эквити, — поэтому идёт первой.
+    Сравниваются только те игроки, у кого прочитаны ОБА места.
+    """
+    disagreements = [
+        f"{label}: у места {at_seat[label]}, в логе {in_log[label]}"
+        for label in sorted(set(at_seat) & set(in_log))
+        if sorted(at_seat[label]) != sorted(in_log[label])
+    ]
+    if not disagreements:
+        return VisionCheck(name=CHECK_CARDS, passed=True, detail="карты обоих мест совпали")
+    first = disagreements[0].split(": ", 1)[0]
+    return VisionCheck(
+        name=CHECK_CARDS,
+        passed=False,
+        detail="; ".join(disagreements),
+        options=[" ".join(at_seat[first]), " ".join(in_log[first])],
+        subject=first,
+    )
+
+
+def equity_check(
+    shown_pct: float | None, hero: list[str], villain: list[str], board: list[str]
+) -> VisionCheck:
+    """Напечатанный GG процент против посчитанного нами (реестр, «Эквити — оракул»).
+
+    Единственная проверка, которая проверяет именно КАРТЫ, а не суммы, и
+    единственная, где второе прочтение не с экрана, а из нашего расчёта. Считает
+    тот же `equity_hand_vs_hand`, что и ядро: две реализации эквити разошлись бы
+    молча, и тогда проверка стала бы измерять разницу между ними, а не ошибку
+    чтения.
+
+    Молчит, когда сверять нечего: процент напечатан только на экспортах с
+    олл-ином, и не на каждом.
+
+    **Импорт эквити — внутри функции, и это не стиль.** Через
+    `harness.analysis` в процесс затягивается весь расчётный стек (`eval7`,
+    `pokerkit`), а `harness.parsers.vision_adapter` импортирует процесс БОТА
+    ради подстановки ответа игрока в руку. Модульный импорт вернул бы в образ
+    бота ровно ту зависимость, которую из него уже однажды выносили
+    (`test_bot_image_does_not_import_calculation_stack`). Считает эквити воркер,
+    и грузит его тоже он.
+    """
+    from harness.analysis.tools.equity import equity_hand_vs_hand
+
+    if shown_pct is None or len(hero) != 2 or len(villain) != 2:
+        return VisionCheck(
+            name=CHECK_EQUITY, passed=True, detail="эквити на экране не напечатано"
+        )
+    if len(set(hero) | set(villain) | set(board)) != len(hero) + len(villain) + len(board):
+        return VisionCheck(
+            name=CHECK_EQUITY,
+            passed=False,
+            detail=f"карта названа дважды: {hero} против {villain} на борде {board}",
+            options=[f"{shown_pct:.2f}", "—"],
+        )
+    computed_pct = 100.0 * equity_hand_vs_hand((hero[0], hero[1]), (villain[0], villain[1]), board)
+    delta = abs(shown_pct - computed_pct)
+    return VisionCheck(
+        name=CHECK_EQUITY,
+        passed=within_tolerance(delta, EQUITY_TOLERANCE_PP),
+        detail=(
+            f"на экране {shown_pct:.2f}%, по прочитанным картам {computed_pct:.2f}%, "
+            f"расхождение {delta:.2f} п.п."
+        ),
+        options=[f"{shown_pct:.2f}", f"{computed_pct:.2f}"],
+    )
+
+
+def positions_check(printed: dict[str, str], derived: dict[str, str]) -> VisionCheck:
+    """Напечатанные метки позиций против рассадки, восстановленной по порядку хода.
+
+    Третий независимый сигнал о рассадке (реестр A3): экспорт подписывает
+    позиции у всех, кроме героя, и подпись эта не участвует в восстановлении
+    круга — тот строится из порядка строк лога. Расхождение означает, что круг
+    собран не из тех строк.
+
+    Ловит лишнего участника, которого денежные сверки не видят: банк, кнопка и
+    эквити считаются по одному и тому же чтению и расходятся только вместе с ним
+    (реестр D4). Случай, ради которого проверка написана, — в отчёте прогона.
+
+    **Сравниваются только сопоставимые метки.** Словарь позиций у рума и у
+    нормалайзера совпадает не весь: рум подписывает середину стола иначе, и
+    набор меток к тому же зависит от числа мест. Метка, которой в круге этого
+    стола не бывает вовсе, ничего не доказывает — она называется в `detail` как
+    «не сопоставимо» и проверку НЕ роняет. Иначе сверка краснела бы на каждом
+    экране непривычного размера, то есть измеряла бы полноту нашей таблицы
+    соответствий, а не чтение (ревью раунда 2, F3).
+
+    Молчит, когда сверять нечего: на живом столе позиций не печатают вовсе.
+    """
+    ring = set(derived.values())
+    common = sorted(set(printed) & set(derived))
+    comparable = [nick for nick in common if printed[nick] in ring]
+    unknown = sorted({printed[nick] for nick in common if printed[nick] not in ring})
+    if not comparable:
+        note = f"не сопоставимо: {', '.join(unknown)}" if unknown else "меток позиций на экране нет"
+        return VisionCheck(name=CHECK_POSITIONS, passed=True, detail=note)
+    wrong = [
+        f"{nick}: напечатано {printed[nick]}, по порядку хода {derived[nick]}"
+        for nick in comparable
+        if printed[nick] != derived[nick]
+    ]
+    detail = "; ".join(wrong) or f"метки позиций сошлись у {len(comparable)} мест"
+    if unknown:
+        detail += f"; не сопоставимо: {', '.join(unknown)}"
+    return VisionCheck(name=CHECK_POSITIONS, passed=not wrong, detail=detail)
+
+
+def seats_check(players: int, max_seats: int | None) -> VisionCheck:
+    """Игроков не больше, чем мест за столом, — если размер стола прочитан.
+
+    Однострочная арифметика, ловящая лишнего участника раньше всех денежных
+    сверок: за восьмиместным столом девятого игрока не бывает.
+    """
+    if not max_seats:
+        return VisionCheck(name=CHECK_SEATS, passed=True, detail="размер стола не прочитан")
+    return VisionCheck(
+        name=CHECK_SEATS,
+        passed=players <= max_seats,
+        detail=f"игроков {players}, мест за столом {max_seats}",
+    )
+
+
+def _normalized(nickname: str) -> str:
+    """Ник без хвоста обрезки и регистра: экран режет длинные ники многоточием.
+
+    Многоточие бывает и одним символом `…`, и тремя точками — модель пишет как
+    видит, а обрезаются оба вида одинаково.
+    """
+    trimmed = nickname.strip().rstrip(".…").strip()
+    return trimmed.casefold()
+
+
+def match_hero(profile_nickname: str, seen: list[str]) -> tuple[str | None, VisionCheck]:
+    """Найти героя КОДОМ по нику из профиля — сопоставление по префиксу.
+
+    Решение реестра 2026-09-05 («Герой определяется кодом по нику из профиля»), и
+    оно закрывает дыру, которую не ловит ни одна контрольная сумма: банк, кнопка
+    и эквити от того, кого назвали героем, не зависят вовсе. Цена ошибки
+    максимальная — чужие решения, предъявленные игроку как его собственные.
+
+    Префикс, а не равенство: экран обрезает длинные ники многоточием
+    (`длинный_ник_иг..`). Совпадение считается, когда один из ников — начало
+    другого, в любую сторону: обрезан бывает экранный, а сокращён — записанный
+    в профиль.
+
+    Ровно одно совпадение — герой найден. Ноль или больше одного — эскалация, а
+    не догадка: продукт разбирает решения героя, и ошибиться тут дороже, чем
+    переспросить.
+
+    **Ник в промпт не передаётся** (реестр, «Почему ник НЕ передаётся»): модель
+    читает ники, не зная, кто из них герой. Подсказка превратила бы проверку в
+    повтор подсказки, и отличить прочитанное от подсказанного стало бы нечем.
+    """
+    profile = _normalized(profile_nickname)
+    matches = [
+        nickname
+        for nickname in seen
+        if (norm := _normalized(nickname))
+        and (profile.startswith(norm) or norm.startswith(profile))
+    ]
+    if len(matches) == 1:
+        return matches[0], VisionCheck(
+            name=CHECK_HERO, passed=True, detail=f"герой опознан по нику из профиля: {matches[0]!r}"
+        )
+    detail = (
+        "ник из профиля не совпал ни с одним прочитанным"
+        if not matches
+        else f"ник из профиля совпал с несколькими: {matches}"
+    )
+    return None, VisionCheck(name=CHECK_HERO, passed=False, detail=detail, options=list(seen))

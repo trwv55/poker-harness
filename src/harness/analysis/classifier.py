@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from harness.contracts import (
@@ -24,10 +25,13 @@ from harness.contracts import (
     CanonicalHand,
     DecisionPoint,
     EnrichedHand,
+    PointVerdict,
     SpotKind,
     Street,
+    Zone,
 )
 from harness.engine.validation import forced_blind
+from harness.normalizer import POSITIONS_BY_COUNT
 
 # Порог пуш-фолд парадигмы (спека §5.5): глубже решение перестаёт сводиться к
 # «шов или фолд», и модель к нему неприменима.
@@ -62,6 +66,38 @@ class SeatSnapshot:
         return self.stack - self.ante
 
 
+def in_action_order_after(
+    seats: Sequence[SeatSnapshot], pivot: str
+) -> tuple[SeatSnapshot, ...]:
+    """Места, ходящие после названного, в порядке хода. Само место не входит.
+
+    Порядок мест за столом и порядок хода — разные вещи. Первый берётся из
+    `hand.players`, то есть из строк `Seat N` hand history; второй начинается со
+    следующего за `pivot` места и заворачивается по кругу. Круг восстанавливается
+    по позициям — `POSITIONS_BY_COUNT` есть тот самый список, по которому
+    нормалайзер позиции и раздавал (`normalize._positions_by_label`), — поэтому
+    номер места в `SeatSnapshot` не нужен.
+
+    Функция одна на оба входа решателя равновесия: `TableState.behind_hero`
+    крутит круг от героя, `preflop._rivals_when_shoved` — от шовера. Порядок
+    решателю не безразличен: `unopened_shove_equilibrium` документирует места
+    1..N как «живых игроков позади в порядке хода» и суммирует EV шова
+    сквозь произведение «до этого места все спасовали». Оба порядка и их
+    расхождение закреплены
+    `test_the_solver_gets_the_seats_behind_hero_in_action_order` и
+    `test_the_rivals_of_the_shover_are_in_action_order_after_him`.
+    """
+    order = POSITIONS_BY_COUNT.get(len(seats))
+    if order is None:
+        raise ValueError(f"стол на {len(seats)} мест: порядка позиций для такого нет")
+    rank = {position: i for i, position in enumerate(order)}
+    around = sorted(seats, key=lambda seat: rank[seat.position])
+    start = next((i for i, seat in enumerate(around) if seat.label == pivot), None)
+    if start is None:
+        raise ValueError(f"места {pivot} за этим столом нет")
+    return tuple(around[(start + 1 + step) % len(around)] for step in range(len(around) - 1))
+
+
 @dataclass(frozen=True)
 class TableState:
     """Стол в точке решения героя: деньги, живые игроки, форма спота."""
@@ -75,12 +111,32 @@ class TableState:
     voluntary_actors: tuple[str, ...]  # кто именно — в порядке хода
     aggressor: SeatSnapshot | None  # последний, кто ставил или повышал до героя
     hero_all_in_after: bool  # после своего действия герой остался без фишек
+    forfeits: frozenset[str]  # места, которые движок вычеркнул из руки (`EngineReport.forfeits`)
+
+    @property
+    def live_total(self) -> int:
+        """Сколько мест ещё в руке, считая героя, — единственный счётчик в анализе.
+
+        С `dp.live_total` совпадает не всегда:
+        `test_live_total_of_the_table_leaves_out_a_forfeited_seat` показывает
+        руку, где движок насчитал 6, а здесь выходит 5.
+        """
+        return sum(1 for s in self.seats if s.live)
 
     @property
     def behind_hero(self) -> tuple[SeatSnapshot, ...]:
-        """Живые игроки, которые ещё не действовали в этом круге."""
+        """Живые игроки, которые ещё не действовали в этом круге, В ПОРЯДКЕ ХОДА.
+
+        Порядок — не оформление списка, а часть входа решателя равновесия:
+        `unopened_shove_equilibrium` суммирует EV шова как
+        `Σ_j (Π_{k<j}(1 − q_k)) · val_j`, то есть вес ветки «заколлировал именно
+        j» зависит от того, кто ходит до него. Отдаётся он
+        `in_action_order_after`, а не порядком `self.seats` (это порядок мест из
+        hand history); закреплено
+        `test_the_solver_gets_the_seats_behind_hero_in_action_order`.
+        """
         return tuple(
-            s for s in self.seats if s.live and not s.acted and s.label != self.hero.label
+            s for s in in_action_order_after(self.seats, self.hero.label) if s.live and not s.acted
         )
 
     @property
@@ -93,12 +149,36 @@ class TableState:
         return self.aggressor is not None and self.aggressor.behind == 0
 
     @property
-    def all_in_before_hero(self) -> tuple[SeatSnapshot, ...]:
-        """Живые игроки, уже ушедшие в олл-ин до решения героя."""
+    def all_in_besides_hero(self) -> tuple[SeatSnapshot, ...]:
+        """Живые игроки без фишек за спиной к моменту решения героя.
+
+        Ни состоявшегося действия, ни хода до героя не требуется: весь стек мог
+        забрать пост блайнда. Отсюда и имя: «помимо героя», а не «до героя».
+
+        Закреплено `test_a_blind_all_in_behind_hero_is_not_priced` (место позади
+        героя считается) и `test_a_forfeited_seat_before_hero_is_not_an_all_in`
+        (сброшенное место не считается).
+        """
+        return tuple(
+            s for s in self.seats if s.live and s.behind == 0 and s.label != self.hero.label
+        )
+
+    @property
+    def callers_before_hero(self) -> tuple[SeatSnapshot, ...]:
+        """Живые игроки, уже действовавшие в этом круге, кроме героя и агрессора.
+
+        Без агрессора — пусто.
+
+        `spot_for` читает непустой результат как «на ставку агрессора уже
+        ответили» и снимает с такой точки вердикт; это чтение закреплено
+        `test_a_player_who_already_called_the_shove_is_not_priced`.
+        """
+        if self.aggressor is None:
+            return ()
         return tuple(
             s
             for s in self.seats
-            if s.live and s.acted and s.behind == 0 and s.label != self.hero.label
+            if s.live and s.acted and s.label not in (self.hero.label, self.aggressor.label)
         )
 
     @property
@@ -113,7 +193,7 @@ class TableState:
         return bool(self.voluntary_actors) and self.aggressor.label == self.voluntary_actors[0]
 
 
-def _action_index(hand: CanonicalHand, dp: DecisionPoint) -> int:
+def action_index(hand: CanonicalHand, dp: DecisionPoint) -> int:
     """Позиция действия точки решения в списке действий руки.
 
     `DecisionPoint.index` нумерует точки решения героя, а не действия руки, и
@@ -121,12 +201,13 @@ def _action_index(hand: CanonicalHand, dp: DecisionPoint) -> int:
     герою пас при нулевом стеке (движок исполняет такой пас без точки решения).
     Поэтому номер проверяется сверкой самого действия, а не принимается на веру.
     """
+    taken = dp.action
     hero_actions = [i for i, action in enumerate(hand.actions) if action.label == hand.hero_label]
     for i in hero_actions[dp.index :]:
-        if hand.actions[i] == dp.action:
+        if hand.actions[i] == taken:
             return i
     raise ValueError(
-        f"действие точки решения {dp.index} не найдено среди действий героя: {dp.action.raw_line}"
+        f"действие точки решения {dp.index} не найдено среди действий героя: {taken.raw_line}"
     )
 
 
@@ -146,9 +227,17 @@ def table_state(dp: DecisionPoint, en: EnrichedHand) -> TableState:
     ante = {p.label: min(hand.ante, p.stack) for p in hand.players}
     committed = {p.label: forced_blind(hand, p, ante[p.label]) for p in hand.players}
     live = dict.fromkeys(committed, True)
+    # Форфейт (`replay._forfeit`) — записанный румом пас игрока, которого
+    # вынужденная ставка оставила без фишек: движок снимает его с руки, а вклад
+    # остаётся в банке. Цикл ниже читает действия только ДО решения героя, и
+    # форфейт, записанный позже, в него не попадает — поэтому список берётся
+    # целиком. На `pot_before` и `to_call` это не влияет: обе величины считаются
+    # по всем местам, а не по живым.
+    for label in en.report.forfeits:
+        live[label] = False
     acted = dict.fromkeys(committed, False)
 
-    target = _action_index(hand, dp)
+    target = action_index(hand, dp)
     voluntary: list[str] = []
     aggressor: str | None = None
     for action in hand.actions[:target]:
@@ -184,7 +273,8 @@ def table_state(dp: DecisionPoint, en: EnrichedHand) -> TableState:
     to_call = min(
         max(s.street_committed for s in seats) - hero_seat.street_committed, hero_seat.behind
     )
-    hero_after = hero_seat.behind - (dp.action.committed_after - hero_seat.street_committed)
+    taken = dp.action
+    hero_after = hero_seat.behind - (taken.committed_after - hero_seat.street_committed)
 
     state = TableState(
         bb=hand.bb,
@@ -196,6 +286,7 @@ def table_state(dp: DecisionPoint, en: EnrichedHand) -> TableState:
         voluntary_actors=tuple(voluntary),
         aggressor=by_label[aggressor] if aggressor is not None else None,
         hero_all_in_after=hero_after <= 0,
+        forfeits=frozenset(en.report.forfeits),
     )
     _cross_check(state, dp)
     return state
@@ -218,10 +309,10 @@ def _cross_check(state: TableState, dp: DecisionPoint) -> None:
 
 def action_name(dp: DecisionPoint) -> str:
     """Человекочитаемое имя сыгранного действия — то, что показывается игроку."""
-    kind = dp.action.kind
-    if kind in (ActionKind.BET, ActionKind.RAISE) and dp.action.is_all_in:
+    taken = dp.action
+    if taken.kind in (ActionKind.BET, ActionKind.RAISE) and taken.is_all_in:
         return "shove"
-    return str(kind)
+    return str(taken.kind)
 
 
 def unpriced_reason(dp: DecisionPoint, state: TableState) -> str:
@@ -240,16 +331,64 @@ def unpriced_reason(dp: DecisionPoint, state: TableState) -> str:
         return "герой уже вложился на этой улице: это война повышений, а не пуш-фолд"
     if not state.opened_voluntarily:
         return "неоткрытый банк, но сыгран не шов и не пас — лимп и мин-рейз модель не считает"
+    if state.aggressor is None:
+        return "банк открыт лимпом: ставки, диапазон которой моделируется, перед героем нет"
     if not (state.call_is_all_in or state.aggressor_all_in):
         return "банк открыт рейзом не в олл-ин, и колл героя олл-ином не был"
     if not state.opened_by_aggressor:
         return "перед героем ре-шов поверх чужого опена: его диапазон уже открытого шова"
-    if len(state.all_in_before_hero) > 1:
+    if len(state.all_in_besides_hero) > 1:
         return (
-            f"перед героем {len(state.all_in_before_hero)} олл-ина: сайд-поты и вскрытие "
-            f"против нескольких диапазонов сразу"
+            f"в руке больше одного олл-ина помимо героя (всего "
+            f"{len(state.all_in_besides_hero)}): вскрытие против нескольких диапазонов сразу"
+        )
+    if state.callers_before_hero:
+        return (
+            "перед героем шов и ответ на него: во вскрытии больше двух участников, "
+            "а модель считает эквити против одного диапазона"
         )
     return "перед героем олл-ин, но сыгран не колл и не пас"
+
+
+def unjudged_point(
+    dp: DecisionPoint,
+    spot: SpotKind,
+    reason: str,
+    detail: Mapping[str, object] | None = None,
+    tools: Sequence[str] = (),
+) -> PointVerdict:
+    """Точка без вердикта: спот размечен, цена не посчитана.
+
+    Признак «вердикта нет» — пустой `best_action`; на такие точки не ссылается
+    ранжирование и не опирается изложение. Зона здесь `strict` не потому, что
+    вывод точен, а потому, что вывода нет вовсе: допущение не сделано, и
+    инвариант «assumption заполнено тогда и только тогда, когда зона assuming»
+    обязан выполняться и на таких точках.
+
+    `detail` — то, что успело посчитаться до отказа. Ранжирование и сумма его
+    не читают (`error_cost.is_judged`), а `ev_diff_bb` здесь ноль; показывается
+    ли что-то из него игроку, решает `presentation` по машинному ключу
+    (`RIVER_CALL_DETAIL`, `TURN_FLOP_CALL_DETAIL`).
+
+    `tools` — чем считали то, что легло в `detail`: у отказа, случившегося до
+    расчёта, список пуст, у точки с посчитанными числами — нет.
+
+    Живёт здесь, рядом с `unpriced_reason`: точку без вердикта строит не только
+    префлоп (`analysis.river` и `analysis.turn_flop` — остальные вызывающие), а
+    обе половины отказа — причина и форма — обязаны оставаться в одном месте.
+    """
+    return PointVerdict(
+        dp_index=dp.index,
+        street=dp.street,
+        spot=spot,
+        zone=Zone.STRICT,
+        action_taken=action_name(dp),
+        best_action="",
+        ev_diff_bb=0.0,
+        assumption=None,
+        tools=list(tools),
+        detail={**(detail or {}), "unjudged": reason},
+    )
 
 
 def classify(dp: DecisionPoint, en: EnrichedHand) -> SpotKind:
@@ -282,7 +421,8 @@ def spot_for(dp: DecisionPoint, state: TableState) -> SpotKind:
     if state.hero.acted:
         return SpotKind.PREFLOP_OTHER
 
-    folded = dp.action.kind is ActionKind.FOLD
+    taken = dp.action
+    folded = taken.kind is ActionKind.FOLD
 
     if state.opened_voluntarily:
         # Колл на весь остаток — тот же олл-ин, чем бы ни была ставка перед
@@ -292,14 +432,22 @@ def spot_for(dp: DecisionPoint, state: TableState) -> SpotKind:
         # котором у героя ещё остаются фишки, — уже не пуш-фолд: там есть
         # третье действие (ре-шов), которого модель не считает.
         faces_shove = state.call_is_all_in or state.aggressor_all_in
-        answered = folded or (dp.action.kind is ActionKind.CALL and state.hero_all_in_after)
-        # Две границы применимости модели, обе найдены прогоном по реальным рукам.
-        # `call_shove_ev_bb` меряет эквити против ОДНОГО диапазона, а пуш-сторона
-        # `nash_hu` — это диапазон игрока, который шовит ПЕРВЫМ. Ре-шов поверх
-        # чужого опена вчетверо уже открытого шова, а два уже вложившихся олл-ина
-        # означают сайд-поты и вскрытие на троих. Оба нарушения завышают эквити
-        # героя, то есть толкают вердикт в сторону колла.
-        applicable = state.opened_by_aggressor and len(state.all_in_before_hero) <= 1
+        answered = folded or (taken.kind is ActionKind.CALL and state.hero_all_in_after)
+        # Модель держится на двух допущениях: `call_shove_ev_bb` берёт эквити
+        # против ОДНОГО диапазона, а равновесие подыгры шовера
+        # (`preflop._shover_equilibrium`) описывает того, кто шовит ПЕРВЫМ в
+        # неоткрытый банк. Каждое условие ниже проверяет одно из них; нарушено любое —
+        # вердикта нет, а `unpriced_reason` называет, какое именно. Все четыре
+        # закреплены: test_a_limped_pot_is_not_a_shove,
+        # test_reshove_over_an_open_is_not_priced,
+        # test_two_all_ins_before_hero_are_not_priced,
+        # test_a_player_who_already_called_the_shove_is_not_priced.
+        applicable = (
+            state.aggressor is not None
+            and state.opened_by_aggressor
+            and len(state.all_in_besides_hero) <= 1
+            and not state.callers_before_hero
+        )
         if faces_shove and answered and applicable:
             return SpotKind.PUSHFOLD_FACING_SHOVE
         return SpotKind.PREFLOP_OTHER

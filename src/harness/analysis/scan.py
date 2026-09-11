@@ -16,6 +16,16 @@
 префлоп) не идёт в сводку вовсе: «неизвестно» не выдаётся ни за «верно», ни за
 «ошибка» (тот же принцип, что в `error_cost.py`).
 
+**Второй список — точки «около нуля» (`close_calls`).** Их интервал EV лежит по
+обе стороны нуля И достаточно узок, чтобы у точки были знак, порядок величины и
+осмысленный потолок цены выбора (`preflop._NEAR_ZERO_MAX_WIDTH_BB`): расхождения
+нет, цена ноль, и в список расхождений они не идут. Но и молчать о них нельзя —
+молчание и было прежним поведением, когда такая точка снималась отказом целиком.
+Точка, чей интервал шире порога, сюда не попадает вовсе: вердикта у неё нет, и
+она считается в «решениях без оценки» наравне с прочими пробелами.
+
+Порядок в списке — по потолку цены, дешевле первым (см. `scan_tournament`).
+
 **Пред-фильтр.** Большинство рук турнирного файла — «сфолдил в неоткрытый банк,
 отдал блайнды». `cheap_fold_verdict` (задача 13, живёт в `preflop.py` рядом с
 остальным правилом зоны) закрывает такие точки одним попаданием в равновесный
@@ -80,11 +90,38 @@ def _hand_points(en: EnrichedHand) -> list[PointVerdict]:
     return points
 
 
+def _item(en: EnrichedHand, point: PointVerdict) -> ScanItem:
+    """Пункт сводки из точки решения — одинаково для расхождения и для «около нуля».
+
+    Разница между двумя списками — только в том, куда пункт положен: сам пункт
+    строится одним конструктором, иначе два соседних списка расходились бы по
+    набору полей.
+    """
+    return ScanItem(
+        hand_no=en.hand.hand_no,
+        hand_index=en.hand.hand_index,
+        hero_class=str(point.detail.get("hero_class", "")),
+        spot=point.spot,
+        action_taken=point.action_taken,
+        best_action=point.best_action,
+        ev_diff_bb=point.ev_diff_bb,
+        zone=point.zone,
+        interval=point.interval,
+    )
+
+
+def _ceiling_of(item: ScanItem) -> float:
+    return 0.0 if item.interval is None else item.interval.cost_ceiling_bb
+
+
 def scan_tournament(enriched: list[EnrichedHand]) -> ScanSummary:
     """Сводка расхождений по всем рукам турнирного файла — ранжированная по цене."""
     items: list[ScanItem] = []
+    close_calls: list[ScanItem] = []
     hands_with_decision = 0
     hands_failed = 0
+    points_total = 0
+    points_judged = 0
     total_loss_bb = 0.0
 
     for en in enriched:
@@ -97,28 +134,41 @@ def scan_tournament(enriched: list[EnrichedHand]) -> ScanSummary:
         judged = [p for p in points if is_judged(p)]
         if judged:
             hands_with_decision += 1
+        # Покрытие в точках, а не в руках: рука с одной оценённой точкой из пяти
+        # считается «рукой с решением», и по одному этому счётчику не видно, что
+        # четыре остались без оценки.
+        points_total += len(points)
+        points_judged += len(judged)
         total_loss_bb += total_ev_loss_bb(points)
 
         for point in judged:
+            item = _item(en, point)
             if point.ev_diff_bb < -_MIN_REPORTED_LOSS_BB:
-                items.append(
-                    ScanItem(
-                        hand_no=en.hand.hand_no,
-                        hand_index=en.hand.hand_index,
-                        hero_class=str(point.detail.get("hero_class", "")),
-                        spot=point.spot,
-                        action_taken=point.action_taken,
-                        best_action=point.best_action,
-                        ev_diff_bb=point.ev_diff_bb,
-                        zone=point.zone,
-                    )
-                )
+                items.append(item)
+            elif point.interval is not None and point.interval.near_zero:
+                close_calls.append(item)
 
     items.sort(key=lambda it: it.ev_diff_bb)
+    # Точки «около нуля» — по потолку цены, ДЕШЕВЛЕ первым. Каждая такая строка
+    # делает игроку ровно одно обещание — «выбор стоит не больше стольки-то», — и
+    # потолок есть единственное, чем они отличаются друг от друга: расхождения нет
+    # ни у одной. Обещание тем сильнее, чем потолок меньше, а список для того и
+    # существует, чтобы освободить внимание. Прежний порядок (дороже первым) ставил
+    # наверх самые слабые обещания, а до порога ширины (`preflop`) — прямо то, о чём
+    # известно меньше всего: у интервала через ноль потолок (`EvInterval`) не
+    # меньше половины его ширины, так что «дороже» там означало «шире». Обрезание
+    # десятью строками теперь снимает те, что ближе к границе, за которой форма
+    # перестаёт быть вердиктом, — в ту же сторону, куда режет и сам порог.
+    # Порядковый номер руки — вторичный ключ: при равных потолках порядок обязан
+    # быть воспроизводимым, а не зависеть от порядка обхода.
+    close_calls.sort(key=lambda it: (_ceiling_of(it), it.hand_index))
     return ScanSummary(
         hands_total=len(enriched),
         hands_with_decision=hands_with_decision,
         items=items,
+        close_calls=close_calls,
         total_loss_bb=round(total_loss_bb, 6),
         hands_failed=hands_failed,
+        points_total=points_total,
+        points_judged=points_judged,
     )

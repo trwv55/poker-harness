@@ -786,13 +786,36 @@ def classes_by_equity_against(rng: Range) -> tuple[str, ...]:
     return tuple(sorted(strength, key=lambda cls: (-strength[cls], cls)))
 
 
-@cache
-def _classes_of_width(depth_key: float, dead_key: float, fraction: float) -> tuple[str, ...]:
-    """Верхние классы против равновесного шова, набирающие долю комбо ближе всего к `fraction`.
+def range_of_width_in_order(ordered: Sequence[str], fraction: float) -> Range:
+    """Верхние классы уже готового порядка, набирающие долю комбо ближе всего к `fraction`.
 
     Граница берётся по КОМБО, а не по числу классов (offsuit-класс весит 12 комбо,
     suited — 4), и выбирается тот префикс, который ближе к цели: заявленная ширина
     обязана быть проверяемой, а не приблизительной.
+
+    Порядок задаётся вызывающей стороной — обычно это `classes_by_equity_against`
+    того диапазона шова, на который коллер и отвечает. Диапазон никогда не пуст:
+    один класс возвращается даже под сколь угодно узкую цель, иначе от такого
+    «диапазона» нельзя было бы посчитать ни эквити, ни вероятность колла.
+    """
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError(f"доля комбо должна лежать в (0, 1], получено {fraction}")
+    if not ordered:
+        raise ValueError("порядок классов пуст — набирать ширину не из чего")
+
+    target = fraction * _TOTAL_COMBOS
+    cumulative = len(combos_of_class(ordered[0]))
+    best_prefix, best_gap = 1, abs(cumulative - target)
+    for position, cls in enumerate(ordered[1:], start=2):
+        cumulative += len(combos_of_class(cls))
+        if abs(cumulative - target) < best_gap:
+            best_gap, best_prefix = abs(cumulative - target), position
+    return Range(weights=dict.fromkeys(ordered[:best_prefix], 1.0))
+
+
+@cache
+def _classes_of_width(depth_key: float, dead_key: float, fraction: float) -> tuple[str, ...]:
+    """Верхние классы против равновесного шова той же глубины, шириной `fraction` комбо.
 
     Порядок классов считается против равновесного шова ТОЙ ЖЕ игры, включая
     мёртвые деньги: с анте шов шире, а против широкого шова порядок рук другой
@@ -801,15 +824,7 @@ def _classes_of_width(depth_key: float, dead_key: float, fraction: float) -> tup
     """
     push_range, _ = nash_hu(depth_key, dead_extra_bb=dead_key)
     ordered = classes_by_equity_against(push_range)
-
-    target = fraction * _TOTAL_COMBOS
-    cumulative = 0
-    best_prefix, best_gap = 0, target
-    for position, cls in enumerate(ordered, start=1):
-        cumulative += len(combos_of_class(cls))
-        if abs(cumulative - target) < best_gap:
-            best_gap, best_prefix = abs(cumulative - target), position
-    return ordered[:best_prefix]
+    return tuple(range_of_width_in_order(ordered, fraction).weights)
 
 
 def range_of_width(
@@ -824,8 +839,6 @@ def range_of_width(
     (-0.05bb) — оба конца сказали бы «шов», хотя внутри интервала вердикт
     переворачивается.
     """
-    if not 0.0 < fraction <= 1.0:
-        raise ValueError(f"доля комбо должна лежать в (0, 1], получено {fraction}")
     classes = _classes_of_width(
         _bracket_depth_key(depth_bb), round(dead_extra_bb, 4), round(fraction, 4)
     )

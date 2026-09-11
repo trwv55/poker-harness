@@ -23,9 +23,9 @@
 типу задачи, с запасом меньше 10 минут: `asyncio.wait_for` вокруг работы станций (не
 вокруг трейса/`complete`/`fail` — тем всегда дают дожить до конца). Задача 16 сознательно
 не ограничила длительность самого вызова модели (только ожидание лимитера) и оставила
-общий бюджет здесь — сейчас `llm` станциями v1-HH не вызывается вовсе (интерфейсы этой
-задачи, дословно), но дедлайн станции уже покрывает и будущий вызов модели внутри неё
-транзитивно, не дожидаясь отдельной задачи на таймаут конкретно LLM-запроса.
+общий бюджет здесь. С задачи 21 модель вызывается на станции `explain` (текст вердикта
+и рассказ по турниру), и покрывает её тот же дедлайн станции — отдельного таймаута на
+LLM-запрос по-прежнему нет.
 
 **Фенсинг (контроллерский рулинг задачи 18, п.2).** `job.locked_by`, который вернул
 `claim()`, передаётся В КАЖДЫЙ вызов `complete()`/`fail()`/`await_user()` как `worker_id`
@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,14 +69,29 @@ from harness.analysis.preflop import (
     equity_cache_seed,
 )
 from harness.analysis.scan import scan_tournament
+from harness.analysis.tournament import tournament_report
+from harness.calcs.routing import answer_question
 from harness.contracts import (
     AnalysisResult,
+    CanonicalHand,
     EnrichedHand,
+    RawHand,
     ScanSummary,
+    TournamentReport,
+    TournamentTextOut,
     ValidationStatus,
+    VerdictTextOut,
+    VisionCheck,
     Zone,
+    is_judged,
 )
 from harness.engine import enrich
+from harness.explanation import (
+    UnfaithfulText,
+    render_range_png,
+    tournament_text,
+    verdict_text,
+)
 from harness.memory.models import Job as JobModel
 from harness.memory.models import Player
 from harness.memory.repos import (
@@ -87,24 +103,57 @@ from harness.memory.repos import (
 )
 from harness.normalizer import normalize
 from harness.parsers import hh_parser
-from harness.platform.llm import LLM
+from harness.parsers.vision_adapter import (
+    VisionOutcome,
+    VisionReadFailed,
+    can_apply_vision_answer,
+    vision_extract,
+)
+from harness.platform.llm import LLM, LLMProviderError, LLMSchemaError
 from harness.platform.queue import JobPreconditionFailed, JobsQueue
 from harness.platform.trace import Clock, Trace
-from harness.presentation import Msg, deep_dive_msg, failed_msg, progress_text, scan_summary_msg
+from harness.presentation import (
+    Msg,
+    Photo,
+    deep_dive_msg,
+    escalation_msg,
+    failed_msg,
+    hand_in_progress_msg,
+    not_a_hand_msg,
+    note_nicks_for_hand,
+    progress_text,
+    question_msg,
+    question_refusal_msg,
+    range_image_title,
+    range_photos,
+    scan_summary_msg,
+    send_as_file_msg,
+    tournament_report_msg,
+    tournament_story_msg,
+    vision_gave_up_msg,
+)
 
 __all__ = ["Deps", "Sender", "run_job"]
 
 _log = structlog.get_logger(__name__)
 
-# Станции v1-HH, показываемые игроку прогрессом (спека — `progress_text` знает четыре
-# ярлыка, "explain" сюда не входит: текст вердикта LLM формулирует задача 21, здесь его
-# ещё не пишем, см. модульный докстринг presentation/messages.py).
-_Station = Literal["parse", "validate", "analyze"]
+# Станции, показываемые игроку прогрессом. "explain" появилась в задаче 21: с неё
+# начинается второй (и последний) вызов модели в системе — текст вердикта.
+_Station = Literal["ask", "read", "parse", "validate", "analyze", "explain"]
 
 # Бюджет попытки по типу задачи — с запасом меньше десятиминутного окна reap()
 # (см. модульный докстринг). `hh_scan` может обрабатывать сотни рук и считать эквити
 # по файлу целиком — щедрее; `deep_dive` — одна рука, дёшево даже с запасом.
-_JOB_DEADLINE_S: dict[str, float] = {"hh_scan": 480.0, "deep_dive": 120.0}
+_JOB_DEADLINE_S: dict[str, float] = {
+    "hh_scan": 480.0,
+    # Вопрос — один вызов фасада с инструментами; обращений к провайдеру внутри
+    # него больше одного (`test_a_tool_call_round_trip_logs_one_row`), а работы
+    # с данными — выборка по готовым колонкам, без пересчёта эквити.
+    "question": 120.0,
+    "deep_dive": 120.0,
+    # Скрин — два вызова модели в худшем случае (каскад) плюс расчёт одной руки.
+    "screenshot_analyze": 240.0,
+}
 _DEFAULT_JOB_DEADLINE_S = 300.0
 
 
@@ -116,6 +165,17 @@ class SourceFileUnavailable(OSError):
     тексте. Поднимается ровно в одном месте — там, где мы сами открываем
     `payload["source_file"]`, — и потому «файл раздач недоступен» под ним верно
     всегда, а не «обычно».
+    """
+
+
+class ScreenshotUnreadable(LookupError):
+    """Картинки нет на диске или игрок не назвал свой ник в руме.
+
+    Путь к картинке приходит в `jobs.payload` от бота (он же её туда и положил),
+    поэтому `data_dir` воркера этой станции не нужен: том общий, а путь абсолютный.
+
+    Свой тип по той же причине, что `SourceFileUnavailable`: причина отказа
+    игроку выбирается по ТИПУ, и «скриншот не прочитать» под ним верно всегда.
     """
 
 
@@ -151,6 +211,8 @@ class HandDataMissing(LookupError):
 _PUBLIC_FAILURE_REASON_DEFAULT = "внутренняя ошибка сервиса"
 _PUBLIC_FAILURE_REASONS: tuple[tuple[type[BaseException], str], ...] = (
     (SourceFileUnavailable, "файл раздач недоступен"),
+    (ScreenshotUnreadable, "скриншот не прочитать"),
+    (VisionReadFailed, "не удалось прочитать скриншот"),
     (HandDataMissing, "не нашли нужные данные по этой раздаче"),
     (TimeoutError, "расчёт не уложился в отведённое время"),
 )
@@ -167,12 +229,18 @@ def _public_failure_reason(exc: BaseException) -> str:
 
 class Sender(Protocol):
     """То, чем `run_job` доставляет сообщения игроку — реализация (Телеграм или
-    тестовый двойник) ему не известна, только эти два метода.
+    тестовый двойник) ему не известна, только эти три метода.
+
+    `send_photo` — отдельным методом, а не полем `Msg`: картинка уходит своим
+    запросом Bot API (`sendPhoto`, multipart), и идемпотентность у неё своя —
+    отредактировать уже отправленную картинку, как текст, нельзя.
     """
 
     async def send(self, chat_id: int, msg: Msg) -> int: ...
 
     async def edit(self, chat_id: int, message_id: int, msg: Msg) -> None: ...
+
+    async def send_photo(self, chat_id: int, photo: Photo) -> int: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +263,11 @@ class Deps:
     llm: LLM
     clock: Clock = time.monotonic
     process_pool: Executor | None = None
+    data_dir: Path | None = None
+    # Настроена ли дорогая ступень каскада зрения (`LLM_VISION_FALLBACK_MODEL`).
+    # Флаг, а не имя модели: имя знает только `Config`, а станции нужно ровно
+    # одно решение — звать вторую ступень или сразу спрашивать игрока.
+    vision_fallback: bool = False
 
 
 def _cache_delta(cache_seed: dict[str, float]) -> dict[str, float]:
@@ -297,7 +370,13 @@ async def _send_idempotent(
     session: AsyncSession,
     job_id: int,
     worker_id: str | None,
-    key: Literal["progress_message_id", "result_message_id"],
+    key: Literal[
+        "progress_message_id",
+        "result_message_id",
+        "report_message_id",
+        "story_message_id",
+        "escalation_message_id",
+    ],
     chat_id: int,
     msg: Msg,
 ) -> dict[str, Any]:
@@ -333,6 +412,70 @@ async def _send_idempotent(
     else:
         await deps.sender.edit(chat_id, message_id, msg)
     return payload
+
+
+# Сколько картинок диапазонов уже ушло игроку по этой задаче. Число, а не флаг:
+# отправка идёт по одной, и повтор попытки обязан продолжить с той, на которой
+# оборвалось, а не прислать заново всё (`_send_range_photos`).
+_RANGE_PHOTOS_SENT = "range_photos_sent"
+
+
+async def _saved_range_images(analyses_repo: AnalysesRepo, hand_id: int) -> list[str]:
+    """Пути картинок из `analyses.range_images` — источник один и он в БД.
+
+    Читается заново, а не берётся из переменной станции `explain`: у повторной
+    попытки, которая нашла готовый разбор чекпоинтом, этой переменной нет вовсе,
+    а картинки уже нарисованы.
+    """
+    record = await analyses_repo.get_by_hand(hand_id)
+    return [] if record is None else (record.range_images or [])
+
+
+async def _send_range_photos(
+    deps: Deps,
+    session: AsyncSession,
+    job_id: int,
+    worker_id: str | None,
+    chat_id: int,
+    photos: list[Photo],
+) -> None:
+    """Отправить матрицы диапазонов вслед за вердиктом — по одной, с отметкой.
+
+    Матрица 13×13 — визуальное доказательство того, что числа настоящие
+    (ARCHITECTURE, «Ценностное ядро»). До этой задачи она рисовалась
+    (`_render_ranges`) и оставалась на диске: `Sender` не умел отправлять
+    картинки вовсе.
+
+    **Идемпотентность — счётчиком, а не флагом.** Отправленную картинку нельзя
+    отредактировать, как текст (`_send_idempotent`), поэтому повтор попытки
+    обязан знать, сколько уже ушло: `payload[_RANGE_PHOTOS_SENT]` растёт после
+    КАЖДОЙ картинки, и обрыв на третьей из пяти стоит игроку двух недошедших,
+    а не пяти дублей.
+
+    **Пропавший файл не роняет разбор.** Картинка — дополнение к числам, а не
+    они сами (то же правило, что у `_render_ranges`); файл мог исчезнуть вместе
+    с томом, и падать из-за него после уже отправленного вердикта незачем.
+    """
+    if not photos:
+        return
+    current_payload, current_owner = (
+        await session.execute(
+            select(JobModel.payload, JobModel.locked_by).where(JobModel.id == job_id)
+        )
+    ).one()
+    if current_owner != worker_id:
+        raise JobPreconditionFailed(
+            f"задача {job_id}: воркер {worker_id!r} больше не владелец — отправка отменена"
+        )
+    payload = dict(current_payload or {})
+    already = int(payload.get(_RANGE_PHOTOS_SENT, 0))
+    for index, photo in enumerate(photos[already:], start=already):
+        if not Path(photo.path).exists():
+            _log.warning("range_image_missing", job_id=job_id)
+            continue
+        await deps.sender.send_photo(chat_id, photo)
+        payload[_RANGE_PHOTOS_SENT] = index + 1
+        await _fenced_update(session, job_id, worker_id, payload=payload)
 
 
 async def _ensure_progress(
@@ -495,31 +638,535 @@ async def _run_hh_scan(job: JobModel, deps: Deps, trace: Trace) -> None:
             await tournaments_repo.save_scan_summary(tournament_id, summary)
             await session.commit()
 
+        # Отчёт по турниру (задача 23) — считается по уже готовым артефактам:
+        # руки этого турнира и его сводка на руках, история игрока — два запроса
+        # в `memory`. Ни одного расчёта эквити здесь нет, поэтому станция стоит
+        # вне процессного пула и вне спана `analyze`.
+        #
+        # Пустой файл (`enriched_hands == []`) отчёта не получает: `tournament_
+        # report` на нуле раздач отказывает, и правильно — describe там нечего.
+        # Молчания при этом не возникает: сводка ниже уходит всегда и говорит
+        # «Скан завершён: 0 рук» прямым текстом.
+        if enriched_hands:
+            report = tournament_report(
+                enriched_hands,
+                summary,
+                player_tournaments=await hands_repo.player_hands_by_tournament(job.player_id),
+                past_summaries=await tournaments_repo.player_scan_summaries(
+                    job.player_id, exclude=tournament_id
+                ),
+            )
+            # Рассказ словами — перед отчётом с числами, отчёт — перед сводкой:
+            # сводка несёт кнопки «разобрать», и им место под последним
+            # сообщением, а не отлистанными вверх. Рассказа может не быть вовсе
+            # (модель недоступна либо её текст не прошёл проверку) — тогда игрок
+            # получает те же два сообщения с числами, и это полноценный ответ.
+            async with trace.span("explain"):
+                payload = await _ensure_progress(
+                    deps, session, job.id, worker_id, chat_id, "explain"
+                )
+                # Чекпоинт рассказа (ревью, раздел G). `story_message_id` в
+                # payload означает, что рассказ УЖЕ отправлен прошлой попыткой:
+                # звать модель снова значило бы заплатить второй раз и
+                # переписать игроку уже прочитанное сообщение другим текстом —
+                # модель не детерминирована, и это был бы не «тот же результат»,
+                # как у остальных станций, а другой
+                # (`test_a_repeat_scan_does_not_pay_for_the_story_twice`).
+                story = (
+                    None
+                    if payload.get("story_message_id") is not None
+                    else await _tournament_story(deps, trace, report)
+                )
+            if story is not None:
+                await _send_idempotent(
+                    deps,
+                    session,
+                    job.id,
+                    worker_id,
+                    "story_message_id",
+                    chat_id,
+                    tournament_story_msg(story),
+                )
+            await _send_idempotent(
+                deps,
+                session,
+                job.id,
+                worker_id,
+                "report_message_id",
+                chat_id,
+                tournament_report_msg(report),
+            )
+
         quota_left, quota_total = await _quota_numbers(session, job.player_id)
         msg = scan_summary_msg(summary, quota_left, quota_total)
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
         await session.commit()
 
 
-def _hand_zone(result: AnalysisResult) -> Zone | None:
-    """Зона доверия ВСЕЙ руки — из всех судимых точек, консервативно (round 5, Item H).
+# --- станция explain: слова поверх посчитанного (задача 21) -------------------------
+
+# Отказы, после которых разбор ВСЁ РАВНО уходит игроку — без прозы, но с числами.
+# Ни один из них не означает, что расчёт неверен: модель недоступна, ответила не по
+# схеме или сказала то, чего расчёт не говорил. Числа, вердикты и зоны посчитаны
+# кодом и от модели не зависят — прятать их из-за её ответа было бы хуже, чем
+# показать разбор молча. Причина при этом не теряется: она в логе.
+_EXPLANATION_FAILURES = (UnfaithfulText, LLMSchemaError, LLMProviderError)
+
+
+async def _verdict_prose(deps: Deps, trace: Trace, result: AnalysisResult) -> VerdictTextOut | None:
+    """Текст модели к разбору или `None`, если его не удалось получить честно."""
+    try:
+        return await verdict_text(deps.llm, result, trace_id=trace.trace_id)
+    except _EXPLANATION_FAILURES as exc:
+        _log.warning("verdict_text_unavailable", hand_no=result.hand_no, error=repr(exc))
+        return None
+    except Exception:  # noqa: BLE001 — см. `_EXPLANATION_FAILURES`: слова
+        # необязательны, числа обязательны. Любой сбой слоя изложения (сюда
+        # попадает и неверная конфигурация провайдера — `UserError` PydanticAI,
+        # который не наследует наши типы) не имеет права отменить разбор, уже
+        # посчитанный кодом. Причина уходит в лог целиком, с трейсбеком.
+        _log.exception("verdict_text_crashed", hand_no=result.hand_no)
+        return None
+
+
+async def _tournament_story(
+    deps: Deps, trace: Trace, report: TournamentReport
+) -> TournamentTextOut | None:
+    """Рассказ по турниру или `None` — по тем же правилам, что и текст разбора."""
+    try:
+        return await tournament_text(deps.llm, report, trace_id=trace.trace_id)
+    except _EXPLANATION_FAILURES as exc:
+        _log.warning("tournament_text_unavailable", error=repr(exc))
+        return None
+    except Exception:  # noqa: BLE001 — та же граница, что у `_verdict_prose`.
+        _log.exception("tournament_text_crashed")
+        return None
+
+
+def _render_ranges(data_dir: Path | None, hand_id: int, result: AnalysisResult) -> list[str]:
+    """Картинки диапазонов на диск; возвращает пути для `analyses.range_images`.
+
+    Рисуются ТОЛЬКО допущения (`PointVerdict.assumption`) — то есть ровно те
+    диапазоны, на которые опирается вывод в зоне «предполагая». У строгой точки
+    показывать нечего: её вывод не зависит от догадки о поле, и картинка
+    подразумевала бы обратное.
+
+    Сбой записи не роняет разбор: картинка — дополнение к числам, а не они сами.
+    """
+    if data_dir is None:
+        return []
+    paths: list[str] = []
+    directory = data_dir / "ranges"
+    for index in result.ranked:
+        point = result.points[index]
+        if point.assumption is None:
+            continue
+        path = directory / f"{hand_id}-{point.dp_index}.png"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(render_range_png(point.assumption.range, range_image_title(point)))
+        except OSError as exc:
+            _log.warning("range_image_failed", hand_id=hand_id, error=repr(exc))
+            continue
+        paths.append(str(path))
+    return paths
+
+
+def _hand_zone(result: AnalysisResult, not_checked: Sequence[str] = ()) -> Zone | None:
+    """Зона доверия ВСЕЙ руки — из всех точек с названной линией, консервативно.
 
     Два правила, оба из CLAUDE.md («`strict` — только когда вывод не опирается на
     угаданный диапазон»):
 
-    * судить нечего (`ranked` пуст) — зоны нет вовсе, `None`. Раньше здесь стоял
-      `Zone.STRICT`, и игрок получал самую уверенную подпись продукта под
-      сообщением «по этой раздаче точек с вердиктом нет»: строгость там, где не
-      было вывода;
+    * вывода нет вовсе — зоны нет, `None`. Раньше здесь стоял `Zone.STRICT`, и
+      игрок получал самую уверенную подпись продукта под сообщением «по этой
+      раздаче точек с вердиктом нет»: строгость там, где не было вывода;
     * есть хоть одна точка `assuming` — вся рука `assuming`. Раньше зона бралась
       у ПЕРВОЙ точки `ranked`, поэтому шапка «зона: строго» могла стоять над
       строками, каждая из которых помечена «(по модели диапазонов)». Слабейшее
       звено определяет, чему можно верить, — не самое дорогое.
+
+    Считаются точки, чей вывод игрок ВИДИТ: судимые из `ranked` плюс те, что
+    цены не несут, но называют лучшую линию, — риверная точка с доказанным
+    фолдом (`test_a_proven_river_fold_puts_its_zone_in_the_status_line`).
+    Судимая точка вне `ranked` в расчёт не идёт: показывается ровно `ranked`.
     """
-    zones = {result.points[idx].zone for idx in result.ranked}
+    shown = [result.points[idx] for idx in result.ranked]
+    shown += [point for point in result.points if point.best_action and not is_judged(point)]
+    zones = {point.zone for point in shown}
     if not zones:
         return None
+    if not_checked:
+        # Вход, часть которого проверить было нечем, не бывает «строгим»: под
+        # этой подписью продукт обещает точный расчёт, а расчёт здесь опирается
+        # на непроверенное чтение (реестр D1, ревью раунда 1, C).
+        return Zone.ASSUMING
     return Zone.STRICT if zones == {Zone.STRICT} else Zone.ASSUMING
+
+
+# --- станция скриншота (задача 22) -------------------------------------------
+
+# Сколько раз подряд мы вправе спросить игрока по одной руке. Второй вопрос
+# законен: первый мог уточнить банк, а следом не сойтись рассадка. Третий уже
+# означает, что чтение не спасти уточнениями, и продолжать значило бы строить
+# уверенный вывод поверх спорных чисел.
+_MAX_ESCALATIONS = 2
+
+# Проверки, чей провал лечится пересылкой того же скрина файлом: обе про карты.
+# Сжатие Телеграма безопасно для чисел и опасно для мелких значков мастей
+# (реестр, «Фото или файл»), поэтому просьба уместна ровно здесь.
+_FILE_HINT_FIELDS = frozenset({"cards", "equity"})
+
+
+def _unresolved_checks(raw: RawHand) -> list[VisionCheck]:
+    """Контрольные суммы, которые всё ещё не сошлись, — включая после ответа игрока.
+
+    Ответ, который код УМЕЛ подставить, закрывает свою проверку
+    (`vision_adapter.apply_vision_answer`); ответ, который подставить не вышло,
+    не закрывает ничего. Разница видна только здесь, и она решающая: без неё
+    возобновлённая задача пропускает чтение, идёт в валидатор — а тот про
+    неверную масть ничего не знает, дубля нет, деньги сходятся — и игрок
+    получает вердикт «зона: строго» по спорному чтению (ревью раунда 1, R1).
+    """
+    return [check for check in (raw.vision.checks if raw.vision else []) if not check.passed]
+
+
+def _escalation_question(field: str, checks: list[VisionCheck]) -> tuple[str, list[str], str]:
+    """Вопрос, два варианта ответа и субъект — из самой непройденной проверки.
+
+    Варианты не выдумываются: каждая контрольная сумма сравнивает ДВА
+    независимых прочтения одного экрана, и оба и есть кнопки. Выбрать из двух
+    прочитанных чисел игроку проще, чем набрать своё, — а «ввести вручную»
+    остаётся третьей кнопкой (спека §8.3).
+
+    Субъект нужен там, где спор про конкретного игрока: два варианта карт без
+    ответа на «чьих» подставить некуда.
+    """
+    check = next((c for c in checks if c.name == field and not c.passed), None)
+    if check is None:
+        return (_VISION_QUESTIONS.get(field, f"Поле «{field}» распознано верно?"), [], "")
+    return (_VISION_QUESTIONS.get(field, check.detail), check.options, check.subject)
+
+
+# Имя поля кнопки в вердикте валидатора (`engine.validation`). Продублировано
+# строкой, а не импортом приватного имени чужого модуля: разойдутся — увидит
+# тест `test_the_validator_asks_about_the_button_with_the_nicknames_it_read`.
+_VALIDATOR_FIELD_BUTTON = "button"
+
+_VISION_QUESTIONS: dict[str, str] = {
+    "pot": "Банк на этом скрине распознан верно?",
+    "button": "Фишка дилера стоит на том игроке?",
+    "cards": "Карты распознаны верно?",
+    "equity": "Карты распознаны верно?",
+    "hero": "Кто из них вы?",
+    "stacks": "Стеки распознаны верно?",
+}
+
+
+async def _ask_player(
+    deps: Deps,
+    session: AsyncSession,
+    job: JobModel,
+    payload: dict[str, Any],
+    chat_id: int,
+    *,
+    field: str,
+    question: str,
+    options: list[str],
+    subject: str = "",
+) -> None:
+    """Задать вопрос и отпустить воркера — точка возврата уже зафиксирована.
+
+    Спека §8.3 дословно: сообщение с кнопками, `await_user`, освобождение. Ответ
+    ловит бот, он же пишет ground truth в `eval_cases`, патчит `hands.raw`,
+    сбрасывает чекпоинты ниже и возвращает задачу в очередь.
+    """
+    worker_id = job.locked_by
+    payload = await _send_idempotent(
+        deps,
+        session,
+        job.id,
+        worker_id,
+        "escalation_message_id",
+        chat_id,
+        escalation_msg(job.id, field, question, options),
+    )
+    if field in _FILE_HINT_FIELDS:
+        await deps.sender.send(chat_id, send_as_file_msg())
+    payload["escalation_field"] = field
+    payload["escalation_options"] = options
+    payload["escalation_subject"] = subject
+    payload["escalations"] = payload.get("escalations", 0) + 1
+    payload.pop("manual_entry", None)
+    await session.commit()
+    # `escalation_message_id` СНИМАЕТСЯ вместе с переходом в `awaiting_user`, а
+    # не раньше: между отправкой и `await_user` попытка может умереть, и тогда
+    # повтор обязан увидеть уже отправленный вопрос, а не задать его второй раз
+    # (ревью раунда 1, F). Ключ нужен ровно до этой границы и не дальше — иначе
+    # следующий вопрос отредактировал бы предыдущий вместо нового сообщения.
+    payload.pop("escalation_message_id", None)
+    await deps.queue.await_user(job.id, payload, worker_id=worker_id)
+
+
+def _validator_options(field: str, raw: RawHand) -> list[str]:
+    """Варианты ответа на вопрос ВАЛИДАТОРА — их у него, в отличие от сверок, нет.
+
+    Контрольная сумма адаптера сравнивает два прочтения и обоими и отвечает;
+    валидатор сравнивает прочтение с правилами покера, и второго прочтения у
+    него не бывает. Кнопки поэтому берутся из того, что уже прочитано с экрана:
+    для кнопки дилера это список ников — игроку остаётся показать, у кого она
+    стояла на самом деле.
+    """
+    if field != _VALIDATOR_FIELD_BUTTON or raw.vision is None:
+        return []
+    return list(raw.vision.hero_candidates)
+
+
+async def _give_up(
+    deps: Deps,
+    session: AsyncSession,
+    job: JobModel,
+    chat_id: int,
+    fields: Sequence[str],
+) -> None:
+    """Прекратить разбор с честным текстом — и назвать путь дальше, если он есть.
+
+    Молча разобрать руку со спорными числами нельзя: вывод поверх неизвестного
+    хуже отсутствия вывода (CLAUDE.md). Если спор про карты, у игрока есть
+    рабочий следующий шаг — прислать тот же экран файлом, без сжатия.
+    """
+    await _send_idempotent(
+        deps,
+        session,
+        job.id,
+        job.locked_by,
+        "result_message_id",
+        chat_id,
+        vision_gave_up_msg(),
+    )
+    if any(field in _FILE_HINT_FIELDS for field in fields):
+        await deps.sender.send(chat_id, send_as_file_msg())
+    await session.commit()
+
+
+async def _read_screen(
+    job: JobModel, deps: Deps, trace: Trace, session: AsyncSession, payload: dict[str, Any]
+) -> VisionOutcome:
+    """Один вызов адаптера плюс перенос ступеней каскада в трейс.
+
+    Ступени возвращаются значением, а не пишутся адаптером: конвейерные пакеты
+    про трейс не знают (правило зависимостей CLAUDE.md). Перенести их обязана
+    станция — иначе в трейсе осталось бы «зрение отработало», а на каком
+    переходе появилось расхождение, видно бы не было.
+    """
+    player = await session.get(Player, job.player_id)
+    if player is None or not player.gg_nickname:
+        raise ScreenshotUnreadable("игрок не назвал свой ник в руме")
+    path = Path(payload["image_file"])
+    try:
+        image = path.read_bytes()
+    except OSError as exc:
+        raise ScreenshotUnreadable("файл скриншота недоступен") from exc
+
+    outcome = await vision_extract(
+        deps.llm,
+        image,
+        gg_nickname=player.gg_nickname,
+        trace_id=trace.trace_id,
+        source_ref=payload.get("image_hash", ""),
+        image_hash=payload.get("image_hash"),
+        fallback_available=deps.vision_fallback,
+    )
+    for hop in outcome.hops:
+        trace.record(
+            f"vision:{hop.role}",
+            model=hop.model,
+            failed_checks=hop.failed_checks,
+            error=hop.error,
+        )
+    return outcome
+
+
+async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: float) -> int | None:
+    """Скрин -> разбор: чтение моделью, проверки, эскалация, ядро, слова.
+
+    **Чекпоинт зрения — `hands.raw`**, и он же гасит петлю эскалаций: после
+    ответа игрока задача возвращается сюда, видит уже сохранённую руку и модель
+    больше не зовёт. Иначе каждый ответ игрока оплачивался бы новым чтением,
+    контрольные суммы падали бы на том же месте, и вопрос повторялся бы вечно.
+    """
+    worker_id = job.locked_by
+    async with deps.db_factory() as session:
+        payload: dict[str, Any] = dict(job.payload)
+        chat_id = await _chat_id(session, job.player_id)
+        hands_repo = HandsRepo(session)
+        analyses_repo = AnalysesRepo(session)
+        hand_id: int | None = payload.get("hand_id")
+
+        async with trace.span("read"):
+            payload = await _ensure_progress(deps, session, job.id, worker_id, chat_id, "read")
+            if hand_id is None:
+                outcome = await _read_screen(job, deps, trace, session, payload)
+                if outcome.hand_in_progress:
+                    # Рука ещё идёт — станция чтения и есть та станция, где такой
+                    # экран останавливается (решение владельца 2026-09-09). Ни
+                    # `hands.raw`, ни вопроса игроку: разбирать нечего, а всё
+                    # ниже по конвейеру считает по сыгранным действиям, которых
+                    # на этом экране ещё нет.
+                    await _send_idempotent(
+                        deps,
+                        session,
+                        job.id,
+                        worker_id,
+                        "result_message_id",
+                        chat_id,
+                        hand_in_progress_msg(),
+                    )
+                    await session.commit()
+                    return None
+                if outcome.raw is None:
+                    # Отказ модели — это ответ, а не сбой: экран не был раздачей.
+                    await _send_idempotent(
+                        deps,
+                        session,
+                        job.id,
+                        worker_id,
+                        "result_message_id",
+                        chat_id,
+                        not_a_hand_msg(outcome.refusal or "не похоже на раздачу"),
+                    )
+                    await session.commit()
+                    return None
+                hand_id = await hands_repo.save_raw(session_id=job.session_id, raw=outcome.raw)
+                await session.commit()
+                payload["hand_id"] = hand_id
+                await _fenced_update(session, job.id, worker_id, hand_id=hand_id, payload=payload)
+                if outcome.escalate:
+                    # Спрашивать можно только о том, что код умеет подставить.
+                    # Провалиться может и `stacks` (поправка на обрезку), и
+                    # `equity`, и обе сверки рассадки — вопрос по ним стоил бы
+                    # игроку внимания и всё равно кончился бы отказом после
+                    # ответа (ревью раунда 2, F2).
+                    failed = [check.name for check in outcome.failed]
+                    field = next(
+                        (name for name in failed if can_apply_vision_answer(name)), None
+                    )
+                    if field is None:
+                        await _give_up(deps, session, job, chat_id, failed)
+                        return hand_id
+                    question, options, subject = _escalation_question(field, outcome.checks)
+                    await _ask_player(
+                        deps,
+                        session,
+                        job,
+                        payload,
+                        chat_id,
+                        field=field,
+                        question=question,
+                        options=options,
+                        subject=subject,
+                    )
+                    return hand_id
+
+        record = await hands_repo.get(hand_id)
+        unresolved = _unresolved_checks(record.raw)
+        if unresolved:
+            # Сюда попадает только возобновлённая задача: на первом проходе
+            # непройденная проверка уходит вопросом игроку и возвращается выше.
+            # Значит, ответ расхождение не закрыл — и разбирать эту руку нельзя.
+            await _give_up(deps, session, job, chat_id, [c.name for c in unresolved])
+            return hand_id
+
+        async with trace.span("validate"):
+            await _ensure_progress(deps, session, job.id, worker_id, chat_id, "validate")
+            canonical: CanonicalHand = record.canonical or normalize(record.raw)
+            enriched = record.enriched or enrich(canonical)
+            await hands_repo.save_canonical(hand_id, canonical)
+            await hands_repo.save_enriched(hand_id, enriched)
+            await session.commit()
+            if enriched.verdict.status is ValidationStatus.ESCALATE:
+                answerable = [
+                    (field, question)
+                    for field, question in zip(
+                        enriched.verdict.fields, enriched.verdict.questions, strict=True
+                    )
+                    if can_apply_vision_answer(field)
+                ]
+                # Вопрос по полю, ответ на которое подставить некуда, — мёртвый:
+                # игрок отвечает, ответ ложится в eval-датасет, рука остаётся
+                # прежней, и следующий проход упирается в то же расхождение
+                # (ревью раунда 1, R3). Такие поля не спрашиваем вовсе.
+                if not answerable or payload.get("escalations", 0) >= _MAX_ESCALATIONS:
+                    await _give_up(deps, session, job, chat_id, enriched.verdict.fields)
+                    return hand_id
+                field, question = answerable[0]
+                await _ask_player(
+                    deps,
+                    session,
+                    job,
+                    payload,
+                    chat_id,
+                    field=field,
+                    question=question,
+                    options=_validator_options(field, record.raw),
+                )
+                return hand_id
+
+        async with trace.span("analyze"):
+            await _ensure_progress(deps, session, job.id, worker_id, chat_id, "analyze")
+            existing = await analyses_repo.get_by_hand(hand_id)
+            if existing is not None:
+                result = existing.result
+            else:
+                loop = asyncio.get_running_loop()
+                result, _exported = await loop.run_in_executor(
+                    deps.process_pool, _analyze_hand_with_cache, enriched, {}
+                )
+                await analyses_repo.save(
+                    hand_id=hand_id,
+                    result=result,
+                    decision_points=enriched.report.decision_points,
+                )
+                await session.commit()
+
+        async with trace.span("explain"):
+            await _ensure_progress(deps, session, job.id, worker_id, chat_id, "explain")
+            saved = existing.verdict_text if existing is not None else None
+            if saved is not None:
+                verdict = VerdictTextOut.model_validate_json(saved)
+            else:
+                verdict = await _verdict_prose(deps, trace, result)
+                images = _render_ranges(deps.data_dir, hand_id, result)
+                await analyses_repo.set_explanation(
+                    hand_id=hand_id,
+                    verdict_text=None if verdict is None else verdict.model_dump_json(),
+                    range_images=images,
+                )
+                await session.commit()
+
+        quota_left, quota_total = await _quota_numbers(session, job.player_id)
+        msg = deep_dive_msg(
+            result,
+            round(deps.clock() - started_at),
+            _hand_zone(result, enriched.verdict.not_checked),
+            quota_left,
+            quota_total,
+            verdict=verdict,
+            not_checked=enriched.verdict.not_checked,
+            note_nicks=note_nicks_for_hand(enriched.hand),
+        )
+        await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
+        await session.commit()
+        await _send_range_photos(
+            deps,
+            session,
+            job.id,
+            worker_id,
+            chat_id,
+            range_photos(await _saved_range_images(analyses_repo, hand_id), result),
+        )
+        await session.commit()
+    return hand_id
 
 
 async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: float) -> int | None:
@@ -560,14 +1207,56 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
                 await cache_repo.upsert_many(prefix, exported)
                 await session.commit()
 
-                await analyses_repo.save(hand_id=hand.id, result=result)
+                await analyses_repo.save(
+                    hand_id=hand.id,
+                    result=result,
+                    decision_points=hand.enriched.report.decision_points,
+                )
+                await session.commit()
+
+        async with trace.span("explain"):
+            await _ensure_progress(deps, session, job.id, worker_id, chat_id, "explain")
+            saved = existing.verdict_text if existing is not None else None
+            if saved is not None:
+                # Чекпоинт станции: слова уже сказаны прошлой попыткой — второй раз
+                # за них не платим (спека §8.2, тот же принцип, что у `hands.*`).
+                verdict = VerdictTextOut.model_validate_json(saved)
+            else:
+                verdict = await _verdict_prose(deps, trace, result)
+                # Картинки диапазонов — выход КОДА, и от того, ответила ли
+                # модель, они не зависят: сохраняются всегда (ревью, раздел G;
+                # прежде отказ модели выбрасывал уже нарисованные файлы).
+                images = _render_ranges(deps.data_dir, hand.id, result)
+                await analyses_repo.set_explanation(
+                    hand_id=hand.id,
+                    verdict_text=None if verdict is None else verdict.model_dump_json(),
+                    range_images=images,
+                )
                 await session.commit()
 
         elapsed_s = round(deps.clock() - started_at)
-        zone = _hand_zone(result)
+        zone = _hand_zone(result, hand.enriched.verdict.not_checked)
         quota_left, quota_total = await _quota_numbers(session, job.player_id)
-        msg = deep_dive_msg(result, elapsed_s, zone, quota_left, quota_total)
+        msg = deep_dive_msg(
+            result,
+            elapsed_s,
+            zone,
+            quota_left,
+            quota_total,
+            verdict=verdict,
+            not_checked=hand.enriched.verdict.not_checked,
+            note_nicks=note_nicks_for_hand(hand.enriched.hand),
+        )
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
+        await session.commit()
+        await _send_range_photos(
+            deps,
+            session,
+            job.id,
+            worker_id,
+            chat_id,
+            range_photos(await _saved_range_images(analyses_repo, hand.id), result),
+        )
         await session.commit()
 
         hand_id = hand.id
@@ -575,12 +1264,52 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
     return hand_id
 
 
+async def _run_question(job: JobModel, deps: Deps, trace: Trace) -> None:
+    """Вопрос игрока: модель выбирает расчёт, код считает, игрок получает подпись.
+
+    Чекпоинта у этой станции нет: повторная попытка зовёт модель заново. Копить
+    было бы нечего — весь результат станции это одно сообщение, а дубля его не
+    будет и так (`_send_idempotent`).
+
+    Отказ модели (провайдер, схема) сюда не перехватывается, в отличие от
+    `_verdict_prose`: там числа посчитаны и без слов, здесь без вызова модели
+    нет ни расчёта, ни ответа — задача честно падает, и игрок получает
+    `failed_msg`.
+    """
+    worker_id = job.locked_by
+    async with deps.db_factory() as session:
+        payload: dict[str, Any] = dict(job.payload)
+        chat_id = await _chat_id(session, job.player_id)
+        async with trace.span("ask"):
+            await _ensure_progress(deps, session, job.id, worker_id, chat_id, "ask")
+            outcome = await answer_question(
+                session,
+                deps.llm,
+                player_id=job.player_id,
+                session_id=job.session_id,
+                question=payload["question"],
+                trace_id=trace.trace_id,
+            )
+        msg = (
+            question_refusal_msg()
+            if outcome.result is None
+            else question_msg(outcome.result, outcome.prose)
+        )
+        await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
+        await session.commit()
+
+
 async def _dispatch(job: JobModel, deps: Deps, trace: Trace, started_at: float) -> int | None:
+    if job.type == "question":
+        await _run_question(job, deps, trace)
+        return None
     if job.type == "hh_scan":
         await _run_hh_scan(job, deps, trace)
         return None
     if job.type == "deep_dive":
         return await _run_deep_dive(job, deps, trace, started_at)
+    if job.type == "screenshot_analyze":
+        return await _run_screenshot(job, deps, trace, started_at)
     # `screenshot_analyze`/`eval_run` существуют в CHECK-констрейнте `jobs.type_allowed`
     # (задача 15, под будущие задачи 19+/22), но станций для них этот воркер ещё не
     # знает — явный отказ вместо молчаливого "ничего не произошло".

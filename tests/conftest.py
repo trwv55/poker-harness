@@ -24,12 +24,44 @@ requires_fixtures = pytest.mark.skipif(
     reason="нет приватных HH-фикстур в fixtures/hh/ — гейт на 318 руках не выполнен",
 )
 
+SRC = Path(__file__).parent.parent / "src" / "harness"
+PROMPTS = SRC / "explanation" / "prompts"
+PROMPT_VERDICT = PROMPTS / "verdict.md"
+PROMPT_TOURNAMENT = PROMPTS / "tournament.md"
+PROMPT_QUESTION = PROMPTS / "question.md"
+PROMPT_VISION = SRC / "parsers" / "prompts" / "vision.md"
 
-def _upgrade_head(sync_dsn: str) -> None:
-    """Прогоняет `alembic upgrade head` на переданном DSN тем же путём, что и деплой
-    (задача 20): `DATABASE_URL` в окружении, `migrations/env.py` читает его сам
-    (`get_url()`). Мутирует `os.environ` процесса pytest, не родительского шелла —
-    и переопределяется здесь же перед каждым использованием, так что даже если у
+# Промпты изложения закрыты политикой публикации — тем же решением владельца, что
+# и vision-промпты, и по той же причине: они копируются за вечер. В публичном
+# клоне этих файлов нет, и тесты, которым нужен НАСТОЯЩИЙ текст промпта (а не
+# только код вокруг него), пропускаются с явной причиной — ровно та же
+# дисциплина, что у HH-фикстур выше: пропуск обязан быть виден строкой
+# `skipped` в `-ra`, а не выглядеть успехом.
+#
+# Пропускается при этом МЕНЬШИНСТВО: проверки верности, отказов и выжимки
+# промпта не читают вовсе, а `PromptUnavailable` (громкий отказ при отсутствии
+# файла) проверяется без него специально.
+# Промпт зрения (задача 22) закрыт тем же решением и тем же путём в хуке, поэтому
+# он входит в ТОТ ЖЕ признак, а не заводит второй: маркер отвечает на вопрос «есть
+# ли в этом клоне промпты вообще», и клона с половиной промптов не бывает — они
+# лежат рядом и приезжают вместе.
+PROMPTS_PRESENT = (
+    PROMPT_VERDICT.exists()
+    and PROMPT_TOURNAMENT.exists()
+    and PROMPT_QUESTION.exists()
+    and PROMPT_VISION.exists()
+)
+requires_prompts = pytest.mark.skipif(
+    not PROMPTS_PRESENT,
+    reason="нет промптов моделей (explanation/prompts, parsers/prompts) — закрыты политикой публикации",
+)
+
+
+def alembic_config(sync_dsn: str) -> Config:
+    """Конфиг alembic на переданном DSN — тем же путём, что и деплой (задача 20):
+    `DATABASE_URL` в окружении, `migrations/env.py` читает его сам (`get_url()`).
+    Мутирует `os.environ` процесса pytest, не родительского шелла — и
+    переопределяется здесь же перед каждым использованием, так что даже если у
     разработчика уже есть свой `DATABASE_URL` (локальный дев-Postgres), тесты на
     него не попадут.
     """
@@ -37,7 +69,11 @@ def _upgrade_head(sync_dsn: str) -> None:
     root = Path(__file__).parent.parent
     cfg = Config(str(root / "alembic.ini"))
     cfg.set_main_option("script_location", str(root / "migrations"))
-    command.upgrade(cfg, "head")
+    return cfg
+
+
+def _upgrade_head(sync_dsn: str) -> None:
+    command.upgrade(alembic_config(sync_dsn), "head")
 
 
 @pytest.fixture(scope="session")

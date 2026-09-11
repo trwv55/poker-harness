@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "hand_no": "SYN-1",
+  "points": [
+    {
+      "dp_index": 0,
+      "street": "preflop",
+      "spot": "pushfold_unopened",
+      "zone": "strict",
+      "action_taken": "fold",
+      "best_action": "shove",
+      "ev_diff_bb": -1.4,
+      "interval": {
+        "point_bb": 1.4,
+        "low_bb": 1.1,
+        "high_bb": 1.8,
+        "near_zero": false
+      },
+      "assumption": null,
+      "tools": [
+        "nash_hu"
+      ],
+      "detail": {}
+    }
+  ],
+  "ranked": [
+    0
+  ],
+  "total_ev_loss_bb": -1.4
+}

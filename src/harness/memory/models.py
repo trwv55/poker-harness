@@ -1,8 +1,8 @@
-"""ORM-модели БД: 12 таблиц спеки §6.
+"""ORM-модели БД: 12 таблиц спеки §6, две таблицы оппонента и точки решения.
 
 Источник — `docs/superpowers/specs/2026-08-28-poker-harness-tech-spec-design.md`,
 раздел "6. Схема БД". Колонки — по табличным строкам спеки дословно; `?` у поля в
-спеке значит nullable, отсутствие `?` — `NOT NULL`. Три отступления от этого
+спеке значит nullable, отсутствие `?` — `NOT NULL`. Шесть отступлений от этого
 правила и почему они не нарушают "дословно":
 
 1. `llm_calls.started_at` — таблица §6 её не называет среди "ключевых полей", но §7
@@ -20,6 +20,26 @@
    плюс отдельно помеченный уникальный бизнес-ключ. `calc_cache.key` — образец
    противоположного случая: там натуральный ключ и есть PK, и спека его никак не
    помечает (UNIQUE избыточен для PK). Инвайты собраны по образцу `players`.
+4. `players.pending_input` (задача 23, миграция 0005) — колонки нет в §6 вовсе.
+   Она хранит не знание о покере, а незакрытый диалог бота: что означает
+   следующее текстовое сообщение игрока. Спека §8.3 требует, чтобы состояние
+   ожидания ответа жило в БД, а не в памяти процесса, — для задач это
+   `jobs.payload`, но ввод ника и текста заметки задачей не сопровождается, и
+   складывать его было некуда.
+5. `opponents`/`opponent_links` (миграции 0006 и 0007) — таблиц нет в §6:
+   на момент спеки сшивать личность между турнирами было нечем. Идентификатор
+   участника в файлах раздач сквозной внутри турнира и не переживает его, а
+   владелец хочет считать статистику по человеку, а не по турнирной метке.
+   Связь между метками утверждает владелец; кода, который догадывался бы о ней
+   сам, в проекте нет. Заметка (§6, `notes`) ссылается на ту же строку
+   `opponents`: личность оппонента в продукте одна (миграция 0007).
+6. `decision_points` (миграция 0008) — таблицы нет в §6: точки решения лежали
+   массивом внутри `analyses.result`. Правило §6 («jsonb — для версионированных
+   документов-контрактов; реляционные колонки — для всего, по чему ищем и
+   джойним») ими же и нарушалось: по точкам ищут и группируют — лики, покрытие,
+   цена вечера, — а каждое новое условие писалось выражением по jsonb руками.
+   Отступление здесь в том, что таблицы нет в §6, а не в том, что она спорит с
+   правилом.
 
 jsonb-колонки хранят `model_dump(mode="json")` пайплайн-контрактов (`RawHand`,
 `CanonicalHand`, `EnrichedHand`, `AnalysisResult`) — уже JSON-совместимые
@@ -39,13 +59,17 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    Double,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     MetaData,
     Numeric,
+    PrimaryKeyConstraint,
     String,
     Text,
+    UniqueConstraint,
     false,
     func,
     text,
@@ -77,11 +101,23 @@ class Player(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     tg_user_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
+    # Ник в руме — единственный способ опознать героя на скриншоте КОДОМ, а не
+    # моделью (реестр vision, решение 2026-09-05 «Герой определяется кодом»: ни
+    # одна контрольная сумма подменённого героя не ловит). NULL — ника ещё не
+    # спросили; тогда разбор скрина упирается в вопрос игроку, а не угадывает.
+    gg_nickname: Mapped[str | None] = mapped_column(String(64))
     # NULL = у игрока нет персонального переопределения, действует дефолт из
     # Config (спека §7: "квоты по умолчанию" — конфиг, не схема БД).
     quota_daily: Mapped[int | None] = mapped_column(Integer)
     subscription: Mapped[str] = mapped_column(String(32), nullable=False, server_default="free")
     is_dev: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    # Что означает СЛЕДУЮЩЕЕ текстовое сообщение игрока: ник в руме, текст
+    # заметки — либо ничего (NULL, обычное состояние). Состояние ввода живёт в
+    # БД, а не в памяти процесса бота, по той же причине, что и состояние
+    # эскалации в `jobs.payload` (спека §8.3): перезапуск бота не имеет права
+    # терять половину диалога. Колонки в таблице §6 нет — это 4-е отступление,
+    # см. пункт 4 модульного докстринга.
+    pending_input: Mapped[Any | None] = mapped_column(JSONB)
 
 
 class Invite(Base):
@@ -100,6 +136,11 @@ class Session(Base):
     """«Сессия = вечер»: `sessions`. Закрывается `/new` (SESSIONS_UX.md), не таймером."""
 
     __tablename__ = "sessions"
+    __table_args__ = (
+        # Мишень составного внешнего ключа `decision_points(session_id,
+        # player_id)` — см. `uq_hands_id_session`.
+        UniqueConstraint("id", "player_id", name="uq_sessions_id_player"),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     player_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("players.id"), nullable=False)
@@ -132,6 +173,11 @@ class Hand(Base):
             "provenance IN ('hand_history', 'screenshot')", name="provenance_allowed"
         ),
         Index("ix_hands_session_id", "session_id"),
+        # Не «вторая уникальность» руки, а мишень составного внешнего ключа
+        # `decision_points(hand_id, session_id)`: без неё денормализованный
+        # `session_id` точки некому проверить (тот же приём, что у
+        # `uq_opponents_id_owner`).
+        UniqueConstraint("id", "session_id", name="uq_hands_id_session"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -161,19 +207,244 @@ class Analysis(Base):
     range_images: Mapped[Any | None] = mapped_column(JSONB)
 
 
+class DecisionPointRow(Base):
+    """Точка решения строкой: `decision_points`. ЕДИНСТВЕННОЕ место, где она лежит.
+
+    До миграции 0008 массив точек жил в `analyses.result -> 'points'` и
+    разворачивался `jsonb_array_elements` на каждом запросе. Теперь `result`
+    хранит документ БЕЗ точек, а `AnalysesRepo` собирает его обратно из этих
+    строк: двух копий одного вердикта в базе нет
+    (`test_the_analysis_document_no_longer_carries_its_points`).
+
+    Имя класса — `...Row`, а не `DecisionPoint`: контракт с таким именем уже
+    есть (`contracts.enriched`), и строка не равна ему — она склеена из двух
+    контрактов сразу. Что откуда:
+
+    * `point_no`, `dp_index`, `street`, `spot`, `zone`, `action_taken`,
+      `best_action`, `ev_diff_bb`, `ev_interval`, `assumption`, `tools`,
+      `detail` — `PointVerdict` целиком, поле в поле
+      (`test_every_field_of_a_point_verdict_has_its_column`). Единственное
+      переименование — `interval` → `ev_interval`: `interval` в Postgres
+      зарезервировано, и колонка с таким именем требовала бы кавычек в каждом
+      запросе.
+    * `position`, `to_call`, `pot_before`, `eff_stack`, `eff_stack_bb`, `spr` —
+      обстановка точки из `DecisionPoint` (`hands.enriched`). Nullable: вердикт
+      сопоставляется с обстановкой по `dp_index`, и вердикт без своей точки
+      решения контракт не запрещает.
+    * `judged` — ответ `contracts.is_judged` на момент записи. Колонка, а не
+      выражение в SQL: иначе правило судимости существовало бы двумя текстами
+      на двух языках, обязанными совпадать. Это СНИМОК правила, а не
+      вычисляемое свойство: изменится правило — строки, записанные раньше,
+      останутся с прежним ответом, и покрытие сложит две редакции. Правило
+      целиком выписано в
+      `test_the_judged_rule_is_pinned_because_the_column_freezes_it`, и правка
+      правила краснит его вместе с требованием переливки.
+    * `hand_id`, `session_id`, `player_id` — адрес точки. Сессия и игрок
+      денормализованы (фильтры словаря расчётов складываются по игроку и по
+      вечеру), и оба закрыты составными внешними ключами на
+      `hands(id, session_id)` и `sessions(id, player_id)`: строка с чужой
+      сессией или чужим игроком не вставляется вовсе
+      (`test_a_point_cannot_claim_a_session_that_is_not_its_hands`).
+
+    `point_no` — МЕСТО В МАССИВЕ `AnalysisResult.points`, а не `dp_index`:
+    `AnalysisResult.ranked` индексирует именно массив, и порядок обязан
+    пережить запись. Равенство `point_no == dp_index` в разборах ядра
+    выполняется, но контракт его не требует, и ключом взято то, что нужно для
+    сборки документа обратно.
+    """
+
+    __tablename__ = "decision_points"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["hand_id", "session_id"],
+            ["hands.id", "hands.session_id"],
+            name="fk_decision_points_hand_id_hands",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["session_id", "player_id"],
+            ["sessions.id", "sessions.player_id"],
+            name="fk_decision_points_session_id_sessions",
+        ),
+        UniqueConstraint("hand_id", "point_no", name="uq_decision_points_hand_id_point_no"),
+        # Обе сквозные выборки идут по игроку: «Мои лики» — по всей истории,
+        # агрегат вечера — по нему же плюс сессия.
+        Index("ix_decision_points_player_id", "player_id"),
+        Index("ix_decision_points_session_id", "session_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    hand_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    session_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    player_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    point_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    dp_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    street: Mapped[str] = mapped_column(String(16), nullable=False)
+    spot: Mapped[str] = mapped_column(String(32), nullable=False)
+    zone: Mapped[str] = mapped_column(String(16), nullable=False)
+    action_taken: Mapped[str] = mapped_column(String, nullable=False)
+    best_action: Mapped[str] = mapped_column(String, nullable=False)
+    ev_diff_bb: Mapped[float] = mapped_column(Double, nullable=False)
+    judged: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    position: Mapped[str | None] = mapped_column(String(16))
+    to_call: Mapped[int | None] = mapped_column(BigInteger)
+    pot_before: Mapped[int | None] = mapped_column(BigInteger)
+    eff_stack: Mapped[int | None] = mapped_column(BigInteger)
+    eff_stack_bb: Mapped[float | None] = mapped_column(Double)
+    spr: Mapped[float | None] = mapped_column(Double)
+    ev_interval: Mapped[Any | None] = mapped_column(JSONB)
+    assumption: Mapped[Any | None] = mapped_column(JSONB)
+    tools: Mapped[Any] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    detail: Mapped[Any] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+
+
 class Note(Base):
-    """Заметки на игроков: `notes`. Только через vision — в HH ники анонимны."""
+    """Заметки на игроков: `notes`. Только через vision — в HH ники анонимны.
+
+    Заметка на оппонента одна и накапливается (SESSIONS_UX: «оппонент
+    встречается в разных сессиях, заметка должна накапливаться»), поэтому
+    уникален `opponent_id` — не пара с владельцем: владелец у оппонента один и
+    тот же, и второй раз в ключе он ничего не добавляет (миграция 0007).
+
+    **Личность оппонента здесь не своя, а общая** — строка `opponents`. До
+    миграции 0007 заметка держала ник строкой, и регистр в ней различался, а в
+    `opponents` — нет: один и тот же ник в разном написании был одним
+    оппонентом для статистики и двумя для заметок
+    (`test_a_note_and_a_link_on_the_same_nick_in_two_cases_meet_on_one_opponent`).
+
+    `owner_player_id` остаётся колонкой, хотя выводится из `opponents`:
+    по нему сверяется владелец во всех методах `NotesRepo`, а составной внешний
+    ключ на `opponents(id, owner_player_id)` не даёт ему разойтись с владельцем
+    самого оппонента — тот же приём, что в `OpponentLink`.
+    """
 
     __tablename__ = "notes"
+    __table_args__ = (
+        Index("uq_notes_opponent_id", "opponent_id", unique=True),
+        ForeignKeyConstraint(
+            ["opponent_id", "owner_player_id"],
+            ["opponents.id", "opponents.owner_player_id"],
+            name="fk_notes_opponent_opponents",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    owner_player_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("players.id"), nullable=False
+    )
+    opponent_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    color: Mapped[str] = mapped_column(String(32), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class Opponent(Base):
+    """`opponents`: оппонент владельца, известный по нику в руме.
+
+    Одна личность на весь продукт: сюда же ссылается заметка (`Note`), сюда же
+    привязываются пары «турнир + идентификатор» (`OpponentLink`). Идентификатор
+    участника в файлах раздач сквозной внутри турнира, но между турнирами не
+    живёт — комната выдаёт новый; ник живёт.
+
+    **Ключ личности — ник, а не произвольный ярлык** (решение владельца).
+
+    **Регистр не различается, написание сохраняется.** Назвать тот же ник второй
+    раз — единственный способ сказать «вот этот идентификатор из другого турнира
+    это он же», и разъехаться на собственной опечатке в регистре этот путь не
+    имеет права. Уникальность держит функциональный индекс по
+    `(owner_player_id, lower(opponent_nick))`, а колонка хранит ник так, как его
+    ввели в первый раз (`test_the_same_nick_in_another_case_is_the_same_opponent`).
+    Имени индекса в коде нет и не нужно: `ON CONFLICT` в
+    `OpponentsRepo.get_or_create` выводится по тем же выражениям, а не по имени.
+
+    **Длина ника не ограничена схемой.** До миграции 0007 колонка повторяла
+    `players.gg_nickname` (64), но ник оппонента приходит не из клавиатуры, а со
+    стола: кнопка заметки возит индекс именно потому, что ник бывает длиннее 64
+    байт (`test_a_long_nick_in_a_note_button_still_opens_the_right_note`), и
+    заметка на такого оппонента писалась до этой миграции. Предел на ник,
+    который владелец печатает РУКАМИ, остался в `bot.handlers`.
+
+    `uq_opponents_id_owner` не проверяет ничего сам: это цель составных внешних
+    ключей из `opponent_links` и `notes`, а Postgres требует уникальности на
+    колонках, на которые ссылается FK.
+    """
+
+    __tablename__ = "opponents"
+    __table_args__ = (
+        Index(
+            "uq_opponents_owner_player_id_lower_nick",
+            "owner_player_id",
+            func.lower(text("opponent_nick")),
+            unique=True,
+        ),
+        UniqueConstraint("id", "owner_player_id", name="uq_opponents_id_owner"),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     owner_player_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("players.id"), nullable=False
     )
     opponent_nick: Mapped[str] = mapped_column(String, nullable=False)
-    color: Mapped[str] = mapped_column(String(32), nullable=False)
-    text: Mapped[str] = mapped_column(Text, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class OpponentLink(Base):
+    """`opponent_links`: пара «турнир + идентификатор участника» → оппонент.
+
+    **Турнир — тот, которым его нумерует комната** (`CanonicalHand.tournament_id`),
+    а не строка `tournaments`: строк на один турнир бывает несколько (тот же
+    файл, загруженный в другой вечер), и привязка не имеет права от этого
+    раздваиваться. Внешнего ключа на `tournaments` поэтому нет вовсе — удаление
+    строки турнира не оставляет висящей ссылки и не теряет привязку.
+
+    **Ключ таблицы — сама уникальность.** «Один идентификатор в одном турнире у
+    одного владельца привязан не более чем к одному оппоненту» — это первичный
+    ключ, а не проверка в коде: два одновременных вызова `OpponentsRepo.link`
+    физически не могут развести одну пару по двум оппонентам
+    (`test_two_opponents_at_once_claim_one_participant_and_the_first_keeps_him`).
+    Натуральный ключ вместо суррогатного `id` — тот же образец, что
+    `calc_cache.key` (пункт 3 модульного докстринга).
+
+    **Владелец в ключе — денормализация**, без которой это правило нельзя
+    выразить индексом: владелец известен только через `opponents`, а индекс не
+    умеет джойнить. Чтобы денормализованная колонка не разошлась с владельцем
+    самого оппонента, ссылка составная — `(opponent_id, owner_player_id)` на
+    `opponents(id, owner_player_id)`: строка с чужим владельцем не вставляется
+    вовсе (`test_an_opponent_of_another_player_takes_no_bindings`).
+
+    `ON DELETE CASCADE` — по той же логике: привязка без оппонента не значит
+    ничего, и переживать его не должна.
+
+    `uq_opponent_links_opponent_tournament` — «у одного оппонента в одном
+    турнире один идентификатор»: в турнире у участника ровно один
+    идентификатор, поэтому вторая метка того же оппонента в том же турнире
+    означала бы, что в статистику одного человека сложены двое, и раздачи
+    турнира посчитались бы дважды
+    (`test_one_opponent_keeps_one_participant_per_tournament`).
+    """
+
+    __tablename__ = "opponent_links"
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "owner_player_id",
+            "room_tournament_id",
+            "participant_label",
+            name="pk_opponent_links",
+        ),
+        ForeignKeyConstraint(
+            ["opponent_id", "owner_player_id"],
+            ["opponents.id", "opponents.owner_player_id"],
+            name="fk_opponent_links_opponent_opponents",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "opponent_id", "room_tournament_id", name="uq_opponent_links_opponent_tournament"
+        ),
+    )
+
+    owner_player_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    room_tournament_id: Mapped[str] = mapped_column(String, nullable=False)
+    participant_label: Mapped[str] = mapped_column(String, nullable=False)
+    opponent_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
 class EvalCase(Base):
@@ -220,7 +491,7 @@ class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
         CheckConstraint(
-            "type IN ('screenshot_analyze', 'hh_scan', 'deep_dive', 'eval_run')",
+            "type IN ('screenshot_analyze', 'hh_scan', 'deep_dive', 'eval_run', 'question')",
             name="type_allowed",
         ),
         CheckConstraint(
@@ -290,7 +561,12 @@ class LlmCall(Base):
     __tablename__ = "llm_calls"
     __table_args__ = (
         CheckConstraint(
-            "purpose IN ('vision_extract', 'verdict_text')", name="purpose_allowed"
+            # `vision_extract_fallback` — вторая ступень каскада зрения (задача
+            # 22). Отдельное назначение, а не то же самое: по нему считается,
+            # сколько раз дешёвого чтения не хватило, и сколько это стоило.
+            "purpose IN ('vision_extract', 'vision_extract_fallback', 'verdict_text', "
+            "'question_answer')",
+            name="purpose_allowed",
         ),
         CheckConstraint(
             "status IN ('started', 'ok', 'error', 'schema_error')", name="status_allowed"

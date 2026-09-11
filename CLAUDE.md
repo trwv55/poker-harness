@@ -10,7 +10,7 @@ LLM живёт ровно в двух местах — извлечение да
 Репозиторий **публичный**. Не коммитить и не пушить:
 
 - `evals/vision/`, `evals/e2e/` — размеченный eval-датасет (это ров продукта)
-- vision-промпты (`src/harness/parsers/prompts/`) — копируются за вечер
+- промпты моделей — vision (`src/harness/parsers/prompts/`) и изложения (`src/harness/explanation/prompts/`) — копируются за вечер
 - `.claude/screens/` — скриншоты столов
 - `fixtures/hh/*.txt` — реальные hand history игрока
 - `data/` — том с присланными боту файлами (`DATA_DIR/hh/{hash}.txt`): те же hand history,

@@ -30,6 +30,8 @@ class DecisionPoint(BaseModel):
     eff_stack: int
     eff_stack_bb: float
     spr: float | None = None
+    # Сыгранное героем действие. Обязательное: точку решения строит только
+    # `harness.engine.replay`, а он строит её ИЗ действия.
     action: CanonicalAction
     live_total: int = 0  # игроков ещё в руке на момент решения, включая Hero
     live_behind: int = 0  # из них ещё не действовавших после Hero — вход правила зоны
@@ -46,6 +48,9 @@ class Verdict(BaseModel):
     fields: list[str] = []
     questions: list[str] = []
     reasons: list[str] = []
+    # Проверки, которые на этом входе выполнить НЕ ИЗ ЧЕГО, названные поимённо:
+    # молчаливый `pass` неотличим от проверенного входа.
+    not_checked: list[str] = []
 
 
 class EngineReport(BaseModel):

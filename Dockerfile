@@ -73,7 +73,15 @@ FROM python:3.12-slim
 # для того, чтобы пустой именованный том Docker при первом монтировании
 # унаследовал права от образа, а не остался root-only. Сам путь тома задан в
 # docker-compose.yml переменной `DATA_DIR` — здесь только каталог.
-RUN useradd --create-home --uid 10001 harness \
+# libcairo2 — системная библиотека, которую грузит `cairosvg` (рендер матрицы
+# диапазонов, `explanation/range_render.py`): колесо cairocffi её НЕ содержит и
+# ищет через dlopen в рантайме. Без пакета образ собирается зелёным, а падает
+# на первой картинке — то есть в проде, а не на сборке. Здесь же, а не в
+# builder-стадии: библиотека нужна тому, кто рисует, а не тому, кто ставит.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libcairo2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 harness \
     && mkdir -p /data \
     && chown harness:harness /data
 

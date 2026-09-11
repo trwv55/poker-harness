@@ -41,6 +41,7 @@ from pydantic import BaseModel
 from pydantic_ai import Agent, BinaryContent
 from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
 from pydantic_ai.models import Model
+from pydantic_ai.tools import Tool
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -111,6 +112,17 @@ def _sniff_image_media_type(data: bytes) -> str:
     )
 
 
+# Предел на одну картинку у провайдера — 10 МБ, и считает он его по BASE64-
+# представлению, а не по сырым байтам. Картинка едет к модели как
+# `BinaryContent`, то есть в base64, поэтому в сырых байтах принимать можно
+# только меньше: base64 добавляет треть. Число ниже взято с запасом и годится
+# при обоих прочтениях «мегабайта» — 10 000 000 здесь именно строгое из двух.
+# Соотношение держит `test_the_image_cap_leaves_room_for_base64_inflation`.
+PROVIDER_BASE64_IMAGE_LIMIT = 10_000_000
+MAX_IMAGE_BYTES = 7 * 1024 * 1024
+MAX_IMAGE_MB = MAX_IMAGE_BYTES // (1024 * 1024)
+
+
 @dataclass(frozen=True, slots=True)
 class CallMeta:
     """Метаданные одной УСПЕШНОЙ попытки — то, что возвращается вызывающему вместе
@@ -136,6 +148,15 @@ class LLMSchemaError(Exception):
     задача 18) должен различать "модель систематически не может выполнить схему"
     (возможно, стоит эскалировать игроку) и "провайдер недоступен" (стоит повторить
     задачу позже) — не одна и та же причина отказа.
+    """
+
+
+class LLMNotConfigured(Exception):
+    """Назначение вызова требует модели, которой в конфиге нет.
+
+    Отдельно от `LLMProviderError`: провайдер тут ни при чём, дело в переменной
+    окружения, и оператору надо править `.env`, а не ждать, пока провайдер
+    оживёт.
     """
 
 
@@ -198,11 +219,14 @@ class LLM:
 
     async def __call__(
         self,
-        purpose: Literal["vision_extract", "verdict_text"],
+        purpose: Literal[
+            "vision_extract", "vision_extract_fallback", "verdict_text", "question_answer"
+        ],
         schema: type[T],
         *,
         prompt: str,
         images: Sequence[bytes] = (),
+        tools: Sequence[Tool[None]] = (),
         trace_id: int,
     ) -> tuple[T, CallMeta]:
         """`trace_id` — обязательный параметр каждого вызова, а не конструктора:
@@ -238,12 +262,21 @@ class LLM:
         следующей попытке МЕНЬШЕ бюджета `slot()`, не отдельный полный. Это
         осознанный компромисс контроллера, не недосмотр: подробное обоснование
         — в докстринге `limiter._ACQUIRE_TIMEOUT_S`.
+
+        `tools` — инструменты, которые модель вправе позвать внутри одного
+        `agent.run()`. Что вызов с инструментами обращается к провайдеру
+        БОЛЬШЕ одного раза (ответ с вызовом инструмента, затем ответ по его
+        результату), а строка `llm_calls` на них по-прежнему одна, закреплено
+        `test_a_tool_call_round_trip_logs_one_row`: окно темпа `PgLimiter`
+        считает такой вызов за один.
         """
         model: Model | str = (
             self._model_override if self._model_override is not None else self._resolve_model(purpose)
         )
         provider, model_name = _describe_model(model)
-        agent = Agent(model, output_type=schema, retries=0)
+        agent: Agent[None, T] = Agent(
+            model, output_type=schema, retries=0, tools=tools, deps_type=type(None)
+        )
         user_prompt: list[str | BinaryContent] = [
             prompt,
             *(
@@ -274,11 +307,24 @@ class LLM:
             ) from last_schema_error
 
     def _resolve_model(self, purpose: str) -> str:
-        return (
-            self._cfg.llm_vision_model
-            if purpose == "vision_extract"
-            else self._cfg.llm_verdict_model
-        )
+        """Модель по назначению вызова — строка конфига, а не ветка кода.
+
+        `vision_extract_fallback` — вторая ступень каскада зрения (задача 22).
+        Её переменная окружения необязательна, и вызвать это назначение с пустой
+        строкой значит попросить `Agent("")` — отказ провайдера тремя уровнями
+        глубже вместо названной причины. Поэтому проверка здесь: решение «звать
+        ли дорогую модель» принимает адаптер, а этот отказ ловит того, кто
+        решение обошёл.
+        """
+        if purpose == "vision_extract":
+            return self._cfg.llm_vision_model
+        if purpose == "vision_extract_fallback":
+            if not self._cfg.llm_vision_fallback_model:
+                raise LLMNotConfigured(
+                    "LLM_VISION_FALLBACK_MODEL не задана — второй ступени каскада нет"
+                )
+            return self._cfg.llm_vision_fallback_model
+        return self._cfg.llm_verdict_model
 
     async def _attempt(
         self,

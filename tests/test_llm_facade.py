@@ -20,6 +20,7 @@ Postgres — сессионные, не транзакционные), а зна
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import re
 import time
@@ -47,6 +48,7 @@ from harness.platform.llm import LLM, LLMProviderError, LLMSchemaError, _sniff_i
 # `Config` был валиден по форме (спека §7: `"<provider>:<model>"`).
 cfg = Config(
     llm_vision_model="anthropic:claude-sonnet-test",
+    llm_vision_fallback_model="anthropic:claude-opus-test",
     llm_verdict_model="anthropic:claude-haiku-test",
     llm_max_concurrency=4,
     llm_max_per_minute=1000,
@@ -429,6 +431,7 @@ async def test_limiter_budget_bounds_full_retry_chain_not_multiplied(db_factory,
 
     narrow_cfg = Config(
         llm_vision_model=cfg.llm_vision_model,
+        llm_vision_fallback_model=cfg.llm_vision_fallback_model,
         llm_verdict_model=cfg.llm_verdict_model,
         llm_max_concurrency=4,
         llm_max_per_minute=1,
@@ -728,6 +731,26 @@ def test_sniff_image_media_type_recognizes_all_four_formats():
         _sniff_image_media_type(b"not-an-image-at-all")
 
 
+def test_the_image_cap_leaves_room_for_base64_inflation():
+    """`MAX_IMAGE_BYTES` — предел в СЫРЫХ байтах, а провайдер считает по base64.
+
+    Картинка едет к модели как `BinaryContent`, то есть в base64, и там она на
+    треть длиннее. Тест держит именно это соотношение: предел, поставленный по
+    сырому размеру файла, обязан укладываться в провайдерский после раздувания —
+    иначе бот пропустил бы к модели то, что она отвергнет.
+    """
+    from harness.platform.llm import (
+        MAX_IMAGE_BYTES,
+        MAX_IMAGE_MB,
+        PROVIDER_BASE64_IMAGE_LIMIT,
+    )
+
+    inflated = len(base64.b64encode(b"\x00" * MAX_IMAGE_BYTES))
+    assert inflated < PROVIDER_BASE64_IMAGE_LIMIT
+    # Число в тексте отказа — тот же предел, а не второе, разошедшееся с ним.
+    assert MAX_IMAGE_MB * 1024 * 1024 == MAX_IMAGE_BYTES
+
+
 async def test_call_sniffs_jpeg_media_type_for_images(db_factory):
     """То же самое, но через публичный `LLM.__call__` end-to-end: JPEG-байты в
     `images=` обязаны долететь до модели как `BinaryContent(media_type='image/
@@ -906,3 +929,39 @@ def test_config_from_env_rejects_non_integer_with_named_error(monkeypatch):
 
     with pytest.raises(InvalidEnvVar, match="LLM_MAX_CONCURRENCY"):
         Config.from_env()
+
+
+async def test_the_expensive_vision_model_is_a_second_purpose_not_a_second_facade(
+    db_factory, monkeypatch
+):
+    """Вторая ступень каскада зрения выбирается назначением вызова, а не веткой кода.
+
+    Смена модели — смена строки конфига (спека §7), и у дорогой ступени эта
+    строка своя. Проверяется резолвом, а не сетью: в этом репозитории ключа
+    провайдера нет.
+    """
+    llm = LLM(cfg, db_factory)
+    assert llm._resolve_model("vision_extract") == cfg.llm_vision_model
+    assert llm._resolve_model("vision_extract_fallback") == cfg.llm_vision_fallback_model
+    assert llm._resolve_model("verdict_text") == cfg.llm_verdict_model
+
+
+async def test_asking_for_an_unconfigured_expensive_model_names_the_variable(db_factory):
+    """Переменная необязательна, поэтому её отсутствие обязано быть НАЗВАНО.
+
+    `Agent("")` дал бы отказ провайдера тремя уровнями глубже, а править надо
+    `.env`, и сообщение обязано это сказать.
+    """
+    from harness.platform.llm import LLMNotConfigured
+
+    without = Config(
+        llm_vision_model=cfg.llm_vision_model,
+        llm_vision_fallback_model="",
+        llm_verdict_model=cfg.llm_verdict_model,
+        llm_max_concurrency=1,
+        llm_max_per_minute=1,
+        database_url=cfg.database_url,
+        telegram_token=cfg.telegram_token,
+    )
+    with pytest.raises(LLMNotConfigured, match="LLM_VISION_FALLBACK_MODEL"):
+        LLM(without, db_factory)._resolve_model("vision_extract_fallback")

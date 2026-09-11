@@ -11,25 +11,61 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+import secrets
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import delete, exists, func, literal, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from harness.contracts import (
+    LEAK_RULES,
+    MAX_NOTE_TEXT_CHARS,
+    NOTE_COLOR_NONE,
     AnalysisResult,
+    CalcName,
     CanonicalHand,
+    CoverageResult,
+    DecisionPoint,
     EnrichedHand,
+    LeakRule,
+    LeaksOverview,
+    LeakStat,
+    Measurement,
+    NoteRecord,
+    OpponentRecord,
+    PointFilter,
     Provenance,
     RawHand,
     ScanSummary,
+    SessionLine,
+    SessionSummary,
+    Window,
+    is_judged,
+    leak_rule_for,
 )
-from harness.memory.models import Analysis, CalcCache, EvalCase, Hand, Job, Player, Tournament
+from harness.memory.models import (
+    Analysis,
+    CalcCache,
+    DecisionPointRow,
+    EvalCase,
+    Hand,
+    Invite,
+    Job,
+    Note,
+    Opponent,
+    OpponentLink,
+    Player,
+    Tournament,
+)
 from harness.memory.models import Session as SessionRow
+
+# Сколько случайных байт в инвайт-коде. 9 байт — 12 символов в base64url;
+# перебором такой код не находится, а продиктовать его голосом всё ещё можно.
+_INVITE_CODE_BYTES = 9
 
 _MONTHS_RU_ABBR = (
     "янв",
@@ -57,6 +93,40 @@ class PlayersRepo:
 
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
+
+    async def set_gg_nickname(self, player_id: int, nickname: str) -> None:
+        """Записать ник игрока в руме — вход опознания героя на скриншоте.
+
+        Спрашивается один раз (задачи 19/23); здесь только запись. Пустой строкой
+        не затирается: «ник неизвестен» это NULL, и превращать его в пустую
+        строку значило бы завести второе значение с тем же смыслом.
+        """
+        if not nickname.strip():
+            raise ValueError("ник в руме не может быть пустым")
+        await self.db.execute(
+            update(Player).where(Player.id == player_id).values(gg_nickname=nickname.strip())
+        )
+        await self.db.flush()
+
+    async def find(self, tg_user_id: int) -> Player | None:
+        """Игрок, если он уже заведён, — и НИКОГДА не заводит нового.
+
+        Отдельно от `get_or_create` затем, что с задачи 23 вход закрыт инвайтом:
+        обработчику надо уметь спросить «этот игрок уже наш?», не впуская
+        незнакомца самим фактом вопроса.
+        """
+        return await self.db.scalar(select(Player).where(Player.tg_user_id == tg_user_id))
+
+    async def set_pending_input(self, player_id: int, value: dict[str, Any] | None) -> None:
+        """Запомнить (или снять) то, что означает следующее текстовое сообщение.
+
+        `None` снимает ожидание. Состояние живёт в БД, а не в памяти бота, — см.
+        комментарий к колонке `players.pending_input` (`memory/models.py`).
+        """
+        await self.db.execute(
+            update(Player).where(Player.id == player_id).values(pending_input=value)
+        )
+        await self.db.flush()
 
     async def get_or_create(self, tg_user_id: int) -> Player:
         """Найти игрока или завести — безопасно при гонке (fix round 1 задачи 19).
@@ -88,6 +158,41 @@ class PlayersRepo:
         created = await self.db.scalar(select(Player).where(Player.id == created_id))
         if created is None:  # pragma: no cover — только что вставленная строка
             raise LookupError(f"игрок {created_id} не найден сразу после вставки")
+        return created
+
+    async def bootstrap_owner(self, tg_user_id: int) -> Player | None:
+        """Завести владельца ПЕРВОЙ строкой `players` — или не завести ничего.
+
+        Существует ради одного обстоятельства: коды выпускает только игрок с
+        `is_dev`, а на чистой базе такого игрока нет, и продукт после деплоя
+        недостижим никому. Здесь он появляется — ровно один раз на базу.
+
+        `None` означает «таблица уже не пуста», и вызывающий обязан отказать
+        обычным путём (`bot/handlers.py`): пустота — единственное условие, при
+        котором id из окружения кого-то впускает, поэтому дверью после первого
+        игрока эта переменная не остаётся
+        (`test_the_owner_bootstrap_is_spent_once_per_database`).
+
+        Проверка пустоты и вставка — ОДИН оператор (`INSERT ... WHERE NOT
+        EXISTS`), а не «прочитали и записали»: два одновременных `/start` иначе
+        разошлись бы между собой (тот же приём и та же причина, что у
+        `InvitesRepo.redeem` и `get_or_create` выше;
+        `test_two_owner_starts_at_once_admit_one_owner`).
+        """
+        created_id = await self.db.scalar(
+            pg_insert(Player)
+            .from_select(
+                ["tg_user_id", "is_dev"],
+                select(literal(tg_user_id), literal(True)).where(~exists(select(Player.id))),
+            )
+            .on_conflict_do_nothing(index_elements=["tg_user_id"])
+            .returning(Player.id)
+        )
+        if created_id is None:
+            return None
+        created = await self.db.scalar(select(Player).where(Player.id == created_id))
+        if created is None:  # pragma: no cover — только что вставленная строка
+            raise LookupError(f"владелец {created_id} не найден сразу после вставки")
         return created
 
 
@@ -161,6 +266,106 @@ class SessionsRepo:
         await self.db.flush()
         return record
 
+    async def count_for_player(self, player_id: int) -> int:
+        """Сколько вечеров у игрока всего — знаменатель строки обрезки экрана.
+
+        Отдельным запросом: длина `list_for_player` — размер страницы, а не
+        история игрока (`test_the_session_count_does_not_depend_on_the_page_size`).
+        """
+        return int(
+            await self.db.scalar(
+                select(func.count())
+                .select_from(SessionRow)
+                .where(SessionRow.player_id == player_id)
+            )
+            or 0
+        )
+
+    async def list_for_player(self, player_id: int, *, limit: int = 10) -> list[SessionLine]:
+        """Сессии игрока, свежие первыми, — список экрана «Сессии».
+
+        Без агрегатов: сводка вечера считается ПО ЗАПРОСУ (решение владельца
+        2026-09-07), и список не платит за неё на каждой строке.
+        """
+        stmt = (
+            select(SessionRow)
+            .where(SessionRow.player_id == player_id)
+            .order_by(SessionRow.started_at.desc(), SessionRow.id.desc())
+            .limit(limit)
+        )
+        return [
+            SessionLine(
+                session_id=row.id,
+                title=row.title,
+                started_at=row.started_at,
+                is_active=row.closed_at is None,
+            )
+            for row in await self.db.scalars(stmt)
+        ]
+
+    async def summary(self, session_id: int, player_id: int) -> SessionSummary | None:
+        """Агрегат вечера: турниры, разобранные руки, цена расхождений, лик вечера.
+
+        `None` — сессии нет или она чужая: номер приезжает из `callback_data`,
+        то есть из внешнего мира, и «показать по номеру» без сверки владельца
+        отдало бы чужой вечер.
+
+        `hands` — руки, по которым есть РАЗБОР (строка `analyses`), а не все
+        сохранённые: сводка вечера отвечает на «сколько разобрано».
+
+        `loss_bb` — сумма отрицательных расхождений по судимым точкам, взятая по
+        модулю; ровно та величина, которую `ScanSummary.total_loss_bb` называет
+        «суммарной потерей в оценённых решениях», только за сессию целиком.
+        """
+        row = await self.db.scalar(
+            select(SessionRow).where(
+                SessionRow.id == session_id, SessionRow.player_id == player_id
+            )
+        )
+        if row is None:
+            return None
+        tournaments = int(
+            await self.db.scalar(
+                select(func.count())
+                .select_from(Tournament)
+                .where(Tournament.session_id == session_id)
+            )
+            or 0
+        )
+        hands = int(
+            await self.db.scalar(
+                select(func.count(func.distinct(Hand.id)))
+                .select_from(Hand)
+                .join(Analysis, Analysis.hand_id == Hand.id)
+                .where(Hand.session_id == session_id)
+            )
+            or 0
+        )
+        leaks = LeaksRepo(self.db)
+        evening = PointFilter(window=Window(session_id=session_id))
+        judged, total = await leaks.coverage(player_id, evening)
+        by_type = await leaks.by_type(player_id, evening)
+        loss = await self._session_loss_bb(player_id, session_id)
+        return SessionSummary(
+            session_id=session_id,
+            title=row.title,
+            tournaments=tournaments,
+            hands=hands,
+            loss_bb=loss,
+            points_judged=judged,
+            points_total=total,
+            top_leak=by_type[0] if by_type else None,
+        )
+
+    async def _session_loss_bb(self, player_id: int, session_id: int) -> float:
+        """Цена расхождений вечера — сумма отрицательных `ev_diff_bb` судимых точек."""
+        loss = await self.db.scalar(
+            select(_negative_loss(DecisionPointRow.judged)).where(
+                *_points_of(player_id, PointFilter(window=Window(session_id=session_id)))
+            )
+        )
+        return -float(loss or 0.0)
+
     async def close_active(self, player_id: int) -> bool:
         """Закрыть открытые сессии игрока; вернуть, было ли что закрывать.
 
@@ -228,6 +433,21 @@ class HandsRepo:
         self.db.add(record)
         await self.db.flush()
         return record.id
+
+    async def replace_raw(self, hand_id: int, raw: RawHand) -> None:
+        """Переписать `hands.raw` и СБРОСИТЬ чекпоинты ниже по конвейеру.
+
+        Спека §8.3, шаг 2: ответ игрока на вопрос валидатора патчит сырую руку, а
+        `canonical`/`enriched` пересчитываются. Сброс здесь, а не у вызывающего, —
+        потому что разъединить эти две записи некому: строка с новым `raw` и
+        старым `enriched` описывает две разные руки сразу, и любой, кто прочитает
+        её между двумя апдейтами, получит именно это.
+        """
+        record = await self._get_row(hand_id)
+        record.raw = raw.model_dump(mode="json")
+        record.canonical = None
+        record.enriched = None
+        await self.db.flush()
 
     async def save_canonical(self, hand_id: int, canonical: CanonicalHand) -> None:
         record = await self._get_row(hand_id)
@@ -302,6 +522,108 @@ class HandsRepo:
         )
         return await self.db.scalar(stmt)
 
+    async def player_hands_by_tournament(self, player_id: int) -> list[list[CanonicalHand]]:
+        """Канонические руки игрока по всем его турнирам — списком на турнир.
+
+        Вход «среднего по всем турнирам» в отчёте (задача 23). Группировка
+        турнирами, а не одним плоским списком, — это не удобство вызывающего:
+        по числу групп отчёт решает, есть ли с чем сравнивать вообще, и
+        передать одно вместо другого он не сможет.
+
+        Читается ровно одна колонка — `canonical`: `raw` и `enriched` весят
+        кратно больше, а формулам статистики (`analysis/player_stats.py`) не
+        нужны ни отчёт движка, ни исходные строки файла. Руки без чекпоинта
+        `canonical` пропускаются: пайплайн до них не дошёл, и считать по ним
+        нечего.
+
+        Область — сессии этого игрока (JOIN по `sessions.player_id`), как и у
+        `find_session_by_hand_no`: без этого условия в среднее попали бы чужие
+        раздачи. Руки без турнира (скриншоты) не входят вовсе — сравнение
+        заявлено «по турнирам».
+
+        Стоимость растёт с историей игрока: это чтение ВСЕХ его рук на каждый
+        отчёт. На порядках величин v1 (единицы турниров по паре сотен раздач)
+        это дешевле, чем отдельная таблица агрегатов, которую пришлось бы
+        держать в согласии с руками; кэш и агрегаты — после телеметрии
+        (SCALING.md, «отложить до телеметрии»).
+        """
+        stmt = (
+            select(Hand.tournament_id, Hand.canonical)
+            .join(SessionRow, SessionRow.id == Hand.session_id)
+            .where(
+                SessionRow.player_id == player_id,
+                Hand.tournament_id.is_not(None),
+                Hand.canonical.is_not(None),
+            )
+            .order_by(Hand.tournament_id, Hand.id)
+        )
+        grouped: dict[int, list[CanonicalHand]] = {}
+        for tournament_id, canonical in await self.db.execute(stmt):
+            grouped.setdefault(tournament_id, []).append(
+                CanonicalHand.model_validate(canonical)
+            )
+        return list(grouped.values())
+
+    async def player_canonical(
+        self, player_id: int, window: Window | None = None
+    ) -> list[CanonicalHand]:
+        """Канонические руки игрока в окне, плоским списком в порядке записи.
+
+        Вход частот словаря расчётов. Плоским, а не по турнирам, в отличие от
+        `player_hands_by_tournament`: там группы несут смысл (по их числу отчёт
+        решает, есть ли с чем сравнивать), здесь считается один знаменатель на
+        всё окно, и группировать нечего.
+
+        Руки без турнира (скриншоты) ВХОДЯТ, в отличие от того же соседа:
+        частота считается по действиям за столом, а они у скриншота такие же.
+        Отсекается только отсутствие чекпоинта `canonical` — пайплайн до состава
+        мест не дошёл, и считать по такой руке нечего.
+
+        Окно — те же две колонки `sessions`, что у `_points_of`, и по той же
+        причине (`contracts.calcs.Window`). Область всегда ограничена сессиями
+        этого игрока, как у `player_hands_by_tournament`: без этого условия в
+        знаменатель попали бы чужие раздачи.
+        """
+        window = window or Window()
+        where = [SessionRow.player_id == player_id, Hand.canonical.is_not(None)]
+        if window.session_id is not None:
+            where.append(Hand.session_id == window.session_id)
+        if window.since is not None:
+            where.append(SessionRow.started_at >= window.since)
+        stmt = (
+            select(Hand.canonical)
+            .join(SessionRow, SessionRow.id == Hand.session_id)
+            .where(*where)
+            .order_by(Hand.id)
+        )
+        return [
+            CanonicalHand.model_validate(canonical)
+            for canonical in await self.db.scalars(stmt)
+        ]
+
+    async def last_canonical(self, player_id: int) -> CanonicalHand | None:
+        """Свежайшая рука игрока, дошедшая до чекпоинта `canonical`, — «последний
+        разбор» для команды псевдонима (`bot/handlers.py`).
+
+        Свежесть — по `hands.id`: он растёт с порядком записи, а времени
+        разбора у таблицы нет вовсе. Руки без `canonical` пропускаются: до
+        состава мест за столом пайплайн по ним не дошёл, и назвать в такой руке
+        участника не по чему.
+
+        Область — сессии этого игрока (JOIN по `sessions.player_id`), как у
+        `find_session_by_hand_no` и `player_hands_by_tournament`: без этого
+        условия «последним разбором» мог бы оказаться чужой.
+        """
+        stmt = (
+            select(Hand.canonical)
+            .join(SessionRow, SessionRow.id == Hand.session_id)
+            .where(SessionRow.player_id == player_id, Hand.canonical.is_not(None))
+            .order_by(Hand.id.desc())
+            .limit(1)
+        )
+        canonical = await self.db.scalar(stmt)
+        return None if canonical is None else CanonicalHand.model_validate(canonical)
+
     def _to_record(self, record: Hand) -> HandRecord:
         return HandRecord(
             id=record.id,
@@ -339,8 +661,48 @@ class AnalysisRecord:
     range_images: list[str] | None
 
 
+# Поле `PointVerdict` → колонка `decision_points`. Одна карта на запись и на
+# чтение: два списка полей, обязанных совпадать, — ровно то, чего эта задача
+# избегает. Переименование единственное и вынужденное (`interval` в Postgres
+# зарезервировано); полнота карты проверяется
+# `test_every_field_of_a_point_verdict_has_its_column`.
+_POINT_COLUMNS: Mapping[str, str] = {
+    "dp_index": "dp_index",
+    "street": "street",
+    "spot": "spot",
+    "zone": "zone",
+    "action_taken": "action_taken",
+    "best_action": "best_action",
+    "ev_diff_bb": "ev_diff_bb",
+    "interval": "ev_interval",
+    "assumption": "assumption",
+    "tools": "tools",
+    "detail": "detail",
+}
+
+# Обстановка точки из `DecisionPoint` (`hands.enriched`): имя поля и имя колонки
+# совпадают. Не весь контракт — только то, по чему фильтруют: улица и сыгранное
+# действие уже приехали из вердикта, а метка места и живые оппоненты в фильтрах
+# не участвуют.
+_CONTEXT_COLUMNS: tuple[str, ...] = (
+    "position",
+    "to_call",
+    "pot_before",
+    "eff_stack",
+    "eff_stack_bb",
+    "spr",
+)
+
+
 class AnalysesRepo:
-    """`analyses`: выход ядра (`result`) и изложения (`verdict_text`, `range_images`)."""
+    """`analyses`: выход ядра (`result`) и изложения (`verdict_text`, `range_images`).
+
+    Точки решения лежат НЕ здесь, а строками в `decision_points` (миграция
+    0008): `result` хранит документ без них, `save` раскладывает массив по
+    строкам, `get_by_hand` собирает его обратно. Второй копии вердикта в базе
+    нет — значит, ей и не с чем расходиться
+    (`test_the_saved_document_carries_no_points_of_its_own`).
+    """
 
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
@@ -350,27 +712,113 @@ class AnalysesRepo:
         *,
         hand_id: int,
         result: AnalysisResult,
+        decision_points: Sequence[DecisionPoint],
         verdict_text: str | None = None,
         range_images: list[str] | None = None,
     ) -> int:
+        """Записать разбор: документ в `analyses`, точки — строками, в одной транзакции.
+
+        `decision_points` — точки решения движка из `hands.enriched` той же
+        руки; из них берётся обстановка (позиция, банк, доплата, стек, SPR),
+        которой в вердикте нет. Вердикт сопоставляется с обстановкой по
+        `dp_index`; вердикту, которому в руке ничего не соответствует, колонки
+        обстановки остаются пустыми, а не заполняются похожей точкой
+        (`test_a_verdict_without_its_decision_point_is_stored_without_context`).
+        """
         record = Analysis(
             hand_id=hand_id,
-            result=result.model_dump(mode="json"),
+            result=result.model_dump(mode="json", exclude={"points"}),
             verdict_text=verdict_text,
             range_images=range_images,
         )
         self.db.add(record)
         await self.db.flush()
+        await self._save_points(hand_id, result, decision_points)
         return record.id
 
+    async def _save_points(
+        self, hand_id: int, result: AnalysisResult, decision_points: Sequence[DecisionPoint]
+    ) -> None:
+        if not result.points:
+            return
+        address = (
+            await self.db.execute(
+                select(Hand.session_id, SessionRow.player_id)
+                .join(SessionRow, SessionRow.id == Hand.session_id)
+                .where(Hand.id == hand_id)
+            )
+        ).one()
+        context = {point.index: point for point in decision_points}
+        rows: list[dict[str, Any]] = []
+        for point_no, point in enumerate(result.points):
+            dumped = point.model_dump(mode="json")
+            row: dict[str, Any] = {
+                field_column: dumped[field] for field, field_column in _POINT_COLUMNS.items()
+            }
+            row |= {
+                "hand_id": hand_id,
+                "session_id": address.session_id,
+                "player_id": address.player_id,
+                "point_no": point_no,
+                # Единственная формулировка правила судимости на всю систему —
+                # `contracts.is_judged`; SQL после этого его не повторяет.
+                "judged": is_judged(point),
+            }
+            source = context.get(point.dp_index)
+            row |= {
+                name: None if source is None else getattr(source, name)
+                for name in _CONTEXT_COLUMNS
+            }
+            rows.append(row)
+        await self.db.execute(pg_insert(DecisionPointRow), rows)
+        await self.db.flush()
+
+    async def set_explanation(
+        self, *, hand_id: int, verdict_text: str | None = None, range_images: list[str]
+    ) -> None:
+        """Дописать изложение к УЖЕ сохранённому разбору — чекпоинт станции explain.
+
+        Отдельным методом, а не вторым `save()`: разбор (`result`) и текст к нему
+        считаются разными станциями конвейера и переживают разные падения (задача
+        18, чекпоинты). Повторная попытка, у которой числа уже посчитаны, обязана
+        дописать к ним слова, а не завести вторую строку на ту же руку.
+
+        `verdict_text=None` — законный случай: картинки диапазонов рисует код, и
+        сохранить их надо даже тогда, когда модель не ответила. Пустой текст при
+        этом НЕ записывается поверх существующего — колонка просто не попадает в
+        `UPDATE` (`test_set_explanation_without_text_keeps_the_saved_one`).
+        """
+        values: dict[str, Any] = {"range_images": range_images}
+        if verdict_text is not None:
+            values["verdict_text"] = verdict_text
+        await self.db.execute(
+            update(Analysis).where(Analysis.hand_id == hand_id).values(**values)
+        )
+
     async def get_by_hand(self, hand_id: int) -> AnalysisRecord | None:
+        """Разбор руки целиком: документ из `analyses` плюс точки из строк.
+
+        Точки возвращаются в порядке `point_no` — в том же, в каком лежали в
+        массиве: `AnalysisResult.ranked` индексирует массив, и перестановка
+        сдвинула бы ранжирование на чужие точки
+        (`test_the_analysis_document_returns_from_the_rows_as_it_went_in`).
+        """
         record = await self.db.scalar(select(Analysis).where(Analysis.hand_id == hand_id))
         if record is None:
             return None
+        rows = await self.db.scalars(
+            select(DecisionPointRow)
+            .where(DecisionPointRow.hand_id == hand_id)
+            .order_by(DecisionPointRow.point_no)
+        )
+        points = [
+            {field: getattr(row, field_column) for field, field_column in _POINT_COLUMNS.items()}
+            for row in rows
+        ]
         return AnalysisRecord(
             id=record.id,
             hand_id=record.hand_id,
-            result=AnalysisResult.model_validate(record.result),
+            result=AnalysisResult.model_validate({**record.result, "points": points}),
             verdict_text=record.verdict_text,
             range_images=record.range_images,
         )
@@ -413,6 +861,33 @@ class TournamentsRepo:
         record.scan_summary = summary.model_dump(mode="json")
         await self.db.flush()
 
+    async def player_scan_summaries(
+        self, player_id: int, *, exclude: int
+    ) -> list[ScanSummary]:
+        """Сводки сканов ПРОШЛЫХ турниров игрока — источник «этот паттерн уже был».
+
+        `exclude` — турнир, по которому отчёт строится сейчас: его сводка к
+        этому моменту уже сохранена, и без исключения каждая находка текущего
+        турнира читалась бы как «то же самое было раньше»
+        (`test_past_scan_summaries_exclude_the_tournament_being_reported`).
+        Аргумент обязателен и именован: молчаливое умолчание «ничего не
+        исключать» — ровно та ошибка, которую он предотвращает.
+
+        Турниры без сохранённой сводки (скан не дошёл до конца) не попадают:
+        отсутствующая сводка — не пустая.
+        """
+        stmt = (
+            select(Tournament.scan_summary)
+            .join(SessionRow, SessionRow.id == Tournament.session_id)
+            .where(
+                SessionRow.player_id == player_id,
+                Tournament.id != exclude,
+                Tournament.scan_summary.is_not(None),
+            )
+            .order_by(Tournament.id)
+        )
+        return [ScanSummary.model_validate(row) for row in await self.db.scalars(stmt)]
+
     async def _get_row(self, tournament_id: int) -> Tournament:
         record = await self.db.get(Tournament, tournament_id)
         if record is None:
@@ -444,6 +919,43 @@ class JobsRepo:
                 Job.session_id == session_id,
                 Job.type == "hh_scan",
                 Job.payload["source_file"].astext == source_file,
+            )
+            .order_by(Job.id.desc())
+            .limit(1)
+        )
+        return await self.db.scalar(stmt)
+
+    async def get_awaiting(self, job_id: int, player_id: int) -> Job | None:
+        """Ждущая ответа задача ПО НОМЕРУ — и только если она этого игрока.
+
+        Номер приходит из нажатой кнопки; сверка с игроком нужна затем, что
+        `callback_data` приходит из внешнего мира и номер в нём может быть
+        любым. Ждущих задач у игрока бывает несколько сразу (спека §8.1:
+        `awaiting_user` не считается активной), поэтому «самая свежая ждущая» —
+        неверный ответ на вопрос «к какой руке относится этот ответ».
+        """
+        stmt = select(Job).where(
+            Job.id == job_id, Job.player_id == player_id, Job.status == "awaiting_user"
+        )
+        return await self.db.scalar(stmt)
+
+    async def awaiting_manual_entry(self, player_id: int) -> Job | None:
+        """Задача игрока, ждущая ЧИСЛА, введённого вручную, — самая свежая из них.
+
+        Обычное сообщение номера задачи не несёт, поэтому адресат ищется по
+        признаку начатого ввода (`payload["manual_entry"]`), а не по одному лишь
+        статусу: у соседней ждущей задачи ввод не начинали, и подставлять число
+        в неё нельзя. Состояние ввода живёт в `jobs.payload`, а не в памяти
+        процесса бота (спека §8.3 — точка возврата уже зафиксирована
+        артефактами, и переживать она обязана перезапуск бота так же, как
+        переживает его сама задача).
+        """
+        stmt = (
+            select(Job)
+            .where(
+                Job.player_id == player_id,
+                Job.status == "awaiting_user",
+                Job.payload["manual_entry"].astext.isnot(None),
             )
             .order_by(Job.id.desc())
             .limit(1)
@@ -491,14 +1003,36 @@ class CalcCacheRepo:
         return {key[len(prefix) :]: float(value) for key, value in rows}
 
     async def upsert_many(self, prefix: str, entries: Mapping[str, float]) -> None:
+        """Записать пачку значений, разбивая её на куски по `_UPSERT_CHUNK` строк.
+
+        Куски обязательны, а не оптимизация: одна строка стоит двух связанных
+        параметров, а протокол Postgres их больше 32767 в одном запросе не
+        принимает — с 16384-й строки asyncpg роняет запрос целиком
+        («the number of query arguments cannot exceed 32767»). Кэш эквити растёт
+        от турнира к турниру и этот рубеж переходит; поймано прогоном, где
+        накопленный дисковый кэш дорос до 16884 записей и КАЖДАЯ задача воркера
+        стала падать на записи в `calc_cache`. Закреплено
+        `test_calc_cache_upsert_survives_more_rows_than_one_statement_allows`.
+        """
         if not entries:
             return
         values: list[dict[str, Any]] = [
             {"key": f"{prefix}{key}", "value": value} for key, value in entries.items()
         ]
-        stmt = pg_insert(CalcCache).values(values).on_conflict_do_nothing(index_elements=["key"])
-        await self.db.execute(stmt)
+        for start in range(0, len(values), _UPSERT_CHUNK):
+            stmt = (
+                pg_insert(CalcCache)
+                .values(values[start : start + _UPSERT_CHUNK])
+                .on_conflict_do_nothing(index_elements=["key"])
+            )
+            await self.db.execute(stmt)
         await self.db.flush()
+
+
+# Сколько строк уходит в БД одним INSERT. Потолок протокола Postgres — 32767
+# связанных параметров на запрос, строка кэша стоит двух (ключ и значение),
+# то есть жёсткий предел 16383 строки. 5000 — с запасом и без лишних рейсов.
+_UPSERT_CHUNK = 5000
 
 
 # Квота по умолчанию (спека §9, пример дословно: «разборов 17/50 за 24 ч») — действует,
@@ -507,7 +1041,11 @@ QUOTA_DAILY_DEFAULT = 50
 
 # Квоту тратят только ИНТЕРАКТИВНЫЕ задачи (спека §9). `hh_scan` в список не входит
 # намеренно: он дёшев для нас и «поощряется щедрее» — это продуктовый рычаг
-# (SCALING.md), а не недосмотр.
+# (SCALING.md), а не недосмотр. `question` не входит по другой причине: этот
+# счётчик подписан игроку словом «разборов» (`quota_exceeded_msg`,
+# `_quota_line`), и списанный с него вопрос сделал бы подпись неверной
+# (`test_a_question_does_not_spend_the_daily_quota`). Своего предела у вопросов
+# сегодня нет — есть только кросс-процессный лимитер модели.
 QUOTA_INTERACTIVE_JOB_TYPES = ("deep_dive", "screenshot_analyze")
 
 # Скользящее окно, а не календарные сутки (спека §9 дословно: ни поля пояса, ни
@@ -637,3 +1175,581 @@ class EvalCasesRepo:
         self.db.add(record)
         await self.db.flush()
         return record.id
+
+
+# Точки решения игрока — источник всех сквозных агрегатов («Мои лики», покрытие,
+# цена вечера). Одно выражение вместо текста запроса: до миграции 0008 точки
+# лежали массивом в `analyses.result`, разворачивались боковым соединением и
+# каждое условие писалось по jsonb руками; теперь фильтры складываются обычным
+# `where` и не требуют ни приведений типа, ни повторения правил на втором языке.
+def _points_of(player_id: int, filters: PointFilter):
+    """Условие «точки этого игрока, подходящие под фильтр» — списком для `where`.
+
+    Каждый фильтр — обычное условие по колонке, и складываются они как угодно:
+    именно ради этого точки переехали из массива `analyses.result` в таблицу
+    (миграция 0008). Отдельного запроса на каждое сочетание фильтров нет
+    (`test_every_filter_narrows_the_same_query`).
+
+    Окно по времени выражено через `sessions.started_at`, а не через отметку
+    внутри руки: у таблицы `hands` собственного времени нет вовсе, а вечер и
+    есть единица времени продукта (`contracts.calcs.Window`). Условие игрока в
+    подзапросе повторено намеренно — без него окно захватило бы чужие вечера,
+    начавшиеся в те же дни.
+    """
+    where = [DecisionPointRow.player_id == player_id]
+    if filters.window.session_id is not None:
+        where.append(DecisionPointRow.session_id == filters.window.session_id)
+    if filters.window.since is not None:
+        where.append(
+            DecisionPointRow.session_id.in_(
+                select(SessionRow.id).where(
+                    SessionRow.player_id == player_id,
+                    SessionRow.started_at >= filters.window.since,
+                )
+            )
+        )
+    if filters.street is not None:
+        where.append(DecisionPointRow.street == filters.street)
+    if filters.spot is not None:
+        where.append(DecisionPointRow.spot == filters.spot)
+    if filters.position is not None:
+        where.append(DecisionPointRow.position == filters.position)
+    return where
+
+
+# Сумма отрицательных расхождений — «столько ушло». Отдельным выражением,
+# потому что складывают её два места (тип лика и цена вечера) и слагаемое у них
+# одно; расходятся они только тем, что цена вечера берёт ещё и судимость, —
+# отсюда `also`.
+def _negative_loss(*also: Any):
+    return func.coalesce(
+        func.sum(DecisionPointRow.ev_diff_bb).filter(*also, DecisionPointRow.ev_diff_bb < 0.0),
+        0.0,
+    )
+
+
+class LeaksRepo:
+    """Сквозная статистика ошибок по всей истории игрока — экран «Мои лики».
+
+    **Группировка по ТИПУ ЛИКА, а не по споту** (решение владельца 2026-09-07):
+    тип — строка таблицы `LEAK_RULES` (`contracts/history.py`), то есть тройка
+    «спот · сыграно · лучше». SQL группирует точки по этой тройке, Python
+    сопоставляет тройки с таблицей правил; тройка, которой в таблице нет, в
+    экран не попадает — этим же отсекаются точки «около нуля» (в `best_action`
+    у них русская фраза ядра) и точки без вердикта (пустой `best_action`),
+    которые в лики не входят по постановке.
+
+    Читается по всей истории игрока, а не по сессии: «типовые ошибки копятся по
+    всей истории, иначе „твой повторяющийся лик“ не вычислить» (SESSIONS_UX,
+    раздел «Что сквозное»). Тот же агрегат с `session_id` — лик одного вечера.
+    """
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def overview(self, player_id: int) -> LeaksOverview:
+        """Экран целиком: покрытие за всю историю плюс типы ликов по цене."""
+        judged, total = await self.coverage(player_id)
+        return LeaksOverview(
+            points_judged=judged,
+            points_total=total,
+            leaks=await self.by_type(player_id),
+        )
+
+    async def coverage(
+        self, player_id: int, filters: PointFilter | None = None
+    ) -> tuple[int, int]:
+        """Сколько точек решения оценено из скольких — под заданным фильтром.
+
+        Пара, которую экран печатает строкой «оценено N из M решений»: без неё
+        список ликов читается как полная картина игры, хотя судится сегодня
+        только префлоп-пуш-фолд. Судимость читается колонкой `judged`, а не
+        условием: правило записано один раз, в `contracts.is_judged`.
+
+        Фильтр по умолчанию пуст — вся история игрока.
+        """
+        row = (
+            await self.db.execute(
+                select(
+                    func.count().label("points_total"),
+                    func.count().filter(DecisionPointRow.judged).label("points_judged"),
+                ).where(*_points_of(player_id, filters or PointFilter()))
+            )
+        ).one()
+        return int(row.points_judged), int(row.points_total)
+
+    async def coverage_and_cost(
+        self, player_id: int, filters: PointFilter | None = None
+    ) -> CoverageResult:
+        """Покрытие и цена под фильтром — три величины с тремя знаменателями.
+
+        Сумма в bb складывается ТОЛЬКО с судимых точек и только с тех из них, где
+        расхождение отрицательно; `priced` называет, сколько их было. Точка
+        разобранная, но без посчитанной цены, входит в знаменатель покрытия и не
+        входит в сумму: сложить её ноль с ценами значило бы подать «здесь не
+        потеряно» там, где не считали (`CoverageResult`,
+        `test_points_without_a_price_do_not_enter_the_sum`).
+        """
+        where = _points_of(player_id, filters or PointFilter())
+        priced = (DecisionPointRow.judged, DecisionPointRow.ev_diff_bb < 0.0)
+        row = (
+            await self.db.execute(
+                select(
+                    func.count().label("total"),
+                    func.count().filter(DecisionPointRow.judged).label("judged"),
+                    func.count().filter(*priced).label("priced"),
+                    _negative_loss(DecisionPointRow.judged).label("loss"),
+                ).where(*where)
+            )
+        ).one()
+        return CoverageResult(
+            calc=CalcName.COVERAGE,
+            filter=filters or PointFilter(),
+            judged=Measurement(numerator=int(row.judged), denominator=int(row.total)),
+            priced=Measurement(numerator=int(row.priced), denominator=int(row.judged)),
+            loss_bb=-float(row.loss),
+        )
+
+    async def by_type(
+        self, player_id: int, filters: PointFilter | None = None
+    ) -> list[LeakStat]:
+        """Типы ликов с частотой и ценой, самый дорогой первым.
+
+        `loss_bb` положителен («столько ушло»), как в `EvSplit`: складываются
+        только отрицательные `ev_diff_bb`, потому что лик — это потеря, а не
+        сальдо (положительных расхождений у судимой точки не бывает по
+        построению ядра, и полагаться на это правило здесь не нужно).
+        """
+        stmt = (
+            select(
+                DecisionPointRow.spot,
+                DecisionPointRow.action_taken,
+                DecisionPointRow.best_action,
+                func.count().label("n"),
+                _negative_loss().label("loss"),
+            )
+            .where(*_points_of(player_id, filters or PointFilter()))
+            .group_by(
+                DecisionPointRow.spot,
+                DecisionPointRow.action_taken,
+                DecisionPointRow.best_action,
+            )
+        )
+        counts: dict[str, int] = {}
+        losses: dict[str, float] = {}
+        rules: dict[str, LeakRule] = {}
+        for row in (await self.db.execute(stmt)).all():
+            rule = leak_rule_for(row.spot, row.action_taken, row.best_action)
+            if rule is None:
+                continue
+            rules[rule.key] = rule
+            counts[rule.key] = counts.get(rule.key, 0) + int(row.n)
+            losses[rule.key] = losses.get(rule.key, 0.0) + float(row.loss)
+        stats = [
+            LeakStat(rule=rules[key], count=counts[key], loss_bb=-losses[key])
+            for key in rules
+        ]
+        # Дорогой лик — первым, при равной цене — более частый. Третий ключ
+        # (порядок в таблице правил) делает порядок полным: две строки с
+        # одинаковой ценой и частотой иначе менялись бы местами от запроса к
+        # запросу, и экран «Мои лики» выглядел бы по-разному без причины.
+        order = {rule.key: index for index, rule in enumerate(LEAK_RULES)}
+        stats.sort(key=lambda stat: (-stat.loss_bb, -stat.count, order[stat.rule.key]))
+        return stats
+
+
+class NotesRepo:
+    """`notes`: заметки на оппонентов — сквозные, одна на оппонента.
+
+    Живут только на vision-пути: в GG-HH оппоненты анонимизированы, и
+    идентичность не переживает турнир (ARCHITECTURE §6, спека §5.2). Ник сюда
+    приходит с экрана, поэтому все методы, кроме списка, сверяют владельца —
+    номер заметки приезжает из `callback_data`, то есть из внешнего мира.
+
+    Личность оппонента общая с частотами: заметка ссылается на строку
+    `opponents` (`OpponentsRepo`), а не держит ник своей колонкой. Поэтому
+    регистр ника здесь не различается — ровно так же, как в сшивках турниров
+    (`test_a_note_and_a_link_on_the_same_nick_in_two_cases_meet_on_one_opponent`).
+    """
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def upsert(
+        self, *, owner_player_id: int, nick: str, text_: str, color: str | None = None
+    ) -> int:
+        """Записать наблюдение об оппоненте; вторая запись на того же — правка.
+
+        Заметка накапливается на оппоненте, а не на вечере (SESSIONS_UX), и
+        уникальный индекс `notes(opponent_id)` (миграция 0007) делает это
+        структурной гарантией, а не соглашением вызывающего. Оппонент по нику
+        заводится тем же `get_or_create`, что и для сшивок, поэтому заметка на
+        `Vasya` и заметка на `vasya` — одна заметка
+        (`test_a_note_is_one_per_opponent_and_editing_keeps_its_colour`).
+
+        `color=None` означает «цвет не трогать»: цвет ставится отдельной
+        кнопкой, и правка текста не имеет права его стирать
+        (`test_a_note_is_one_per_opponent_and_editing_keeps_its_colour`).
+        """
+        stripped = text_.strip()
+        if not stripped:
+            raise ValueError("заметка не может быть пустой")
+        if len(stripped) > MAX_NOTE_TEXT_CHARS:
+            # Инвариант хранилища, а не текст игроку: отказ словами выдаёт
+            # `bot.handlers` до вызова, здесь стоит нижняя граница
+            # (`test_a_note_longer_than_the_limit_is_refused_rather_than_cut`).
+            raise ValueError(f"заметка длиннее {MAX_NOTE_TEXT_CHARS} символов")
+        opponent_id = await OpponentsRepo(self.db).get_or_create(
+            owner_player_id=owner_player_id, nick=nick
+        )
+        now = datetime.now(UTC)
+        insert = pg_insert(Note).values(
+            owner_player_id=owner_player_id,
+            opponent_id=opponent_id,
+            color=color if color is not None else NOTE_COLOR_NONE,
+            text=stripped,
+            updated_at=now,
+        )
+        updates: dict[str, Any] = {"text": stripped, "updated_at": now}
+        if color is not None:
+            updates["color"] = color
+        stmt = insert.on_conflict_do_update(
+            index_elements=["opponent_id"], set_=updates
+        ).returning(Note.id)
+        note_id = await self.db.scalar(stmt)
+        await self.db.flush()
+        if note_id is None:  # pragma: no cover — upsert всегда возвращает строку
+            raise LookupError(f"заметка на {nick!r} не записалась")
+        return int(note_id)
+
+    async def set_color(self, note_id: int, owner_player_id: int, color: str) -> bool:
+        """Поставить цветовой архетип; `False` — заметки нет или она чужая."""
+        result = await self.db.execute(
+            update(Note)
+            .where(Note.id == note_id, Note.owner_player_id == owner_player_id)
+            .values(color=color, updated_at=datetime.now(UTC))
+            .returning(Note.id)
+        )
+        await self.db.flush()
+        return result.first() is not None
+
+    async def delete(self, note_id: int, owner_player_id: int) -> bool:
+        """Удалить заметку; `False` — её нет или она чужая.
+
+        Оппонент переживает свою заметку: сшивки турниров держатся на нём, и
+        удалять его вместе с текстом наблюдения означало бы стереть привязки,
+        о которых игрок не просил
+        (`test_deleting_a_note_leaves_the_opponent_and_his_links`).
+        """
+        result = await self.db.execute(
+            delete(Note)
+            .where(Note.id == note_id, Note.owner_player_id == owner_player_id)
+            .returning(Note.id)
+        )
+        await self.db.flush()
+        return result.first() is not None
+
+    async def get(self, note_id: int, owner_player_id: int) -> NoteRecord | None:
+        row = (
+            await self.db.execute(
+                select(Note, Opponent.opponent_nick)
+                .join(Opponent, Note.opponent_id == Opponent.id)
+                .where(Note.id == note_id, Note.owner_player_id == owner_player_id)
+            )
+        ).first()
+        return None if row is None else self._to_record(row[0], row[1])
+
+    async def find_by_nick(self, owner_player_id: int, nick: str) -> NoteRecord | None:
+        """Заметка на этого оппонента, если она уже есть, — для показа перед правкой."""
+        row = (
+            await self.db.execute(
+                select(Note, Opponent.opponent_nick)
+                .join(Opponent, Note.opponent_id == Opponent.id)
+                .where(
+                    Note.owner_player_id == owner_player_id,
+                    func.lower(Opponent.opponent_nick) == func.lower(nick.strip()),
+                )
+            )
+        ).first()
+        return None if row is None else self._to_record(row[0], row[1])
+
+    async def count_for_player(self, owner_player_id: int) -> int:
+        """Сколько заметок у игрока всего — знаменатель строки обрезки экрана.
+
+        Отдельным запросом, потому что `list_for_player` возвращает страницу:
+        её длина — размер страницы, а не то, сколько заметок у игрока
+        (`test_the_note_count_does_not_depend_on_the_page_size`).
+        """
+        return int(
+            await self.db.scalar(
+                select(func.count())
+                .select_from(Note)
+                .where(Note.owner_player_id == owner_player_id)
+            )
+            or 0
+        )
+
+    async def list_for_player(self, owner_player_id: int, *, limit: int = 50) -> list[NoteRecord]:
+        """Заметки игрока, свежие первыми."""
+        stmt = (
+            select(Note, Opponent.opponent_nick)
+            .join(Opponent, Note.opponent_id == Opponent.id)
+            .where(Note.owner_player_id == owner_player_id)
+            .order_by(Note.updated_at.desc(), Note.id.desc())
+            .limit(limit)
+        )
+        return [self._to_record(note, nick) for note, nick in await self.db.execute(stmt)]
+
+    @staticmethod
+    def _to_record(record: Note, nick: str) -> NoteRecord:
+        return NoteRecord(
+            note_id=record.id,
+            nick=nick,
+            color=record.color,
+            text=record.text,
+            updated_at=record.updated_at,
+        )
+
+
+class InvitesRepo:
+    """`invites`: доступ по коду. Выдаёт владелец (`players.is_dev`), гасит `/start`.
+
+    Код — случайные байты из `secrets`, а не последовательность: инвайт это
+    пропуск в закрытый продукт, и угадываемый код отменял бы саму его цель.
+    """
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def mint(self, issued_by: int) -> str:
+        """Создать неиспользованный код и вернуть его текст."""
+        code = secrets.token_urlsafe(_INVITE_CODE_BYTES)
+        record = Invite(code=code, issued_by=issued_by)
+        self.db.add(record)
+        await self.db.flush()
+        return code
+
+    async def redeem(self, code: str, used_by: int) -> bool:
+        """Погасить код на игрока; `False` — кода нет или он уже использован.
+
+        Одним `UPDATE ... WHERE used_by IS NULL`, а не «прочитать и записать»:
+        два одновременных `/start` с одним кодом иначе прошли бы оба, и один
+        инвайт впустил бы двоих (тот же приём, что `ON CONFLICT DO NOTHING` в
+        `PlayersRepo.get_or_create`).
+        """
+        result = await self.db.execute(
+            update(Invite)
+            .where(Invite.code == code.strip(), Invite.used_by.is_(None))
+            .values(used_by=used_by, used_at=datetime.now(UTC))
+            .returning(Invite.id)
+        )
+        await self.db.flush()
+        return result.first() is not None
+
+
+class OpponentsRepo:
+    """`opponents` + `opponent_links`: кто из участников турнира — какой оппонент.
+
+    В файлах раздач участники обезличены, и метка участника сквозная только
+    внутри турнира: между турнирами комната выдаёт новую. Связь между метками
+    разных турниров утверждает ВЛАДЕЛЕЦ. Здесь нет ни одной функции, которая
+    предлагала бы связь сама, — ни по стилю игры, ни по стеку, ни по совпадению
+    чего бы то ни было; методы ниже только записывают и читают сказанное
+    владельцем.
+
+    Личность названа ником в руме и одна на весь продукт: на ту же строку
+    ссылается заметка (`NotesRepo`).
+    """
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def get_or_create(self, *, owner_player_id: int, nick: str) -> int:
+        """Номер оппонента по нику; второй раз тот же ник — тот же номер.
+
+        Регистр не различается: `Vasya` и `vasya` — один оппонент
+        (`test_the_same_nick_in_another_case_is_the_same_opponent`). Хранится
+        написание, которым ник назвали в первый раз: переписывать его вторым
+        вызовом значило бы менять то, что владелец уже видит на экране.
+
+        Гонка закрыта тем же приёмом, что в `PlayersRepo.get_or_create`:
+        `ON CONFLICT DO NOTHING` вместо «прочитали — не нашли — вставили», и
+        проигравший перечитывает готовую строку.
+        """
+        stripped = nick.strip()
+        if not stripped:
+            raise ValueError("ник оппонента не может быть пустым")
+        found = await self._find_by_nick(owner_player_id, stripped)
+        if found is not None:
+            return found
+        created_id = await self.db.scalar(
+            pg_insert(Opponent)
+            .values(owner_player_id=owner_player_id, opponent_nick=stripped)
+            .on_conflict_do_nothing(
+                index_elements=[
+                    Opponent.owner_player_id,
+                    func.lower(Opponent.opponent_nick),
+                ]
+            )
+            .returning(Opponent.id)
+        )
+        await self.db.flush()
+        if created_id is not None:
+            return int(created_id)
+        found = await self._find_by_nick(owner_player_id, stripped)
+        if found is None:  # pragma: no cover — конфликт был, а строки нет
+            raise LookupError(f"оппонент {stripped!r} исчез после конфликта вставки")
+        return found
+
+    async def link(
+        self,
+        *,
+        owner_player_id: int,
+        opponent_id: int,
+        room_tournament_id: str,
+        participant_label: str,
+    ) -> int | None:
+        """Привязать метку участника В ЭТОМ ТУРНИРЕ к оппоненту.
+
+        Возвращает номер оппонента, за которым пара «турнир + метка» закреплена
+        ПОСЛЕ вызова: он же, если привязка состоялась, и ЧУЖОЙ, если эту пару
+        уже занял другой ник — вызывающему нужно различать эти два исхода, а не
+        получать «не получилось»
+        (`test_a_participant_already_bound_keeps_his_first_nick`). `None` —
+        такого оппонента у этого владельца нет.
+
+        Один оператор, а не «прочитали — не нашли — вставили»: пара занимается
+        первичным ключом `opponent_links`, и два одновременных вызова физически
+        не могут развести её по двум оппонентам — проигравший ждёт коммита
+        победителя на самом конфликте и возвращает победителя
+        (`test_two_opponents_at_once_claim_one_participant_and_the_first_keeps_him`).
+        `DO UPDATE`, а не `DO NOTHING`, именно ради этого: `DO NOTHING` вернул
+        бы пустоту, неотличимую от «оппонента нет», а отдельным SELECT'ом после
+        него чужую ещё не закоммиченную строку не увидеть.
+
+        Владелец сверяется тем же оператором: строка берётся из `opponents`, и
+        чужой номер просто не даёт ни одной строки на вставку
+        (`test_an_opponent_of_another_player_takes_no_bindings`).
+        """
+        tournament = room_tournament_id.strip()
+        label = participant_label.strip()
+        if not tournament or not label:
+            raise ValueError("турнир и метка участника не могут быть пустыми")
+        taken = await self.db.scalar(
+            select(OpponentLink.participant_label).where(
+                OpponentLink.opponent_id == opponent_id,
+                OpponentLink.room_tournament_id == tournament,
+            )
+        )
+        if taken is not None and taken != label:
+            # Пол, ниже которого не пускает уникальный индекс
+            # `uq_opponent_links_opponent_tournament`; словами про это говорит
+            # бот, до вызова
+            # (`test_one_opponent_keeps_one_participant_per_tournament`).
+            # Проверка читает уже закоммиченное, поэтому ДВЕ одновременные
+            # привязки разных меток одного турнира к одному оппоненту доходят до
+            # индекса, и проигравший получает `IntegrityError`, а не эти слова:
+            # у команды владельца такой одновременности не бывает, а тихо
+            # разойтись правило не имеет права.
+            raise ValueError("у этого оппонента в этом турнире уже есть метка")
+        source = select(
+            literal(owner_player_id),
+            literal(tournament),
+            literal(label),
+            Opponent.id,
+        ).where(
+            Opponent.id == opponent_id, Opponent.owner_player_id == owner_player_id
+        )
+        holder = await self.db.scalar(
+            pg_insert(OpponentLink)
+            .from_select(
+                ["owner_player_id", "room_tournament_id", "participant_label", "opponent_id"],
+                source,
+            )
+            .on_conflict_do_update(
+                index_elements=[
+                    OpponentLink.owner_player_id,
+                    OpponentLink.room_tournament_id,
+                    OpponentLink.participant_label,
+                ],
+                set_={"opponent_id": OpponentLink.opponent_id},
+            )
+            .returning(OpponentLink.opponent_id)
+        )
+        await self.db.flush()
+        return None if holder is None else int(holder)
+
+    async def unlink(
+        self, *, owner_player_id: int, room_tournament_id: str, participant_label: str
+    ) -> bool:
+        """Снять привязку пары «турнир + метка»; `False` — её не было или она чужая."""
+        result = await self.db.execute(
+            delete(OpponentLink)
+            .where(
+                OpponentLink.owner_player_id == owner_player_id,
+                OpponentLink.room_tournament_id == room_tournament_id.strip(),
+                OpponentLink.participant_label == participant_label.strip(),
+            )
+            .returning(OpponentLink.opponent_id)
+        )
+        await self.db.flush()
+        return result.first() is not None
+
+    async def list_for_player(self, owner_player_id: int) -> list[OpponentRecord]:
+        """Все оппоненты владельца по алфавиту, с числом привязок у каждого.
+
+        Без потолка запроса: страницу пришлось бы сопровождать вторым запросом
+        за общим числом (как у заметок, `NotesRepo.count_for_player`), а число
+        оппонентов, которых владелец назвал руками, того же порядка, что число
+        заметок. Обрезку по пределу сообщения делает `presentation`, и она
+        печатает честный знаменатель, потому что видит весь список.
+        """
+        stmt = (
+            select(
+                Opponent.id,
+                Opponent.opponent_nick,
+                func.count(OpponentLink.opponent_id),
+            )
+            .outerjoin(OpponentLink, OpponentLink.opponent_id == Opponent.id)
+            .where(Opponent.owner_player_id == owner_player_id)
+            .group_by(Opponent.id, Opponent.opponent_nick)
+            .order_by(func.lower(Opponent.opponent_nick), Opponent.id)
+        )
+        return [
+            OpponentRecord(opponent_id=opponent_id, nick=nick, links=links)
+            for opponent_id, nick, links in await self.db.execute(stmt)
+        ]
+
+    async def get(self, opponent_id: int, owner_player_id: int) -> OpponentRecord | None:
+        """Оппонент по номеру — только свой; `None`, если номер чужой или его нет."""
+        found = [
+            record
+            for record in await self.list_for_player(owner_player_id)
+            if record.opponent_id == opponent_id
+        ]
+        return found[0] if found else None
+
+    async def links(self, opponent_id: int, owner_player_id: int) -> dict[str, str]:
+        """Все привязки оппонента: турнир комнаты → метка участника в нём.
+
+        Форма словаря, а не списка пар, — вход `player_stats_across_tournaments`
+        (`analysis/player_stats.py`) один в один. Она не теряет строк: у одного
+        оппонента в одном турнире метка не больше одной, и это держит уникальный
+        индекс `uq_opponent_links_opponent_tournament`, а не порядок обхода
+        (`test_one_opponent_keeps_one_participant_per_tournament`).
+        """
+        stmt = select(
+            OpponentLink.room_tournament_id, OpponentLink.participant_label
+        ).where(
+            OpponentLink.opponent_id == opponent_id,
+            OpponentLink.owner_player_id == owner_player_id,
+        )
+        return {row[0]: row[1] for row in await self.db.execute(stmt)}
+
+    async def _find_by_nick(self, owner_player_id: int, nick: str) -> int | None:
+        return await self.db.scalar(
+            select(Opponent.id).where(
+                Opponent.owner_player_id == owner_player_id,
+                func.lower(Opponent.opponent_nick) == func.lower(nick),
+            )
+        )

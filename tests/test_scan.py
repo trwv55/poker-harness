@@ -16,7 +16,6 @@ from harness.analysis.preflop import cheap_fold_verdict
 from harness.analysis.scan import scan_tournament
 from harness.contracts import (
     ActionKind,
-    Assumption,
     Post,
     PostKind,
     Provenance,
@@ -336,31 +335,33 @@ def test_cheap_fold_verdict_hu_is_strict_no_assumption():
     assert point.ev_diff_bb == 0.0
 
 
-def test_cheap_fold_verdict_multiway_is_assuming_with_shown_range():
-    """Мультивей-фолд, закрытый префильтром, обязан нести допущение (правило зоны).
+def test_cheap_fold_verdict_does_not_close_a_multiway_point():
+    """Мультивей дешёвый лукап не закрывает — ни вердиктом, ни отказом.
 
-    Мультивей-равновесия у нас нет (задача 12), и дешёвый лукап здесь опирается
-    на равновесный чарт ОДНОГО оппонента на самой короткой глубине — то есть
-    сам является допущением и обязан быть показан игроку, а не выдан за точный
-    расчёт (контракт `PointVerdict._assumption_matches_zone`).
+    Интервал EV по ширинам колл-диапазона лукап не считает вовсе, а именно его
+    знак решает, получит точка точечную оценку или форму «около нуля».
+    Поэтому здесь он уступает дорогу полному расчёту, а не пытается закрыть
+    точку сам: уверенности выше, чем у `verdict_for`, у него быть не должно.
+
+    Контрольную сумму модели он при этом считает — и считает по тому же
+    равновесию стола, — но снять точку она здесь не может: на 8bb с тремя
+    позади модель проверку проходит.
     """
     en = _make_multiway_fold_hand(hero_cards=("3c", "2d"), eff_bb=8.0, players_behind=3)
     dp = en.report.decision_points[0]
-    point = cheap_fold_verdict(dp, en)
-    assert point is not None
-    assert point.zone is Zone.ASSUMING
-    assert isinstance(point.assumption, Assumption)
+    assert cheap_fold_verdict(dp, en) is None
+    # Полный расчёт точку разбирает и решает сам — пробела на этом месте нет.
+    assert scan_tournament([en]).points_total == 1
 
 
 def _make_fold_with_short_allin_bb(hero_cards: tuple[str, str], eff_bb: float):
     """UTG (Hero) фолдит неоткрытый банк за столом, где BB — вынужденный олл-ин.
 
     BB посажен со стеком РОВНО в блайнд: пост забирает стек целиком, и BB живой,
-    но `behind == 0` — тот самый случай, который `_unopened_verdict` учитывает
-    отдельно (`all_in_behind`) и который заставляет `zone_for` вернуть
-    `assuming` через `unmodelled`, а не через сетку ширин. Полный перебор
-    подмножеств коллеров этого игрока просто не видит; префильтр не имеет права
-    быть увереннее него.
+    но `behind == 0` — тот самый случай, на котором `_unopened_verdict` снимает
+    вердикт целиком (`test_a_blind_all_in_behind_the_hero_shove_is_not_priced`).
+    Полный перебор подмножеств коллеров этого игрока просто не видит; префильтр
+    не имеет права быть увереннее него.
     """
     hero_stack = round(eff_bb * _BB)
     labels = {"SB": "SB", "BB": "BB", "UTG": "Hero", "BTN": "BTN"}
@@ -393,10 +394,9 @@ def test_cheap_fold_verdict_defers_when_a_live_player_behind_is_already_all_in()
     """Живой олл-ин от блайнда позади — вне модели, префильтр обязан отступить.
 
     Даже для заведомо мусорной руки (72o) лукап не имеет права закрыть точку:
-    `_unopened_verdict` в этой же ситуации ставит `assuming` через `unmodelled`
-    (см. докстринг `zone_for`), а не через сетку ширин, — префильтр не обязан
-    и не должен пытаться воспроизвести это решение дёшево, он обязан просто
-    уступить дорогу полному расчёту.
+    `_unopened_verdict` в этой же ситуации вердикта не выносит вовсе —
+    префильтр не обязан и не должен пытаться воспроизвести это решение дёшево,
+    он обязан просто уступить дорогу полному расчёту.
     """
     en = _make_fold_with_short_allin_bb(hero_cards=("7c", "2d"), eff_bb=10.0)
     dp = en.report.decision_points[0]
@@ -462,6 +462,33 @@ def test_scan_summary_shape_and_threshold():
     assert s.total_loss_bb == pytest.approx(item.ev_diff_bb)
 
 
+def test_scan_counts_every_decision_point_and_those_with_a_verdict():
+    """Покрытие считается по точкам, а не по рукам: сводка обязана его показать.
+
+    У руки может быть точка решения, по которой вердикта нет вовсе (модель стола
+    не годится, вилка рвётся, постфлоп), — и тогда «расхождений не найдено»
+    означает «не нашли среди оценённых», а не «сыграно чисто». Чтобы сводка
+    могла сказать это честно, в ней должны быть оба числа.
+    """
+    judged = _make_hu_fold_hand(hero_cards=("3c", "2d"), eff_bb=10.0)
+    # Две точки в ОДНОЙ руке — иначе счётчик точек неотличим от счётчика рук:
+    # у синтетики этого файла по одной точке решения на раздачу.
+    judged = judged.model_copy(
+        update={
+            "report": judged.report.model_copy(
+                update={"decision_points": list(judged.report.decision_points) * 2}
+            )
+        }
+    )
+    # Точка без вердикта: живых позади больше, чем перебирает модель (8 > 7).
+    unjudged = _make_wide_field_fold_hand(hero_cards=("3c", "2d"), eff_bb=10.0)
+    s = scan_tournament([judged, unjudged])
+
+    assert s.hands_total == 2 and s.hands_with_decision == 1
+    assert s.points_total == 3
+    assert s.points_judged == 2
+
+
 def test_scan_hands_with_no_hero_decision_are_not_counted():
     """Рука без единой точки решения героя не считается «рукой с решением»."""
     en = _make_hu_fold_hand(hero_cards=("3c", "2d"), eff_bb=10.0)
@@ -502,3 +529,46 @@ def test_scan_skips_a_hand_that_fails_reconciliation_and_counts_it(monkeypatch):
     assert s.hands_failed == 1
     assert s.hands_with_decision == 1  # только «good» дошла до вердикта
     assert s.items == []  # good — верный фолд, bad пропущена целиком
+
+
+def test_close_calls_are_ordered_by_the_promise_they_make(monkeypatch):
+    """Список «около нуля» идёт от самого дешёвого выбора к самому дорогому.
+
+    Каждая строка такого списка обещает игроку одно: «выбор стоит не больше
+    столько-то». Обещание тем сильнее, чем потолок меньше, а список для того и
+    существует, чтобы освободить внимание, — поэтому сверху стоит самое сильное
+    из них. Прежний порядок (дороже первым) ставил наверх самые слабые.
+    """
+    import harness.analysis.scan as scan_mod
+    from harness.contracts import EvInterval, PointVerdict, SpotKind, Street
+
+    hands = [
+        _make_hu_fold_hand(hero_cards=("3c", "2d"), eff_bb=10.0),
+        _make_hu_fold_hand(hero_cards=("4c", "2d"), eff_bb=10.0),
+        _make_hu_fold_hand(hero_cards=("5c", "2d"), eff_bb=10.0),
+    ]
+    ceilings = {id(hands[0]): 1.5, id(hands[1]): 0.4, id(hands[2]): 0.9}
+
+    def near_zero(dp, en):
+        top = ceilings[id(en)]
+        return PointVerdict(
+            dp_index=dp.index,
+            street=Street.PREFLOP,
+            spot=SpotKind.PUSHFOLD_UNOPENED,
+            zone=Zone.STRICT,  # без допущения — иначе контракт требует `assumption`
+            action_taken="fold",
+            best_action="около нуля, оба варианта допустимы",
+            ev_diff_bb=0.0,
+            interval=EvInterval(point_bb=0.0, low_bb=-0.1, high_bb=top, near_zero=True),
+            detail={"hero_class": "32o"},
+        )
+
+    monkeypatch.setattr(scan_mod, "verdict_for", near_zero)
+    monkeypatch.setattr(scan_mod, "cheap_fold_verdict", lambda dp, en: None)
+
+    s = scan_tournament(hands)
+    assert [round(it.interval.cost_ceiling_bb, 1) for it in s.close_calls if it.interval] == [
+        0.4,
+        0.9,
+        1.5,
+    ]
