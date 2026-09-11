@@ -1911,6 +1911,14 @@ def test_owner_admitted_msg_does_not_claim_a_code_was_used():
     assert msg.menu == start_msg().menu
 
 
+def test_help_msg_names_the_question_command():
+    """Вход в расчёты по вопросу — командой, и help обязан её назвать: без этого
+    единственный способ узнать о ней — прочитать исходник."""
+    from harness.presentation import help_msg
+
+    assert "/ask" in help_msg().text
+
+
 def test_help_msg_carries_the_bottom_menu_and_names_every_button():
     from harness.presentation import MAIN_MENU, help_msg
 
@@ -2027,3 +2035,111 @@ def test_aliases_msg_marks_the_numbers_that_stand_on_a_stitching():
 
     assert "Vasya — турниров: 1" in one and "по вашей сшивке" not in one
     assert "Vasya — турниров: 2 · по вашей сшивке" in two
+
+
+# --- Ответ на вопрос игрока ---------------------------------------------------------
+
+
+def _question_results():
+    """По одному результату на каждое имя словаря — вход `question_msg`."""
+    from tests.test_question_text import ALL_RESULTS
+
+    return ALL_RESULTS
+
+
+def test_the_answer_names_the_calculation_it_came_from():
+    """Подпись под ответом называет расчёт — у всех шести, а не у одного.
+
+    Неверно выбранный расчёт выглядит нормальным ответом, просто не на тот
+    вопрос: подпись — единственное, что делает подмену видимой игроку.
+    """
+    from harness.presentation import question_msg
+
+    for result in _question_results():
+        assert "Посчитано:" in question_msg(result, prose=None).text
+
+
+def test_the_answer_carries_the_denominator_next_to_the_number():
+    """Рядом с величиной — её выборка: «71.4% (5 из 7)», а не «71.4%»."""
+    from harness.presentation import question_msg
+    from tests.test_question_text import _frequency
+
+    assert "71.4% (5 из 7)" in question_msg(_frequency(), prose=None).text
+
+
+def test_the_answer_without_prose_still_shows_the_numbers():
+    """Текст модели не прошёл проверку — числа расчёта всё равно у игрока.
+
+    Прятать посчитанное кодом из-за фразы модели хуже, чем показать его без
+    неё: то же решение, что у разбора без текста вердикта.
+    """
+    from harness.presentation import question_msg
+    from tests.test_question_text import _frequency
+
+    msg = question_msg(_frequency(), prose=None)
+
+    assert "71.4%" in msg.text
+    assert not msg.text.startswith("\n")
+    assert "\n\n\n" not in msg.text
+
+
+def test_the_prose_stands_above_the_numbers_it_came_from():
+    from harness.presentation import question_msg
+    from tests.test_question_text import _frequency
+
+    msg = question_msg(_frequency(), prose="Вы ставите часто.")
+
+    assert msg.text.index("Вы ставите часто.") < msg.text.index("Посчитано:")
+
+
+def test_an_undecided_threshold_asks_for_the_missing_sample_not_a_verdict():
+    """Интервал накрывает порог — наружу идёт недостающая выборка, а не вывод.
+
+    Сам интервал при этом не печатается ни числом, ни словом (решение
+    владельца): наружу идут величина, выборка, порог и то, чего не хватает.
+    """
+    from harness.contracts import ThresholdOutcome
+    from harness.presentation import question_msg
+    from tests.test_question_text import _threshold
+
+    msg = question_msg(_threshold(ThresholdOutcome.UNDECIDED, 42), prose=None)
+
+    assert "для вывода нужно около 42 наблюдений" in msg.text
+    assert "выше порога" not in msg.text
+    assert "ниже порога" not in msg.text
+
+
+def test_a_measured_threshold_shows_its_own_sample():
+    """Порог, взятый у поля, едет со своим знаменателем: он тоже измерен."""
+    from harness.contracts import ThresholdOutcome
+    from harness.presentation import question_msg
+    from tests.test_question_text import _threshold
+
+    msg = question_msg(_threshold(ThresholdOutcome.ABOVE, None), prose=None)
+
+    assert "Порог — 61.0% (измерен по полю: 61 из 100)." in msg.text
+
+
+def test_a_refusal_lists_what_can_be_counted_instead():
+    """Отказ не пустой: он называет то, на что расчёт есть.
+
+    И ни одной строки текста модели в нём нет — ответ без расчёта это общие
+    знания о покере, а продукт продаёт посчитанное.
+    """
+    from harness.presentation import question_refusal_msg
+
+    text = question_refusal_msg().text
+
+    assert "нет расчёта" in text
+    assert "Посчитать могу:" in text
+    assert "против порога" in text
+
+
+def test_a_question_answer_never_calls_a_decision_a_mistake():
+    """Слово «ошиб» не печатается ни в одном ответе: расчёт судит против диапазона."""
+    from harness.presentation import question_msg, question_refusal_msg
+
+    texts = [question_msg(result, prose=None).text for result in _question_results()]
+    texts.append(question_refusal_msg().text)
+
+    assert not [text for text in texts if "ошиб" in text.lower()]

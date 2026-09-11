@@ -99,6 +99,20 @@ from harness.contracts.analysis import (
     river_call_detail,
     turn_flop_call_detail,
 )
+from harness.contracts.calcs import (
+    CalcName,
+    CalcResult,
+    CoverageResult,
+    DefenseResult,
+    FrequencyResult,
+    FrequencyStat,
+    LeaksResult,
+    Measurement,
+    Subject,
+    ThresholdOutcome,
+    ThresholdResult,
+    Window,
+)
 from harness.contracts.explanation import TournamentTextOut, VerdictTextOut
 from harness.contracts.history import (
     MAX_NOTE_TEXT_CHARS,
@@ -160,6 +174,10 @@ __all__ = [
     "note_saved_msg",
     "notes_msg",
     "progress_text",
+    "question_msg",
+    "question_refusal_msg",
+    "question_too_long_msg",
+    "question_usage_msg",
     "quota_exceeded_msg",
     "range_image_title",
     "range_photos",
@@ -299,6 +317,7 @@ _ACTIVE_WORD: dict[SpotKind, str] = {
 # разбор файла раздач кодом; путать их в трейсе и в дедлайне задачи нельзя, а в
 # сообщении игроку различать нечего.
 _STATION_TEXT: dict[str, str] = {
+    "ask": "Считаю по вашим раздачам…",
     "read": "Читаю стол…",
     "parse": "Читаю стол…",
     "validate": "Проверяю руку…",
@@ -432,7 +451,9 @@ def _quota_line(quota_left: int, quota_total: int) -> str:
     return f"разборов {quota_left}/{quota_total} за 24 ч"
 
 
-def progress_text(station: Literal["read", "parse", "validate", "analyze", "explain"]) -> str:
+def progress_text(
+    station: Literal["ask", "read", "parse", "validate", "analyze", "explain"],
+) -> str:
     """Строка прогресса, которой редактируется одно сообщение по станциям конвейера."""
     return _STATION_TEXT[station]
 
@@ -1708,7 +1729,8 @@ def help_msg() -> Msg:
             f"{MENU_SETTINGS} — ник в руме и остаток дневного лимита.\n\n"
             "/new — начать новую сессию.\n"
             "/nick — указать ник в руме.\n"
-            "/alias — назвать участника разбора ником в руме."
+            "/alias — назвать участника разбора ником в руме.\n"
+            "/ask ВОПРОС — спросить о своей игре; отвечаю только посчитанным."
         ),
         menu=MAIN_MENU,
     )
@@ -2035,3 +2057,223 @@ def alias_screenshot_only_msg() -> Msg:
             "Привязка нужна для файлов PokerCraft, где участники обезличены."
         )
     )
+
+
+# --- Ответ на вопрос игрока ---------------------------------------------------------
+
+# Имя расчёта словами игрока. Второй словарь рядом с `_CALC_BRIEF`
+# (`explanation/question.py`) — намеренно: тот описывает величину модели,
+# которая пишет прозу сама, а этот печатается игроку и подчиняется правилу
+# единого голоса. То же решение и та же причина, что у пары
+# `_SPOT_BRIEF`/`_SPOT_WORD`.
+_CALC_WORD: dict[CalcName, str] = {
+    CalcName.HERO_FREQUENCY: "ваша частота",
+    CalcName.OPPONENT_FREQUENCY: "частота оппонента",
+    CalcName.COVERAGE: "покрытие разбора и цена расхождений",
+    CalcName.LEAKS: "типы расхождений",
+    CalcName.DEFENSE_FREQUENCY: "требуемая частота защиты",
+    CalcName.FREQUENCY_VS_THRESHOLD: "частота против порога",
+}
+
+_STAT_WORD: dict[FrequencyStat, str] = {
+    FrequencyStat.VPIP: "добровольный вход в банк",
+    FrequencyStat.PFR: "повышение до флопа",
+    FrequencyStat.RERAISE: "ре-рейз до флопа",
+    FrequencyStat.FOLD_TO_CBET: "сдача на продолженную ставку",
+    FrequencyStat.CBET_FLOP: "продолженная ставка на флопе",
+    FrequencyStat.BARREL_TURN: "второй баррель (ставка на тёрне)",
+    FrequencyStat.BARREL_RIVER: "третий баррель (ставка на ривере)",
+    FrequencyStat.SHOWDOWN: "доход до вскрытия",
+}
+
+_SUBJECT_WORD: dict[Subject, str] = {
+    Subject.HERO: "у вас",
+    Subject.OPPONENT: "у него",
+    Subject.FIELD: "у поля",
+}
+
+_OUTCOME_WORD: dict[ThresholdOutcome, str] = {
+    ThresholdOutcome.ABOVE: "Ваша величина выше порога.",
+    ThresholdOutcome.BELOW: "Ваша величина ниже порога.",
+    ThresholdOutcome.UNDECIDED: "",
+}
+
+_WINDOW_WORD = {True: "за этот вечер", False: "за всю историю разборов"}
+
+
+def _measured(measurement: Measurement) -> str:
+    """Величина со своим знаменателем — требование владельца, безусловное.
+
+    Доля печатается только при ненулевом знаменателе: «0 из 0» — не ноль
+    процентов, а отсутствие наблюдений (`Measurement.share`).
+    """
+    counted = f"{measurement.numerator} из {measurement.denominator}"
+    share = measurement.share
+    if share is None:
+        return f"наблюдений нет ({counted})"
+    return f"{_fmt_pct(100.0 * share)} ({counted})"
+
+
+def _window_word(window: Window) -> str:
+    return _WINDOW_WORD[window.session_id is not None]
+
+
+def _measured_line(
+    stat: FrequencyStat, subject: Subject, position: str | None, measurement: Measurement,
+    window: Window,
+) -> str:
+    """Строка измеренной величины: что, у кого, где, сколько и из скольких."""
+    where = f", позиция {position}" if position is not None else ""
+    title = _STAT_WORD[stat]
+    return (
+        f"{title[0].upper()}{title[1:]} {_SUBJECT_WORD[subject]}{where}: "
+        f"{_measured(measurement)}, {_window_word(window)}."
+    )
+
+
+def _frequency_answer(result: FrequencyResult) -> list[str]:
+    return [
+        _measured_line(
+            result.stat, result.subject, result.position, result.measurement, result.window
+        )
+    ]
+
+
+def _threshold_answer(result: ThresholdResult) -> list[str]:
+    lines = [
+        _measured_line(
+            result.stat, result.subject, result.position, result.measurement, result.window
+        )
+    ]
+    threshold = f"Порог — {_fmt_pct(100.0 * result.threshold)}"
+    if result.reference is not None:
+        reference = result.reference
+        threshold += (
+            f" (измерен по полю: {reference.numerator} из {reference.denominator})"
+        )
+    lines.append(threshold + ".")
+    if result.outcome is ThresholdOutcome.UNDECIDED:
+        needed = result.observations_needed
+        lines.append(
+            f"Данных пока мало: для вывода нужно около {needed} наблюдений."
+            if needed is not None
+            else "Данных пока мало, и при такой величине никакая выборка вывода не даст."
+        )
+    else:
+        lines.append(_OUTCOME_WORD[result.outcome])
+    return lines
+
+
+def _coverage_answer(result: CoverageResult) -> list[str]:
+    return [
+        _coverage_line(
+            result.judged.numerator,
+            result.judged.denominator,
+            f"{_window_word(result.filter.window)} под этим фильтром",
+        ),
+        (
+            f"Цена посчитана у {result.priced.numerator} из {result.priced.denominator} "
+            f"оценённых, всего {_fmt_bb(-result.loss_bb)}."
+        ),
+        _COVERAGE_NOTE,
+    ]
+
+
+def _leaks_answer(result: LeaksResult) -> list[str]:
+    lines = [
+        _coverage_line(
+            result.judged.numerator,
+            result.judged.denominator,
+            _window_word(result.window),
+        )
+    ]
+    if result.leaks:
+        lines.extend(_leak_line(stat) for stat in result.leaks)
+    else:
+        lines.append("Повторяющихся расхождений среди оценённых решений не нашлось.")
+    lines.append(_LEAKS_DISCLAIMER)
+    return lines
+
+
+def _defense_answer(result: DefenseResult) -> list[str]:
+    return [
+        (
+            f"Против ставки {chips(result.bet)} в банк {chips(result.pot_before)} "
+            f"защищаться нужно в {_fmt_pct(100.0 * result.defend_frequency)} случаев, "
+            f"сдаваться допустимо в {_fmt_pct(100.0 * result.fold_frequency)}."
+        ),
+        f"Колл окупается от {_fmt_pct(100.0 * result.required_equity)} эквити.",
+        "Ваших раздач здесь нет вовсе: это арифметика от размера ставки.",
+    ]
+
+
+def question_msg(result: CalcResult, prose: str | None) -> Msg:
+    """Ответ на вопрос: слова модели (если они прошли проверку) и числа расчёта.
+
+    **Подпись собирается по `CalcResult.calc`, а не по словам модели.** Неверно
+    выбранный расчёт выглядит нормальным ответом — просто не на тот вопрос, — и
+    подпись здесь единственное, что делает подмену видимой игроку
+    (`test_the_answer_names_the_calculation_it_came_from`).
+
+    `prose is None` — слова не прошли проверку чисел; числа при этом посчитаны
+    кодом и показываются как есть. То же решение, что у разбора без текста
+    вердикта: прятать посчитанное из-за фразы модели хуже, чем показать его без
+    неё.
+    """
+    lines: list[str] = []
+    if prose is not None and prose.strip():
+        lines += [line.strip() for line in prose.strip().splitlines() if line.strip()]
+        lines.append("")
+    if isinstance(result, FrequencyResult):
+        numbers = _frequency_answer(result)
+    elif isinstance(result, ThresholdResult):
+        numbers = _threshold_answer(result)
+    elif isinstance(result, CoverageResult):
+        numbers = _coverage_answer(result)
+    elif isinstance(result, LeaksResult):
+        numbers = _leaks_answer(result)
+    else:
+        numbers = _defense_answer(result)
+    lines.append(f"Посчитано: {_CALC_WORD[result.calc]}.")
+    lines.extend(line for line in numbers if line)
+    return Msg(text="\n".join(lines))
+
+
+def question_usage_msg() -> Msg:
+    """Команда без вопроса — что написать, одной строкой и примером."""
+    return Msg(
+        text=(
+            "Спросите о своей игре текстом после команды.\n\n"
+            "Например: /ask плюсовой или минусовой я на BB?\n\n"
+            + _WHAT_CAN_BE_COUNTED
+        )
+    )
+
+
+def question_refusal_msg() -> Msg:
+    """Честный отказ: расчёта под этот вопрос нет, и вот что есть.
+
+    Показывается, когда ни один инструмент не был вызван. Текста модели в нём
+    нет ни строки: ответ, не опирающийся на расчёт, — это общие знания о
+    покере, а продукт продаёт посчитанное.
+    """
+    return Msg(text="На этот вопрос у меня нет расчёта.\n\n" + _WHAT_CAN_BE_COUNTED)
+
+
+def question_too_long_msg(limit: int) -> Msg:
+    return Msg(text=f"Вопрос длиннее {limit} символов — сократите его.")
+
+
+# Список того, что продукт умеет считать. Один на отказ и на подсказку команды:
+# два списка разошлись бы, и один из них начал бы обещать несуществующее.
+_WHAT_CAN_BE_COUNTED = (
+    "Посчитать могу:\n"
+    "• ваши частоты — вход в банк, повышение, ре-рейз, продолженная ставка, "
+    "бареллы, сдача на продолженную ставку, доход до вскрытия;\n"
+    "• те же частоты у поля или у названного оппонента;\n"
+    "• вашу частоту против порога — по размеру ставки или по полю;\n"
+    "• покрытие разбора и цену расхождений;\n"
+    "• типы повторяющихся расхождений;\n"
+    "• требуемую частоту защиты против ставки.\n\n"
+    "Можно сузить вопрос позицией и вечером."
+)
