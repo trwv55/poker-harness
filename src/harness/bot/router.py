@@ -48,6 +48,7 @@ from harness.bot.handlers import (
     handle_new_session,
     handle_nickname_command,
     handle_photo,
+    handle_question_command,
     handle_start,
     handle_text,
     handle_ui_callback,
@@ -162,6 +163,16 @@ def build_router(deps: BotDeps) -> Router:
         if message.from_user is None:
             return
         msg = await handle_alias_command(deps, message.from_user.id, command.args or "")
+        await _deliver(bot, message.chat.id, msg)
+
+    @router.message(Command("ask"))
+    async def on_ask(message: Message, bot: Bot, command: CommandObject) -> None:
+        """`/ask ВОПРОС` — вопрос о своей игре. `None` значит, что дальше говорит воркер."""
+        if message.from_user is None:
+            return
+        msg = await handle_question_command(deps, message.from_user.id, command.args or "")
+        if msg is None:
+            return
         await _deliver(bot, message.chat.id, msg)
 
     @router.message(Command("invite"))

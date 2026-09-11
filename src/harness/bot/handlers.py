@@ -98,6 +98,8 @@ from harness.presentation import (
     note_saved_msg,
     note_too_long_msg,
     owner_admitted_msg,
+    question_too_long_msg,
+    question_usage_msg,
     quota_exceeded_msg,
     ranges_msg,
     replay_msg,
@@ -126,6 +128,7 @@ __all__ = [
     "handle_new_session",
     "handle_nickname_command",
     "handle_photo",
+    "handle_question_command",
     "handle_start",
     "handle_text",
     "handle_ui_callback",
@@ -148,6 +151,10 @@ MANUAL_ANSWER = "manual"
 # состояние продукт больше не входит (решение владельца 2026-09-07).
 _INPUT_NICKNAME = "gg_nickname"
 _INPUT_NOTE = "note"
+
+# Предел длины вопроса. Он стоит на том, что игрок печатает руками, и защищает
+# не базу (`jobs.payload` — JSONB), а промпт: вопрос едет в него целиком.
+MAX_QUESTION_CHARS = 300
 
 # Ник в руме не длиннее колонки `players.gg_nickname` (`String(64)`). Число здесь
 # не второе определение предела, а ссылка на него: длиннее БД просто не примет.
@@ -606,6 +613,48 @@ async def handle_deep_dive_callback(deps: BotDeps, tg_user_id: int, hand_no: str
         player_id=player_id,
         session_id=session_id,
         payload={"hand_no": hand_no},
+    )
+    return None
+
+
+async def handle_question_command(deps: BotDeps, tg_user_id: int, args: str = "") -> Msg | None:
+    """`/ask ВОПРОС` — вопрос о своей игре; считает воркер, бот только ставит задачу.
+
+    **Командой, а не свободным текстом.** Свободный текст в этом продукте уже
+    занят: он достаётся заметке, нику в руме или ответу на эскалацию
+    (`handle_text` ниже, `players.pending_input`). Вопрос идёт мимо этой
+    очереди и её не гасит — ожидающий ввод остаётся ждать своего текста
+    (`test_a_question_is_not_swallowed_by_a_pending_input`).
+
+    **Дневной лимит разборов вопрос не тратит** (`QUOTA_INTERACTIVE_JOB_TYPES`
+    его не перечисляет, `test_a_question_does_not_spend_the_daily_quota`):
+    счётчик подписан «разборов X/Y», и списывать с него вопрос значило бы
+    показывать игроку число, которое не означает того, что написано рядом.
+
+    `None` — то же сознательное молчание, что у кнопки «разобрать»: дальше
+    говорит воркер.
+    """
+    question = args.strip()
+    async with deps.db_factory() as db:
+        player = await _known_player(db, tg_user_id)
+        if player is None:
+            await db.commit()
+            return invite_required_msg()
+        player_id = player.id
+        if not question:
+            await db.commit()
+            return question_usage_msg()
+        if len(question) > MAX_QUESTION_CHARS:
+            await db.commit()
+            return question_too_long_msg(MAX_QUESTION_CHARS)
+        session_id = (await SessionsRepo(db).active_or_create(player_id)).id
+        await db.commit()
+
+    await deps.queue.enqueue(
+        type="question",
+        player_id=player_id,
+        session_id=session_id,
+        payload={"question": question},
     )
     return None
 

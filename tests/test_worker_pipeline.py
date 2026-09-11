@@ -2182,3 +2182,81 @@ async def test_a_missing_picture_file_does_not_take_the_verdict_away(
 
     assert fake_sender.photos == []
     assert (await job_status(db_factory, job_id)) == "running"
+
+
+# --- станция вопроса ----------------------------------------------------------------
+
+
+@requires_prompts
+async def test_a_question_is_answered_with_the_calculation_that_produced_it(
+    db_factory, queue, deps, fake_sender
+):
+    """Задача `question` целиком: модель зовёт инструмент, игрок видит подпись.
+
+    Раздачи кладутся в базу построителем — без них знаменатель частоты нулевой,
+    и ответ проверял бы форматирование пустоты.
+    """
+    from pydantic_ai.models.function import FunctionModel
+
+    from tests.test_calcs import _open_from, _store
+    from tests.test_question_routing import _Script
+
+    player_id, session_id = await _make_scope(db_factory)
+    async with db_factory() as session:
+        for index in (1, 2):
+            await _store(
+                session,
+                session_id=session_id,
+                raw=_open_from("CO", tournament_id="T1", hand_no=f"W{index}"),
+            )
+        await session.commit()
+
+    jid = await queue.enqueue(
+        type="question",
+        player_id=player_id,
+        session_id=session_id,
+        payload={"question": "как часто я вхожу в банк"},
+    )
+    script = _Script(
+        [("hero_frequency", {"stat": "vpip"})],
+        "Вы входите в банк в 100.0% раздач (2 из 2).",
+    )
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(
+        job, replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script)))
+    )
+
+    assert (await job_status(db_factory, jid)) == "done"
+    texts = _all_texts(fake_sender)
+    assert any("Посчитано: ваша частота." in text for text in texts)
+    assert any("Вы входите в банк в 100.0% раздач (2 из 2)." in text for text in texts)
+
+
+@requires_prompts
+async def test_a_question_without_a_calculation_shows_the_refusal_not_the_model(
+    db_factory, queue, deps, fake_sender
+):
+    """Модель ответила, не позвав инструмент, — игрок видит отказ, а не её текст."""
+    from pydantic_ai.models.function import FunctionModel
+
+    from tests.test_question_routing import _Script
+
+    player_id, session_id = await _make_scope(db_factory)
+    jid = await queue.enqueue(
+        type="question",
+        player_id=player_id,
+        session_id=session_id,
+        payload={"question": "что мне открывать с 12 бб"},
+    )
+    script = _Script([], "С 12 бб открывайте 25% рук.")
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(
+        job, replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script)))
+    )
+
+    assert (await job_status(db_factory, jid)) == "done"
+    texts = _all_texts(fake_sender)
+    assert any("нет расчёта" in text for text in texts)
+    assert not [text for text in texts if "25% рук" in text]

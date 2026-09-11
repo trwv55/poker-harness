@@ -34,21 +34,23 @@ from pathlib import Path
 
 import pytest
 import structlog
-from sqlalchemy import text
+from sqlalchemy import text, update
 
 import harness.bot.handlers as handlers_module
 from harness.bot.handlers import (
+    MAX_QUESTION_CHARS,
     BotDeps,
     check_quota,
     handle_deep_dive_callback,
     handle_document,
     handle_invite_command,
     handle_new_session,
+    handle_question_command,
     handle_start,
 )
 from harness.bot.router import build_router
 from harness.contracts import Provenance, RawHand
-from harness.memory.models import Job
+from harness.memory.models import Job, Player
 from harness.memory.repos import HandsRepo, PlayersRepo, SessionsRepo
 from harness.normalizer import normalize
 from harness.platform.logs import configure_logging
@@ -2217,3 +2219,81 @@ async def test_a_screenshot_analysis_has_no_tournament_to_bind_to(deps, db_facto
     msg = await handle_alias_command(deps, _TG_USER_ID, "BTN Vasya")
 
     assert msg == alias_screenshot_only_msg()
+
+
+# --- вопрос о своей игре (`/ask`) ---------------------------------------------------
+
+
+async def test_a_question_becomes_a_job_for_the_worker(db_factory, deps, invited):
+    """Бот не считает и не говорит: он ставит задачу, дальше говорит воркер.
+
+    Вопрос едет в `payload` целиком — воркер читает его оттуда и отдаёт модели.
+    """
+    msg = await handle_question_command(deps, _TG_USER_ID, "плохо ли я коллирую на BTN")
+
+    assert msg is None
+    job = await fetch_one(db_factory, "select type, payload, priority from jobs")
+    assert job["type"] == "question"
+    assert job["payload"] == {"question": "плохо ли я коллирую на BTN"}
+    assert job["priority"] == 100
+
+
+async def test_a_question_does_not_spend_the_daily_quota(db_factory, deps, invited):
+    """Счётчик подписан «разборов X/Y» — вопрос с него не списывается.
+
+    Иначе игрок, спросивший про свою игру, платил бы за это разбором, а число
+    рядом со словом «разборов» перестало бы означать написанное.
+    """
+    player_id, _session_id = await _seed_player(db_factory, quota_daily=1)
+
+    await handle_question_command(deps, _TG_USER_ID, "есть ли у меня третий баррель")
+
+    assert (await check_quota(deps, player_id)).allowed is True
+
+
+async def test_a_question_without_words_explains_how_to_ask(db_factory, deps, invited):
+    """`/ask` без вопроса — подсказка и список того, что посчитать можно."""
+    msg = await handle_question_command(deps, _TG_USER_ID, "   ")
+
+    assert msg is not None
+    assert "Посчитать могу:" in msg.text
+    assert await fetch_all(db_factory, "select id from jobs") == []
+
+
+async def test_a_question_longer_than_the_limit_is_refused(db_factory, deps, invited):
+    """Предел стоит на том, что игрок печатает руками: вопрос едет в промпт целиком."""
+    msg = await handle_question_command(deps, _TG_USER_ID, "а" * (MAX_QUESTION_CHARS + 1))
+
+    assert msg is not None
+    assert str(MAX_QUESTION_CHARS) in msg.text
+    assert await fetch_all(db_factory, "select id from jobs") == []
+
+
+async def test_a_question_is_not_swallowed_by_a_pending_input(db_factory, deps, invited):
+    """Ожидание заметки не перехватывает вопрос и не гасится им.
+
+    Свободный текст в продукте уже занят заметкой, ником и ответом на
+    эскалацию; команда идёт мимо этой очереди, и открытый ввод остаётся ждать
+    своего текста.
+    """
+    async with db_factory() as session:
+        await session.execute(
+            update(Player).where(Player.id == invited).values(pending_input="note")
+        )
+        await session.commit()
+
+    msg = await handle_question_command(deps, _TG_USER_ID, "плюсовой ли я на BB")
+
+    assert msg is None
+    assert (await fetch_one(db_factory, "select type from jobs"))["type"] == "question"
+    waiting = await fetch_one(db_factory, f"select pending_input from players where id = {invited}")
+    assert waiting["pending_input"] == "note"
+
+
+async def test_a_stranger_gets_no_answer_and_leaves_no_job(db_factory, deps):
+    """Вход закрыт инвайтом: незнакомец не заводит себе ни строки, ни задачи."""
+    msg = await handle_question_command(deps, 909090, "плюсовой ли я на BB")
+
+    assert msg is not None
+    assert msg.text == invite_required_msg().text
+    assert await fetch_all(db_factory, "select id from jobs") == []

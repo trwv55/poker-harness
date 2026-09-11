@@ -70,6 +70,7 @@ from harness.analysis.preflop import (
 )
 from harness.analysis.scan import scan_tournament
 from harness.analysis.tournament import tournament_report
+from harness.calcs.routing import answer_question
 from harness.contracts import (
     AnalysisResult,
     CanonicalHand,
@@ -121,6 +122,8 @@ from harness.presentation import (
     not_a_hand_msg,
     note_nicks_for_hand,
     progress_text,
+    question_msg,
+    question_refusal_msg,
     range_image_title,
     range_photos,
     scan_summary_msg,
@@ -136,13 +139,17 @@ _log = structlog.get_logger(__name__)
 
 # Станции, показываемые игроку прогрессом. "explain" появилась в задаче 21: с неё
 # начинается второй (и последний) вызов модели в системе — текст вердикта.
-_Station = Literal["read", "parse", "validate", "analyze", "explain"]
+_Station = Literal["ask", "read", "parse", "validate", "analyze", "explain"]
 
 # Бюджет попытки по типу задачи — с запасом меньше десятиминутного окна reap()
 # (см. модульный докстринг). `hh_scan` может обрабатывать сотни рук и считать эквити
 # по файлу целиком — щедрее; `deep_dive` — одна рука, дёшево даже с запасом.
 _JOB_DEADLINE_S: dict[str, float] = {
     "hh_scan": 480.0,
+    # Вопрос — один вызов фасада с инструментами; обращений к провайдеру внутри
+    # него больше одного (`test_a_tool_call_round_trip_logs_one_row`), а работы
+    # с данными — выборка по готовым колонкам, без пересчёта эквити.
+    "question": 120.0,
     "deep_dive": 120.0,
     # Скрин — два вызова модели в худшем случае (каскад) плюс расчёт одной руки.
     "screenshot_analyze": 240.0,
@@ -1257,7 +1264,45 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
     return hand_id
 
 
+async def _run_question(job: JobModel, deps: Deps, trace: Trace) -> None:
+    """Вопрос игрока: модель выбирает расчёт, код считает, игрок получает подпись.
+
+    Чекпоинта у этой станции нет: повторная попытка зовёт модель заново. Копить
+    было бы нечего — весь результат станции это одно сообщение, а дубля его не
+    будет и так (`_send_idempotent`).
+
+    Отказ модели (провайдер, схема) сюда не перехватывается, в отличие от
+    `_verdict_prose`: там числа посчитаны и без слов, здесь без вызова модели
+    нет ни расчёта, ни ответа — задача честно падает, и игрок получает
+    `failed_msg`.
+    """
+    worker_id = job.locked_by
+    async with deps.db_factory() as session:
+        payload: dict[str, Any] = dict(job.payload)
+        chat_id = await _chat_id(session, job.player_id)
+        async with trace.span("ask"):
+            await _ensure_progress(deps, session, job.id, worker_id, chat_id, "ask")
+            outcome = await answer_question(
+                session,
+                deps.llm,
+                player_id=job.player_id,
+                session_id=job.session_id,
+                question=payload["question"],
+                trace_id=trace.trace_id,
+            )
+        msg = (
+            question_refusal_msg()
+            if outcome.result is None
+            else question_msg(outcome.result, outcome.prose)
+        )
+        await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
+        await session.commit()
+
+
 async def _dispatch(job: JobModel, deps: Deps, trace: Trace, started_at: float) -> int | None:
+    if job.type == "question":
+        await _run_question(job, deps, trace)
+        return None
     if job.type == "hh_scan":
         await _run_hh_scan(job, deps, trace)
         return None
