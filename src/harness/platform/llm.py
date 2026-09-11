@@ -41,6 +41,7 @@ from pydantic import BaseModel
 from pydantic_ai import Agent, BinaryContent
 from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
 from pydantic_ai.models import Model
+from pydantic_ai.tools import Tool
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -218,11 +219,14 @@ class LLM:
 
     async def __call__(
         self,
-        purpose: Literal["vision_extract", "vision_extract_fallback", "verdict_text"],
+        purpose: Literal[
+            "vision_extract", "vision_extract_fallback", "verdict_text", "question_answer"
+        ],
         schema: type[T],
         *,
         prompt: str,
         images: Sequence[bytes] = (),
+        tools: Sequence[Tool[None]] = (),
         trace_id: int,
     ) -> tuple[T, CallMeta]:
         """`trace_id` — обязательный параметр каждого вызова, а не конструктора:
@@ -258,12 +262,21 @@ class LLM:
         следующей попытке МЕНЬШЕ бюджета `slot()`, не отдельный полный. Это
         осознанный компромисс контроллера, не недосмотр: подробное обоснование
         — в докстринге `limiter._ACQUIRE_TIMEOUT_S`.
+
+        `tools` — инструменты, которые модель вправе позвать внутри одного
+        `agent.run()`. Что вызов с инструментами обращается к провайдеру
+        БОЛЬШЕ одного раза (ответ с вызовом инструмента, затем ответ по его
+        результату), а строка `llm_calls` на них по-прежнему одна, закреплено
+        `test_a_tool_call_round_trip_logs_one_row`: окно темпа `PgLimiter`
+        считает такой вызов за один.
         """
         model: Model | str = (
             self._model_override if self._model_override is not None else self._resolve_model(purpose)
         )
         provider, model_name = _describe_model(model)
-        agent = Agent(model, output_type=schema, retries=0)
+        agent: Agent[None, T] = Agent(
+            model, output_type=schema, retries=0, tools=tools, deps_type=type(None)
+        )
         user_prompt: list[str | BinaryContent] = [
             prompt,
             *(

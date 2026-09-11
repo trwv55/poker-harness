@@ -491,7 +491,7 @@ class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
         CheckConstraint(
-            "type IN ('screenshot_analyze', 'hh_scan', 'deep_dive', 'eval_run')",
+            "type IN ('screenshot_analyze', 'hh_scan', 'deep_dive', 'eval_run', 'question')",
             name="type_allowed",
         ),
         CheckConstraint(
@@ -564,7 +564,8 @@ class LlmCall(Base):
             # `vision_extract_fallback` — вторая ступень каскада зрения (задача
             # 22). Отдельное назначение, а не то же самое: по нему считается,
             # сколько раз дешёвого чтения не хватило, и сколько это стоило.
-            "purpose IN ('vision_extract', 'vision_extract_fallback', 'verdict_text')",
+            "purpose IN ('vision_extract', 'vision_extract_fallback', 'verdict_text', "
+            "'question_answer')",
             name="purpose_allowed",
         ),
         CheckConstraint(

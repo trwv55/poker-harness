@@ -2303,3 +2303,85 @@ async def test_migration_0008_gives_the_document_back_on_downgrade(pg_before_000
     assert stripped == [], "после переливки документ всё ещё несёт свои точки"
     assert {document["hand_no"]: document for document in back} == planted["analyses"]
     assert tables == 0
+
+
+@pytest.fixture
+def pg_at_head():
+    """Свой контейнер на `head` — сессионный `pg` катать откатами нельзя.
+
+    Ревизия здесь `head`, а не номер: тест про откат 0009 → 0008 и обратно, и
+    начинать он обязан с того состояния, в котором база живёт в проде.
+    """
+    from alembic import command
+    from testcontainers.community.postgres import PostgresContainer
+
+    from tests.conftest import alembic_config
+
+    with PostgresContainer("postgres:16-alpine") as container:
+        command.upgrade(alembic_config(container.get_connection_url(driver="psycopg")), "head")
+        yield container
+
+
+def test_migration_0009_rolls_back_the_rows_its_constraint_forbids(pg_at_head):
+    """Откат снимает вопрос вместе со всем, что на него ссылается.
+
+    Старый CHECK не знает ни типа задачи `question`, ни назначения вызова
+    `question_answer`, поэтому накопленные строки обязаны уйти — и уйти в
+    порядке внешних ключей (`llm_calls` → `traces` → `jobs`), иначе откат
+    падает на первой же паре.
+    """
+    from alembic import command
+    from sqlalchemy import create_engine
+
+    from tests.conftest import alembic_config
+
+    dsn = pg_at_head.get_connection_url(driver="psycopg")
+    engine = create_engine(dsn)
+    try:
+        with engine.begin() as conn:
+            player = conn.execute(
+                text("insert into players (tg_user_id) values (5150) returning id")
+            ).scalar_one()
+            session_id = conn.execute(
+                text(
+                    "insert into sessions (player_id, title, started_at) "
+                    "values (:p, 'вечер', now()) returning id"
+                ),
+                {"p": player},
+            ).scalar_one()
+            job = conn.execute(
+                text(
+                    "insert into jobs (type, payload, session_id, player_id) "
+                    "values ('question', '{}'::jsonb, :s, :p) returning id"
+                ),
+                {"s": session_id, "p": player},
+            ).scalar_one()
+            trace = conn.execute(
+                text("insert into traces (job_id) values (:j) returning id"), {"j": job}
+            ).scalar_one()
+            conn.execute(
+                text(
+                    "insert into llm_calls (trace_id, provider, model, purpose) "
+                    "values (:t, 'anthropic', 'm', 'question_answer')"
+                ),
+                {"t": trace},
+            )
+        config = alembic_config(dsn)
+        command.downgrade(config, "0008")
+        with engine.connect() as conn:
+            left = conn.execute(text("select count(*) from jobs")).scalar_one()
+            calls = conn.execute(text("select count(*) from llm_calls")).scalar_one()
+        command.upgrade(config, "0009")
+        with engine.begin() as conn:
+            back = conn.execute(
+                text(
+                    "insert into jobs (type, payload, session_id, player_id) "
+                    "values ('question', '{}'::jsonb, :s, :p) returning id"
+                ),
+                {"s": session_id, "p": player},
+            ).scalar_one()
+    finally:
+        engine.dispose()
+
+    assert (left, calls) == (0, 0)
+    assert back > 0, "после повторного наката тип задачи снова не принимается"
