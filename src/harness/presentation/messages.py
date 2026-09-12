@@ -690,7 +690,8 @@ def _bluff_line(numbers: _CallNumbers) -> list[str]:
 
 
 # Обрезка называется вслух и одним и тем же словом везде, где она случается:
-# экран заметок (`_fitted`) и разбор, которому не хватило места (`_shrink_rows`).
+# экран заметок (`_fitted`) и хвост разбора, не влезший даже во второе сообщение
+# (`hand_analysis_msgs`).
 _MARKER = " […показано не целиком]"
 
 
@@ -826,6 +827,12 @@ _SHARE_KEYS = frozenset(
 # Ключи, чьё значение — токен действия движка (`fold`/`call`/`shove`).
 _ACTION_KEYS = frozenset({"best_vs_one", "best_all_behind"})
 
+# Ключи, чьё значение — свободный текст ядра, написанный для игрока, но с
+# токенами движка внутри: «на узком конце лучше «shove»». Кавычки-ёлочки и есть
+# та граница, по которой токен можно перевести, не трогая остальную фразу
+# (`test_the_reason_for_the_zone_speaks_the_words_of_the_player`).
+_PROSE_KEYS = frozenset({"zone_reason", "unmodelled"})
+
 # Ключи, чьё значение — глубина стека в ББ: печатается одним знаком, как все
 # стеки продукта. Два знака у глубины и один у стека в соседней строке читатель
 # принимает за разную точность измерения.
@@ -851,14 +858,16 @@ def _required_equity(to_call: int, pot_before: int) -> float:
 
 
 def _detail_number(value: float) -> str:
-    """Число `detail`: два знака, мельче сотой — четыре, минус типографский.
+    """Число `detail`: два знака, мельче сотой — шесть, минус типографский.
 
-    Экспоненциальной записи нет ни при каком значении: «5e-06» в тексте игрока
-    не число, а сообщение об усталости формата
+    Шесть, а не четыре: ядро округляет доли до шестого знака (`preflop.py`), и
+    на четырёх `0.000005` показалось бы нулём — то есть «не посчитано» вместо
+    посчитанного. Экспоненциальной записи нет ни при каком значении: «5e-06» в
+    тексте игрока не число, а сообщение об усталости формата
     (`test_a_detail_value_that_is_empty_prints_a_dash_not_a_blank`).
     """
     magnitude = abs(value)
-    digits = 2 if magnitude >= 0.01 or magnitude == 0.0 else 4
+    digits = 2 if magnitude >= 0.01 or magnitude == 0.0 else 6
     body = f"{magnitude:.{digits}f}"
     return f"−{body}" if value < 0 and float(body) != 0.0 else body
 
@@ -888,6 +897,13 @@ def _detail_value(value: Any) -> str:
     return str(value)
 
 
+def _translated_tokens(text: str) -> str:
+    """Токены движка в кавычках-ёлочках — словами игрока; остальной текст как есть."""
+    for token, word in _ACTION_WORD.items():
+        text = text.replace(f"«{token}»", f"«{word}»")
+    return text
+
+
 def _width_key(key: str) -> str:
     """Ключ разбивки по ширине диапазона: `x0.35` — множитель, а не латинская
     буква перед числом."""
@@ -903,6 +919,8 @@ def _keyed_value(key: str, value: Any) -> str:
         return "—" if value is None else str(_fmt_pct(100.0 * float(value)))
     if key in _ACTION_KEYS:
         return "—" if value is None else _action_word(str(value))
+    if key in _PROSE_KEYS and isinstance(value, str):
+        return _translated_tokens(value)
     if key in _STACK_KEYS:
         if isinstance(value, list):
             return ", ".join(f"{float(item):.1f}" for item in value) if value else "—"
@@ -1219,7 +1237,9 @@ def hand_analysis_msgs(
     )
     if kept == len(blocks):
         return [first]
-    return [first, Msg(text=_fitted("\n".join(_joined(blocks[kept:])), _TELEGRAM_TEXT_LIMIT))]
+    head_line = f"Рука {res.hand_no}, продолжение разбора:\n\n"
+    rest = _fitted("\n".join(_joined(blocks[kept:])), _TELEGRAM_TEXT_LIMIT - len(head_line))
+    return [first, Msg(text=head_line + rest)]
 
 
 def range_image_title(point: PointVerdict) -> str:
@@ -1905,9 +1925,9 @@ def _replay_html(replay: HandReplay) -> str:
     `explanation.hand_replay` отдаёт куски с флагом `emphasis`, а во что
     превратится выделение — решает этот модуль. Здесь это `<b>` при
     `parse_mode=HTML`, поэтому весь остальной текст экранируется
-    (`_html_escape`). Отдельно от `deep_dive_msg`, единственного вызывающего,
-    потому что там же живёт `_fit_html`: разметка блока и подгонка сообщения
-    под предел — два разных решения, и читаются они порознь.
+    (`_html_escape`). Отдельно от `hand_analysis_msgs`, единственного
+    вызывающего: разметка блока и сборка сообщения — два разных решения, и
+    читаются они порознь.
     """
     return "".join(
         f"<b>{_html_escape(span.text)}</b>" if span.emphasis else _html_escape(span.text)

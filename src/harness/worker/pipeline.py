@@ -758,10 +758,12 @@ def _hand_zone(result: AnalysisResult, not_checked: Sequence[str] = ()) -> Zone 
       строками, каждая из которых помечена «(по модели диапазонов)». Слабейшее
       звено определяет, чему можно верить, — не самое дорогое.
 
-    Считаются точки, чей вывод игрок ВИДИТ: судимые из `ranked` плюс те, что
-    цены не несут, но называют лучшую линию, — риверная точка с доказанным
-    фолдом (`test_a_proven_river_fold_puts_its_zone_in_the_status_line`).
-    Судимая точка вне `ranked` в расчёт не идёт: показывается ровно `ranked`.
+    Считаются точки, У КОТОРЫХ ЕСТЬ ВЫВОД: судимые (`is_judged` — они же
+    `ranked`) плюс те, что цены не несут, но называют лучшую линию, — риверная
+    точка с доказанным фолдом
+    (`test_a_proven_river_fold_puts_its_zone_in_the_status_line`). Печатаются
+    при этом ВСЕ точки раздачи: у точки без вывода зона и не показывается, и в
+    подпись руки не идёт.
     """
     shown = [result.points[idx] for idx in result.ranked]
     shown += [point for point in result.points if point.best_action and not is_judged(point)]

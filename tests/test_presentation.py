@@ -703,20 +703,6 @@ def _two_point_result() -> AnalysisResult:
     )
 
 
-def _padded_result(filler: str) -> AnalysisResult:
-    """Тот же разбор, но с сырыми числами, которые заведомо не влезают в 4096.
-
-    Длина берётся из `detail`, а не из выдуманного поля: это и есть содержимое,
-    которое режется в тесноте (`_shrink_rows`).
-    """
-    res = _two_point_result()
-    points = [
-        point.model_copy(update={"detail": {"zone_reason": filler * 3000}})
-        for point in res.points
-    ]
-    return res.model_copy(update={"points": points})
-
-
 def _replay() -> HandReplay:
     return HandReplay(
         spans=[
@@ -776,8 +762,13 @@ def test_a_hand_too_long_for_one_message_goes_out_in_two():
     assert "Сверка денег с источником" in first.text, "сверка несжимаема и живёт в первом"
     assert "разборов 17/50" in first.text, "статус-строка не уезжает"
     assert first.buttons and not second.buttons
-    assert re.match(r"^\d+\. (префлоп|флоп|тёрн|ривер)", second.text), (
-        "второе сообщение начинается с целой точки"
+    head, blank, rest = second.text.split("\n", 2)
+    assert head == f"Рука {res.hand_no}, продолжение разбора:", (
+        "второе сообщение обязано сказать, чьё оно: игрок видит его отдельно"
+    )
+    assert blank == ""
+    assert re.match(r"^\d+\. (префлоп|флоп|тёрн|ривер)", rest), (
+        "дальше — целая точка, без обрубка предыдущей"
     )
     assert "\n\n\n" not in first.text
 
@@ -1825,8 +1816,10 @@ def test_the_raw_data_block_prints_no_money_the_hand_does_not_contain():
 def test_every_detail_key_the_analysis_produces_has_a_label():
     """Ключ `detail` без подписи печатался бы машинным именем — и это не подпись.
 
-    Гоняется настоящий `analyze_hand` по фикстурам всех расчётов: подпись
-    обязана быть у каждого ключа, который ядро способно положить в точку.
+    Полнота таблицы держится двумя способами сразу: ключи, до которых фикстуры
+    доходят, собираются прогоном настоящего `analyze_hand`, а ключи веток, куда
+    фикстуры не попадают (отказ солвера, лукап по чарту), перечислены ниже
+    списком. Прогон один этого обещания не даёт.
     """
     from harness.presentation.messages import _DETAIL_LABELS
     from tests.test_preflop_analysis import (
@@ -1877,7 +1870,8 @@ def test_a_detail_value_that_is_empty_prints_a_dash_not_a_blank():
     assert _detail_value(0) == "0"
     assert _detail_value(0.0) == "0.00"
     assert _detail_value(-0.96) == "−0.96", "минус типографский, как у всех чисел продукта"
-    assert _detail_value(0.000005) == "0.0000", "никакой экспоненциальной записи"
+    assert _detail_value(0.000005) == "0.000005", "ненулевое не показывается нулём"
+    assert "e" not in _detail_value(0.000005), "никакой экспоненциальной записи"
 
 
 def test_no_engine_token_reaches_the_player_in_the_raw_block():
@@ -1996,6 +1990,25 @@ def test_no_engine_token_of_the_analysis_reaches_the_player():
             assert token not in text, f"токен движка дошёл до игрока: «{token}»"
     assert "×0.14" in texts[0], "ключ ширины печатается знаком умножения, не латинской x"
     assert "устойчивость к входу живых за вами: вердикт не меняется" in texts[1]
+
+
+def test_the_reason_for_the_zone_speaks_the_words_of_the_player():
+    """`zone_reason` — свободный текст ядра, и токены движка внутри него стоят в
+    кавычках: «на узком конце лучше «shove»». Кавычки и есть та граница, по
+    которой их можно перевести, не трогая остальную фразу.
+    """
+    point = _point(
+        spot=SpotKind.PUSHFOLD_UNOPENED, ev_diff_bb=-1.0, zone=Zone.STRICT
+    ).model_copy(
+        update={
+            "detail": {
+                "zone_reason": "на узком конце лучше «shove», на широком — «fold»",
+            }
+        }
+    )
+    text = _deep_dive(AnalysisResult(hand_no="TM1", points=[point], ranked=[0])).text
+    assert "на узком конце лучше «шов», на широком — «фолд»" in text
+    assert "«shove»" not in text and "«fold»" not in text
 
 
 def test_every_validation_status_has_a_word_of_its_own():
