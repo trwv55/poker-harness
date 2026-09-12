@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 from harness.presentation.keyboards import (
-    DETAIL_PREFIX,
     DISAGREE_PREFIX,
     MAIN_MENU,
     MENU_HELP,
@@ -82,8 +81,6 @@ from harness.presentation.messages import (
     range_image_title,
     range_photos,
     ranges_msg,
-    replay_msg,
-    replay_unavailable_msg,
     scan_summary_msg,
     screenshot_too_large_msg,
     send_as_file_msg,
@@ -104,7 +101,6 @@ from harness.presentation.messages import (
 )
 
 __all__ = [
-    "DETAIL_PREFIX",
     "DISAGREE_PREFIX",
     "MAIN_MENU",
     "MENU_HELP",
@@ -175,8 +171,6 @@ __all__ = [
     "range_image_title",
     "range_photos",
     "ranges_msg",
-    "replay_msg",
-    "replay_unavailable_msg",
     "scan_summary_msg",
     "screenshot_too_large_msg",
     "send_as_file_msg",

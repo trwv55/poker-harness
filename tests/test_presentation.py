@@ -62,7 +62,6 @@ from harness.presentation import (
     new_session_msg,
     progress_text,
     quota_exceeded_msg,
-    replay_msg,
     scan_summary_msg,
     start_msg,
     tournament_report_msg,
@@ -476,13 +475,22 @@ def test_deep_dive_msg_point_line_is_grammatically_correct():
     assert "верно" not in msg.text  # старая (нечестная в assuming) формулировка round 2
 
 
-def test_deep_dive_msg_buttons_are_ranges_detail_disagree_with_hand_no():
+def test_the_verdict_buttons_are_two():
+    """Реплей переехал в разбор (задача 3); кнопка, показывающая его второй раз,
+    осталась бы без содержания. `deep_dive_button` («разобрать» под сканом) —
+    другая кнопка, её план не касается."""
+    from harness.presentation import verdict_buttons
+
+    assert [b.text for b in verdict_buttons("TM99")] == ["🎯 Диапазоны", "✋ Не согласен"]
+
+
+def test_deep_dive_msg_buttons_are_ranges_and_disagree_with_hand_no():
     res = _mixed_result(hand_no="H99")
     msg = deep_dive_msg(res, elapsed_s=1, zone=Zone.STRICT, quota_left=1, quota_total=1)
     assert len(msg.buttons) == 1
     row = msg.buttons[0]
-    assert [b.text for b in row] == ["🎯 Диапазоны", "🔍 Подробнее", "✋ Не согласен"]
-    assert [b.callback_data for b in row] == ["ranges:H99", "detail:H99", "disagree:H99"]
+    assert [b.text for b in row] == ["🎯 Диапазоны", "✋ Не согласен"]
+    assert [b.callback_data for b in row] == ["ranges:H99", "disagree:H99"]
 
 
 def test_deep_dive_msg_dev_line_appears_only_when_passed():
@@ -1136,6 +1144,7 @@ def test_the_deep_dive_opens_with_what_happened_in_html():
     assert msg.parse_mode == "HTML"
     assert msg.text.startswith("Что было\n")
     assert "<b>вы олл-ин 9.9</b>" in msg.text
+    assert "<b>Вы на SB" not in msg.text, "жирным — только помеченный кусок"
     assert "BB &amp; CO" in msg.text, "остальной текст экранируется"
 
 
@@ -1185,22 +1194,12 @@ def test_a_deep_dive_cut_to_the_bone_has_no_holes_where_the_prose_was():
     assert "\n\n\n" not in msg.text
 
 
-def test_replay_msg_marks_the_hero_decision_in_bold():
-    """Точка решения героя выделена прямо в потоке действий (спека §5.6).
-
-    Выделение — разметка Телеграма, поэтому у сообщения стоит `parse_mode`, и
-    выделен ровно тот кусок, который пометил `explanation.hand_replay`.
-    """
-    msg = replay_msg(_replay(), "TM77")
-    assert msg.parse_mode == "HTML"
-    assert "<b>вы олл-ин 9.9</b>" in msg.text
-    assert "<b>Вы на SB" not in msg.text
-
-
-def test_replay_msg_escapes_a_nickname_that_looks_like_a_tag():
+def test_the_deep_dive_escapes_a_nickname_that_looks_like_a_tag():
     """Ники приходят со скрина: незакрытый `<` уронил бы отправку целиком."""
-    replay = HandReplay(spans=[ReplaySpan(text="<script> & Hero"), ReplaySpan(text="шов", emphasis=True)])
-    msg = replay_msg(replay, "TM<1>")
+    replay = HandReplay(
+        spans=[ReplaySpan(text="<script> & Hero"), ReplaySpan(text="шов", emphasis=True)]
+    )
+    msg = deep_dive_msg(_prose_result(), 12, Zone.STRICT, 17, 50, replay=replay)
     assert "&lt;script&gt; &amp; Hero" in msg.text
     assert "<script>" not in msg.text
 

@@ -182,8 +182,6 @@ __all__ = [
     "range_image_title",
     "range_photos",
     "ranges_msg",
-    "replay_msg",
-    "replay_unavailable_msg",
     "scan_summary_msg",
     "screenshot_too_large_msg",
     "send_as_file_msg",
@@ -1898,7 +1896,7 @@ def _html_escape(text: str) -> str:
 
     Телеграм требует экранировать `<`, `>` и `&`; ник оппонента и подписи карт
     приходят из внешнего мира, и незакрытый `<` уронил бы отправку сообщения
-    целиком (`test_replay_msg_escapes_a_nickname_that_looks_like_a_tag`).
+    целиком (`test_the_deep_dive_escapes_a_nickname_that_looks_like_a_tag`).
     """
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -1910,30 +1908,14 @@ def _replay_html(replay: HandReplay) -> str:
     `explanation.hand_replay` отдаёт куски с флагом `emphasis`, а во что
     превратится выделение — решает этот модуль. Здесь это `<b>` при
     `parse_mode=HTML`, поэтому весь остальной текст экранируется
-    (`_html_escape`). Одна разметка на оба места, где реплей показывается, —
-    блоком в разборе (`deep_dive_msg`) и отдельным сообщением (`replay_msg`).
+    (`_html_escape`). Отдельно от `deep_dive_msg`, единственного вызывающего,
+    потому что там же живёт `_fit_html`: разметка блока и подгонка сообщения
+    под предел — два разных решения, и читаются они порознь.
     """
     return "".join(
         f"<b>{_html_escape(span.text)}</b>" if span.emphasis else _html_escape(span.text)
         for span in replay.spans
     )
-
-
-def replay_msg(replay: HandReplay, hand_no: str) -> Msg:
-    """Ответ на кнопку «Подробнее»: ход раздачи отдельным сообщением."""
-    return Msg(
-        text=f"Ход раздачи {_html_escape(hand_no)}\n\n{_replay_html(replay)}",
-        parse_mode="HTML",
-    )
-
-
-def replay_unavailable_msg() -> Msg:
-    """Кнопка «Подробнее» нажата под раздачей, хода которой у нас нет.
-
-    Так бывает у старых разборов: реплей строится из `hands.enriched`, а
-    сохранённая рука могла остаться на чекпоинте ниже (спека §8.2).
-    """
-    return Msg(text="Хода этой раздачи у меня не сохранилось — показать нечего.")
 
 
 def disagreement_saved_msg() -> Msg:

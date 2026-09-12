@@ -942,8 +942,8 @@ async def test_deep_dive_callback_refuses_when_quota_exhausted(db_factory, deps)
 async def test_a_button_without_a_handler_still_gets_an_answer_not_a_spinner(deps):
     """Кнопка без обработчика обязана получать честный ответ, а не «часики».
 
-    Три кнопки под вердиктом (`ranges:`, `detail:`, `disagree:`) с задачи 23
-    разбираются по-настоящему (`handle_ui_callback`), но catch-all не убран: он
+    Кнопки под вердиктом (`ranges:`, `disagree:`) с задачи 23 разбираются
+    по-настоящему (`handle_ui_callback`), но catch-all не убран: он
     закрывает ЛЮБОЙ будущий префикс, у которого обработчика ещё нет. Проверяются
     оба утверждения: catch-all стоит последним и без фильтра (иначе он перехватил
     бы `deep:` у настоящего обработчика), и его тело отвечает текстом из
@@ -969,13 +969,13 @@ async def test_a_button_without_a_handler_still_gets_an_answer_not_a_spinner(dep
     await handlers[-1].call(_FakeCallback("будущая-кнопка:TM123"))
 
     assert answered == [unknown_button_msg().text]
-    # Докстринг catch-all перечислял `ranges:`/`detail:`/`disagree:` как то, что
-    # до него доходит; с задачи 23 они разбираются, и перечень стал неверным.
+    # Докстринг catch-all перечислял `ranges:`/`disagree:` как то, что до него
+    # доходит; с задачи 23 они разбираются, и перечень стал неверным.
     assert "три кнопки" not in (handlers[-1].callback.__doc__ or "")
 
 
 async def test_every_verdict_button_is_routed_to_a_real_handler(deps):
-    """Ни одна из трёх кнопок под вердиктом больше не проваливается в catch-all.
+    """Ни одна из кнопок под вердиктом не проваливается в catch-all.
 
     Фильтр UI-обработчика перечисляет префиксы, которые разбирает
     `handle_ui_callback`; расхождение между кнопкой и фильтром означало бы
@@ -1930,49 +1930,18 @@ async def test_the_ranges_button_sends_the_pictures_that_were_rendered(
     assert "колл шова" in msg.photos[0].caption
 
 
-async def test_the_details_button_shows_the_replay_of_the_hand(deps, db_factory, invited):
-    """«Подробнее» отдаёт ход раздачи отдельным сообщением — пока кнопка жива.
+async def test_an_old_details_button_falls_through_to_the_catch_all(deps, invited):
+    """«Подробнее» ушла из клавиатуры, но в УЖЕ отправленных разборах осталась.
 
-    С этой задачи тот же ход стоит блоком «Что было» в самом разборе; что делать
-    с кнопкой, решает следующая задача плана, а до неё она обязана работать.
+    Такое нажатие обработчика больше не находит — `handle_ui_callback` отдаёт
+    `None`, и роутер отвечает «Эта кнопка не работает.» (`on_unhandled_callback`,
+    сквозной путь закреплён `test_a_button_without_a_handler_still_gets_an_answer_not_a_spinner`).
+    Переписывать старые сообщения дороже, чем принять этот ответ.
     """
-    from harness.bot.handlers import handle_ui_callback
-    from harness.engine import enrich
-    from harness.memory.repos import HandsRepo
-    from harness.normalizer import normalize
-    from harness.parsers.hh_parser import parse_hand
-    from tests.test_hh_parser import SAMPLE
+    from harness.bot.handlers import UI_CALLBACK_PREFIXES, handle_ui_callback
 
-    await handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="t.txt")
-    active = await fetch_one(db_factory, "select * from sessions")
-    raw = parse_hand(SAMPLE, source_ref="x").model_copy(update={"hand_no": "RC1234"})
-    async with db_factory() as session:
-        hands = HandsRepo(session)
-        hand_id = await hands.save_raw(session_id=active["id"], raw=raw)
-        canonical = normalize(raw)
-        await hands.save_canonical(hand_id, canonical)
-        await hands.save_enriched(hand_id, enrich(canonical))
-        await session.commit()
-
-    msg = await handle_ui_callback(deps, _TG_USER_ID, "detail:RC1234")
-
-    assert msg is not None
-    assert msg.parse_mode == "HTML"
-    assert "Вы на " in msg.text
-
-
-async def test_the_details_button_of_an_unfinished_hand_says_so(deps, db_factory, invited):
-    """Рука осталась на чекпоинте ниже — показывать нечего, и это говорится прямо."""
-    from harness.bot.handlers import handle_ui_callback
-    from harness.presentation import replay_unavailable_msg
-
-    await handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="t.txt")
-    active = await fetch_one(db_factory, "select * from sessions")
-    await _seed_hand(db_factory, session_id=active["id"], hand_no="RC1234")
-
-    assert await handle_ui_callback(
-        deps, _TG_USER_ID, "detail:RC1234"
-    ) == replay_unavailable_msg()
+    assert not "detail:RC1234".startswith(UI_CALLBACK_PREFIXES), "фильтр роутера её не ловит"
+    assert await handle_ui_callback(deps, _TG_USER_ID, "detail:RC1234") is None
 
 
 async def test_the_disagree_button_writes_the_objection_to_the_eval_dataset(
