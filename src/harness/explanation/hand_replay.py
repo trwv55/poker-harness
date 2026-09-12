@@ -208,24 +208,18 @@ def _action_text(
     hand: CanonicalHand,
     action: CanonicalAction,
     raise_ordinal: int,
-    stats: Mapping[str, PlayerStats] | None,
-    marked: set[str],
+    mark: str,
 ) -> str:
     """Один ход: кто (позицией; герой — «вы»), что сделал и — у ставок — на сколько в ББ.
 
-    Метка и частоты оппонента печатаются при его ПЕРВОМ ходе, дошедшем сюда, и
-    больше не повторяются: `marked` копит уже помеченных
-    (`test_an_opponent_carries_its_label_and_both_frequencies_once`). У героя
-    метки нет — к нему обращаются «вы».
+    `mark` — готовая скобка с меткой и частотами оппонента (`_opponent_mark`)
+    либо пустая строка; КОМУ и когда она достаётся, решает `_street_flow`:
+    правило «при первом ходе, дошедшем до потока» неотделимо от слипания
+    фолдов, которым владеет он. Здесь скобка только приписывается к тому, кто
+    ходит.
     """
     word = _action_word(action, raise_ordinal)
-    if action.label == hand.hero_label:
-        who = "вы"
-    else:
-        who = _position(hand, action.label)
-        if action.label not in marked:
-            who += _opponent_mark(action.label, stats)
-            marked.add(action.label)
+    who = "вы" if action.label == hand.hero_label else _position(hand, action.label) + mark
     show_amount = action.is_all_in or action.kind in _ACTIONS_WITH_AMOUNT
     if not show_amount:
         return f"{who} {word}"
@@ -243,9 +237,15 @@ def _street_flow(
 
     Подряд идущие пасы сливаются в один шаг (`UTG/HJ фолд`) — они одинаковы по
     смыслу и занимают место, которого у сообщения нет. Пас героя в слипание не
-    попадает: его решение обязано остаться видимым отдельно. Слипшийся пас не
-    доходит до `_action_text`, а значит и метки оппонента не несёт — у
-    пасующего сказать нечего (`test_a_folding_opponent_gets_no_label`).
+    попадает: его решение обязано остаться видимым отдельно.
+
+    Здесь же решается, кому достанется метка с частотами: её получает ПЕРВЫЙ
+    ход оппонента, ставший отдельным шагом (`marked` копит уже помеченных,
+    `test_an_opponent_carries_its_label_and_both_frequencies_once`). Правило
+    стоит рядом со слипанием не случайно — оно от него и зависит: слипшийся пас
+    отдельным шагом не становится и метки не несёт, у пасующего сказать нечего
+    (`test_a_folding_opponent_gets_no_label`). У героя метки нет — к нему
+    обращаются «вы».
 
     `marked` живёт выше по стеку (`hand_replay`), потому что метка ставится
     один раз на раздачу, а не один раз на улицу.
@@ -272,8 +272,12 @@ def _street_flow(
             folds.append(_position(hand, action.label))
             continue
         flush_folds()
+        mark = ""
+        if not is_hero and action.label not in marked:
+            mark = _opponent_mark(action.label, stats)
+            marked.add(action.label)
         step(
-            _action_text(hand, action, raises_so_far, stats, marked),
+            _action_text(hand, action, raises_so_far, mark),
             emphasis=is_hero and index in hero_decisions,
         )
     flush_folds()
