@@ -580,6 +580,13 @@ class LlmCall(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     trace_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("traces.id"), nullable=False)
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Кто НА САМОМ ДЕЛЕ обслужил вызов, когда между нами и моделью стоит шлюз
+    # (миграция 0011). `provider` — куда слали (`openrouter`), это — кто ответил
+    # (`Parasail`). У одной модели на OpenRouter несколько хостеров, и они
+    # различаются поддержкой `seed` и `tool_choice: required`; без этой колонки
+    # разбор расхождений между прогонами упирается в «неизвестно, кто отвечал».
+    # `None` — прямой вызов вендора, он хостера не называет, и это факт, а не пропуск.
+    served_by: Mapped[str | None] = mapped_column(String(64))
     model: Mapped[str] = mapped_column(String(128), nullable=False)
     purpose: Mapped[str] = mapped_column(String(32), nullable=False)
     tokens_in: Mapped[int | None] = mapped_column(Integer)
