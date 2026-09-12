@@ -696,6 +696,78 @@ def _bluff_line(numbers: _CallNumbers) -> list[str]:
     return [f"{head}{need_word} {bluffs} {bluffs_word} — {tail}."]
 
 
+# Обрезка называется вслух и одним и тем же словом везде, где она случается:
+# экран заметок (`_fitted`) и разбор, которому не хватило места (`_shrink_prose`).
+_MARKER = " […показано не целиком]"
+
+
+def _shrink_prose(rows: list[tuple[str, bool]], budget: int) -> list[tuple[str, bool]]:
+    """Уместить строки в бюджет, срезая ТОЛЬКО прозу модели (сырую, до экранирования).
+
+    Слова необязательны, числа обязательны — то же правило, по которому
+    `worker.pipeline` отдаёт разбор без прозы, когда модель не ответила.
+    Строка, которая влезает целиком, не трогается; которой не хватает места
+    даже на маркер — пропадает целиком (иначе `_fitted` вернул бы один маркер
+    и пробил бюджет на его длину).
+    """
+    fixed = sum(len(text) + 1 for text, is_prose in rows if not is_prose)
+    left = budget - fixed
+    out: list[tuple[str, bool]] = []
+    for text, is_prose in rows:
+        if not is_prose:
+            out.append((text, False))
+            continue
+        if len(text) + 1 <= left:
+            out.append((text, True))
+            left -= len(text) + 1
+            continue
+        if left <= len(_MARKER) + 1:
+            continue
+        cut = _fitted(text, left - 1)
+        out.append((cut, True))
+        left -= len(cut) + 1
+    return out
+
+
+def _render_html(head: str, rows: list[tuple[str, bool]]) -> str:
+    """Блок уже с разметкой; остальные строки экранируются здесь, ПОСЛЕ усадки."""
+    return "\n".join([head, *(_html_escape(text) for text, _ in rows)])
+
+
+def _fit_html(head: str, rows: list[tuple[str, bool]], limit: int) -> str:
+    """Итоговый текст не длиннее `limit` — меряется ПОСЛЕ экранирования и разметки.
+
+    Режется сырая проза, а экранируется то, что осталось: разрез по
+    экранированному попал бы внутрь `&amp;`, и что Телеграм сделает с `&am` —
+    неизвестно.
+
+    Отсюда и поиск бюджета. Сколько сырых символов прозы даст текст ровно в
+    `limit`, заранее не знает никто: экранирование раздувает строку от нуля
+    (обычная проза) до пятикратного (текст из одних `&`), и вычесть перелёт из
+    бюджета значит выбросить всю прозу там, где влезала пятая её часть. Поэтому
+    бюджет подбирается делением пополам — берётся самый щедрый, при котором
+    ИТОГОВЫЙ текст ещё влезает (`test_the_model_prose_is_cut_before_the_
+    replay_is`). Каждый кандидат проверяется по факту, а не по оценке.
+
+    Ничего не влезло — остаются числа без прозы, даже если и они длиннее
+    предела: резать их этой функции нельзя (спека §5.6).
+    """
+    text = _render_html(head, rows)
+    if len(text) <= limit:
+        return text
+    best = _render_html(head, [(t, is_prose) for t, is_prose in rows if not is_prose])
+    low, high = 0, limit
+    while low <= high:
+        budget = (low + high) // 2
+        candidate = _render_html(head, _shrink_prose(rows, budget))
+        if len(candidate) <= limit:
+            best = candidate
+            low = budget + 1
+        else:
+            high = budget - 1
+    return best
+
+
 def deep_dive_msg(
     res: AnalysisResult,
     elapsed_s: int,
@@ -704,6 +776,7 @@ def deep_dive_msg(
     quota_total: int,
     dev_line: str | None = None,
     verdict: VerdictTextOut | None = None,
+    replay: HandReplay | None = None,
     not_checked: Sequence[str] = (),
     note_nicks: Sequence[str] = (),
 ) -> Msg:
@@ -743,24 +816,27 @@ def deep_dive_msg(
     (`_hand_zone`), а называет непроверенное эта строка: одно без другого
     оставляет либо неназванную оговорку, либо неоправданную уверенность.
 
-    **Реплея здесь нет — он под кнопкой «Подробнее»** (задача 23). Ход раздачи
-    печатался прямо в этом сообщении и занимал в нём больше места, чем сам
-    разбор, а `sendMessage` жёстко ограничен 4096 символами: длинная раздача с
-    прозой модели упиралась в этот предел (`_MAX_STORY_CHARS` рядом — про ту же
-    границу). Кнопка отдаёт тот же реплей отдельным сообщением, где выделение
-    точки решения ещё и видно (`replay_msg`).
+    **Блок «Что было» — первым** (спека §5.6, план 2026-09-12): проза короче
+    построчного реплея, ради которого его когда-то прятали за кнопку; в тесноте
+    режется проза модели, не блок (`_shrink_prose`). `parse_mode="HTML"` только
+    при наличии блока — иначе экранировать пришлось бы весь текст всюду.
 
     `note_nicks` — оппоненты, на которых можно записать заметку одним тапом
     (решение владельца 2026-09-04: путь заметки начинается ИЗ РАЗБОРА). Ники
     приходят только со скрина; на HH-пути список пуст, потому что там их нет.
     """
-    lines = [f"Рука {res.hand_no}", ""]
+    # Строка и флаг «это проза модели»: в тесноте режется только она
+    # (`_shrink_prose`), а числа и статус остаются на месте.
+    rows: list[tuple[str, bool]] = []
+    if replay is not None:
+        rows.append(("", False))  # пустая строка после блока; сам блок — `head`
+    rows.extend([(f"Рука {res.hand_no}", False), ("", False)])
 
     prose = {} if verdict is None else {point.dp_index: point.text for point in verdict.points}
     postflop = [line for point in res.points for line in _postflop_call_lines(point)]
 
     if not res.ranked and not postflop:
-        lines.append(_NO_VERDICT_LINE)
+        rows.append((_NO_VERDICT_LINE, False))
     elif res.ranked:
         for idx in res.ranked:
             point = res.points[idx]
@@ -772,45 +848,55 @@ def deep_dive_msg(
                 # все три числа, которых не давал прежний отказ: точка, интервал
                 # и потолок цены выбора.
                 active = _ACTIVE_WORD.get(point.spot, "вход")
-                lines.append(
+                headline = (
                     f"{street} · {_spot_word(point.spot)}: {active} или фолд — "
                     f"{point.best_action}{marker}"
                 )
-                lines.append(
+                numbers = (
                     f"    EV {active}а {_fmt_signed_bb(interval.point_bb)}, "
                     f"{_interval_words(point.spot, interval)}."
                 )
-                lines.extend(_prose_lines(prose.get(point.dp_index)))
+                rows.append((headline, False))
+                rows.append((numbers, False))
+                rows.extend((line, True) for line in _prose_lines(prose.get(point.dp_index)))
                 continue
-            lines.append(
+            headline = (
                 f"{street} · "
                 f"{_spot_word(point.spot)}: {_action_word(point.action_taken)} "
-                f"(лучше: {_action_word(point.best_action)}) — {_fmt_bb(point.ev_diff_bb)}{marker}"
+                f"(лучше: {_action_word(point.best_action)}) — "
+                f"{_fmt_bb(point.ev_diff_bb)}{marker}"
             )
-            lines.extend(_prose_lines(prose.get(point.dp_index)))
+            rows.append((headline, False))
+            rows.extend((line, True) for line in _prose_lines(prose.get(point.dp_index)))
 
     if postflop:
         if res.ranked:
-            lines.append("")
-        lines.extend(postflop)
+            rows.append(("", False))
+        rows.extend((line, False) for line in postflop)
 
     if verdict is not None and verdict.summary.strip():
-        lines.append("")
-        lines.append(verdict.summary.strip())
+        rows.append(("", False))
+        rows.append((verdict.summary.strip(), True))
 
     if not_checked:
-        lines.append("")
-        lines.append(f"{_NOT_CHECKED_PREFIX} {', '.join(not_checked)}.")
+        rows.append(("", False))
+        rows.append((f"{_NOT_CHECKED_PREFIX} {', '.join(not_checked)}.", False))
 
-    lines.append("")
+    rows.append(("", False))
     zone_segment = "" if zone is None else f"зона: {_ZONE_WORD[zone]} · "
     status = f"⏱ {elapsed_s}с · {zone_segment}{_quota_line(quota_left, quota_total)}"
-    lines.append(status)
+    rows.append((status, False))
     if dev_line is not None:
-        lines.append(dev_line)
+        rows.append((dev_line, False))
 
     buttons = [verdict_buttons(res.hand_no), *note_buttons_for_hand(res.hand_no, note_nicks)]
-    return Msg(text="\n".join(lines), buttons=buttons)
+    if replay is None:
+        return Msg(text="\n".join(text for text, _ in rows), buttons=buttons)
+    return Msg(
+        text=_fit_html(f"Что было\n{_replay_html(replay)}", rows, _TELEGRAM_TEXT_LIMIT),
+        buttons=buttons,
+        parse_mode="HTML",
+    )
 
 
 def range_image_title(point: PointVerdict) -> str:
@@ -1542,8 +1628,7 @@ def _fitted(text: str, budget: int) -> str:
     """
     if len(text) <= budget:
         return text
-    marker = " […показано не целиком]"
-    return text[: max(0, budget - len(marker))] + marker
+    return text[: max(0, budget - len(_MARKER))] + _MARKER
 
 
 def _note_lines(note: NoteRecord) -> list[str]:
@@ -1802,20 +1887,28 @@ def _html_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def replay_msg(replay: HandReplay, hand_no: str) -> Msg:
-    """Ответ на кнопку «Подробнее»: ход раздачи, точка решения героя — жирным.
+def _replay_html(replay: HandReplay) -> str:
+    """Ход раздачи разметкой Телеграма: точка решения героя — жирным.
 
     Спека §5.6 требует выделить точку решения прямо в потоке действий;
     `explanation.hand_replay` отдаёт куски с флагом `emphasis`, а во что
     превратится выделение — решает этот модуль. Здесь это `<b>` при
     `parse_mode=HTML`, поэтому весь остальной текст экранируется
-    (`_html_escape`).
+    (`_html_escape`). Одна разметка на оба места, где реплей показывается, —
+    блоком в разборе (`deep_dive_msg`) и отдельным сообщением (`replay_msg`).
     """
-    body = "".join(
+    return "".join(
         f"<b>{_html_escape(span.text)}</b>" if span.emphasis else _html_escape(span.text)
         for span in replay.spans
     )
-    return Msg(text=f"Ход раздачи {_html_escape(hand_no)}\n\n{body}", parse_mode="HTML")
+
+
+def replay_msg(replay: HandReplay, hand_no: str) -> Msg:
+    """Ответ на кнопку «Подробнее»: ход раздачи отдельным сообщением."""
+    return Msg(
+        text=f"Ход раздачи {_html_escape(hand_no)}\n\n{_replay_html(replay)}",
+        parse_mode="HTML",
+    )
 
 
 def replay_unavailable_msg() -> Msg:

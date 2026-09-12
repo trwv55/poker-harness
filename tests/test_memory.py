@@ -484,6 +484,37 @@ async def test_player_hands_skip_a_hand_that_never_reached_canonical(db):
     assert [[h.hand_no for h in group] for group in grouped] == [["DONE"]]
 
 
+async def test_canonical_by_tournament_reads_only_hands_with_a_canonical_checkpoint(db):
+    """Одна колонка, как у `player_hands_by_tournament`: `raw` и `enriched`
+    весят кратно больше, а частотам нужен только `canonical`."""
+    _player_id, session_id = await _player_with_session(db, tg_user_id=7002)
+    tid = await TournamentsRepo(db).create(session_id=session_id, source_file="t.txt")
+    await _save_hand_in(db, session_id=session_id, tournament_id=tid, hand_no="C1")
+    await HandsRepo(db).save_raw(
+        session_id=session_id,
+        tournament_id=tid,
+        raw=parse_hand(SAMPLE, source_ref="x").model_copy(update={"hand_no": "C2"}),
+    )
+
+    hands = await HandsRepo(db).canonical_by_tournament(tid)
+
+    assert [h.hand_no for h in hands] == ["C1"]
+
+
+async def test_canonical_by_tournament_does_not_reach_into_a_neighbouring_tournament(db):
+    """Частоты оппонентов считаются по ОДНОМУ турниру: метка сквозная только внутри
+    него, и рука соседнего турнира приписала бы чужие действия тому же месту."""
+    _player_id, session_id = await _player_with_session(db, tg_user_id=7003)
+    mine = await TournamentsRepo(db).create(session_id=session_id, source_file="mine.txt")
+    other = await TournamentsRepo(db).create(session_id=session_id, source_file="other.txt")
+    await _save_hand_in(db, session_id=session_id, tournament_id=mine, hand_no="MINE")
+    await _save_hand_in(db, session_id=session_id, tournament_id=other, hand_no="OTHER")
+
+    hands = await HandsRepo(db).canonical_by_tournament(mine)
+
+    assert [h.hand_no for h in hands] == ["MINE"]
+
+
 async def test_past_scan_summaries_exclude_the_tournament_being_reported(db):
     """Сводка текущего турнира уже сохранена к моменту отчёта — и в «прошлые» не идёт.
 

@@ -564,6 +564,29 @@ class HandsRepo:
             )
         return list(grouped.values())
 
+    async def canonical_by_tournament(self, tournament_id: int) -> list[CanonicalHand]:
+        """Канонические руки одного турнира — одной колонкой.
+
+        Вход частот оппонентов для блока «Что было» (план 2026-09-12). Читается
+        только `canonical`, как в `player_hands_by_tournament`: `raw` и
+        `enriched` весят кратно больше, а `player_stats_by_label` нужен лишь
+        канон. Руки без чекпоинта пропускаются
+        (`test_canonical_by_tournament_reads_only_hands_with_a_canonical_checkpoint`).
+
+        Область — один турнир: метка места сквозная только внутри него, и рука
+        соседнего турнира приписала бы той же метке чужие действия
+        (`test_canonical_by_tournament_does_not_reach_into_a_neighbouring_tournament`).
+        """
+        stmt = (
+            select(Hand.canonical)
+            .where(Hand.tournament_id == tournament_id, Hand.canonical.is_not(None))
+            .order_by(Hand.id)
+        )
+        return [
+            CanonicalHand.model_validate(canonical)
+            for canonical in await self.db.scalars(stmt)
+        ]
+
     async def player_canonical(
         self, player_id: int, window: Window | None = None
     ) -> list[CanonicalHand]:

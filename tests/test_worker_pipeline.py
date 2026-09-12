@@ -83,7 +83,7 @@ from harness.platform.llm import LLM, LLMProviderError
 from harness.platform.queue import JobsQueue
 from harness.presentation import Msg, Photo, deep_dive_msg
 from harness.worker import pipeline as pipeline_module
-from harness.worker.main import configure_logging
+from harness.worker.main import _payload, configure_logging
 from harness.worker.pipeline import (
     Deps,
     HandDataMissing,
@@ -1395,15 +1395,16 @@ async def test_deep_dive_saves_the_model_text_and_shows_it_to_the_player(
     texts = _all_texts(fake_sender)
     assert record.verdict_text is not None
     assert any("Разбор без выдуманных чисел." in text for text in texts)
-    # Ход раздачи с задачи 23 уходит не с вердиктом, а по кнопке «Подробнее»
-    # (`presentation.replay_msg`): в самом разборе его больше нет, а кнопка есть.
+    # Ход раздачи — блоком «Что было» первым в самом разборе (план 2026-09-12).
+    assert any(text.startswith("Что было\n") for text in texts)
     assert not any("ПРЕФЛОП" in text for text in texts)
-    assert any(
-        btn.callback_data.startswith("detail:")
-        for msg in [*fake_sender.sent, *(m for _mid, m in fake_sender.edits)]
-        for row in msg.buttons
-        for btn in row
-    ), "кнопка «Подробнее» обязана стоять под разбором"
+
+
+def test_the_payload_carries_parse_mode_when_the_message_has_markup():
+    """Разбор с блоком «Что было» едет в HTML; без этого поля Bot API показал
+    бы `<b>` и `&amp;` буквально. Без разметки поля нет — как и раньше."""
+    assert _payload(Msg(text="x", parse_mode="HTML"), chat_id=1)["parse_mode"] == "HTML"
+    assert "parse_mode" not in _payload(Msg(text="x"), chat_id=1)
 
 
 @requires_fixtures

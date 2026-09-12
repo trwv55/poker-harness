@@ -1093,9 +1093,9 @@ def _verdict_text() -> VerdictTextOut:
 def _replay() -> HandReplay:
     return HandReplay(
         spans=[
-            ReplaySpan(text="T1 · ур. 12 · 50/100\nHero SB J♥️9♥️ · 1 000 (10.0bb)\n\n"),
-            ReplaySpan(text="ПРЕФЛОП · банк 210\nUTG фолд → "),
-            ReplaySpan(text="Hero олл-ин 990 (9.9bb)", emphasis=True),
+            ReplaySpan(text="Вы на SB, J♥️9♥️, 10.0 ББ.\nUTG фолд → "),
+            ReplaySpan(text="вы олл-ин 9.9", emphasis=True),
+            ReplaySpan(text=" → BB & CO фолд."),
         ]
     )
 
@@ -1126,17 +1126,42 @@ def test_deep_dive_msg_without_prose_has_no_holes_in_it():
     assert "−2.3 bb" in msg.text
 
 
-def test_the_replay_left_the_verdict_message_for_the_details_button():
-    """Ход раздачи ушёл под кнопку «Подробнее» (задача 23), а сама кнопка осталась.
+def test_the_deep_dive_opens_with_what_happened_in_html():
+    """Блок «Что было» — первым в разборе (спека §5.6, план 2026-09-12).
 
-    Реплей занимал в сообщении больше места, чем разбор, и упирался в предел
-    `sendMessage` в 4096 символов вместе с прозой модели. Проверяются оба
-    утверждения сразу: в вердикте хода нет, а нажать на него по-прежнему есть
-    где — иначе «убрали» превратилось бы в «потеряли».
+    Выделение точки решения — разметка Телеграма, поэтому у сообщения стоит
+    `parse_mode`, а весь остальной текст экранируется.
     """
-    msg = deep_dive_msg(_prose_result(), 12, Zone.STRICT, 17, 50, verdict=_verdict_text())
-    assert "ПРЕФЛОП" not in msg.text
-    assert any(btn.callback_data.startswith("detail:") for row in msg.buttons for btn in row)
+    msg = deep_dive_msg(_prose_result(), 12, Zone.STRICT, 17, 50, replay=_replay())
+    assert msg.parse_mode == "HTML"
+    assert msg.text.startswith("Что было\n")
+    assert "<b>вы олл-ин 9.9</b>" in msg.text
+    assert "BB &amp; CO" in msg.text, "остальной текст экранируется"
+
+
+def test_without_a_replay_the_deep_dive_stays_plain():
+    """Без блока разметки в сообщении нет — и экранировать текст незачем."""
+    msg = deep_dive_msg(_prose_result(), 12, Zone.STRICT, 17, 50)
+    assert msg.parse_mode is None and "Что было" not in msg.text
+
+
+def test_the_model_prose_is_cut_before_the_replay_is():
+    """Слова необязательны, числа обязательны: в тесноте режется проза, и
+    инвариант меряется по ИТОГОВОМУ тексту — после экранирования и разметки."""
+    res = _prose_result()
+    long_prose = VerdictTextOut(
+        points=[
+            PointText(dp_index=p.dp_index, verdict_label="mistake", text="&" * 3000)
+            for p in res.points
+        ],
+        summary="я" * 2000,
+    )
+    msg = deep_dive_msg(res, 12, Zone.STRICT, 17, 50, replay=_replay(), verdict=long_prose)
+    assert len(msg.text) <= 4096
+    assert msg.text.startswith("Что было\n") and "<b>вы олл-ин 9.9</b>" in msg.text
+    assert "показано не целиком" in msg.text
+    assert "разборов 17/50" in msg.text, "статус-строка не режется"
+    assert "&am" not in msg.text.replace("&amp;", ""), "разрез не рвёт сущность"
 
 
 def test_replay_msg_marks_the_hero_decision_in_bold():
@@ -1147,8 +1172,8 @@ def test_replay_msg_marks_the_hero_decision_in_bold():
     """
     msg = replay_msg(_replay(), "TM77")
     assert msg.parse_mode == "HTML"
-    assert "<b>Hero олл-ин 990 (9.9bb)</b>" in msg.text
-    assert "<b>ПРЕФЛОП" not in msg.text
+    assert "<b>вы олл-ин 9.9</b>" in msg.text
+    assert "<b>Вы на SB" not in msg.text
 
 
 def test_replay_msg_escapes_a_nickname_that_looks_like_a_tag():

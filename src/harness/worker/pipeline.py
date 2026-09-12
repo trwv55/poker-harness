@@ -63,6 +63,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from harness.analysis import analyze_hand
+from harness.analysis.player_stats import player_stats_by_label
 from harness.analysis.preflop import (
     equity_cache_export,
     equity_cache_fingerprint,
@@ -75,6 +76,7 @@ from harness.contracts import (
     AnalysisResult,
     CanonicalHand,
     EnrichedHand,
+    PlayerStats,
     RawHand,
     ScanSummary,
     TournamentReport,
@@ -88,6 +90,7 @@ from harness.contracts import (
 from harness.engine import enrich
 from harness.explanation import (
     UnfaithfulText,
+    hand_replay,
     render_range_png,
     tournament_text,
     verdict_text,
@@ -521,6 +524,22 @@ async def _quota_numbers(session: AsyncSession, player_id: int) -> tuple[int, in
     """
     quota = await QuotaRepo(session).check(player_id)
     return quota.left, quota.total
+
+
+async def _tournament_stats(
+    session: AsyncSession, tournament_id: int | None
+) -> dict[str, PlayerStats] | None:
+    """Частоты соседей по столу — или `None`, если считать их не по чему.
+
+    Провенанс решает (спека §5.6): метка участника сквозная внутри турнира,
+    поэтому на HH-входе частоты набираются по рукам турнира, а у скриншота
+    `tournament_id` нет — и частот нет. `None`, не пустой словарь: «не считали»
+    и «посчитали, вышло пусто» — разные вещи.
+    """
+    if tournament_id is None:
+        return None
+    hands = await HandsRepo(session).canonical_by_tournament(tournament_id)
+    return player_stats_by_label(hands) if hands else None
 
 
 async def _run_hh_scan(job: JobModel, deps: Deps, trace: Trace) -> None:
@@ -1145,6 +1164,13 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
                 await session.commit()
 
         quota_left, quota_total = await _quota_numbers(session, job.player_id)
+        replay = hand_replay(
+            enriched,
+            # Цена решения печатается, только если её кто-то вынес: у пустого
+            # `ranked` `total_ev_loss_bb` — умолчание 0.0, а не измеренный ноль.
+            ev_loss_bb=result.total_ev_loss_bb if result.ranked else None,
+            stats=None,  # скрин: одна рука, знаменателя нет
+        )
         msg = deep_dive_msg(
             result,
             round(deps.clock() - started_at),
@@ -1152,6 +1178,7 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
             quota_left,
             quota_total,
             verdict=verdict,
+            replay=replay,
             not_checked=enriched.verdict.not_checked,
             note_nicks=note_nicks_for_hand(enriched.hand),
         )
@@ -1237,6 +1264,11 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
         elapsed_s = round(deps.clock() - started_at)
         zone = _hand_zone(result, hand.enriched.verdict.not_checked)
         quota_left, quota_total = await _quota_numbers(session, job.player_id)
+        replay = hand_replay(
+            hand.enriched,
+            ev_loss_bb=result.total_ev_loss_bb if result.ranked else None,
+            stats=await _tournament_stats(session, hand.tournament_id),
+        )
         msg = deep_dive_msg(
             result,
             elapsed_s,
@@ -1244,6 +1276,7 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
             quota_left,
             quota_total,
             verdict=verdict,
+            replay=replay,
             not_checked=hand.enriched.verdict.not_checked,
             note_nicks=note_nicks_for_hand(hand.enriched.hand),
         )

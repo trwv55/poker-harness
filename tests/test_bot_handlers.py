@@ -1931,7 +1931,11 @@ async def test_the_ranges_button_sends_the_pictures_that_were_rendered(
 
 
 async def test_the_details_button_shows_the_replay_of_the_hand(deps, db_factory, invited):
-    """«Подробнее» отдаёт ход раздачи — тот, что ушёл из сообщения с вердиктом."""
+    """«Подробнее» отдаёт ход раздачи отдельным сообщением — пока кнопка жива.
+
+    С этой задачи тот же ход стоит блоком «Что было» в самом разборе; что делать
+    с кнопкой, решает следующая задача плана, а до неё она обязана работать.
+    """
     from harness.bot.handlers import handle_ui_callback
     from harness.engine import enrich
     from harness.memory.repos import HandsRepo
