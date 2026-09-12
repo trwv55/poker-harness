@@ -1164,6 +1164,27 @@ def test_the_model_prose_is_cut_before_the_replay_is():
     assert "&am" not in msg.text.replace("&amp;", ""), "разрез не рвёт сущность"
 
 
+def test_a_deep_dive_cut_to_the_bone_has_no_holes_where_the_prose_was():
+    """Выброшенная проза уносит с собой и свою пустую строку-разделитель.
+
+    Тот же инвариант «цельное сообщение, а не то же самое с дырами», что у
+    разбора без прозы вовсе (`test_deep_dive_msg_without_prose_has_no_holes_in_it`):
+    там прозы не было с самого начала, здесь она не поместилась. Игрок видит
+    разницу глазами, а не по длине текста.
+    """
+    res = _prose_result()
+    long_prose = VerdictTextOut(
+        points=[
+            PointText(dp_index=p.dp_index, verdict_label="mistake", text="я" * 3000)
+            for p in res.points
+        ],
+        summary="я" * 2000,
+    )
+    msg = deep_dive_msg(res, 12, Zone.STRICT, 17, 50, replay=_replay(), verdict=long_prose)
+    assert len(msg.text) <= 4096
+    assert "\n\n\n" not in msg.text
+
+
 def test_replay_msg_marks_the_hero_decision_in_bold():
     """Точка решения героя выделена прямо в потоке действий (спека §5.6).
 

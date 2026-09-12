@@ -1398,6 +1398,11 @@ async def test_deep_dive_saves_the_model_text_and_shows_it_to_the_player(
     # Ход раздачи — блоком «Что было» первым в самом разборе (план 2026-09-12).
     assert any(text.startswith("Что было\n") for text in texts)
     assert not any("ПРЕФЛОП" in text for text in texts)
+    # Частоты оппонента набраны по рукам ТУРНИРА (`_tournament_stats` →
+    # `canonical_by_tournament`): в сессии их 20, знаменатель у каждого места
+    # есть. Без этого утверждения перепутанный `tournament_id` или лишний
+    # `None` отняли бы у игрока скобку молча.
+    assert any("VPIP" in text for text in texts), "скобка с частотами оппонента"
 
 
 def test_the_payload_carries_parse_mode_when_the_message_has_markup():
