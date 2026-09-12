@@ -149,6 +149,18 @@ def bb(value_chips: int, big_blind: int) -> str:
     return f"{value_chips / big_blind:.1f}"
 
 
+def _sentence_start(text: str) -> str:
+    """Первая буква предложения — заглавная.
+
+    Один способ на весь модуль: так поднимается и первый шаг улицы («вы чек» →
+    «Вы чек»), и самостоятельная строка показа карт
+    (`test_a_street_sentence_starts_with_a_capital_even_when_it_is_you`,
+    `test_a_show_without_a_showdown_is_not_called_a_showdown`). Обращение «вы»
+    попадает в начало предложения в обоих местах, и разъехаться им негде.
+    """
+    return text[:1].upper() + text[1:]
+
+
 def _card(card: str) -> str:
     return f"{card[0]}{_SUIT_SYMBOL.get(card[1], card[1])}"
 
@@ -335,31 +347,38 @@ def _showdown_line(hand: CanonicalHand) -> str | None:
     что `vs` между ним и вскрывшимися утверждало бы, что он с ними мерился
     (`test_a_card_shown_after_a_fold_is_marked_as_a_show`). Слово «Вскрытие»
     поэтому стоит только там, где вскрытие было: показ без вскрытия печатается
-    сам по себе.
+    сам по себе, с заглавной буквы (`_sentence_start`).
+
+    **У героя показ — не пометка, а фраза: «вы показали J♥️»** (решение владельца
+    2026-09-12). Скобка третьего лица у обращения во втором («вы J♥️ (игрок
+    показал)») по-русски не читается, а блок говорит с игроком на «вы» везде
+    (`test_a_show_without_a_showdown_is_not_called_a_showdown`,
+    `test_a_hero_show_beside_a_real_showdown_stays_inside_the_line`).
 
     Третье происхождение — скриншот: карманные карты героя видны на экране
     ВСЕГДА, в том числе в раздаче, где он спасовал, и зрение честно записывает
     прочитанное. Карт спасовавшего соперника на экране не видно, поэтому запись
     о спасовавшем на скрине показом быть не может — она не печатается вовсе
     (`test_cards_of_a_folded_player_read_off_a_screenshot_are_not_printed`), а
-    карты героя и так стоят в шапке блока. Цена решения: скриншотная раздача с
-    настоящим добровольным показом потеряла бы строку; на базе, по которой
-    правило написано, таких раздач нет.
+    карты героя и так стоят в шапке блока. Чем платим за это правило и на какой
+    базе оно измерено — спека §5.6.
     """
     seen: list[str] = []
     shown: list[str] = []
     for entry in hand.showdowns:
         if not entry.cards:
             continue
-        who = "вы" if entry.label == hand.hero_label else _position(hand, entry.label)
+        is_hero = entry.label == hand.hero_label
+        who = "вы" if is_hero else _position(hand, entry.label)
+        cards = _cards(entry.cards)
         if went_to_showdown(hand, entry.label):
-            seen.append(f"{who} {_cards(entry.cards)}")
+            seen.append(f"{who} {cards}")
         elif hand.provenance is not Provenance.SCREENSHOT:
-            shown.append(f"{who} {_cards(entry.cards)} (игрок показал)")
+            shown.append(f"вы показали {cards}" if is_hero else f"{who} {cards} (игрок показал)")
     if seen:
         tail = f"; {', '.join(shown)}" if shown else ""
         return f"Вскрытие: {' vs '.join(seen)}{tail}"
-    return ", ".join(shown) if shown else None
+    return _sentence_start(", ".join(shown)) if shown else None
 
 
 def hand_replay(
@@ -428,9 +447,7 @@ def hand_replay(
             spans.append(ReplaySpan(text=sep()))
         flow = _street_flow(hand, actions, decisions, stats, marked)
         first_step = flow[0]
-        flow[0] = first_step.model_copy(
-            update={"text": first_step.text[:1].upper() + first_step.text[1:]}
-        )
+        flow[0] = first_step.model_copy(update={"text": _sentence_start(first_step.text)})
         spans.extend(flow)
         spans.append(ReplaySpan(text="."))
         pot_before = en.report.pot_by_street.get(street, pot_before)

@@ -271,6 +271,92 @@ def _river_fold_hand(
     )
 
 
+def _river_fold_beside_a_showdown_hand() -> EnrichedHand:
+    """Герой пасует на ривере, а двое соперников доходят до вскрытия.
+
+    Единственная фикстура файла, где запись о показе стоит РЯДОМ с настоящим
+    вскрытием: герой в ряд вскрывшихся не попадает, а его показ — попадает в то
+    же предложение.
+    """
+    return _enriched(
+        _raw(
+            actions=[
+                _fold("P3"),
+                _fold("P4"),
+                RawAction(
+                    street=Street.PREFLOP,
+                    label="P5",
+                    kind=ActionKind.RAISE,
+                    to_amount=250,
+                    raw_line="P5: raises 150 to 250",
+                ),
+                RawAction(
+                    street=Street.PREFLOP,
+                    label="P6",
+                    kind=ActionKind.CALL,
+                    amount=250,
+                    raw_line="P6: calls 250",
+                ),
+                RawAction(
+                    street=Street.PREFLOP,
+                    label="Hero",
+                    kind=ActionKind.CALL,
+                    amount=200,
+                    raw_line="Hero: calls 200",
+                ),
+                _fold("P2"),
+                *[
+                    RawAction(
+                        street=street,
+                        label=label,
+                        kind=ActionKind.CHECK,
+                        raw_line=f"{label}: checks",
+                    )
+                    for street in (Street.FLOP, Street.TURN)
+                    for label in ("Hero", "P5", "P6")
+                ],
+                RawAction(
+                    street=Street.RIVER,
+                    label="Hero",
+                    kind=ActionKind.CHECK,
+                    raw_line="Hero: checks",
+                ),
+                RawAction(
+                    street=Street.RIVER,
+                    label="P5",
+                    kind=ActionKind.BET,
+                    amount=300,
+                    raw_line="P5: bets 300",
+                ),
+                RawAction(
+                    street=Street.RIVER,
+                    label="P6",
+                    kind=ActionKind.CALL,
+                    amount=300,
+                    raw_line="P6: calls 300",
+                ),
+                RawAction(
+                    street=Street.RIVER,
+                    label="Hero",
+                    kind=ActionKind.FOLD,
+                    raw_line="Hero: folds",
+                ),
+            ],
+            dealt={"Hero": ["Jh", "Ts"]},
+            boards={
+                Street.FLOP: ["6s", "Jd", "Qd"],
+                Street.TURN: ["7h"],
+                Street.RIVER: ["Ah"],
+            },
+            showdowns=[
+                ShowdownEntry(label="P5", cards=["Ks", "Kd"]),
+                ShowdownEntry(label="P6", cards=["8c", "8d"]),
+                ShowdownEntry(label="Hero", cards=["Jh"]),
+            ],
+        )
+    )
+
+
 def _lines(text: str) -> list[str]:
     return [line for line in text.splitlines() if line.strip()]
 
@@ -484,15 +570,25 @@ def test_cards_of_a_folded_player_read_off_a_screenshot_are_not_printed():
 
 def test_a_show_without_a_showdown_is_not_called_a_showdown():
     """Рум назвал карту спасовавшего в раздаче, где до вскрытия не дошёл никто:
-    карта печатается с пометкой, а слово «Вскрытие» — нет, вскрытия не было."""
+    карта печатается, а слово «Вскрытие» — нет, вскрытия не было. Показ героя —
+    фраза во втором лице и отдельное предложение, значит с заглавной буквы."""
     text = hand_replay(
         _river_fold_hand(
             provenance=Provenance.HAND_HISTORY,
             showdowns=[ShowdownEntry(label="Hero", cards=["Jh"])],
         )
     ).plain
-    assert text.rstrip().endswith("вы J♥️ (игрок показал).")
+    assert text.rstrip().endswith("вы фолд. Вы показали J♥️.")
     assert "Вскрытие" not in text
+
+
+def test_a_hero_show_beside_a_real_showdown_stays_inside_the_line():
+    """Герой спасовал и показал карту, а двое соперников вскрылись: их ряд — через
+    ` vs `, показ героя — той же фразой во втором лице, но внутри предложения и
+    потому со строчной."""
+    text = hand_replay(_river_fold_beside_a_showdown_hand()).plain
+    line = next(line for line in _lines(text) if "Вскрытие" in line)
+    assert "Вскрытие: CO K♠️K♦️ vs BTN 8♣️8♦️; вы показали J♥️." in line
 
 
 def test_a_hand_without_a_showdown_says_nothing_about_one():
