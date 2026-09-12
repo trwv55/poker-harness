@@ -502,11 +502,68 @@ def _side_pot_loss_hand() -> EnrichedHand:
     return _enriched(raw)
 
 
+def _fabricated_showdown_hand() -> EnrichedHand:
+    """Скрин: соперник дошёл до вскрытия, а его карт зрение не прочитало.
+
+    Движок добирает неизвестные карты из остатка колоды и разыгрывает вскрытие
+    ими, валидатор ставит пометку в `not_checked` и оставляет статус `pass`.
+    Стек героя на конец такой руки — исход выдуманного вскрытия; строки «Победа»
+    на экране нет, поэтому `collected` пуст и сверка выплат молчит.
+    """
+    return _enriched(
+        _raw(
+            provenance=Provenance.SCREENSHOT,
+            actions=[
+                _fold("P3"),
+                _fold("P4"),
+                RawAction(
+                    street=Street.PREFLOP,
+                    label="P5",
+                    kind=ActionKind.RAISE,
+                    to_amount=250,
+                    raw_line="P5: raises 150 to 250",
+                ),
+                _fold("P6"),
+                RawAction(
+                    street=Street.PREFLOP,
+                    label="Hero",
+                    kind=ActionKind.RAISE,
+                    to_amount=990,
+                    is_all_in=True,
+                    raw_line="Hero: raises 940 to 990 and is all-in",
+                ),
+                _fold("P2"),
+                RawAction(
+                    street=Street.PREFLOP,
+                    label="P5",
+                    kind=ActionKind.CALL,
+                    amount=740,
+                    raw_line="P5: calls 740",
+                ),
+            ],
+            dealt={"Hero": ["Jh", "9h"]},  # карт соперника на экране не видно
+            # Борд подобран так, чтобы выдуманное вскрытие герой ПРОИГРАЛ:
+            # остаток колоды движок берёт по порядку (`replay._DECK`), и
+            # непрочитанному сопернику достаётся 4♣️4♦️ — сет на этом борде.
+            # Выиграй герой, блок промолчал бы и без страховки (банка рум не
+            # записал), и тест ничего бы не проверял.
+            boards={
+                Street.FLOP: ["Kc", "Qd", "2s"],
+                Street.TURN: ["3h"],
+                Street.RIVER: ["4s"],
+            },
+            showdowns=[ShowdownEntry(label="Hero", cards=["Jh", "9h"])],
+        )
+    )
+
+
 def _untouched_stack_hand() -> EnrichedHand:
     """Раздача без анте: герой на BTN пасует, и стек его не меняется ни на фишку.
 
-    Единственный способ получить ровный ноль: анте платят все и всегда, поэтому
-    на столе с анте пас героя стоит ему как минимум анте.
+    Простейший способ получить ровный ноль: анте платят все и всегда, поэтому на
+    столе с анте пас героя стоит ему как минимум анте. Ноль бывает и там —
+    например, сплит, вернувший ровно вложенное, — но такую руку пришлось бы
+    подгонять до фишки, а проверяется здесь не она.
     """
     seats = [
         SeatInfo(seat=1, label="Hero", stack=1000),
@@ -828,7 +885,26 @@ def test_a_win_the_source_did_not_record_stays_silent():
     """
     en = _folded_through_shove_hand()
     en.hand.collected.clear()
-    assert "Забираете" not in hand_replay(en).plain
+    text = hand_replay(en).plain
+    assert text.rstrip().endswith("BB фолд."), "абзац кончился не ходом раздачи"
+    assert "Забираете" not in text and "Отдаёте" not in text
+
+
+def test_an_unverified_showdown_leaves_the_outcome_unsaid():
+    """Вскрытие решено на доукомплектованных картах — исход раздачи не факт.
+
+    Движок добирает непрочитанную карту соперника из остатка колоды, и стек на
+    конец руки становится исходом выдуманного вскрытия: «Отдаёте Z ББ» назвало
+    бы проигрыш, которого могло не быть. Блок молчит по тому же признаку, по
+    которому `worker.pipeline._hand_zone` понижает зону до «предполагая», —
+    непустому `Verdict.not_checked`.
+    """
+    en = _fabricated_showdown_hand()
+    assert en.verdict.not_checked, "фикстура перестала быть непроверенным входом"
+    assert hero_stack_delta_bb(en) < 0, "без проигрыша по стекам блок промолчал бы и без страховки"
+    text = hand_replay(en).plain
+    assert text.rstrip().endswith("Вскрытие: вы J♥️9♥️.")
+    assert "Забираете" not in text and "Отдаёте" not in text
 
 
 def test_the_replay_no_longer_prints_the_cost_of_the_decision():
