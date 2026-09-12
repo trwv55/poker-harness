@@ -13,6 +13,13 @@
 ядро судит решение против диапазона, а не против вскрытой карты, и решение,
 проигравшее по случайности, ошибкой не считается (CLAUDE.md, дисциплина).
 
+**Разбор раздачи — сырые числа расчёта, без единого слова модели** (решение
+владельца 2026-09-12): блок «Что было», затем всё, что посчитал код, с подписью
+у каждого числа. В этой половине модуля регистр другой и сознательно: там
+печатаются и машинные ключи `detail`, потому что прятать посчитанное нельзя
+(`_DETAIL_LABELS`, `_raw_hand_lines`). Правило «расхождение, не ошибка»
+действует и там.
+
 **Зона доверия — не подпись для галочки.** `Zone.ASSUMING` у `ScanItem`/
 `PointVerdict` означает, что вывод опирается на угаданный диапазон оппонента;
 `Zone.STRICT` — что нет. Пометка `_ASSUMING_MARKER` показывается ровно там,
@@ -47,19 +54,20 @@
 
 **Постфлоп-точка — числа без цены.** У неё нет ни `ev_diff_bb`, ни интервала:
 перебор борда отвечает на вопрос «сколько блефов нужно в его ставящем
-диапазоне», а не «сколько стоило решение». Поэтому её строки стоят отдельно от
-строк расхождений и не несут ни цены, ни слова «лучше» — кроме случая, когда
-ядро назвало лучшую линию (`PointVerdict.best_action`), и тогда рядом названо
-допущение, на котором она держится. Ривер, тёрн и флоп печатаются одними
-словами и одной функцией (`_postflop_call_lines`): считают их разные
-инструменты, но подписи у чисел одни и те же.
+диапазоне», а не «сколько стоило решение». Её строки не несут ни цены, ни слова
+«лучше» — кроме случая, когда ядро назвало лучшую линию
+(`PointVerdict.best_action`), и тогда рядом названо допущение, на котором она
+держится. Ривер, тёрн и флоп печатаются одними словами и одной функцией
+(`_postflop_call_lines`): считают их разные инструменты, но подписи у чисел
+одни и те же.
 
-**Форма «около нуля» — вердикт, а не отказ.** У части точек интервал EV лежит
-по обе стороны нуля: при одних моделях поведения оппонентов лучше входить, при
-других пасовать. Раньше такая точка до игрока не доходила вовсе — ядро
-отказывалось называть число, — и вместе с числом пропадали три вещи, которые у
-нас на неё есть: знак и порядок величины, ширина интервала (она и есть мера
-маргинальности решения, объяснять её словами не надо) и потолок цены выбора.
+**Форма «около нуля» в сводке скана — вердикт, а не отказ.** У части точек
+интервал EV лежит по обе стороны нуля: при одних моделях поведения оппонентов
+лучше входить, при других пасовать. Раньше такая точка до игрока не доходила
+вовсе — ядро отказывалось называть число, — и вместе с числом пропадали три
+вещи, которые у нас на неё есть: знак и порядок величины, ширина интервала (она
+и есть мера маргинальности решения, объяснять её словами не надо) и потолок
+цены выбора.
 
 Сюда доходят только те из них, чей интервал узок: широкий отсеивается в ядре
 (`analysis.preflop`), потому что «около нуля» при широком интервале значило бы
@@ -76,25 +84,20 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from itertools import pairwise
 from math import ceil, floor
-from typing import Literal, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel, model_validator
 
 from harness.contracts.analysis import (
-    AllInEvent,
+    RIVER_CALL_DETAIL,
+    TURN_FLOP_CALL_DETAIL,
     AnalysisResult,
-    ChipMove,
     EvInterval,
-    EvSplit,
-    Finding,
     PointVerdict,
     ScanItem,
     ScanSummary,
     SpotKind,
-    StackTrajectory,
-    TournamentReport,
     Zone,
     river_call_detail,
     turn_flop_call_detail,
@@ -113,8 +116,7 @@ from harness.contracts.calcs import (
     ThresholdResult,
     Window,
 )
-from harness.contracts.enriched import EnrichedHand
-from harness.contracts.explanation import TournamentTextOut, VerdictTextOut
+from harness.contracts.enriched import DecisionPoint, EnrichedHand, hero_stack_delta_bb
 from harness.contracts.history import (
     MAX_NOTE_TEXT_CHARS,
     NOTE_COLORS,
@@ -192,8 +194,6 @@ __all__ = [
     "sessions_msg",
     "settings_msg",
     "start_msg",
-    "tournament_report_msg",
-    "tournament_story_msg",
     "unknown_button_msg",
     "unknown_text_msg",
     "unsupported_document_msg",
@@ -250,11 +250,18 @@ class Msg(BaseModel):
 
 # --- Словари перевода внутренних токенов в слова игрока -------------------------
 
-# `PointVerdict.action_taken`/`best_action` — токены движка (см. `preflop.py`);
-# словарь переводит их в слова игрока. Строка, которой в словаре нет,
-# показывается как есть: так сюда приходит готовая формулировка развилки из
-# `preflop._BEST_DEPENDS_ON_BEHIND`.
-_ACTION_WORD: dict[str, str] = {"fold": "фолд", "shove": "шов", "call": "колл"}
+# `PointVerdict.action_taken`/`best_action` и `CanonicalAction.kind` — токены
+# движка (см. `preflop.py`, `classifier.action_name`); словарь переводит их в
+# слова игрока. Строка, которой в словаре нет, показывается как есть: так сюда
+# приходит готовая формулировка развилки из `preflop._BEST_DEPENDS_ON_BEHIND`.
+_ACTION_WORD: dict[str, str] = {
+    "fold": "фолд",
+    "shove": "шов",
+    "call": "колл",
+    "check": "чек",
+    "bet": "ставка",
+    "raise": "рейз",
+}
 
 _SPOT_WORD: dict[SpotKind, str] = {
     SpotKind.PUSHFOLD_UNOPENED: "пуш-фолд",
@@ -333,7 +340,6 @@ _STATION_TEXT: dict[str, str] = {
     "parse": "Читаю стол…",
     "validate": "Проверяю руку…",
     "analyze": "Считаю эквити…",
-    "explain": "Формулирую…",
 }
 
 
@@ -365,8 +371,8 @@ def _fmt_bb(value_bb: float) -> str:
     return f"{_bb_number(value_bb)} bb"
 
 
-def _fmt_signed_bb(value_bb: float) -> str:
-    """То же, что `_fmt_bb`, но плюс у положительного числа проговаривается.
+def _signed_bb_number(value_bb: float) -> str:
+    """Число в bb со знаком у обоих направлений — без единицы.
 
     В интервале «−0.3 … +0.8» знак верхнего конца несёт смысл: он и говорит, что
     интервал пересекает ноль. Без явного плюса читатель видит два числа и должен
@@ -374,8 +380,13 @@ def _fmt_signed_bb(value_bb: float) -> str:
     """
     magnitude = round(abs(value_bb), 1)
     if magnitude == 0.0:
-        return "0.0 bb"
-    return f"{'−' if value_bb < 0 else '+'}{magnitude:.1f} bb"
+        return "0.0"
+    return f"{'−' if value_bb < 0 else '+'}{magnitude:.1f}"
+
+
+def _fmt_signed_bb(value_bb: float) -> str:
+    """То же, что `_fmt_bb`, но плюс у положительного числа проговаривается."""
+    return f"{_signed_bb_number(value_bb)} bb"
 
 
 def _tenth_down(value_bb: float) -> float:
@@ -427,25 +438,21 @@ def _close_call_line(item: ScanItem) -> str:
     )
 
 
-def _prose_lines(text: str | None) -> list[str]:
-    """Абзац модели под строкой точки — с отступом, чтобы было видно, где чья речь.
+def _fmt_pct(value: float | None) -> str | None:
+    """Доля одним знаком после запятой; `None` — доли нет, и печатать нечего.
 
-    Пустой текст не даёт пустой строки: разбор без прозы (модель недоступна либо
-    её текст не прошёл проверку верности) обязан выглядеть цельным, а не
-    дырявым (`test_deep_dive_msg_without_prose_has_no_holes_in_it`).
+    Возвращается `None`, а не «0.0%»: доля отсутствует ровно тогда, когда
+    знаменатель нулевой (`PlayerStats`), и ноль процентов на этом месте был бы
+    утверждением о том, чего не измеряли.
     """
-    if text is None or not text.strip():
-        return []
-    return [f"    {line.strip()}" for line in text.strip().splitlines() if line.strip()]
+    return None if value is None else f"{value:.1f}%"
 
 
 def _plural_form(count: int, one: str, few: str, many: str) -> str:
     """Форма слова по числу: 1 — `one`, 2–4 — `few`, остальное — `many`.
 
-    Правило трёх форм, а не двух. Управляет и существительным, и глаголом: при
-    пяти и больше подлежащее в родительном множественного, и сказуемое встаёт в
-    средний род единственного числа — «Показано 5 абзацев», а не «Показаны»
-    (`test_tournament_story_msg_counts_paragraphs_grammatically`).
+    Правило трёх форм, а не двух: «нужен 1 блеф», «нужно 2 блефа», «нужно 11
+    блефов» (`test_the_bluff_count_agrees_with_its_own_plural_form`).
     """
     tail_100 = abs(count) % 100
     tail_10 = abs(count) % 10
@@ -463,7 +470,7 @@ def _quota_line(quota_left: int, quota_total: int) -> str:
 
 
 def progress_text(
-    station: Literal["ask", "read", "parse", "validate", "analyze", "explain"],
+    station: Literal["ask", "read", "parse", "validate", "analyze"],
 ) -> str:
     """Строка прогресса, которой редактируется одно сообщение по станциям конвейера."""
     return _STATION_TEXT[station]
@@ -476,53 +483,26 @@ def scan_summary_msg(s: ScanSummary, quota_left: int, quota_total: int) -> Msg:
     диапазонам, не по факту выигрыша раздачи. Строки `zone is Zone.ASSUMING`
     несут `_ASSUMING_MARKER`, строки `strict` — нет.
 
-    Заголовочное число подписано тем множеством, по которому посчитано, —
-    оценёнными решениями, то есть судимыми точками (`error_cost.is_judged`),
-    теми же, что стоят числителем в строке покрытия строкой выше. «По всем
-    точкам разбора» накрывало бы подписью и `points_total - points_judged`
-    точек без вердикта, которых в сумме нет: ноль несчитанной точки означает
-    «не посчитано», а не «сыграно верно» (докстринг модуля `error_cost`), и
-    сумма, подписанная всем множеством, читается как «потерь не было»
-    (`test_scan_summary_msg_scopes_the_loss_to_the_judged_points`).
-
-    Подпись не пересказывает и список ниже: `total_loss_bb` считает все судимые
-    точки файла, `items` — только те дороже порога 0.1bb, поэтому первое число
-    и сумма вторых расходятся
-    (`test_scan_summary_msg_total_loss_label_differs_from_items_sum`).
+    **Счётчиков покрытия в сводке нет** (решение владельца 2026-09-12): «оценено
+    решений X из Y» и сумма цены расхождений говорили о движке, а не о турнире, и
+    на файле, где судимых точек не нашлось, были единственным содержанием сводки.
+    Пустой список расхождений теперь не комментируется ничем
+    (`test_the_scan_summary_counts_nothing_it_cannot_judge`).
 
     `hands_failed` (руки, пропущенные политикой отказа скана) показывается
     только когда он не ноль — молчание о деградации ровно то, против чего
-    спроектирован весь продукт (fix round 1, дискреционный пункт ревью).
+    спроектирован весь продукт.
 
-    Строка покрытия (`points_judged` из `points_total`) печатается ВСЕГДА, а
-    пустой список расхождений прямо говорит, что пустота относится к оценённым
-    решениям, и называет число неоценённых. Точка без вердикта в список не
-    попадает по построению, поэтому «расхождений не найдено» без покрытия рядом
-    читается как «сыграно чисто» — то же молчание о деградации, что и
-    умолчанный `hands_failed` абзацем выше, только на уровне точек.
-
-    Список обрезается `_MAX_RENDERED_SCAN_ITEMS` (round 5, Item J — обоснование
-    числа там же) и, если обрезан, говорит об этом прямо: сколько найдено и
-    сколько показано. Молча показать 20 из 60 — та же деградация без огласки,
-    что и `hands_failed` абзацем выше.
+    Список обрезается `_MAX_RENDERED_SCAN_ITEMS` и, если обрезан, говорит об этом
+    прямо: сколько найдено и сколько показано. Молча показать 20 из 60 — та же
+    деградация без огласки, что и умолчанный `hands_failed` абзацем выше.
     """
-    lines = [f"Скан завершён: {s.hands_total} рук, {s.hands_with_decision} с решением."]
+    lines = [f"Скан завершён: {s.hands_total} рук."]
     if s.hands_failed:
         lines.append(f"Раздач не разобрано: {s.hands_failed} — не вошли в сводку.")
-    lines.append(f"Оценено решений: {s.points_judged} из {s.points_total}.")
-    lines.append(f"Суммарная потеря в оценённых решениях: {_fmt_bb(s.total_loss_bb)}.")
     buttons: list[list[Btn]] = []
 
-    if not s.items:
-        lines.append("")
-        # Числа стоят после двоеточия намеренно: «остальные 181 решение» требует
-        # согласования с числительным, а строка собирается для любого числа.
-        lines.append(
-            f"Среди оценённых решений расхождений дороже 0.1 bb не найдено. "
-            f"Решений без оценки: {s.points_total - s.points_judged} — про них "
-            f"расчёт не говорит ничего."
-        )
-    else:
+    if s.items:
         shown = s.items[:_MAX_RENDERED_SCAN_ITEMS]
         lines.append("")
         if len(shown) < len(s.items):
@@ -579,11 +559,6 @@ def scan_summary_msg(s: ScanSummary, quota_left: int, quota_total: int) -> Msg:
 # Оговорка о непроверенном. «Проверить было нечем» — не то же, что «проверено и
 # сошлось», и разница обязана быть видна игроку, а не только в трейсе.
 _NOT_CHECKED_PREFIX = "Проверить на этом экране было нечем:"
-
-# Вердикта нет ни по одной точке. Внутренние формулировки ядра написаны для
-# разбора, а не для чтения вслух, и игроку не пересказываются.
-_NO_VERDICT_LINE = "По этой раздаче точек с вердиктом нет."
-
 
 # Слова про постфлоп-точку — одни и те же на всех трёх улицах. Требование к
 # ставящему диапазону — число блефов на заданное вэлью — печатается вместе с
@@ -726,24 +701,23 @@ def _bluff_line(numbers: _CallNumbers) -> list[str]:
 
 
 # Обрезка называется вслух и одним и тем же словом везде, где она случается:
-# экран заметок (`_fitted`) и разбор, которому не хватило места (`_shrink_prose`).
+# экран заметок (`_fitted`) и разбор, которому не хватило места (`_shrink_rows`).
 _MARKER = " […показано не целиком]"
 
 
-def _shrink_prose(rows: list[tuple[str, bool]], budget: int) -> list[tuple[str, bool]]:
-    """Уместить строки в бюджет, срезая ТОЛЬКО прозу модели (сырую, до экранирования).
+def _shrink_rows(rows: list[tuple[str, bool]], budget: int) -> list[tuple[str, bool]]:
+    """Уместить строки в бюджет, срезая ТОЛЬКО сжимаемые (сырые, до экранирования).
 
-    Слова необязательны, числа обязательны — то же правило, по которому
-    `worker.pipeline` отдаёт разбор без прозы, когда модель не ответила.
-    Строка, которая влезает целиком, не трогается; которой не хватает места
-    даже на маркер — пропадает целиком (иначе `_fitted` вернул бы один маркер
-    и пробил бюджет на его длину).
+    Второй элемент кортежа и означает «эту строку можно резать». Строка, которая
+    влезает целиком, не трогается; которой не хватает места даже на маркер —
+    пропадает целиком (иначе `_fitted` вернул бы один маркер и пробил бюджет на
+    его длину).
     """
-    fixed = sum(len(text) + 1 for text, is_prose in rows if not is_prose)
+    fixed = sum(len(text) + 1 for text, shrinkable in rows if not shrinkable)
     left = budget - fixed
     out: list[tuple[str, bool]] = []
-    for text, is_prose in rows:
-        if not is_prose:
+    for text, shrinkable in rows:
+        if not shrinkable:
             out.append((text, False))
             continue
         if len(text) + 1 <= left:
@@ -761,11 +735,10 @@ def _shrink_prose(rows: list[tuple[str, bool]], budget: int) -> list[tuple[str, 
 def _render_html(head: str, rows: list[tuple[str, bool]]) -> str:
     """Блок уже с разметкой; остальные строки экранируются здесь, ПОСЛЕ усадки.
 
-    Выброшенная усадкой проза уносит с собой и свою пустую строку-разделитель:
-    две пустые строки подряд — дыра в сообщении, тот же изъян, от которого
-    бережётся разбор вовсе без прозы (`_prose_lines`). Пустая строка идёт в
-    текст, только если предыдущая непустая
-    (`test_a_deep_dive_cut_to_the_bone_has_no_holes_where_the_prose_was`).
+    Выброшенная усадкой строка уносит с собой и свою пустую строку-разделитель:
+    две пустые строки подряд — дыра в сообщении. Пустая строка идёт в текст,
+    только если предыдущая непустая
+    (`test_a_deep_dive_cut_to_the_bone_has_no_holes_where_the_numbers_were`).
     """
     lines = [head]
     for text, _ in rows:
@@ -778,33 +751,33 @@ def _render_html(head: str, rows: list[tuple[str, bool]]) -> str:
 def _fit_html(head: str, rows: list[tuple[str, bool]], limit: int) -> str:
     """Итоговый текст не длиннее `limit` — меряется ПОСЛЕ экранирования и разметки.
 
-    Режется сырая проза, а экранируется то, что осталось: разрез по
+    Режется сырой текст, а экранируется то, что осталось: разрез по
     экранированному попал бы внутрь `&amp;`, и что Телеграм сделает с `&am` —
     неизвестно.
 
-    Отсюда и поиск бюджета. Сколько сырых символов прозы даст текст ровно в
-    `limit`, заранее не знает никто, и арифметика «вычесть перелёт из бюджета»
+    Отсюда и поиск бюджета. Сколько сырых символов даст текст ровно в `limit`,
+    заранее не знает никто, и арифметика «вычесть перелёт из бюджета»
     промахивается дважды. Во-первых, первый перелёт меряется по НЕУСАЖЕННОМУ
     тексту, а вычитается из бюджета, который усадка ещё ни разу не применяла, —
-    двойной счёт, выбрасывающий всю прозу даже там, где экранировать нечего.
-    Во-вторых, экранирование раздувает строку от нуля (обычная проза) до
+    двойной счёт, выбрасывающий все сжимаемые строки даже там, где экранировать
+    нечего. Во-вторых, экранирование раздувает строку от нуля (обычный текст) до
     пятикратного (текст из одних `&`), и один и тот же перелёт означает разный
     перебор сырых символов. Поэтому бюджет подбирается делением пополам —
     берётся самый щедрый, при котором ИТОГОВЫЙ текст ещё влезает
-    (`test_the_model_prose_is_cut_before_the_replay_is`). Каждый кандидат
+    (`test_the_raw_numbers_are_cut_before_the_replay_is`). Каждый кандидат
     проверяется по факту, а не по оценке.
 
-    Ничего не влезло — остаются числа без прозы, даже если и они длиннее
-    предела: резать их этой функции нельзя (спека §5.6).
+    Ничего не влезло — остаётся несжимаемое, даже если и оно длиннее предела:
+    резать его этой функции нельзя (спека §5.6).
     """
     text = _render_html(head, rows)
     if len(text) <= limit:
         return text
-    best = _render_html(head, [(t, is_prose) for t, is_prose in rows if not is_prose])
+    best = _render_html(head, [(t, keep) for t, keep in rows if not keep])
     low, high = 0, limit
     while low <= high:
         budget = (low + high) // 2
-        candidate = _render_html(head, _shrink_prose(rows, budget))
+        candidate = _render_html(head, _shrink_rows(rows, budget))
         if len(candidate) <= limit:
             best = candidate
             low = budget + 1
@@ -813,43 +786,313 @@ def _fit_html(head: str, rows: list[tuple[str, bool]], limit: int) -> str:
     return best
 
 
+# --- сырые данные раздачи: всё, что посчитал код, с подписью у каждого числа ----------
+
+def _raw_bb(value_chips: int, big_blind: int) -> str:
+    """Сумма в ББ с единицей. Формат общий с блоком «Что было» (`hand_replay.bb`),
+    а не вторая его копия: одна величина в двух местах одного сообщения обязана
+    округляться одинаково, иначе разбор спорит сам с собой."""
+    return f"{bb(value_chips, big_blind)} ББ"
+
+
+def _raw_bb_value(value_bb: float) -> str:
+    """Готовая величина в ББ — знак и округление общие с продуктовым `_fmt_bb`.
+
+    Отличается от него ТОЛЬКО единицей: «ББ», как весь блок «Что было» (спека
+    §5.6). Смешивать две записи в одном сообщении нельзя: читатель принимает их
+    за разные величины.
+    """
+    return f"{_bb_number(value_bb)} ББ"
+
+
+def _raw_signed_bb(value_bb: float) -> str:
+    """То же в ББ, но плюс у положительного числа проговаривается: у цены и у
+    концов интервала знак несёт смысл."""
+    return f"{_signed_bb_number(value_bb)} ББ"
+
+
+# Слово игрока для типа анте. Ключ без перевода печатается как есть: выдумать
+# вместо него нечего, а спрятать нельзя.
+_ANTE_TYPE_WORD: dict[str, str] = {
+    "per_player": "с каждого",
+    "big_blind": "с большого блайнда",
+}
+
+# Подписи ключей `detail` — того, что ядро положило в точку. Собраны по местам,
+# где `detail` наполняется: `analysis/preflop.py` (шов в неоткрытый банк, ответ
+# на шов, лукап по чарту, `_call_model_detail`) и `analysis/classifier.py`
+# (`unjudged_point`). Ключ без подписи печатается своим машинным именем —
+# прятать посчитанное нельзя, — а тест
+# `test_every_detail_key_the_analysis_produces_has_a_label` гоняет настоящий
+# `analyze_hand` по фикстурам всех расчётов и требует подпись для каждого
+# встретившегося ключа.
+_DETAIL_LABELS: dict[str, str] = {
+    "method": "метод расчёта",
+    "bracket": "вилка по ширине диапазона",
+    "branches": "перебранных веток вскрытия",
+    "fold_equity_ok": "фолд-эквити возможна",
+    "ev_shove_bb": "EV шова, ББ",
+    "ev_shove_tight_bb": "EV шова против узкого диапазона, ББ",
+    "ev_shove_wide_bb": "EV шова против широкого диапазона, ББ",
+    "ev_shove_by_width_bb": "EV шова по ширине диапазона, ББ",
+    "ev_call_bb": "EV колла, ББ",
+    "ev_call_tight_bb": "EV колла против узкого диапазона, ББ",
+    "ev_call_wide_bb": "EV колла против широкого диапазона, ББ",
+    "ev_call_by_width_bb": "EV колла по ширине диапазона, ББ",
+    "ev_call_all_behind_bb": "EV колла, если входят все живые за вами, ББ",
+    "hero_class": "класс вашей руки",
+    "depths_bb": "глубины стеков, ББ",
+    "dead_extra_bb": "мёртвых денег в банке, ББ",
+    "zone_reason": "почему такая зона доверия",
+    "model_within_bracket": "модель попала в вилку",
+    "shove_range_fraction": "доля рук в диапазоне шова",
+    "call_range_fractions": "доли рук в диапазонах колла",
+    "equilibrium_hand_regret_bb": "отклонение этой руки от равновесия, ББ",
+    "p_all_fold": "вероятность, что все спасуют",
+    "expected_callers": "ожидаемое число ответивших",
+    "required_equity": "требуемая эквити, доля",
+    "shover_depth_bb": "глубина стека шовера, ББ",
+    "live_others": "живых за вами в переборе",
+    "behind_axis": "устойчивость к входу живых за вами",
+    "rivals_when_shoved": "соперников на момент шова",
+    "best_vs_one": "лучше против одного диапазона",
+    "best_all_behind": "лучше, если входят все живые за вами",
+    "push_weight": "вес руки в чарте шова",
+    "lookup_depth_bb": "глубина лукапа по чарту, ББ",
+    "unjudged": "почему вердикта нет",
+}
+
+
+def _required_equity(to_call: int, pot_before: int) -> float:
+    """Доля банка, от которой колл окупается: `to_call / (pot_before + to_call)`.
+
+    Копия `analysis.tools.pot_odds.required_equity` — не по лени, а по правилу
+    зависимостей (CLAUDE.md): `presentation` не имеет права импортировать
+    `analysis`, потому что пакет тянет в образ бота `eval7` и `pokerkit`
+    (`test_bot_image_does_not_import_calculation_stack`). Две копии держит
+    рядом тест `test_the_pot_odds_of_the_raw_block_agree_with_the_calculation_tool`,
+    а не память правившего.
+    """
+    return to_call / (pot_before + to_call)
+
+
+def _detail_number(value: float) -> str:
+    """Число `detail` — до двух знаков, но не в ноль.
+
+    Доли бывают мельче сотой (`p_all_fold`), и «0.00» на их месте означало бы
+    «не посчитано», а посчитано было.
+    """
+    if value == 0.0:
+        return "0.00"
+    if abs(value) >= 0.01:
+        return f"{value:.2f}"
+    return f"{value:g}"
+
+
+def _detail_value(value: Any) -> str:
+    """Значение из `detail` в текст.
+
+    `bool` проверяется раньше числа: он им и является. Пустота печатается прочерком,
+    а не пустым местом: «доли рук в диапазонах колла:» без единого знака после
+    двоеточия читается как потерянное значение, а не как «их не было»
+    (`test_a_detail_value_that_is_empty_prints_a_dash_not_a_blank`).
+    """
+    if value is None:
+        return "—"
+    if isinstance(value, bool):
+        return "да" if value else "нет"
+    if isinstance(value, float):
+        return _detail_number(value)
+    if isinstance(value, dict):
+        if not value:
+            return "—"
+        return " · ".join(f"{key}: {_detail_value(item)}" for key, item in value.items())
+    if isinstance(value, list | tuple):
+        if not value:
+            return "—"
+        return ", ".join(_detail_value(item) for item in value)
+    return str(value)
+
+
+def _detail_lines(point: PointVerdict) -> list[str]:
+    """Всё содержимое `detail` — сначала подписанные числа инструментов колла,
+    потом остальные ключи по таблице подписей."""
+    lines = _postflop_call_lines(point)
+    for key, value in point.detail.items():
+        if key in (RIVER_CALL_DETAIL, TURN_FLOP_CALL_DETAIL):
+            continue  # напечатаны выше словами игрока (`_postflop_call_lines`)
+        lines.append(f"    {_DETAIL_LABELS.get(key, key)}: {_detail_value(value)}")
+    return lines
+
+
+def _hand_head_lines(en: EnrichedHand, hand_no: str) -> list[str]:
+    """Шапка раздачи: уровень, блайнды, стол, ваши карты и стек, борд, банк, исход."""
+    hand = en.hand
+    rep = en.report
+    ante = (
+        f"{hand.ante} фишек ({_ANTE_TYPE_WORD.get(hand.ante_type, hand.ante_type)})"
+        if hand.ante
+        else "нет"
+    )
+    lines = [
+        (
+            f"Рука {hand_no} · уровень {hand.level} · "
+            f"блайнды {hand.sb}/{hand.bb} фишек · анте {ante}"
+        ),
+        f"Игроков в раздаче: {len(hand.players)}.",
+    ]
+    hero = next((p for p in hand.players if p.label == hand.hero_label), None)
+    if hero is not None:
+        cards = " ".join(hand.dealt.get(hand.hero_label, [])) or "не известны"
+        ended = rep.stacks_end.get(hand.hero_label)
+        tail = "" if ended is None else f" → после раздачи {_raw_bb(ended, hand.bb)}"
+        lines.append(
+            f"Вы: {cards} · позиция {hero.position} · "
+            f"стек до раздачи {_raw_bb(hero.stack, hand.bb)}{tail}"
+        )
+    if hand.boards:
+        board = " · ".join(
+            f"{_STREET_WORD.get(street, street.value).lower()} {' '.join(cards)}"
+            for street, cards in hand.boards.items()
+        )
+        lines.append(f"Борд по улицам: {board}")
+    pots = " · ".join(
+        f"{_STREET_WORD.get(street, street.value).lower()} {_raw_bb(value, hand.bb)}"
+        for street, value in rep.pot_by_street.items()
+    )
+    lines.append(f"Банк по улицам (сколько лежало в банке к концу улицы): {pots}.")
+    lines.append(f"Конечный банк: {_raw_bb(rep.final_pot, hand.bb)}.")
+    if rep.side_pots:
+        pots_side = " · ".join(
+            f"{_raw_bb(pot.amount, hand.bb)} на {', '.join(pot.eligible)}"
+            for pot in rep.side_pots
+        )
+        lines.append(f"Сайд-поты: {pots_side}.")
+    if hero is not None:
+        lines.append(f"Исход раздачи для вас: {_raw_signed_bb(hero_stack_delta_bb(en))}.")
+    return lines
+
+
+def _decision_lines(dp: DecisionPoint, big_blind: int) -> list[str]:
+    """Числа точки решения: что сыграно, сколько в банке, доставить, SPR, шансы банка."""
+    spr = "—" if dp.spr is None else f"{dp.spr:.1f}"
+    kind = _action_word(dp.action.kind.value)
+    all_in = ", олл-ин" if dp.action.is_all_in else ""
+    lines = [
+        (
+            f"{dp.index + 1}. {_STREET_WORD.get(dp.street, dp.street.value).lower()} · "
+            f"позиция {dp.position} · сыграно: {kind} "
+            f"{_raw_bb(dp.action.committed_after, big_blind)}{all_in}"
+        ),
+        (
+            f"    банк до хода {_raw_bb(dp.pot_before, big_blind)} · "
+            f"доставить {_raw_bb(dp.to_call, big_blind)} · "
+            f"эфф. стек {_raw_bb(dp.eff_stack, big_blind)} · SPR {spr} · "
+            f"живых {dp.live_total} (после вас {dp.live_behind})"
+        ),
+    ]
+    if dp.to_call > 0:
+        equity = _fmt_pct(100.0 * _required_equity(dp.to_call, dp.pot_before))
+        lines.append(
+            f"    шансы банка: доставить {_raw_bb(dp.to_call, big_blind)} "
+            f"в банк {_raw_bb(dp.pot_before, big_blind)} — "
+            f"колл окупается от {equity} эквити"
+        )
+    return lines
+
+
+def _verdict_lines(point: PointVerdict) -> list[str]:
+    """Вердикт точки целиком: спот, зона, сыграно, лучше, цена, интервал, допущение."""
+    best = _action_word(point.best_action) if point.best_action else "не названо"
+    lines = [
+        (
+            f"    вердикт: спот {_spot_word(point.spot)} · "
+            f"зона {_ZONE_WORD.get(point.zone, str(point.zone))} · "
+            f"сыграно {_action_word(point.action_taken)} · лучше {best} · "
+            f"цена {_raw_signed_bb(point.ev_diff_bb)}"
+        )
+    ]
+    interval = point.interval
+    if interval is not None:
+        across = ", интервал через ноль" if interval.near_zero else ""
+        lines.append(
+            f"    интервал EV: точка {_raw_signed_bb(interval.point_bb)}, "
+            f"от {_raw_signed_bb(interval.low_bb)} до {_raw_signed_bb(interval.high_bb)}, "
+            f"потолок цены выбора {_raw_bb_value(interval.cost_ceiling_bb)}{across}"
+        )
+    assumption = point.assumption
+    if assumption is not None:
+        share = _fmt_pct(100.0 * assumption.range.fraction_of_hands())
+        note = f" · {assumption.note}" if assumption.note else ""
+        lines.append(
+            f"    допущение: источник {assumption.source} · "
+            f"доля рук в диапазоне {share}{note}"
+        )
+    if point.tools:
+        lines.append(f"    инструменты: {', '.join(point.tools)}")
+    return lines
+
+
+def _raw_hand_lines(res: AnalysisResult, en: EnrichedHand) -> list[str]:
+    """Всё, что код посчитал по раздаче, с подписью у каждого числа.
+
+    Подпись обязательна у каждого числа (`test_the_raw_data_block_names_what_
+    each_number_means`): «9.1» не говорит ничего, «конечный банк 9.1 ББ» говорит
+    всё. Ни одной величины, которой не было бы в `EnrichedHand` или
+    `AnalysisResult` (`test_the_raw_data_block_prints_no_money_the_hand_does_
+    not_contain`).
+
+    Точки идут в порядке раздачи, без ранжирования: ранжирование отвечало на
+    вопрос «что разбирать первым», а здесь показывается посчитанное, а не выбор
+    из него.
+    """
+    hand = en.hand
+    lines = _hand_head_lines(en, res.hand_no)
+    decisions = {dp.index: dp for dp in en.report.decision_points}
+    for point in res.points:
+        lines.append("")
+        dp = decisions.get(point.dp_index)
+        if dp is not None:
+            lines += _decision_lines(dp, hand.bb)
+        else:
+            lines.append(f"{point.dp_index + 1}. {_STREET_WORD.get(point.street, point.street.value).lower()}")
+        lines += _verdict_lines(point)
+        lines += _detail_lines(point)
+    if any(is_judged(point) for point in res.points):
+        lines.append("")
+        lines.append(
+            f"Сумма цены расхождений: {_raw_signed_bb(res.total_ev_loss_bb)} — "
+            f"только по оценённым точкам."
+        )
+    lines.append("")
+    lines.append(f"Сверка денег с источником: {en.verdict.status.value}.")
+    return lines
+
+
 def deep_dive_msg(
     res: AnalysisResult,
+    en: EnrichedHand,
     elapsed_s: int,
     zone: Zone | None,
     quota_left: int,
     quota_total: int,
     dev_line: str | None = None,
-    verdict: VerdictTextOut | None = None,
     replay: HandReplay | None = None,
     not_checked: Sequence[str] = (),
     note_nicks: Sequence[str] = (),
 ) -> Msg:
-    """Полный разбор раздачи: точки решения числами (текст LLM — задача 21) +
-    статус-строка (⏱ время · зона доверия · остаток квоты) + две кнопки под
-    вердиктом (`verdict_buttons`, `test_the_verdict_buttons_are_two`) и, если
-    есть кому, кнопки заметок (см. `note_nicks` ниже).
+    """Разбор раздачи: блок «Что было», сырые числа расчёта, статус-строка, кнопки.
 
-    Точки с ценой берутся в порядке `res.ranked` (самая дорогая первой) — это
-    уже отфильтрованный и отранжированный список судимых точек
-    (`error_cost.py`), без точек-пробелов, которым нечего показать честно.
+    **Слов модели здесь нет** (решение владельца 2026-09-12): разбор состоит из
+    того, что посчитал код, и ничего больше. Аргумента, куда передать текст
+    модели, у функции нет вовсе
+    (`test_the_deep_dive_carries_no_words_of_the_model`).
 
-    **Под ними — постфлоп-точки, у которых цены нет** (`_postflop_call_lines`):
-    их числа посчитаны перебором борда, а не против диапазона, и в ранжирование
-    они не входят по построению (`SpotKind.POSTFLOP` вне `JUDGED_SPOTS`).
-    Порядок такой, а не по улицам: сначала то, что стоило денег, потом то, что
-    посчитано без цены; внутри второй половины улицы идут в порядке раздачи —
-    том же, в каком лежат точки решения. Строка «точек с вердиктом нет»
-    печатается, только когда нет ни одной из двух половин
-    (`test_a_river_point_alone_is_not_a_hand_without_a_verdict`).
-
-    **`zone=None` — «зоны нет», и тогда её нет и в строке (round 5, Item H).**
-    Прежняя сигнатура требовала `Zone`, и вызывающий, которому нечего было
-    сказать (ни одной судимой точки), подставлял `Zone.STRICT` — самую
-    уверенную подпись продукта под сообщением «точек с вердиктом нет». CLAUDE.md
-    разрешает `strict` только там, где вывод не опирается на угаданный диапазон;
-    вывода в этом случае нет вообще, а значит нет и зоны. Молчание тут честнее
-    любого слова, поэтому сегмент просто исчезает из статус-строки.
+    **`zone=None` — «зоны нет», и тогда её нет и в строке.** Вызывающий,
+    которому нечего сказать (ни одной судимой точки), прежде подставлял
+    `Zone.STRICT` — самую уверенную подпись продукта. CLAUDE.md разрешает
+    `strict` только там, где вывод не опирается на угаданный диапазон; вывода в
+    этом случае нет вообще, а значит нет и зоны.
 
     Зона относится ко ВСЕЙ руке, поэтому вызывающий обязан выводить её из всех
     судимых точек, а не из первой (`worker.pipeline._hand_zone` — единственный
@@ -863,67 +1106,20 @@ def deep_dive_msg(
     (`_hand_zone`), а называет непроверенное эта строка: одно без другого
     оставляет либо неназванную оговорку, либо неоправданную уверенность.
 
-    **Блок «Что было» — первым** (спека §5.6, план 2026-09-12): проза короче
-    построчного реплея, ради которого его когда-то прятали за кнопку; в тесноте
-    режется проза модели, не блок (`_shrink_prose`). `parse_mode="HTML"` только
-    при наличии блока — иначе экранировать пришлось бы весь текст всюду.
+    **Блок «Что было» — первым** (спека §5.6): в тесноте режутся сырые числа, не
+    блок (`_shrink_rows`). `parse_mode="HTML"` только при наличии блока — иначе
+    экранировать пришлось бы весь текст всюду.
 
     `note_nicks` — оппоненты, на которых можно записать заметку одним тапом
     (решение владельца 2026-09-04: путь заметки начинается ИЗ РАЗБОРА). Ники
     приходят только со скрина; на HH-пути список пуст, потому что там их нет.
     """
-    # Строка и флаг «это проза модели»: в тесноте режется только она
-    # (`_shrink_prose`), а числа и статус остаются на месте.
+    # Строка и флаг «эту можно резать»: в тесноте режутся только сырые числа
+    # (`_shrink_rows`), а реплей, оговорка и статус остаются на месте.
     rows: list[tuple[str, bool]] = []
     if replay is not None:
         rows.append(("", False))  # пустая строка после блока; сам блок — `head`
-    rows.extend([(f"Рука {res.hand_no}", False), ("", False)])
-
-    prose = {} if verdict is None else {point.dp_index: point.text for point in verdict.points}
-    postflop = [line for point in res.points for line in _postflop_call_lines(point)]
-
-    if not res.ranked and not postflop:
-        rows.append((_NO_VERDICT_LINE, False))
-    elif res.ranked:
-        for idx in res.ranked:
-            point = res.points[idx]
-            marker = f" ({_ASSUMING_MARKER})" if point.zone is Zone.ASSUMING else ""
-            street = _STREET_WORD.get(point.street, point.street.value)
-            interval = point.interval
-            if interval is not None and interval.near_zero:
-                # Форма «около нуля»: ни одного «лучше» — упрёка тут нет, — зато
-                # все три числа, которых не давал прежний отказ: точка, интервал
-                # и потолок цены выбора.
-                active = _ACTIVE_WORD.get(point.spot, "вход")
-                headline = (
-                    f"{street} · {_spot_word(point.spot)}: {active} или фолд — "
-                    f"{point.best_action}{marker}"
-                )
-                numbers = (
-                    f"    EV {active}а {_fmt_signed_bb(interval.point_bb)}, "
-                    f"{_interval_words(point.spot, interval)}."
-                )
-                rows.append((headline, False))
-                rows.append((numbers, False))
-                rows.extend((line, True) for line in _prose_lines(prose.get(point.dp_index)))
-                continue
-            headline = (
-                f"{street} · "
-                f"{_spot_word(point.spot)}: {_action_word(point.action_taken)} "
-                f"(лучше: {_action_word(point.best_action)}) — "
-                f"{_fmt_bb(point.ev_diff_bb)}{marker}"
-            )
-            rows.append((headline, False))
-            rows.extend((line, True) for line in _prose_lines(prose.get(point.dp_index)))
-
-    if postflop:
-        if res.ranked:
-            rows.append(("", False))
-        rows.extend((line, False) for line in postflop)
-
-    if verdict is not None and verdict.summary.strip():
-        rows.append(("", False))
-        rows.append((verdict.summary.strip(), True))
+    rows.extend((line, True) for line in _raw_hand_lines(res, en))
 
     if not_checked:
         rows.append(("", False))
@@ -1200,318 +1396,6 @@ def new_session_msg(title: str, previous_closed: bool) -> Msg:
     return Msg(text=" ".join(lines))
 
 
-# --- отчёт по турниру (задача 23) --------------------------------------------------
-
-# Потолки показа — тот же предел `sendMessage` в 4096 символов, что режет список
-# расхождений выше, и та же цена отказа: `raise_for_status()` в отправителе,
-# ретрай задачи, три пересчёта турнира вместо одного сообщения. Отчёт длиннее
-# сводки (пять разделов вместо одного), поэтому потолки ниже; сумма всех
-# разделов на максимуме проверена тестом
-# (`test_tournament_report_msg_of_a_long_tournament_fits_one_telegram_message`).
-_MAX_REPORT_LEVELS = 12
-_MAX_REPORT_ALL_INS = 6
-_MAX_REPORT_CHIP_MOVES = 8
-_MAX_REPORT_FINDINGS = 4
-
-# Строка, без которой таблица уровней читается как ошибка в счёте: стек на входе
-# уровня МЕНЬШЕ, чем на выходе предыдущего, при тех же фишках. Объяснение
-# кодовое, а не модельное — это факт («блайнды выросли»), а не суждение, и
-# показывать его должен тот же голос, что печатает саму таблицу.
-_BLIND_JUMP_LINE = (
-    "Стек на входе уровня бывает меньше, чем на выходе предыдущего: фишки те же, "
-    "выросли блайнды — в новых bb та же гора стоит меньше."
-)
-
-# Потолок текста рассказа по турниру: тот же предел `sendMessage` в 4096
-# символов. Абзацы, которые в него не влезли, не выбрасываются молча — строка
-# ниже говорит, сколько показано из скольких.
-_MAX_STORY_CHARS = 3500
-
-# Улица последнего действия героя — строчной буквой: она стоит внутри фразы
-# («префлоп, олл-ин»), а не заголовком строки, как в разборе одной раздачи.
-_STREET_WHERE: dict[Street, str] = {street: word.lower() for street, word in _STREET_WORD.items()}
-
-
-def _hand_head(hand_no: str, hero_class: str, level: int) -> str:
-    """«№TM123 · AKs · ур. 23» — общая шапка строк отчёта.
-
-    Класс руки пропускается, если он неизвестен (карты героя в источнике не
-    записаны): пустой сегмент оставил бы в строке две точки подряд, а выдумать
-    вместо него что-либо нельзя
-    (`test_tournament_report_msg_omits_a_hand_class_it_does_not_know`).
-    """
-    parts = [f"№{hand_no}", hero_class, f"ур. {level}"]
-    return " · ".join(part for part in parts if part)
-
-
-def _fmt_pct(value: float | None) -> str | None:
-    """Доля одним знаком после запятой; `None` — доли нет, и печатать нечего.
-
-    Возвращается `None`, а не «0.0%»: доля отсутствует ровно тогда, когда
-    знаменатель нулевой (`PlayerStats`), и ноль процентов на этом месте был бы
-    утверждением о том, чего не измеряли
-    (`test_tournament_report_msg_does_not_print_a_missing_share_as_zero`).
-    """
-    return None if value is None else f"{value:.1f}%"
-
-
-def _fmt_duration(minutes: int) -> str:
-    """«1 ч 12 мин» для часа и дольше, «45 мин» — короче часа."""
-    if minutes < 60:
-        return f"{minutes} мин"
-    return f"{minutes // 60} ч {minutes % 60:02d} мин"
-
-
-def _levels_word(first: int, last: int) -> str:
-    return f"{first}" if first == last else f"{first}–{last}"
-
-
-def _share_line(title: str, share_pct: float | None, taken: int, chances: int) -> str:
-    """Строка доли со счётчиками в скобках; при нулевом знаменателе — прямо об этом.
-
-    Долю считает `PlayerStats` и передаёт сюда готовой — второй такой формулы в
-    изложении нет и быть не должно. Счётчики показываются рядом с процентом
-    намеренно: «8.3%» на двух десятках возможностей и на двух сотнях — разной
-    силы утверждения, и отличить их можно только по знаменателю.
-    """
-    share = _fmt_pct(share_pct)
-    if share is None:
-        return f"{title}: таких развилок не было."
-    return f"{title}: {share} ({taken} из {chances})."
-
-
-def _stats_lines(report: TournamentReport) -> list[str]:
-    """Статистика турнира и среднее игрока по всем его турнирам — или отказ сравнивать.
-
-    При единственном турнире в базе среднее совпало бы с самим турниром, и
-    сравнение было бы пустым: строка говорит об этом прямо, а не показывает два
-    одинаковых числа (`TournamentReport.baseline`, бриф задачи).
-    """
-    stats = report.stats
-    lines = [
-        (
-            f"Добровольный вход в банк: {_fmt_pct(stats.vpip_pct)}. "
-            f"Повышение до флопа: {_fmt_pct(stats.pfr_pct)}."
-        )
-    ]
-    baseline = report.baseline
-    if baseline is None:
-        lines.append("Сравнить не с чем: это первый турнир в базе.")
-    else:
-        lines.append(
-            f"В среднем по всем турнирам (их {report.baseline_tournaments}): "
-            f"вход {_fmt_pct(baseline.vpip_pct)}, повышение {_fmt_pct(baseline.pfr_pct)}."
-        )
-    lines.append(
-        _share_line(
-            "Ре-рейз до флопа", stats.reraise_pct, stats.reraise, stats.reraise_chances
-        )
-    )
-    lines.append(
-        _share_line(
-            "Сдача на продолженную ставку",
-            stats.fold_to_cbet_pct,
-            stats.fold_to_cbet,
-            stats.cbet_faced,
-        )
-    )
-    return lines
-
-
-def _trajectory_lines(trajectory: StackTrajectory) -> list[str]:
-    """Стек по уровням и переломная точка.
-
-    Обрезается по ПОСЛЕДНИМ уровням, а не по первым: обрезка нужна только очень
-    длинному турниру, и в нём ближе к концу то, чем он кончился. Строка перелома
-    печатается всегда — она и есть ответ на вопрос «где всё повернуло», и её
-    уровень мог остаться за обрезкой.
-    """
-    shown = trajectory.levels[-_MAX_REPORT_LEVELS:]
-    head = "Стек по уровням:"
-    if len(shown) < len(trajectory.levels):
-        head = (
-            f"Стек по уровням (показаны последние {len(shown)} "
-            f"из {len(trajectory.levels)}):"
-        )
-    lines = [head]
-    lines += [
-        f"Ур. {level.level}: {_bb_number(level.start_bb)} → {_fmt_bb(level.end_bb)}, "
-        f"раздач: {level.hands}"
-        for level in shown
-    ]
-    lines.append(
-        f"Максимум: {_fmt_bb(trajectory.peak_bb)} на уровне {trajectory.peak_level} "
-        f"(раздача №{trajectory.peak_hand_no}). После неё раздач: "
-        f"{trajectory.hands_after_peak}, к концу турнира: {_fmt_bb(trajectory.final_bb)}."
-    )
-    if any(nxt.start_bb < prev.end_bb for prev, nxt in pairwise(shown)):
-        lines.append(_BLIND_JUMP_LINE)
-    return lines
-
-
-def _all_in_lines(events: list[AllInEvent]) -> list[str]:
-    """Олл-ины с исходом. Пустой список проговаривается, а не пропускается молча."""
-    if not events:
-        return ["Олл-инов в этом турнире не было."]
-    shown = events[:_MAX_REPORT_ALL_INS]
-    head = "Олл-ины:"
-    if len(shown) < len(events):
-        head = f"Олл-ины (показаны {len(shown)} самых крупных из {len(events)}):"
-    return [head] + [
-        f"{_hand_head(event.hand_no, event.hero_class, event.level)} · "
-        f"вошёл с {_fmt_bb(event.stack_before_bb)} → {_fmt_signed_bb(event.delta_bb)}"
-        f"{', вскрытие' if event.showdown else ''}"
-        for event in shown
-    ]
-
-
-def _chip_move_lines(moves: list[ChipMove]) -> list[str]:
-    """«Где ушли фишки»: раздача · что было · цена, дороже первой."""
-    if not moves:
-        return ["Раздач, в которых стек уменьшился, нет."]
-    shown = moves[:_MAX_REPORT_CHIP_MOVES]
-    head = "Где ушли фишки:"
-    if len(shown) < len(moves):
-        head = f"Где ушли фишки (показаны {len(shown)} самых дорогих из {len(moves)}):"
-    lines = [head]
-    for move in shown:
-        what = _STREET_WHERE.get(move.last_street, move.last_street.value)
-        if move.all_in:
-            what += ", олл-ин"
-        if move.showdown:
-            what += ", вскрытие"
-        lines.append(
-            f"{_hand_head(move.hand_no, move.hero_class, move.level)} · {what} "
-            f"— {_fmt_bb(move.cost_bb)}"
-        )
-    return lines
-
-
-def _finding_lines(findings: list[Finding]) -> list[str]:
-    """Находки — только по оценённым решениям, с ценой и историей игрока.
-
-    Слово то же, что во всём модуле: «расхождение», не «ошибка», и «лучше», не
-    «верно» — находка утверждает лишь, что у другой ветки была выше EV
-    (`test_tournament_report_msg_never_calls_variance_a_mistake`).
-    """
-    if not findings:
-        return ["Повторяющихся развилок среди оценённых решений не нашлось."]
-    shown = findings[:_MAX_REPORT_FINDINGS]
-    head = "Находки — только среди оценённых решений:"
-    if len(shown) < len(findings):
-        head = (
-            f"Находки — только среди оценённых решений (показаны {len(shown)} "
-            f"самых дорогих из {len(findings)}):"
-        )
-    lines = [head]
-    for finding in shown:
-        marker = f" ({_ASSUMING_MARKER})" if finding.zone is Zone.ASSUMING else ""
-        lines.append(
-            f"{_spot_word(finding.spot)}: {_action_word(finding.action_taken)} "
-            f"(лучше: {_action_word(finding.best_action)}) — повторов: {finding.count}, "
-            f"суммарно {_fmt_bb(finding.total_cost_bb)}{marker}"
-        )
-        if finding.seen_before:
-            lines.append(
-                f"    та же развилка в прошлых турнирах — точек: {finding.seen_before}, "
-                f"турниров: {finding.seen_before_tournaments}"
-            )
-    return lines
-
-
-def _ev_lines(ev: EvSplit) -> list[str]:
-    """Честный счёт: цена расхождений, дисперсия и несудимое — тремя разными строками.
-
-    Ни одно из чисел не подписано как «цена ошибок», и ни одно не складывается с
-    соседним: EV расхождения посчитан против диапазона на момент решения, фишки
-    — по факту раздачи. Последняя строка говорит это прямо, чтобы читатель не
-    сложил их сам.
-    """
-    return [
-        "Сколько это стоило:",
-        f"Оценено решений: {ev.points_judged} из {ev.points_total}.",
-        f"Цена расхождений в оценённых решениях: {_fmt_bb(ev.judged_loss_bb)}.",
-        f"Фишки в раздачах с расхождением: {_fmt_bb(ev.chips_in_gap_hands_bb)}.",
-        (
-            f"Фишки в проигранных олл-инах без расхождения: "
-            f"{_fmt_bb(ev.chips_in_lost_allins_bb)} — эти решения расчёт не оспаривает."
-        ),
-        (
-            f"Фишки в остальных раздачах: {_fmt_bb(ev.chips_elsewhere_bb)} — про них "
-            f"расчёт не говорит ничего."
-        ),
-        "Цена расхождений и потерянные фишки — разные величины: складывать их нельзя.",
-    ]
-
-
-def tournament_report_msg(report: TournamentReport) -> Msg:
-    """Отчёт по турниру целиком: что случилось, где ушли фишки, находки, сколько стоило.
-
-    Кнопок нет намеренно: «разобрать» стоит под пунктами сводки скана
-    (`scan_summary_msg`), которая приходит следующим сообщением, и вторая копия
-    тех же кнопок раздвоила бы одно действие на два места.
-
-    Каждый список обрезан своим потолком и, если обрезан, говорит об этом
-    прямо — молча показать восемь строк из ста было бы той же деградацией без
-    огласки, что и умолчанный `hands_failed`.
-    """
-    lines = [
-        (
-            f"Турнир. Раздач: {report.hands_total}. "
-            f"Уровни: {_levels_word(report.first_level, report.last_level)}. "
-            f"Время: {_fmt_duration(report.duration_minutes)}."
-        )
-    ]
-    if report.hands_failed:
-        lines.append(f"Раздач не разобрано: {report.hands_failed} — они не вошли в оценку.")
-    lines.append("")
-    lines += _stats_lines(report)
-    lines.append("")
-    lines += _trajectory_lines(report.trajectory)
-    lines.append("")
-    lines += _all_in_lines(report.all_ins)
-    lines.append("")
-    lines += _chip_move_lines(report.chip_moves)
-    lines.append("")
-    lines += _finding_lines(report.findings)
-    lines.append("")
-    lines += _ev_lines(report.ev)
-    return Msg(text="\n".join(lines))
-
-
-def tournament_story_msg(narrative: TournamentTextOut) -> Msg:
-    """Рассказ по турниру словами — отдельным сообщением ПЕРЕД отчётом с числами.
-
-    Отдельным, а не абзацем внутри отчёта, по одной причине: вместе они не
-    помещаются в `sendMessage` (4096 символов), и урезать пришлось бы либо
-    числа, либо текст. Порядок «сначала рассказ, потом числа» — тот же, что у
-    пары «отчёт → сводка со сводными кнопками»: кнопки должны остаться под
-    последним сообщением.
-
-    Абзацы, не влезшие в потолок, не пропадают молча — сообщение говорит,
-    сколько абзацев показано из скольких
-    (`test_tournament_story_msg_says_when_it_had_to_cut`).
-    """
-    shown: list[str] = []
-    length = 0
-    for paragraph in narrative.paragraphs:
-        cleaned = paragraph.strip()
-        if not cleaned:
-            continue
-        if length + len(cleaned) + 2 > _MAX_STORY_CHARS and shown:
-            break
-        shown.append(cleaned)
-        length += len(cleaned) + 2
-
-    total = len([p for p in narrative.paragraphs if p.strip()])
-    if len(shown) < total:
-        count = len(shown)
-        verb = _plural_form(count, "Показан", "Показаны", "Показано")
-        noun = _plural_form(count, "абзац", "абзаца", "абзацев")
-        shown.append(f"{verb} {count} {noun} из {total} — текст не поместился целиком.")
-    return Msg(text="\n\n".join(shown))
-
-
 # --- экраны нижнего меню (задача 23) -------------------------------------------------
 
 # Жёсткий предел `sendMessage`: сообщение длиннее 4096 символов Телеграм не
@@ -1607,9 +1491,8 @@ def sessions_msg(sessions: Sequence[SessionLine], total: int) -> Msg:
     Кнопка «Начать новую» — та же логика, что `/new` (SESSIONS_UX).
 
     `total` — сколько вечеров у игрока всего (`SessionsRepo.count_for_player`).
-    Список приходит с потолком запроса, и обрезка называется вслух: молчать о
-    ней этот файл запрещает себе дважды — в `scan_summary_msg` и в
-    `tournament_report_msg`
+    Список приходит с потолком запроса, и обрезка называется вслух — так же,
+    как в `scan_summary_msg`
     (`test_sessions_msg_says_when_the_history_did_not_fit`).
     """
     if not sessions:
@@ -2402,124 +2285,3 @@ _WHAT_CAN_BE_COUNTED = (
     "• требуемую частоту защиты против ставки.\n\n"
     "Можно сузить вопрос позицией и вечером."
 )
-
-
-# --- сырые данные расчёта: диагностика владельцу ---------------------------------------
-
-
-def _raw_bb(value_chips: int, big_blind: int) -> str:
-    """Сумма в ББ с единицей. Формат общий с блоком «Что было» (`hand_replay.bb`),
-    а не вторая его копия: одна величина в двух местах одного сообщения обязана
-    округляться одинаково, иначе диагностика спорит сама с собой."""
-    return f"{bb(value_chips, big_blind)} ББ"
-
-
-def _raw_bb_value(value_bb: float) -> str:
-    """Готовая величина в ББ — знак и округление общие с продуктовым `_fmt_bb`.
-
-    Отличается от него ТОЛЬКО единицей: продукт пишет «bb», блок сырых данных —
-    «ББ», как весь блок «Что было» (спека §5.6). Смешивать две записи в одном
-    сообщении нельзя: читатель принимает их за разные величины.
-    """
-    return f"{_bb_number(value_bb)} ББ"
-
-
-def hand_raw_data_msg(en: EnrichedHand, res: AnalysisResult) -> Msg:
-    """Всё, что код посчитал по раздаче, с подписью у каждого числа.
-
-    Назначение — диагностика: увидеть вход разбора целиком, не открывая БД.
-    Поэтому здесь нет ни одной величины, которой не было бы в `EnrichedHand` или
-    `AnalysisResult`, и ни одного слова о качестве игры: судит `deep_dive_msg`,
-    а это сообщение только показывает числа, на которых он судил.
-
-    **Подпись обязательна у каждого числа** (`test_the_raw_data_block_names_what_
-    each_number_means`). «9.1» не говорит ничего, «конечный банк 9.1 ББ» говорит
-    всё; блок сырых чисел без подписей был бы не диагностикой, а шумом.
-
-    Отдельным сообщением, а не хвостом разбора: у `deep_dive_msg` бюджет 4096
-    символов, и при нехватке он режет прозу модели. Диагностика, вытесняющая
-    продуктовый текст, — плохой размен.
-    """
-    hand = en.hand
-    rep = en.report
-    lines = ["Сырые данные — то, что посчитал код.", ""]
-
-    lines.append(f"Раздача {hand.hand_no}, уровень {hand.level}, ББ {hand.bb} фишек.")
-    pots = " · ".join(
-        f"{_STREET_WORD.get(street, street.value).lower()} {_raw_bb(value, hand.bb)}"
-        for street, value in rep.pot_by_street.items()
-    )
-    lines.append(f"Банк по улицам (сколько лежало в банке к концу улицы): {pots}.")
-    lines.append(f"Конечный банк: {_raw_bb(rep.final_pot, hand.bb)}.")
-
-    hero = next((p for p in hand.players if p.label == hand.hero_label), None)
-    if hero is not None:
-        ended = rep.stacks_end.get(hand.hero_label)
-        tail = "" if ended is None else f" → {_raw_bb(ended, hand.bb)}"
-        lines.append(f"Стек героя (до раздачи{' → после' if ended is not None else ''}): "
-                     f"{_raw_bb(hero.stack, hand.bb)}{tail}.")
-
-    lines.append("")
-    lines.append(
-        f"Точки решения (развилки, где ходил герой): {len(rep.decision_points)}. "
-        f"Столбцы: улица · позиция · доставить · банк до хода · эфф. стек · SPR · "
-        f"живых за столом (из них ходят после вас)."
-    )
-    for dp in rep.decision_points:
-        spr = "—" if dp.spr is None else f"{dp.spr:.1f}"
-        lines.append(
-            f"{dp.index + 1}. {_STREET_WORD.get(dp.street, dp.street.value).lower()} · "
-            f"{dp.position} · доставить {_raw_bb(dp.to_call, hand.bb)} · "
-            f"банк {_raw_bb(dp.pot_before, hand.bb)} · "
-            f"эфф. стек {_raw_bb(dp.eff_stack, hand.bb)} · SPR {spr} · "
-            f"живых {dp.live_total} (после вас {dp.live_behind})"
-        )
-
-    lines.append("")
-    lines.append("Вердикты — что расчёт сказал по каждой точке.")
-    for point in res.points:
-        best = point.best_action or "не названо"
-        zone = "—" if point.zone is None else _ZONE_WORD.get(point.zone, str(point.zone))
-        lines.append(
-            f"{point.dp_index + 1}. спот {_spot_word(point.spot)} · "
-            f"сыграно {point.action_taken} · лучше {best} · зона {zone} · "
-            f"цена {_raw_bb_value(point.ev_diff_bb)}"
-        )
-    judged = sum(1 for point in res.points if is_judged(point))
-    lines.append(
-        f"Оценено точек: {judged} из {len(res.points)} — вердикт бывает только "
-        f"у пуш-фолд спотов, остальные расчёт не судит."
-    )
-    lines.append(
-        f"Сумма цены расхождений: {_raw_bb_value(res.total_ev_loss_bb)} — только по оценённым точкам."
-    )
-
-    lines.append("")
-    lines.append(f"Сверка денег с источником: {en.verdict.status.value}.")
-    if en.verdict.not_checked:
-        lines.append(f"Не проверено: {', '.join(en.verdict.not_checked)}.")
-    return Msg(text="\n".join(lines))
-
-
-def scan_raw_data_msg(s: ScanSummary) -> Msg:
-    """То же для файла турнира: числа сводки скана с подписью у каждого.
-
-    Ход раздачи сюда не входит — он свойство ОДНОЙ раздачи, а в файле их сотни
-    и ни одна не выделена (та же развилка, что держит `worker._hand_analysis_msg`).
-    """
-    return Msg(
-        text="\n".join(
-            [
-                "Сырые данные скана — то, что посчитал код.",
-                "",
-                f"Раздач в файле: {s.hands_total}.",
-                f"Раздач не разобрано (расчёт разошёлся с движком по деньгам): {s.hands_failed}.",
-                f"Раздач с оценённой точкой: {s.hands_with_decision}.",
-                f"Точек решения всего (развилок, где ходил герой): {s.points_total}.",
-                f"Точек с вердиктом: {s.points_judged} — остальные расчёт не судит.",
-                f"Суммарная цена расхождений: {_raw_bb_value(s.total_loss_bb)} — по оценённым точкам.",
-                f"Расхождений дороже порога показа: {len(s.items)}.",
-                f"Решений около нуля: {len(s.close_calls)}.",
-            ]
-        )
-    )

@@ -23,9 +23,7 @@
 типу задачи, с запасом меньше 10 минут: `asyncio.wait_for` вокруг работы станций (не
 вокруг трейса/`complete`/`fail` — тем всегда дают дожить до конца). Задача 16 сознательно
 не ограничила длительность самого вызова модели (только ожидание лимитера) и оставила
-общий бюджет здесь. С задачи 21 модель вызывается на станции `explain` (текст вердикта
-и рассказ по турниру), и покрывает её тот же дедлайн станции — отдельного таймаута на
-LLM-запрос по-прежнему нет.
+общий бюджет здесь: отдельного таймаута на LLM-запрос по-прежнему нет.
 
 **Фенсинг (контроллерский рулинг задачи 18, п.2).** `job.locked_by`, который вернул
 `claim()`, передаётся В КАЖДЫЙ вызов `complete()`/`fail()`/`await_user()` как `worker_id`
@@ -70,7 +68,6 @@ from harness.analysis.preflop import (
     equity_cache_seed,
 )
 from harness.analysis.scan import scan_tournament
-from harness.analysis.tournament import tournament_report
 from harness.calcs.routing import answer_question
 from harness.contracts import (
     AnalysisResult,
@@ -79,22 +76,13 @@ from harness.contracts import (
     PlayerStats,
     RawHand,
     ScanSummary,
-    TournamentReport,
-    TournamentTextOut,
     ValidationStatus,
-    VerdictTextOut,
     VisionCheck,
     Zone,
     is_judged,
 )
 from harness.engine import enrich
-from harness.explanation import (
-    UnfaithfulText,
-    hand_replay,
-    render_range_png,
-    tournament_text,
-    verdict_text,
-)
+from harness.explanation import hand_replay, render_range_png
 from harness.memory.models import Job as JobModel
 from harness.memory.models import Player
 from harness.memory.repos import (
@@ -112,7 +100,7 @@ from harness.parsers.vision_adapter import (
     can_apply_vision_answer,
     vision_extract,
 )
-from harness.platform.llm import LLM, LLMProviderError, LLMSchemaError
+from harness.platform.llm import LLM
 from harness.platform.queue import JobPreconditionFailed, JobsQueue
 from harness.platform.trace import Clock, Trace
 from harness.presentation import (
@@ -122,7 +110,6 @@ from harness.presentation import (
     escalation_msg,
     failed_msg,
     hand_in_progress_msg,
-    hand_raw_data_msg,
     not_a_hand_msg,
     note_nicks_for_hand,
     progress_text,
@@ -130,11 +117,8 @@ from harness.presentation import (
     question_refusal_msg,
     range_image_title,
     range_photos,
-    scan_raw_data_msg,
     scan_summary_msg,
     send_as_file_msg,
-    tournament_report_msg,
-    tournament_story_msg,
     vision_gave_up_msg,
 )
 
@@ -142,9 +126,10 @@ __all__ = ["Deps", "Sender", "run_job"]
 
 _log = structlog.get_logger(__name__)
 
-# Станции, показываемые игроку прогрессом. "explain" появилась в задаче 21: с неё
-# начинается второй (и последний) вызов модели в системе — текст вердикта.
-_Station = Literal["ask", "read", "parse", "validate", "analyze", "explain"]
+# Станции, показываемые игроку прогрессом. Станции `explain` больше нет:
+# формулировать в разборе раздачи нечего, а вопрос игрока проходит станцию `ask`
+# (решение владельца 2026-09-12).
+_Station = Literal["ask", "read", "parse", "validate", "analyze"]
 
 # Бюджет попытки по типу задачи — с запасом меньше десятиминутного окна reap()
 # (см. модульный докстринг). `hh_scan` может обрабатывать сотни рук и считать эквити
@@ -378,10 +363,7 @@ async def _send_idempotent(
     key: Literal[
         "progress_message_id",
         "result_message_id",
-        "report_message_id",
-        "story_message_id",
         "escalation_message_id",
-        "raw_data_message_id",
     ],
     chat_id: int,
     msg: Msg,
@@ -429,9 +411,9 @@ _RANGE_PHOTOS_SENT = "range_photos_sent"
 async def _saved_range_images(analyses_repo: AnalysesRepo, hand_id: int) -> list[str]:
     """Пути картинок из `analyses.range_images` — источник один и он в БД.
 
-    Читается заново, а не берётся из переменной станции `explain`: у повторной
-    попытки, которая нашла готовый разбор чекпоинтом, этой переменной нет вовсе,
-    а картинки уже нарисованы.
+    Читается заново, а не берётся из переменной, в которую их положил рендер: у
+    повторной попытки, которая нашла готовый разбор чекпоинтом, этой переменной
+    нет вовсе, а картинки уже нарисованы.
     """
     record = await analyses_repo.get_by_hand(hand_id)
     return [] if record is None else (record.range_images or [])
@@ -514,42 +496,6 @@ async def _chat_id(session: AsyncSession, player_id: int) -> int:
     return player.tg_user_id
 
 
-async def _is_owner(session: AsyncSession, player_id: int) -> bool:
-    """Владелец продукта (`players.is_dev`) — тот, кому положена диагностика.
-
-    Тот же флаг, что пускает `/invite` (`bot/handlers.py`), и намеренно ОДИН на
-    обе привилегии: второй признак «свой» разошёлся бы с первым на первом же
-    новом входе.
-    """
-    player = await session.get(Player, player_id)
-    return player is not None and player.is_dev
-
-
-async def _send_raw_data(
-    deps: Deps,
-    session: AsyncSession,
-    job: JobModel,
-    worker_id: str | None,
-    chat_id: int,
-    msg: Msg,
-) -> None:
-    """Сырые числа расчёта — ОТДЕЛЬНЫМ сообщением и только владельцу.
-
-    Отдельным, а не хвостом разбора: у сообщения разбора бюджет 4096 символов, и
-    при нехватке `_fit_html` режет прозу модели. Диагностика, вытесняющая
-    продуктовый текст, — плохой размен, поэтому сообщений два и режется только
-    второе (`test_the_owner_gets_the_raw_numbers_beside_the_analysis`).
-
-    Молчание для обычного игрока держится тестом, а не намерением
-    (`test_an_ordinary_player_never_sees_the_raw_numbers_of_the_calculation`):
-    отправить эти числа всем — вопрос одной забытой проверки.
-    """
-    if not await _is_owner(session, job.player_id):
-        return
-    await _send_idempotent(deps, session, job.id, worker_id, "raw_data_message_id", chat_id, msg)
-    await session.commit()
-
-
 async def _quota_numbers(session: AsyncSession, player_id: int) -> tuple[int, int]:
     """Числа для строки «разборов X/Y за 24ч» (спека §9: скользящее окно, SQL-счётчик
     интерактивных задач).
@@ -572,7 +518,6 @@ def _hand_analysis_msg(
     elapsed_s: int,
     quota_left: int,
     quota_total: int,
-    verdict: VerdictTextOut | None,
     stats: Mapping[str, PlayerStats] | None,
 ) -> Msg:
     """Сообщение разбора ОДНОЙ раздачи — единственное место, где оно собирается.
@@ -592,11 +537,11 @@ def _hand_analysis_msg(
     """
     return deep_dive_msg(
         result,
+        enriched,
         elapsed_s,
         _hand_zone(result, enriched.verdict.not_checked),
         quota_left,
         quota_total,
-        verdict=verdict,
         replay=hand_replay(enriched, stats=stats),
         not_checked=enriched.verdict.not_checked,
         note_nicks=note_nicks_for_hand(enriched.hand),
@@ -734,110 +679,13 @@ async def _run_hh_scan(job: JobModel, deps: Deps, trace: Trace) -> None:
             await tournaments_repo.save_scan_summary(tournament_id, summary)
             await session.commit()
 
-        # Отчёт по турниру (задача 23) — считается по уже готовым артефактам:
-        # руки этого турнира и его сводка на руках, история игрока — два запроса
-        # в `memory`. Ни одного расчёта эквити здесь нет, поэтому станция стоит
-        # вне процессного пула и вне спана `analyze`.
-        #
-        # Пустой файл (`enriched_hands == []`) отчёта не получает: `tournament_
-        # report` на нуле раздач отказывает, и правильно — describe там нечего.
-        # Молчания при этом не возникает: сводка ниже уходит всегда и говорит
-        # «Скан завершён: 0 рук» прямым текстом.
-        if enriched_hands:
-            report = tournament_report(
-                enriched_hands,
-                summary,
-                player_tournaments=await hands_repo.player_hands_by_tournament(job.player_id),
-                past_summaries=await tournaments_repo.player_scan_summaries(
-                    job.player_id, exclude=tournament_id
-                ),
-            )
-            # Рассказ словами — перед отчётом с числами, отчёт — перед сводкой:
-            # сводка несёт кнопки «разобрать», и им место под последним
-            # сообщением, а не отлистанными вверх. Рассказа может не быть вовсе
-            # (модель недоступна либо её текст не прошёл проверку) — тогда игрок
-            # получает те же два сообщения с числами, и это полноценный ответ.
-            async with trace.span("explain"):
-                payload = await _ensure_progress(
-                    deps, session, job.id, worker_id, chat_id, "explain"
-                )
-                # Чекпоинт рассказа (ревью, раздел G). `story_message_id` в
-                # payload означает, что рассказ УЖЕ отправлен прошлой попыткой:
-                # звать модель снова значило бы заплатить второй раз и
-                # переписать игроку уже прочитанное сообщение другим текстом —
-                # модель не детерминирована, и это был бы не «тот же результат»,
-                # как у остальных станций, а другой
-                # (`test_a_repeat_scan_does_not_pay_for_the_story_twice`).
-                story = (
-                    None
-                    if payload.get("story_message_id") is not None
-                    else await _tournament_story(deps, trace, report)
-                )
-            if story is not None:
-                await _send_idempotent(
-                    deps,
-                    session,
-                    job.id,
-                    worker_id,
-                    "story_message_id",
-                    chat_id,
-                    tournament_story_msg(story),
-                )
-            await _send_idempotent(
-                deps,
-                session,
-                job.id,
-                worker_id,
-                "report_message_id",
-                chat_id,
-                tournament_report_msg(report),
-            )
-
         quota_left, quota_total = await _quota_numbers(session, job.player_id)
         msg = scan_summary_msg(summary, quota_left, quota_total)
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
         await session.commit()
-        await _send_raw_data(deps, session, job, worker_id, chat_id, scan_raw_data_msg(summary))
 
 
-# --- станция explain: слова поверх посчитанного (задача 21) -------------------------
-
-# Отказы, после которых разбор ВСЁ РАВНО уходит игроку — без прозы, но с числами.
-# Ни один из них не означает, что расчёт неверен: модель недоступна, ответила не по
-# схеме или сказала то, чего расчёт не говорил. Числа, вердикты и зоны посчитаны
-# кодом и от модели не зависят — прятать их из-за её ответа было бы хуже, чем
-# показать разбор молча. Причина при этом не теряется: она в логе.
-_EXPLANATION_FAILURES = (UnfaithfulText, LLMSchemaError, LLMProviderError)
-
-
-async def _verdict_prose(deps: Deps, trace: Trace, result: AnalysisResult) -> VerdictTextOut | None:
-    """Текст модели к разбору или `None`, если его не удалось получить честно."""
-    try:
-        return await verdict_text(deps.llm, result, trace_id=trace.trace_id)
-    except _EXPLANATION_FAILURES as exc:
-        _log.warning("verdict_text_unavailable", hand_no=result.hand_no, error=repr(exc))
-        return None
-    except Exception:  # noqa: BLE001 — см. `_EXPLANATION_FAILURES`: слова
-        # необязательны, числа обязательны. Любой сбой слоя изложения (сюда
-        # попадает и неверная конфигурация провайдера — `UserError` PydanticAI,
-        # который не наследует наши типы) не имеет права отменить разбор, уже
-        # посчитанный кодом. Причина уходит в лог целиком, с трейсбеком.
-        _log.exception("verdict_text_crashed", hand_no=result.hand_no)
-        return None
-
-
-async def _tournament_story(
-    deps: Deps, trace: Trace, report: TournamentReport
-) -> TournamentTextOut | None:
-    """Рассказ по турниру или `None` — по тем же правилам, что и текст разбора."""
-    try:
-        return await tournament_text(deps.llm, report, trace_id=trace.trace_id)
-    except _EXPLANATION_FAILURES as exc:
-        _log.warning("tournament_text_unavailable", error=repr(exc))
-        return None
-    except Exception:  # noqa: BLE001 — та же граница, что у `_verdict_prose`.
-        _log.exception("tournament_text_crashed")
-        return None
+# --- картинки диапазонов: выход кода, не модели -------------------------------------
 
 
 def _render_ranges(data_dir: Path | None, hand_id: int, result: AnalysisResult) -> list[str]:
@@ -875,9 +723,8 @@ def _hand_zone(result: AnalysisResult, not_checked: Sequence[str] = ()) -> Zone 
     Два правила, оба из CLAUDE.md («`strict` — только когда вывод не опирается на
     угаданный диапазон»):
 
-    * вывода нет вовсе — зоны нет, `None`. Раньше здесь стоял `Zone.STRICT`, и
-      игрок получал самую уверенную подпись продукта под сообщением «по этой
-      раздаче точек с вердиктом нет»: строгость там, где не было вывода;
+    * вывода нет вовсе — зоны нет, `None`. Иначе игрок получал бы самую
+      уверенную подпись продукта под разбором, в котором вывода не было;
     * есть хоть одна точка `assuming` — вся рука `assuming`. Раньше зона бралась
       у ПЕРВОЙ точки `ranked`, поэтому шапка «зона: строго» могла стоять над
       строками, каждая из которых помечена «(по модели диапазонов)». Слабейшее
@@ -1085,7 +932,7 @@ async def _read_screen(
 
 
 async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: float) -> int | None:
-    """Скрин -> разбор: чтение моделью, проверки, эскалация, ядро, слова.
+    """Скрин -> разбор: чтение моделью, проверки, эскалация, ядро.
 
     **Чекпоинт зрения — `hands.raw`**, и он же гасит петлю эскалаций: после
     ответа игрока задача возвращается сюда, видит уже сохранённую руку и модель
@@ -1226,18 +1073,12 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
                 )
                 await session.commit()
 
-        async with trace.span("explain"):
-            await _ensure_progress(deps, session, job.id, worker_id, chat_id, "explain")
-            saved = existing.verdict_text if existing is not None else None
-            if saved is not None:
-                verdict = VerdictTextOut.model_validate_json(saved)
-            else:
-                verdict = await _verdict_prose(deps, trace, result)
-                images = _render_ranges(deps.data_dir, hand_id, result)
+            # Та же развилка, что в `_run_deep_dive`: картинки рисует код внутри
+            # `analyze`, станции `explain` на этом пути больше нет.
+            if existing is None or existing.range_images is None:
                 await analyses_repo.set_explanation(
                     hand_id=hand_id,
-                    verdict_text=None if verdict is None else verdict.model_dump_json(),
-                    range_images=images,
+                    range_images=_render_ranges(deps.data_dir, hand_id, result),
                 )
                 await session.commit()
 
@@ -1248,14 +1089,10 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
             elapsed_s=round(deps.clock() - started_at),
             quota_left=quota_left,
             quota_total=quota_total,
-            verdict=verdict,
             stats=None,  # скрин: турнира нет, а значит нет и знаменателя частот
         )
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
         await session.commit()
-        await _send_raw_data(
-            deps, session, job, worker_id, chat_id, hand_raw_data_msg(enriched, result)
-        )
         await _send_range_photos(
             deps,
             session,
@@ -1313,23 +1150,15 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
                 )
                 await session.commit()
 
-        async with trace.span("explain"):
-            await _ensure_progress(deps, session, job.id, worker_id, chat_id, "explain")
-            saved = existing.verdict_text if existing is not None else None
-            if saved is not None:
-                # Чекпоинт станции: слова уже сказаны прошлой попыткой — второй раз
-                # за них не платим (спека §8.2, тот же принцип, что у `hands.*`).
-                verdict = VerdictTextOut.model_validate_json(saved)
-            else:
-                verdict = await _verdict_prose(deps, trace, result)
-                # Картинки диапазонов — выход КОДА, и от того, ответила ли
-                # модель, они не зависят: сохраняются всегда (ревью, раздел G;
-                # прежде отказ модели выбрасывал уже нарисованные файлы).
-                images = _render_ranges(deps.data_dir, hand.id, result)
+            # Картинки диапазонов — выход КОДА, и рисуются они внутри `analyze`:
+            # отдельной станции у них больше нет, потому что формулировать в
+            # разборе раздачи нечего (решение владельца 2026-09-12). Чекпоинт —
+            # записанный список путей: он отличает «уже рисовали, вышло пусто»
+            # от «ещё не рисовали».
+            if existing is None or existing.range_images is None:
                 await analyses_repo.set_explanation(
                     hand_id=hand.id,
-                    verdict_text=None if verdict is None else verdict.model_dump_json(),
-                    range_images=images,
+                    range_images=_render_ranges(deps.data_dir, hand.id, result),
                 )
                 await session.commit()
 
@@ -1340,14 +1169,10 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
             elapsed_s=round(deps.clock() - started_at),
             quota_left=quota_left,
             quota_total=quota_total,
-            verdict=verdict,
             stats=await _tournament_stats(session, hand.tournament_id),
         )
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
         await session.commit()
-        await _send_raw_data(
-            deps, session, job, worker_id, chat_id, hand_raw_data_msg(hand.enriched, result)
-        )
         await _send_range_photos(
             deps,
             session,
@@ -1370,8 +1195,7 @@ async def _run_question(job: JobModel, deps: Deps, trace: Trace) -> None:
     было бы нечего — весь результат станции это одно сообщение, а дубля его не
     будет и так (`_send_idempotent`).
 
-    Отказ модели (провайдер, схема) сюда не перехватывается, в отличие от
-    `_verdict_prose`: там числа посчитаны и без слов, здесь без вызова модели
+    Отказ модели (провайдер, схема) сюда не перехватывается: без вызова модели
     нет ни расчёта, ни ответа — задача честно падает, и игрок получает
     `failed_msg`.
     """
