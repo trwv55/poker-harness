@@ -1954,7 +1954,7 @@ async def test_the_details_button_shows_the_replay_of_the_hand(deps, db_factory,
 
     assert msg is not None
     assert msg.parse_mode == "HTML"
-    assert "ПРЕФЛОП" in msg.text
+    assert "Вы на " in msg.text
 
 
 async def test_the_details_button_of_an_unfinished_hand_says_so(deps, db_factory, invited):

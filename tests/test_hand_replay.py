@@ -5,9 +5,9 @@
 посчитал движок, и подставлять их руками значило бы проверять реплей на входе,
 которого конвейер никогда не произведёт.
 
-Главные утверждения этого файла — не «текст выглядит так», а четыре запрета,
+Главные утверждения этого файла — не «текст выглядит так», а пять запретов,
 каждый из которых уже стоил бы игроку доверия: масти буквами, выдуманное число,
-шапка длиннее двух строк и потерянная точка решения героя.
+фишки вместо ББ, «чек» там, где никто не ходил, и потерянная точка решения героя.
 """
 
 from __future__ import annotations
@@ -95,7 +95,7 @@ def _preflop_shove_hand() -> EnrichedHand:
     """Герой (SB, 10bb) шовит против рейза CO, тот коллирует. Постфлопа нет.
 
     Улицы после префлопа проходят без единого действия — на них и проверяется
-    схлопывание тихих улиц в одну строку.
+    прогон борда: печатается борд, и никаких приписанных игрокам ходов.
     """
     return _enriched(
         _raw(
@@ -190,57 +190,41 @@ def _postflop_hand() -> EnrichedHand:
     )
 
 
-def _preflop_fold_hand() -> EnrichedHand:
-    """Герой пасует на префлопе, борда нет — самая короткая раздача из возможных."""
-    return _enriched(
-        _raw(
-            actions=[
-                _fold("P3"),
-                _fold("P4"),
-                RawAction(
-                    street=Street.PREFLOP,
-                    label="P5",
-                    kind=ActionKind.RAISE,
-                    to_amount=250,
-                    raw_line="P5: raises 150 to 250",
-                ),
-                _fold("P6"),
-                _fold("Hero"),
-                _fold("P2"),
-            ],
-            dealt={"Hero": ["3c", "2d"]},
-        )
-    )
-
-
 def _lines(text: str) -> list[str]:
     return [line for line in text.splitlines() if line.strip()]
 
 
-# --- форма и объём ------------------------------------------------------------------
+# --- форма: проза, ББ, «вы» ----------------------------------------------------------
 
 
-def test_header_is_two_lines_with_level_blinds_and_hero():
-    """Шапка ровно в две строки (спека §5.6): турнир с уровнем и блайндами, затем
-    герой с позицией, картами и стеком в фишках и bb."""
-    text = hand_replay(_preflop_shove_hand()).plain
-    head, hero, *_ = text.splitlines()
-    assert "ур. 12" in head
-    assert "50/100" in head
-    assert head.startswith("TSYN")
-    assert hero.startswith("Hero SB")
-    assert "10.0bb" in hero
+def test_header_is_one_line_with_position_cards_and_stack():
+    """Шапка — одна строка (спека §5.6): позиция героя, карманные карты, стек в ББ."""
+    assert hand_replay(_preflop_shove_hand()).plain.startswith("Вы на SB, J♥️9♥️, 10.0 ББ.\n")
 
 
-def test_a_preflop_hand_stays_within_the_size_budget():
-    """Ориентир спеки: префлоп-рука — 4–5 строк. Длиннее — формат нарушен."""
-    assert len(_lines(hand_replay(_preflop_fold_hand()).plain)) <= 5
+def test_the_replay_speaks_in_big_blinds_not_chips():
+    text = hand_replay(_postflop_hand()).plain
+    assert "250" not in text and "300" not in text, "фишки остались в тексте"
+    assert "ББ" in text
 
 
-def test_a_hand_with_postflop_stays_within_its_own_budget():
-    """Тот же ориентир для руки с борда — 6–8 строк; шов с прогоном тоже сюда."""
-    assert len(_lines(hand_replay(_postflop_hand()).plain)) <= 8
-    assert len(_lines(hand_replay(_preflop_shove_hand()).plain)) <= 8
+def test_the_replay_is_a_short_paragraph():
+    """Построчный формат и был причиной, по которой блок прятали под кнопку."""
+    assert len(_lines(hand_replay(_postflop_hand()).plain)) <= 3
+
+
+def test_the_replay_addresses_the_player_as_you_everywhere():
+    """Блок и текст под ним не имеют права говорить с игроком по-разному —
+    включая строку вскрытия (`_preflop_shove_hand` её имеет)."""
+    for en in (_postflop_hand(), _preflop_shove_hand()):
+        text = hand_replay(en).plain
+        assert "Hero" not in text
+        assert "вы" in text.lower()
+
+
+def test_a_street_sentence_starts_with_a_capital_even_when_it_is_you():
+    text = hand_replay(_postflop_hand()).plain
+    assert "банк 6.6. Вы чек" in text and "→ вы фолд" in text
 
 
 # --- масти -------------------------------------------------------------------------
@@ -269,7 +253,7 @@ def test_hero_decision_is_emphasised_inside_the_flow_not_on_its_own_line():
     replay = hand_replay(_preflop_shove_hand())
     emphasised = [span.text for span in replay.spans if span.emphasis]
     assert emphasised, "точка решения героя не выделена вовсе"
-    assert all("Hero" in span for span in emphasised)
+    assert all("вы" in span.lower() for span in emphasised)
     flow = next(line for line in replay.plain.splitlines() if "олл-ин" in line)
     assert "→" in flow, "выделенное действие вынесено из потока в отдельную строку"
 
@@ -279,20 +263,12 @@ def test_consecutive_folds_are_merged_into_one_token():
     assert "UTG/HJ фолд" in hand_replay(_preflop_shove_hand()).plain
 
 
-def test_quiet_streets_collapse_into_a_single_line():
-    """Улицы без действий и без ставок — одной строкой (`ТЁРН 7♥ · РИВЕР A♥`)."""
-    line = next(
-        line for line in _lines(hand_replay(_preflop_shove_hand()).plain) if "ТЁРН" in line
-    )
-    assert "РИВЕР" in line and "ФЛОП" in line
-
-
-def test_a_street_with_action_gets_its_own_line_with_the_board():
-    """Улица с действиями получает свой заголовок с бордом, а под ним — поток ходов."""
-    lines = _lines(hand_replay(_postflop_hand()).plain)
-    head = next(i for i, line in enumerate(lines) if line.startswith("ФЛОП"))
-    assert "♠️" in lines[head] and "банк" in lines[head]
-    assert "бет 300" in lines[head + 1] and "Hero" in lines[head + 1]
+def test_a_run_out_street_prints_only_its_board():
+    """После олл-ина никто не ходит. Печатается борд — и НИКАКИХ «чек-чек»:
+    приписать игрокам действия, которых не было, значит выдумать ход руки."""
+    text = hand_replay(_preflop_shove_hand()).plain
+    assert "чек" not in text.lower()
+    assert "Флоп 6♠️ J♦️ Q♦️ · Тёрн 7♥️ · Ривер A♥️." in text
 
 
 def test_raise_over_a_raise_is_called_a_3bet_preflop():
@@ -325,31 +301,18 @@ def test_raise_over_a_raise_is_called_a_3bet_preflop():
     ]
     en = _enriched(_raw(actions=raw_actions, dealt={"Hero": ["Jh", "9h"]}))
     text = hand_replay(en).plain
-    assert "рейз 250" in text and "3-бет 700" in text
+    assert "опен 2.5" in text and "3-бет 7.0" in text
 
 
 # --- числа: только то, что посчитал движок --------------------------------------------
 
 
-def test_street_pot_is_the_engine_number_not_the_summary():
-    """Банк улицы берётся из отчёта движка — единственного источника истины о деньгах.
-
-    Раздача кончилась на префлопе, банк вырос вчетверо — значит итоговый банк
-    улицы печатается отдельной строкой (спека §5.6: «только если улица изменила
-    его существенно»).
-    """
-    en = _preflop_shove_hand()
-    pot = en.report.pot_by_street[Street.PREFLOP]
-    assert f"банк {pot:,}".replace(",", "\u00a0") in hand_replay(en).plain
-
-
-def test_the_final_pot_is_printed_once_not_twice():
-    """Итоговый банк улицы, за которой идёт ДРУГАЯ улица с действиями, отдельной
-    строкой не печатается: он уже стоит в заголовке следующей."""
+def test_a_printed_amount_is_the_whole_bet_not_the_increment():
+    """Спека §5.6: `бет 1.9` — 1.9 ББ от этого игрока на этой улице целиком.
+    Берётся `committed_after`, а не разница с предыдущим действием."""
     en = _postflop_hand()
-    pot = en.report.pot_by_street[Street.PREFLOP]
-    text = hand_replay(en).plain
-    assert text.count(f"банк {pot:,}".replace(",", "\u00a0")) == 1
+    raise_action = next(a for a in en.hand.actions if a.kind is ActionKind.RAISE)
+    assert f"опен {raise_action.committed_after / en.hand.bb:.1f}" in hand_replay(en).plain
 
 
 def test_the_replay_prints_no_number_the_hand_does_not_contain():
@@ -365,10 +328,13 @@ def test_the_replay_prints_no_number_the_hand_does_not_contain():
     allowed = {float(hand.level), float(hand.sb), float(hand.bb)}
     allowed |= {float(p.stack) for p in hand.players}
     allowed |= {round(p.stack_bb, 1) for p in hand.players}
+    allowed |= {round(p.stack / hand.bb, 1) for p in hand.players}
     allowed |= {float(a.committed_after) for a in hand.actions}
     allowed |= {round(a.committed_after / hand.bb, 1) for a in hand.actions}
     allowed |= {float(v) for v in en.report.pot_by_street.values()}
+    allowed |= {round(v / hand.bb, 1) for v in en.report.pot_by_street.values()}
     allowed |= {float(sum(post.amount for post in hand.posts))}
+    allowed |= {round(sum(post.amount for post in hand.posts) / hand.bb, 1)}
     allowed |= {float(sum(p.amount for p in hand.posts if p.kind is PostKind.ANTE))}
     # Ранги карт — не деньги: те же карты, что в `dealt` и `boards`, только
     # символом масти вместо буквы.
@@ -383,14 +349,31 @@ def test_the_replay_prints_no_number_the_hand_does_not_contain():
     assert set(numbers) <= allowed, f"выдуманные числа: {set(numbers) - allowed}"
 
 
+# --- вскрытие и цена решения ----------------------------------------------------------
+
+
 def test_showdown_line_shows_the_cards_that_were_actually_shown():
     """Вскрытие — одной строкой, картами тех, кто их показал; комбинации не
     называются: назвать их значило бы оценить руку, а реплей ничего не считает."""
     line = next(
         line for line in _lines(hand_replay(_preflop_shove_hand()).plain) if "Вскрытие" in line
     )
-    assert "Hero" in line and "K♠️K♦️" in line
+    assert "вы J♥️9♥️" in line and "K♠️K♦️" in line
 
 
 def test_a_hand_without_a_showdown_says_nothing_about_one():
     assert "Вскрытие" not in hand_replay(_postflop_hand()).plain
+
+
+def test_the_replay_ends_with_the_cost_when_it_is_known():
+    text = hand_replay(_postflop_hand(), ev_loss_bb=-3.9).plain
+    assert text.rstrip().endswith("Потеря 3.9 ББ.")
+
+
+def test_a_measured_zero_cost_is_printed():
+    """`ranked` непустой при сумме 0.0 — измеренный ноль, и он печатается."""
+    assert "Потеря 0.0 ББ." in hand_replay(_postflop_hand(), ev_loss_bb=0.0).plain
+
+
+def test_the_replay_without_a_cost_says_nothing_about_it():
+    assert "Потеря" not in hand_replay(_postflop_hand()).plain
