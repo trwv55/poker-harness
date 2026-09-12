@@ -57,7 +57,7 @@ from harness.platform.logs import configure_logging
 from harness.platform.queue import JobsQueue
 from harness.presentation import (
     hh_accepted_msg,
-    hh_duplicate_msg,
+    hh_scan_in_progress_msg,
     invite_accepted_msg,
     invite_required_msg,
     new_session_msg,
@@ -314,10 +314,65 @@ async def test_same_file_twice_is_not_analysed_twice(db_factory, deps, invited):
     )
 
     assert first == hh_accepted_msg()
-    assert second == hh_duplicate_msg()
+    assert second == hh_scan_in_progress_msg()
     assert len(await fetch_all(db_factory, "select * from jobs")) == 1
     assert len(await fetch_all(db_factory, "select * from tournaments")) == 1
     assert len(await fetch_all(db_factory, "select * from sessions")) == 1
+
+
+async def test_the_same_file_is_accepted_again_once_its_scan_has_finished(db_factory, deps, invited):
+    """Разобранный файл можно разобрать ещё раз, не закрывая сессию.
+
+    Защита от дубля ловила ЛЮБОЙ статус кроме `failed`, то есть и `done`, —
+    и на сессии, которая живёт неделями (а не «вечер», как предполагалось),
+    правило читалось буквально «файл, разобранный однажды, нельзя разобрать
+    никогда». Единственным выходом оставался `/new`, то есть разрыв истории
+    ради повтора одного файла.
+
+    Повтор безопасен, и не этой строкой: турнир переиспользуется
+    (`TournamentsRepo.find_in_session` ниже по тому же обработчику), а уже
+    сохранённые руки пропускают чекпоинты `_run_hh_scan`. Вторых `hands` и
+    второго турнира не появляется — появляется свежая сводка, за которой игрок
+    и пришёл.
+    """
+    first = await handle_document(
+        deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="t.txt"
+    )
+    async with db_factory() as session:
+        await session.execute(text("update jobs set status = 'done' where type = 'hh_scan'"))
+        await session.commit()
+
+    second = await handle_document(
+        deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="он-же.txt"
+    )
+
+    assert first == hh_accepted_msg()
+    assert second == hh_accepted_msg()
+    assert len(await fetch_all(db_factory, "select * from jobs")) == 2
+    assert len(await fetch_all(db_factory, "select * from tournaments")) == 1
+    assert len(await fetch_all(db_factory, "select * from sessions")) == 1
+
+
+async def test_a_file_whose_scan_is_still_running_is_not_queued_a_second_time(
+    db_factory, deps, invited
+):
+    """Вторая половина того же правила: пока скан В РАБОТЕ, повтор отклоняется.
+
+    Здесь отказ по делу — две задачи на один файл отработали бы подряд и
+    прислали две одинаковые сводки. Держать надо именно пару: тест только на
+    приём после `done` пропустил бы возврат к отказу «на всякий случай».
+    """
+    await handle_document(deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="t.txt")
+    async with db_factory() as session:
+        await session.execute(text("update jobs set status = 'running' where type = 'hh_scan'"))
+        await session.commit()
+
+    second = await handle_document(
+        deps, tg_user_id=_TG_USER_ID, file_bytes=_HH_BYTES, filename="он-же.txt"
+    )
+
+    assert second == hh_scan_in_progress_msg()
+    assert len(await fetch_all(db_factory, "select * from jobs")) == 1
 
 
 async def test_different_files_in_one_session_are_both_accepted(db_factory, deps, invited):

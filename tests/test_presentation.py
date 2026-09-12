@@ -26,6 +26,9 @@
 
 from __future__ import annotations
 
+import re
+
+from harness.analysis import analyze_hand
 from harness.contracts import (
     AllInEvent,
     AnalysisResult,
@@ -49,6 +52,7 @@ from harness.contracts import (
     VerdictTextOut,
     Zone,
 )
+from harness.contracts.enriched import hero_stack_delta_bb
 from harness.explanation import HandReplay, ReplaySpan
 from harness.presentation import (
     Btn,
@@ -57,17 +61,20 @@ from harness.presentation import (
     deep_dive_msg,
     escalation_msg,
     failed_msg,
+    hand_raw_data_msg,
     hh_accepted_msg,
-    hh_duplicate_msg,
+    hh_scan_in_progress_msg,
     new_session_msg,
     progress_text,
     quota_exceeded_msg,
+    scan_raw_data_msg,
     scan_summary_msg,
     start_msg,
     tournament_report_msg,
     tournament_story_msg,
     unsupported_document_msg,
 )
+from tests.test_hand_replay import _postflop_hand
 
 # --- progress_text -----------------------------------------------------------------
 
@@ -574,7 +581,7 @@ def test_entry_messages_are_plain_text_without_buttons():
     for msg in (
         start_msg(),
         hh_accepted_msg(),
-        hh_duplicate_msg(),
+        hh_scan_in_progress_msg(),
         bot_failure_msg(),
         unsupported_document_msg(),
         new_session_msg("Сессия 4 сен", previous_closed=True),
@@ -657,10 +664,17 @@ def test_new_session_msg_mentions_closing_only_when_something_was_closed():
 
 
 
-def test_hh_duplicate_msg_offers_a_way_out():
-    """Отказ от повторного разбора обязан назвать путь дальше — иначе игрок,
-    которому ДЕЙСТВИТЕЛЬНО нужен тот же турнир заново, упирается в тупик."""
-    assert "/new" in hh_duplicate_msg().text
+def test_the_in_progress_refusal_asks_to_wait_and_does_not_send_anyone_to_a_new_session():
+    """Отказ на время работы обязан обещать ответ, а не отправлять игрока прочь.
+
+    Прежний текст звал `/new`, потому что отклонял и УЖЕ РАЗОБРАННЫЙ файл: без
+    новой сессии тот же турнир нельзя было разобрать повторно вовсе. Теперь
+    повтор законченного скана просто принимается, и звать куда-либо не за чем —
+    ждать надо секунды.
+    """
+    text = hh_scan_in_progress_msg().text
+    assert "считаю" in text
+    assert "/new" not in text
 
 
 def test_bot_failure_msg_says_whose_side_it_is_without_the_reason():
@@ -2196,3 +2210,140 @@ def test_a_question_answer_never_calls_a_decision_a_mistake():
     texts.append(question_refusal_msg().text)
 
     assert not [text for text in texts if "ошиб" in text.lower()]
+
+
+# --- сырые данные: что посчитал код, с подписью у каждого числа -----------------------
+
+
+def test_the_raw_data_block_names_what_each_number_means():
+    """Число без подписи — не диагностика, а шум: «9.1» не говорит ничего, «конечный
+    банк 9.1 ББ» говорит всё. Тест держит ПОДПИСИ, а не числа: числа меняются от
+    раздачи к раздаче, а обещание «здесь сказано, что это значит» — нет.
+    """
+    en = _postflop_hand()
+    text = hand_raw_data_msg(en, analyze_hand(en)).text
+    for label in (
+        "Банк по улицам",
+        "Конечный банк",
+        "Стек героя",
+        "Точки решения",
+        "эфф. стек",
+        "Оценено точек",
+        "Сверка денег с источником",
+    ):
+        assert label in text, f"число печатается без подписи: нет «{label}»"
+
+
+def test_the_raw_data_block_prints_no_money_the_hand_does_not_contain():
+    """Ни одной выдуманной суммы (CLAUDE.md). Проверяются именно ДЕНЬГИ — числа
+    при «ББ»: номера точек, позиции и счётчики игроков деньгами не являются, и
+    сверять их с суммами раздачи значило бы проверять не то правило.
+    """
+    en = _postflop_hand()
+    hand = en.hand
+    allowed = {round(v / hand.bb, 1) for v in en.report.pot_by_street.values()}
+    allowed |= {round(en.report.final_pot / hand.bb, 1)}
+    allowed |= {round(p.stack / hand.bb, 1) for p in hand.players}
+    allowed |= {round(v / hand.bb, 1) for v in en.report.stacks_end.values()}
+    allowed |= {abs(round(hero_stack_delta_bb(en), 1))}
+    allowed |= {round(dp.to_call / hand.bb, 1) for dp in en.report.decision_points}
+    allowed |= {round(dp.pot_before / hand.bb, 1) for dp in en.report.decision_points}
+    allowed |= {round(dp.eff_stack / hand.bb, 1) for dp in en.report.decision_points}
+    allowed |= {round(dp.eff_stack_bb, 1) for dp in en.report.decision_points}
+    res = analyze_hand(en)
+    allowed |= {abs(round(p.ev_diff_bb, 1)) for p in res.points}
+    allowed |= {abs(round(res.total_ev_loss_bb, 1))}
+
+    text = hand_raw_data_msg(en, res).text
+    money = [float(n) for n in re.findall(r"(\d+(?:\.\d+)?)\s*ББ", text)]
+    assert money, "в блоке не осталось ни одной суммы — тест перестал что-либо значить"
+    assert set(money) <= allowed, f"выдуманные суммы: {set(money) - allowed}"
+
+
+def test_the_scan_raw_data_block_names_what_each_number_means():
+    """Та же подпись у чисел сводки турнира: «4» само по себе не значит ничего."""
+    summary = ScanSummary(
+        hands_total=7,
+        hands_with_decision=2,
+        items=[],
+        close_calls=[],
+        total_loss_bb=-1.5,
+        hands_failed=1,
+        points_total=19,
+        points_judged=3,
+    )
+    text = scan_raw_data_msg(summary).text
+    for label in (
+        "Раздач в файле",
+        "Раздач с оценённой точкой",
+        "Точек решения всего",
+        "Точек с вердиктом",
+        "Раздач не разобрано",
+    ):
+        assert label in text, f"число печатается без подписи: нет «{label}»"
+    assert "7" in text and "19" in text and "3" in text
+
+
+# --- дверь в разбор раздачи: кнопка под КАЖДОЙ рукой скана ----------------------------
+
+
+def _scan_of(hand_nos: list[str], items: list[ScanItem] | None = None) -> ScanSummary:
+    return ScanSummary(
+        hands_total=len(hand_nos),
+        hands_with_decision=len(items or []),
+        items=items or [],
+        close_calls=[],
+        total_loss_bb=0.0,
+        hands_failed=0,
+        points_total=len(hand_nos),
+        points_judged=0,
+        hand_nos=hand_nos,
+    )
+
+
+def test_a_hand_without_a_disagreement_still_has_a_way_into_its_analysis():
+    """Кнопка «разобрать» — дверь в раздачу, а не награда за найденное расхождение.
+
+    До этого теста кнопка ставилась ТОЛЬКО под строками списка расхождений. Файл,
+    в котором расчёт не взялся судить ни одной точки (движок v1 судит только
+    пуш-фолд), кнопок не получал вовсе — и разбор раздачи со всем, что в нём есть
+    (блок «Что было», числа расчёта), был из HH-входа недостижим в принципе, на
+    одной руке и на трёхстах одинаково.
+    """
+    msg = scan_summary_msg(_scan_of(["TM1"]), quota_left=1, quota_total=5)
+    assert "deep:TM1" in [b.callback_data for row in msg.buttons for b in row]
+
+
+def test_the_door_into_a_hand_is_offered_once_even_when_the_hand_is_in_the_list():
+    """Рука с расхождением уже несёт свою кнопку — второй такой же быть не должно.
+
+    Иначе под сводкой оказываются две одинаковые кнопки «разобрать» на одну
+    раздачу, и игрок обязан гадать, чем они отличаются (ничем).
+    """
+    item = ScanItem(
+        hand_no="TM1",
+        hand_index=0,
+        hero_class="AKo",
+        spot=SpotKind.PUSHFOLD_UNOPENED,
+        action_taken="fold",
+        best_action="shove",
+        ev_diff_bb=-1.2,
+        zone=Zone.STRICT,
+    )
+    msg = scan_summary_msg(_scan_of(["TM1", "TM2"], items=[item]), quota_left=1, quota_total=5)
+    data = [b.callback_data for row in msg.buttons for b in row]
+    assert data.count("deep:TM1") == 1
+    assert "deep:TM2" in data
+
+
+def test_the_door_prefix_matches_the_one_the_router_listens_to():
+    """`presentation` не импортирует роутер (правило зависимостей, CLAUDE.md), и
+    две копии строки «deep:» держатся рядом только этим тестом.
+
+    Разойдясь, они дали бы кнопку, на которую бот не отвечает ничем, кроме
+    «Эта кнопка не работает» из `on_unhandled_callback`.
+    """
+    from harness.bot.router import DEEP_DIVE_PREFIX
+    from harness.presentation.messages import _DEEP_PREFIX
+
+    assert _DEEP_PREFIX == DEEP_DIVE_PREFIX

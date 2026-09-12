@@ -113,6 +113,7 @@ from harness.contracts.calcs import (
     ThresholdResult,
     Window,
 )
+from harness.contracts.enriched import EnrichedHand
 from harness.contracts.explanation import TournamentTextOut, VerdictTextOut
 from harness.contracts.history import (
     MAX_NOTE_TEXT_CHARS,
@@ -123,9 +124,10 @@ from harness.contracts.history import (
     OpponentRecord,
     SessionLine,
     SessionSummary,
+    is_judged,
 )
 from harness.contracts.raw import Street
-from harness.explanation.hand_replay import HandReplay, chips
+from harness.explanation.hand_replay import HandReplay, bb, chips
 from harness.presentation.keyboards import (
     MAIN_MENU,
     MENU_LEAKS,
@@ -158,8 +160,8 @@ __all__ = [
     "gg_nickname_too_long_msg",
     "help_msg",
     "hh_accepted_msg",
-    "hh_duplicate_msg",
     "hh_prompt_msg",
+    "hh_scan_in_progress_msg",
     "invite_accepted_msg",
     "invite_created_msg",
     "invite_required_msg",
@@ -293,6 +295,17 @@ _MAX_RENDERED_SCAN_ITEMS = 20
 # ценность списка другая. Список расхождений говорит, ЧТО разобрать; список
 # «около нуля» говорит, что разбирать нечего, и десяти строк для этого хватает.
 _MAX_RENDERED_CLOSE_CALLS = 10
+
+# Сколько дверей в разбор показывать под сводкой. Предел ставит Телеграм (клавиатура
+# из сотен кнопок не приходит вовсе), а не аналитика: на файле в 318 рук кнопка под
+# каждой невозможна физически. Десять — столько же, сколько у решений около нуля:
+# оба списка существуют, чтобы дать игроку куда нажать, а не чтобы перечислить всё.
+_MAX_RENDERED_DOORS = 10
+
+# Префикс `callback_data` кнопки разбора. Дублирует `bot.router.DEEP_DIVE_PREFIX`
+# по букве, но не по зависимости: `presentation` не имеет права знать про роутер
+# (правило зависимостей, CLAUDE.md). Сходство держит тест, а не импорт.
+_DEEP_PREFIX = "deep:"
 
 # Что варьируется, когда мы говорим «по моделям»: в неоткрытом банке —
 # готовность стола отвечать на шов, против чужого шова — то, с какими руками
@@ -539,6 +552,24 @@ def scan_summary_msg(s: ScanSummary, quota_left: int, quota_total: int) -> Msg:
             )
         lines.append(f"{head}:")
         lines.extend(_close_call_line(item) for item in shown_close)
+
+    # Дверь в разбор — под КАЖДОЙ раздачей файла, а не только под теми, где нашлось
+    # расхождение (round 6). Движок v1 судит лишь пуш-фолд, поэтому на обычном
+    # файле список расхождений пуст — и вместе с ним прежде исчезала единственная
+    # кнопка `deep_dive_button` во всём продукте: разбор раздачи со всем, что в нём
+    # есть (блок «Что было», числа расчёта), был из HH-входа недостижим в принципе.
+    # Кнопка — дверь, а не награда за найденную ошибку
+    # (`test_a_hand_without_a_disagreement_still_has_a_way_into_its_analysis`).
+    already = {b.callback_data for row in buttons for b in row}
+    rest = [no for no in s.hand_nos if f"{_DEEP_PREFIX}{no}" not in already]
+    if rest:
+        shown_rest = rest[:_MAX_RENDERED_DOORS]
+        lines.append("")
+        head = "Разобрать раздачу"
+        if len(shown_rest) < len(rest):
+            head += f" (первые {len(shown_rest)} из {len(rest)})"
+        lines.append(f"{head}:")
+        buttons.extend([deep_dive_button(no)] for no in shown_rest)
 
     lines.append("")
     lines.append(f"Доступно: {_quota_line(quota_left, quota_total)}.")
@@ -1004,18 +1035,19 @@ def hh_accepted_msg() -> Msg:
     return Msg(text="Файл принят. Считаю префлоп-скан — пришлю сводку, когда закончу.")
 
 
-def hh_duplicate_msg() -> Msg:
-    """Тот же файл уже принят в эту сессию — считать второй раз незачем.
+def hh_scan_in_progress_msg() -> Msg:
+    """Тот же файл СЕЙЧАС считается — второй задачи на него не надо.
 
-    Называет и путь дальше (`/new`): игрок, который ДЕЙСТВИТЕЛЬНО хочет разобрать
-    тот же турнир заново, не должен упереться в тупик.
+    Отказ ровно на время работы, и не дольше. Прежняя версия отклоняла файл при
+    любом статусе кроме `failed`, то есть и после успешного разбора: на сессии,
+    которая живёт неделями, это означало «файл, разобранный однажды, нельзя
+    разобрать никогда», а выходом называла `/new` — разрыв истории ради повтора
+    одного файла. Повтор законченного скана безопасен (турнир переиспользуется,
+    сохранённые руки пропускают чекпоинты) и теперь просто принимается.
+
+    Про `/new` здесь молчим: ждать нужно секунды, а не начинать что-то новое.
     """
-    return Msg(
-        text=(
-            "Этот файл уже разбирается в текущей сессии — второй раз считать не буду. "
-            "Нужен свежий разбор того же турнира — начните новую сессию: /new."
-        )
-    )
+    return Msg(text="Этот файл сейчас считаю — подождите, пришлю сводку, как закончу.")
 
 
 def bot_failure_msg() -> Msg:
@@ -2370,3 +2402,124 @@ _WHAT_CAN_BE_COUNTED = (
     "• требуемую частоту защиты против ставки.\n\n"
     "Можно сузить вопрос позицией и вечером."
 )
+
+
+# --- сырые данные расчёта: диагностика владельцу ---------------------------------------
+
+
+def _raw_bb(value_chips: int, big_blind: int) -> str:
+    """Сумма в ББ с единицей. Формат общий с блоком «Что было» (`hand_replay.bb`),
+    а не вторая его копия: одна величина в двух местах одного сообщения обязана
+    округляться одинаково, иначе диагностика спорит сама с собой."""
+    return f"{bb(value_chips, big_blind)} ББ"
+
+
+def _raw_bb_value(value_bb: float) -> str:
+    """Готовая величина в ББ — знак и округление общие с продуктовым `_fmt_bb`.
+
+    Отличается от него ТОЛЬКО единицей: продукт пишет «bb», блок сырых данных —
+    «ББ», как весь блок «Что было» (спека §5.6). Смешивать две записи в одном
+    сообщении нельзя: читатель принимает их за разные величины.
+    """
+    return f"{_bb_number(value_bb)} ББ"
+
+
+def hand_raw_data_msg(en: EnrichedHand, res: AnalysisResult) -> Msg:
+    """Всё, что код посчитал по раздаче, с подписью у каждого числа.
+
+    Назначение — диагностика: увидеть вход разбора целиком, не открывая БД.
+    Поэтому здесь нет ни одной величины, которой не было бы в `EnrichedHand` или
+    `AnalysisResult`, и ни одного слова о качестве игры: судит `deep_dive_msg`,
+    а это сообщение только показывает числа, на которых он судил.
+
+    **Подпись обязательна у каждого числа** (`test_the_raw_data_block_names_what_
+    each_number_means`). «9.1» не говорит ничего, «конечный банк 9.1 ББ» говорит
+    всё; блок сырых чисел без подписей был бы не диагностикой, а шумом.
+
+    Отдельным сообщением, а не хвостом разбора: у `deep_dive_msg` бюджет 4096
+    символов, и при нехватке он режет прозу модели. Диагностика, вытесняющая
+    продуктовый текст, — плохой размен.
+    """
+    hand = en.hand
+    rep = en.report
+    lines = ["Сырые данные — то, что посчитал код.", ""]
+
+    lines.append(f"Раздача {hand.hand_no}, уровень {hand.level}, ББ {hand.bb} фишек.")
+    pots = " · ".join(
+        f"{_STREET_WORD.get(street, street.value).lower()} {_raw_bb(value, hand.bb)}"
+        for street, value in rep.pot_by_street.items()
+    )
+    lines.append(f"Банк по улицам (сколько лежало в банке к концу улицы): {pots}.")
+    lines.append(f"Конечный банк: {_raw_bb(rep.final_pot, hand.bb)}.")
+
+    hero = next((p for p in hand.players if p.label == hand.hero_label), None)
+    if hero is not None:
+        ended = rep.stacks_end.get(hand.hero_label)
+        tail = "" if ended is None else f" → {_raw_bb(ended, hand.bb)}"
+        lines.append(f"Стек героя (до раздачи{' → после' if ended is not None else ''}): "
+                     f"{_raw_bb(hero.stack, hand.bb)}{tail}.")
+
+    lines.append("")
+    lines.append(
+        f"Точки решения (развилки, где ходил герой): {len(rep.decision_points)}. "
+        f"Столбцы: улица · позиция · доставить · банк до хода · эфф. стек · SPR · "
+        f"живых за столом (из них ходят после вас)."
+    )
+    for dp in rep.decision_points:
+        spr = "—" if dp.spr is None else f"{dp.spr:.1f}"
+        lines.append(
+            f"{dp.index + 1}. {_STREET_WORD.get(dp.street, dp.street.value).lower()} · "
+            f"{dp.position} · доставить {_raw_bb(dp.to_call, hand.bb)} · "
+            f"банк {_raw_bb(dp.pot_before, hand.bb)} · "
+            f"эфф. стек {_raw_bb(dp.eff_stack, hand.bb)} · SPR {spr} · "
+            f"живых {dp.live_total} (после вас {dp.live_behind})"
+        )
+
+    lines.append("")
+    lines.append("Вердикты — что расчёт сказал по каждой точке.")
+    for point in res.points:
+        best = point.best_action or "не названо"
+        zone = "—" if point.zone is None else _ZONE_WORD.get(point.zone, str(point.zone))
+        lines.append(
+            f"{point.dp_index + 1}. спот {_spot_word(point.spot)} · "
+            f"сыграно {point.action_taken} · лучше {best} · зона {zone} · "
+            f"цена {_raw_bb_value(point.ev_diff_bb)}"
+        )
+    judged = sum(1 for point in res.points if is_judged(point))
+    lines.append(
+        f"Оценено точек: {judged} из {len(res.points)} — вердикт бывает только "
+        f"у пуш-фолд спотов, остальные расчёт не судит."
+    )
+    lines.append(
+        f"Сумма цены расхождений: {_raw_bb_value(res.total_ev_loss_bb)} — только по оценённым точкам."
+    )
+
+    lines.append("")
+    lines.append(f"Сверка денег с источником: {en.verdict.status.value}.")
+    if en.verdict.not_checked:
+        lines.append(f"Не проверено: {', '.join(en.verdict.not_checked)}.")
+    return Msg(text="\n".join(lines))
+
+
+def scan_raw_data_msg(s: ScanSummary) -> Msg:
+    """То же для файла турнира: числа сводки скана с подписью у каждого.
+
+    Ход раздачи сюда не входит — он свойство ОДНОЙ раздачи, а в файле их сотни
+    и ни одна не выделена (та же развилка, что держит `worker._hand_analysis_msg`).
+    """
+    return Msg(
+        text="\n".join(
+            [
+                "Сырые данные скана — то, что посчитал код.",
+                "",
+                f"Раздач в файле: {s.hands_total}.",
+                f"Раздач не разобрано (расчёт разошёлся с движком по деньгам): {s.hands_failed}.",
+                f"Раздач с оценённой точкой: {s.hands_with_decision}.",
+                f"Точек решения всего (развилок, где ходил герой): {s.points_total}.",
+                f"Точек с вердиктом: {s.points_judged} — остальные расчёт не судит.",
+                f"Суммарная цена расхождений: {_raw_bb_value(s.total_loss_bb)} — по оценённым точкам.",
+                f"Расхождений дороже порога показа: {len(s.items)}.",
+                f"Решений около нуля: {len(s.close_calls)}.",
+            ]
+        )
+    )

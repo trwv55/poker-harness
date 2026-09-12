@@ -123,6 +123,11 @@ def scan_tournament(enriched: list[EnrichedHand]) -> ScanSummary:
     points_total = 0
     points_judged = 0
     total_loss_bb = 0.0
+    # Номера разобранных рук — вход дверей в разбор (`presentation.scan_summary_msg`).
+    # Копятся здесь же, где считается покрытие, и по тому же правилу: рука,
+    # отвергнутая политикой отказа, в список не попадает — предлагать разбор
+    # раздачи, чьим числам мы сами не верим, было бы хуже, чем не предлагать.
+    hand_nos: list[str] = []
 
     for en in enriched:
         try:
@@ -139,6 +144,7 @@ def scan_tournament(enriched: list[EnrichedHand]) -> ScanSummary:
         # четыре остались без оценки.
         points_total += len(points)
         points_judged += len(judged)
+        hand_nos.append(en.hand.hand_no)
         total_loss_bb += total_ev_loss_bb(points)
 
         for point in judged:
@@ -171,4 +177,5 @@ def scan_tournament(enriched: list[EnrichedHand]) -> ScanSummary:
         hands_failed=hands_failed,
         points_total=points_total,
         points_judged=points_judged,
+        hand_nos=hand_nos,
     )

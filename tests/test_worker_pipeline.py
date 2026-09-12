@@ -58,6 +58,7 @@ from harness.contracts import (
     PointVerdict,
     Range,
     RawHand,
+    ScanSummary,
     SpotKind,
     Street,
     VerdictTextOut,
@@ -81,18 +82,20 @@ from harness.parsers.vision_adapter import reading_to_raw
 from harness.platform.config import Config
 from harness.platform.llm import LLM, LLMProviderError
 from harness.platform.queue import JobsQueue
-from harness.presentation import Msg, Photo, deep_dive_msg
+from harness.presentation import Msg, Photo, deep_dive_msg, scan_summary_msg
 from harness.worker import pipeline as pipeline_module
 from harness.worker.main import _payload, configure_logging
 from harness.worker.pipeline import (
     Deps,
     HandDataMissing,
     SourceFileUnavailable,
+    _hand_analysis_msg,
     _hand_zone,
     _public_failure_reason,
     run_job,
 )
 from tests.conftest import FIXTURE_DAILY, requires_fixtures, requires_prompts
+from tests.test_hand_replay import _postflop_hand
 
 # Тестовый `Config` — те же плейсхолдеры, что в `test_llm_facade.py`: `LLM` внутри
 # `Deps` собирается по-настоящему (тип `Deps.llm` — конкретный класс, не протокол),
@@ -2266,3 +2269,168 @@ async def test_a_question_without_a_calculation_shows_the_refusal_not_the_model(
     texts = _all_texts(fake_sender)
     assert any("нет расчёта" in text for text in texts)
     assert not [text for text in texts if "25% рук" in text]
+
+
+# --- развилка «Что было»: блок принадлежит разбору раздачи, не скану HH ---------------
+
+
+def test_a_hand_analysis_always_carries_the_what_happened_block():
+    """Разбор ОДНОЙ раздачи собирается единственной функцией, и она сама строит
+    реплей — забыть его нельзя, не удалив строку сознательно.
+
+    До этого теста оба пути разбора (скрин и кнопка «разобрать») звали
+    `deep_dive_msg` напрямую, а `replay` был необязательным аргументом со
+    значением `None`: новый путь, забывший его передать, молча терял блок и не
+    ронял ни одного теста.
+    """
+    enriched = _postflop_hand()
+    msg = _hand_analysis_msg(
+        analyze_hand(enriched),
+        enriched,
+        elapsed_s=3,
+        quota_left=1,
+        quota_total=5,
+        verdict=None,
+        stats=None,
+    )
+    assert "Что было" in msg.text
+
+
+def test_the_hh_scan_summary_never_carries_the_what_happened_block():
+    """Вторая сторона развилки, и держать надо именно пару: тест только на первую
+    пропустил бы «а давайте покажем ход раздачи и в сводке скана».
+
+    Ход раздачи — свойство ОДНОЙ раздачи. В файле турнира их сотни, и ни одна не
+    выделена; сводка называет руки номерами, а рассказывает про турнир.
+    """
+    summary = ScanSummary(
+        hands_total=1,
+        hands_with_decision=0,
+        items=[],
+        close_calls=[],
+        total_loss_bb=0.0,
+        hands_failed=0,
+        points_total=4,
+        points_judged=0,
+    )
+    assert "Что было" not in scan_summary_msg(summary, quota_left=1, quota_total=5).text
+
+
+# --- сырые данные расчёта: владельцу, не игроку ---------------------------------------
+
+
+async def _as_owner(db_factory, player_id: int) -> None:
+    async with db_factory() as session:
+        await session.execute(
+            text("update players set is_dev = true where id = :pid"), {"pid": player_id}
+        )
+        await session.commit()
+
+
+async def test_an_ordinary_player_never_sees_the_raw_numbers_of_the_calculation(
+    deps, queue, db_factory, fake_sender, tmp_path, monkeypatch
+):
+    """Сырые данные — диагностика владельца, и по умолчанию их не видит никто.
+
+    Держится тестом, а не намерением: блок собирается в `presentation` и
+    отправить его игроку — вопрос одной забытой проверки в воркере.
+    """
+    player_id, session_id = await _make_scope(db_factory)
+    await _with_nickname(db_factory, player_id)
+    _stub_vision(monkeypatch, _outcome(raw=_screenshot_raw()))
+    await _enqueue_screenshot(queue, tmp_path, player_id=player_id, session_id=session_id)
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    texts = _all_texts(fake_sender)
+    assert [text_ for text_ in texts if "⏱" in text_], "разбор не состоялся — тест ничего не значит"
+    assert not [text_ for text_ in texts if "Сырые данные" in text_]
+
+
+async def test_the_owner_gets_the_raw_numbers_beside_the_analysis(
+    deps, queue, db_factory, fake_sender, tmp_path, monkeypatch
+):
+    """Владельцу числа приходят ОТДЕЛЬНЫМ сообщением, а не хвостом разбора.
+
+    У разбора бюджет 4096 символов, и при нехватке он режет прозу модели
+    (`_fit_html`). Диагностика, вытесняющая продуктовый текст, — плохой размен:
+    сообщений два, и режется, если что, только второе.
+    """
+    player_id, session_id = await _make_scope(db_factory)
+    await _with_nickname(db_factory, player_id)
+    await _as_owner(db_factory, player_id)
+    _stub_vision(monkeypatch, _outcome(raw=_screenshot_raw()))
+    await _enqueue_screenshot(queue, tmp_path, player_id=player_id, session_id=session_id)
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    texts = _all_texts(fake_sender)
+    raw = [text_ for text_ in texts if "Сырые данные" in text_]
+    assert len(raw) == 1, "сырые данные владельцу не пришли или пришли дважды"
+    assert "Точки решения" in raw[0]
+    assert "Что было" not in raw[0], "ход раздачи живёт в разборе, а не в блоке чисел"
+
+
+_SYNTHETIC_HH = """Poker Hand #SYNTH1: Tournament #1, Synthetic Hold'em No Limit - \
+Level5(100/200(20)) - 2026/01/01 00:00:00
+Table 'S1' 3-max Seat #1 is the button
+Seat 1: Alice (2,000 in chips)
+Seat 2: Bob (2,000 in chips)
+Seat 3: Hero (2,000 in chips)
+Alice: posts the ante 20
+Bob: posts the ante 20
+Hero: posts the ante 20
+Bob: posts small blind 100
+Hero: posts big blind 200
+*** HOLE CARDS ***
+Dealt to Alice\x20
+Dealt to Bob\x20
+Dealt to Hero [Ah Kd]
+Alice: folds
+Bob: raises 500 to 600
+Hero: folds
+Uncalled bet (400) returned to Bob
+Bob collected 460 from pot
+*** SUMMARY ***
+Total pot 460 | Rake 0 | Jackpot 0 | Bingo 0 | Fortune 0 | Tax 0
+Seat 1: Alice (button) folded before Flop
+Seat 2: Bob (small blind) collected (460)
+Seat 3: Hero (big blind) folded before Flop
+"""
+"""Одна выдуманная раздача в формате GG: три места, герой пасует на рейз.
+
+Синтетика здесь законна ровно потому, что тест проверяет ОРКЕСТРАЦИЮ (кому
+воркер шлёт второе сообщение), а не качество разбора: про качество говорит
+регрессионная сетка на настоящих руках, и она гейтится `@requires_fixtures`.
+Настоящие hand history в репозиторий не кладутся (CLAUDE.md, публикация).
+"""
+
+
+async def test_the_owner_gets_the_raw_numbers_of_an_hh_scan_too(
+    deps, queue, db_factory, fake_sender, tmp_path
+):
+    """Скан файла — вторая половина задачи: числа турнира тоже с подписями.
+
+    Блока «Что было» здесь нет и быть не должно: ход раздачи — свойство ОДНОЙ
+    раздачи, а в файле их сотни и ни одна не выделена (та же развилка, что
+    держит `_hand_analysis_msg`).
+    """
+    player_id, session_id = await _make_scope(db_factory)
+    await _as_owner(db_factory, player_id)
+    source = tmp_path / "hand.txt"
+    source.write_text(_SYNTHETIC_HH, encoding="utf-8")
+    await enqueue_hh_scan(queue, source, player_id=player_id, session_id=session_id)
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    texts = _all_texts(fake_sender)
+    raw = [text_ for text_ in texts if "Сырые данные скана" in text_]
+    assert len(raw) == 1, "сырые данные скана владельцу не пришли или пришли дважды"
+    assert "Точек решения всего" in raw[0]
+    assert "Что было" not in "".join(texts), "ход раздачи в сводке турнира не печатается"

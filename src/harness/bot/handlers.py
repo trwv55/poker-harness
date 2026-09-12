@@ -82,7 +82,7 @@ from harness.presentation import (
     gg_nickname_saved_msg,
     gg_nickname_too_long_msg,
     hh_accepted_msg,
-    hh_duplicate_msg,
+    hh_scan_in_progress_msg,
     invite_accepted_msg,
     invite_created_msg,
     invite_required_msg,
@@ -175,6 +175,11 @@ UI_CALLBACK_PREFIXES: tuple[str, ...] = (
 
 # PokerCraft отдаёт историю раздач текстом; всё остальное сканировать нечем.
 _HH_SUFFIX = ".txt"
+
+# Статусы задачи скана, при которых файл СЧИТАЕТСЯ прямо сейчас. `done` и
+# `failed` сюда не входят намеренно: законченный скан повтору не мешает, а
+# провалившийся повтором и лечится.
+_SCAN_IN_FLIGHT = frozenset({"queued", "running", "awaiting_user"})
 
 # Картинка, присланная документом («отправить без сжатия»), — тот же вход зрения,
 # что и фотография. Набор УЖЕ, чем понимает `platform/llm.py` (там ещё и GIF):
@@ -533,10 +538,17 @@ async def handle_document(
         session_row = await SessionsRepo(db).active_or_create(player.id)
         tournaments = TournamentsRepo(db)
 
+        # Отказ — только пока скан этого файла В РАБОТЕ. Две задачи на один файл
+        # отработали бы подряд и прислали две одинаковые сводки, поэтому вторую
+        # не заводим; но законченный скан повтору не помеха. Прежде отклонялся
+        # любой статус кроме `failed`, включая `done`, и на сессии, которая живёт
+        # неделями (а не «вечер», как предполагалось), правило означало «файл,
+        # разобранный однажды, нельзя разобрать никогда» — выходом оставался
+        # `/new`, то есть разрыв истории ради повтора одного файла.
         last_status = await JobsRepo(db).last_scan_status(session_row.id, source_file)
-        if last_status is not None and last_status != "failed":
+        if last_status in _SCAN_IN_FLIGHT:
             await db.commit()  # игрок/сессия могли быть заведены выше — это не откатываем
-            return hh_duplicate_msg()
+            return hh_scan_in_progress_msg()
 
         # Явная сверка с None, а не `... or ...`: `or` считает ложным и целый ноль,
         # а id турнира — число из последовательности, и молчаливая зависимость от

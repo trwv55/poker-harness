@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass
 from pathlib import Path
@@ -122,6 +122,7 @@ from harness.presentation import (
     escalation_msg,
     failed_msg,
     hand_in_progress_msg,
+    hand_raw_data_msg,
     not_a_hand_msg,
     note_nicks_for_hand,
     progress_text,
@@ -129,6 +130,7 @@ from harness.presentation import (
     question_refusal_msg,
     range_image_title,
     range_photos,
+    scan_raw_data_msg,
     scan_summary_msg,
     send_as_file_msg,
     tournament_report_msg,
@@ -379,6 +381,7 @@ async def _send_idempotent(
         "report_message_id",
         "story_message_id",
         "escalation_message_id",
+        "raw_data_message_id",
     ],
     chat_id: int,
     msg: Msg,
@@ -511,6 +514,42 @@ async def _chat_id(session: AsyncSession, player_id: int) -> int:
     return player.tg_user_id
 
 
+async def _is_owner(session: AsyncSession, player_id: int) -> bool:
+    """Владелец продукта (`players.is_dev`) — тот, кому положена диагностика.
+
+    Тот же флаг, что пускает `/invite` (`bot/handlers.py`), и намеренно ОДИН на
+    обе привилегии: второй признак «свой» разошёлся бы с первым на первом же
+    новом входе.
+    """
+    player = await session.get(Player, player_id)
+    return player is not None and player.is_dev
+
+
+async def _send_raw_data(
+    deps: Deps,
+    session: AsyncSession,
+    job: JobModel,
+    worker_id: str | None,
+    chat_id: int,
+    msg: Msg,
+) -> None:
+    """Сырые числа расчёта — ОТДЕЛЬНЫМ сообщением и только владельцу.
+
+    Отдельным, а не хвостом разбора: у сообщения разбора бюджет 4096 символов, и
+    при нехватке `_fit_html` режет прозу модели. Диагностика, вытесняющая
+    продуктовый текст, — плохой размен, поэтому сообщений два и режется только
+    второе (`test_the_owner_gets_the_raw_numbers_beside_the_analysis`).
+
+    Молчание для обычного игрока держится тестом, а не намерением
+    (`test_an_ordinary_player_never_sees_the_raw_numbers_of_the_calculation`):
+    отправить эти числа всем — вопрос одной забытой проверки.
+    """
+    if not await _is_owner(session, job.player_id):
+        return
+    await _send_idempotent(deps, session, job.id, worker_id, "raw_data_message_id", chat_id, msg)
+    await session.commit()
+
+
 async def _quota_numbers(session: AsyncSession, player_id: int) -> tuple[int, int]:
     """Числа для строки «разборов X/Y за 24ч» (спека §9: скользящее окно, SQL-счётчик
     интерактивных задач).
@@ -524,6 +563,44 @@ async def _quota_numbers(session: AsyncSession, player_id: int) -> tuple[int, in
     """
     quota = await QuotaRepo(session).check(player_id)
     return quota.left, quota.total
+
+
+def _hand_analysis_msg(
+    result: AnalysisResult,
+    enriched: EnrichedHand,
+    *,
+    elapsed_s: int,
+    quota_left: int,
+    quota_total: int,
+    verdict: VerdictTextOut | None,
+    stats: Mapping[str, PlayerStats] | None,
+) -> Msg:
+    """Сообщение разбора ОДНОЙ раздачи — единственное место, где оно собирается.
+
+    **Развилка блока «Что было» (спека §5.6).** Ход раздачи принадлежит разбору
+    раздачи и только ему: сюда заходят оба пути разбора (скриншот и кнопка
+    «разобрать»), а скан HH собирает `scan_summary_msg` и сюда не заходит вовсе.
+    В файле турнира раздач сотни и ни одна не выделена — реплей там не о чем.
+
+    Развилка держится тем, что реплей строится ЗДЕСЬ, а не приходит аргументом
+    (`test_a_hand_analysis_always_carries_the_what_happened_block`, парный ему
+    `test_the_hh_scan_summary_never_carries_the_what_happened_block`). Прежде оба
+    пути звали `deep_dive_msg` напрямую, где `replay` — необязательный аргумент
+    со значением `None`: путь, забывший его передать, молча терял блок и не
+    ронял ни одного теста. Аргументом осталось только то, что у путей РАЗНОЕ:
+    `stats` (у скриншота нет турнира, а значит и частот).
+    """
+    return deep_dive_msg(
+        result,
+        elapsed_s,
+        _hand_zone(result, enriched.verdict.not_checked),
+        quota_left,
+        quota_total,
+        verdict=verdict,
+        replay=hand_replay(enriched, stats=stats),
+        not_checked=enriched.verdict.not_checked,
+        note_nicks=note_nicks_for_hand(enriched.hand),
+    )
 
 
 async def _tournament_stats(
@@ -720,6 +797,7 @@ async def _run_hh_scan(job: JobModel, deps: Deps, trace: Trace) -> None:
         msg = scan_summary_msg(summary, quota_left, quota_total)
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
         await session.commit()
+        await _send_raw_data(deps, session, job, worker_id, chat_id, scan_raw_data_msg(summary))
 
 
 # --- станция explain: слова поверх посчитанного (задача 21) -------------------------
@@ -1164,20 +1242,20 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
                 await session.commit()
 
         quota_left, quota_total = await _quota_numbers(session, job.player_id)
-        replay = hand_replay(enriched, stats=None)  # скрин: одна рука, знаменателя нет
-        msg = deep_dive_msg(
+        msg = _hand_analysis_msg(
             result,
-            round(deps.clock() - started_at),
-            _hand_zone(result, enriched.verdict.not_checked),
-            quota_left,
-            quota_total,
+            enriched,
+            elapsed_s=round(deps.clock() - started_at),
+            quota_left=quota_left,
+            quota_total=quota_total,
             verdict=verdict,
-            replay=replay,
-            not_checked=enriched.verdict.not_checked,
-            note_nicks=note_nicks_for_hand(enriched.hand),
+            stats=None,  # скрин: турнира нет, а значит нет и знаменателя частот
         )
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
         await session.commit()
+        await _send_raw_data(
+            deps, session, job, worker_id, chat_id, hand_raw_data_msg(enriched, result)
+        )
         await _send_range_photos(
             deps,
             session,
@@ -1255,26 +1333,21 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
                 )
                 await session.commit()
 
-        elapsed_s = round(deps.clock() - started_at)
-        zone = _hand_zone(result, hand.enriched.verdict.not_checked)
         quota_left, quota_total = await _quota_numbers(session, job.player_id)
-        replay = hand_replay(
-            hand.enriched,
-            stats=await _tournament_stats(session, hand.tournament_id),
-        )
-        msg = deep_dive_msg(
+        msg = _hand_analysis_msg(
             result,
-            elapsed_s,
-            zone,
-            quota_left,
-            quota_total,
+            hand.enriched,
+            elapsed_s=round(deps.clock() - started_at),
+            quota_left=quota_left,
+            quota_total=quota_total,
             verdict=verdict,
-            replay=replay,
-            not_checked=hand.enriched.verdict.not_checked,
-            note_nicks=note_nicks_for_hand(hand.enriched.hand),
+            stats=await _tournament_stats(session, hand.tournament_id),
         )
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
         await session.commit()
+        await _send_raw_data(
+            deps, session, job, worker_id, chat_id, hand_raw_data_msg(hand.enriched, result)
+        )
         await _send_range_photos(
             deps,
             session,
