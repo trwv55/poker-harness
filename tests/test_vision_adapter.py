@@ -47,7 +47,6 @@ from harness.parsers.vision_adapter import (
 )
 from harness.parsers.vision_checks import (
     CHECK_BUTTON,
-    CHECK_CARDS,
     CHECK_EQUITY,
     CHECK_HERO,
     CHECK_POT,
@@ -89,9 +88,9 @@ def export_reading(**over) -> VisionReading:
         "pot_unit": Unit.BB,
         "board": ["6h", "9h", "Ah", "Jc", "2d"],
         "players": [
-            _player("N3", 17.51, cards_in_log=["Tc", "Th"], equity_shown_pct=57.28),
+            _player("N3", 17.51, cards_at_seat=["Tc", "Th"], equity_shown_pct=57.28),
             _player("N4", 14.89),
-            _player("N5", 0.0, cards_in_log=["Ks", "Ad"], equity_shown_pct=42.72),
+            _player("N5", 0.0, cards_at_seat=["Ks", "Ad"], equity_shown_pct=42.72),
             _player("N6", 33.09),
             _player("N7", 60.85),
             _player("N8", 2.66, has_button=True),
@@ -109,28 +108,26 @@ def export_reading(**over) -> VisionReading:
             SeenAction(
                 street=Street.PREFLOP,
                 nickname="N3",
-                position="UTG",
                 kind=ActionKind.RAISE,
                 to_amount=32.14,
                 is_all_in=True,
             ),
             SeenAction(
-                street=Street.PREFLOP, nickname="N4", position="UTG+1", kind=ActionKind.FOLD
+                street=Street.PREFLOP, nickname="N4", kind=ActionKind.FOLD
             ),
             SeenAction(
                 street=Street.PREFLOP,
                 nickname="N5",
-                position="MP",
                 kind=ActionKind.CALL,
                 amount=14.62,
                 is_all_in=True,
             ),
             SeenAction(
-                street=Street.PREFLOP, nickname="N6", position="MP+1", kind=ActionKind.FOLD
+                street=Street.PREFLOP, nickname="N6", kind=ActionKind.FOLD
             ),
-            SeenAction(street=Street.PREFLOP, nickname="N7", position="CO", kind=ActionKind.FOLD),
-            SeenAction(street=Street.PREFLOP, nickname="N8", position="BTN", kind=ActionKind.FOLD),
-            SeenAction(street=Street.PREFLOP, nickname="N1", position="SB", kind=ActionKind.FOLD),
+            SeenAction(street=Street.PREFLOP, nickname="N7", kind=ActionKind.FOLD),
+            SeenAction(street=Street.PREFLOP, nickname="N8", kind=ActionKind.FOLD),
+            SeenAction(street=Street.PREFLOP, nickname="N1", kind=ActionKind.FOLD),
             SeenAction(street=Street.PREFLOP, kind=ActionKind.FOLD),  # строка героя — без подписи
         ],
         "showdown_seen": True,
@@ -201,19 +198,29 @@ def test_the_seating_is_rebuilt_from_the_order_of_the_preflop_log():
     assert raw.seats[-1].label == "S8"
 
 
-def test_the_dealer_chip_is_checked_against_the_seating_and_not_trusted_alone():
-    """Фишка дилера — второе прочтение той же рассадки, и оно сверяется (реестр D3)."""
-    _raw, checks = built()
-    button = next(c for c in checks if c.name == CHECK_BUTTON)
-    assert button.passed
+def test_the_seating_is_anchored_on_the_small_blind_and_not_on_a_dealer_chip():
+    """Кнопку не читаем вовсе: малый блайнд сидит следом за ней, этого достаточно.
 
-    moved = export_reading(
-        players=[
-            p.model_copy(update={"has_button": p.nickname == "N7"})
-            for p in export_reading().players
-        ]
+    Решение владельца 2026-09-12. Фишка дилера была третьим кубиком — обе
+    проверенные модели ставили её не тому игроку (Qwen в 8 прогонах из 10), — а
+    сверять её стало не с чем: вторая сторона сверки и есть то, что мы считаем
+    сами. Здесь закреплено, что рассадка от блайнда собирается верно, и что её
+    отсутствие НЕ выдумывается: без опознанного блайнда круг не складывается.
+    """
+    raw, _checks = built()
+    assert raw.vision is not None
+    # Круг начинается с малого блайнда: он же первое место, он же N1 в фикстуре.
+    assert raw.vision.nicknames["S1"] == "N1"
+    assert raw.seats[0].label == "S1"
+
+    blind_lost = export_reading(
+        blinds_block=[
+            post for post in export_reading().blinds_block
+            if post.label.strip().casefold() not in {"sb", "мб"}
+        ],
+        actions=[],
     )
-    _raw2, checks2 = reading_to_raw(moved, hero_nickname=HERO_NICK, source_ref="s")
+    _raw2, checks2 = reading_to_raw(blind_lost, hero_nickname=HERO_NICK, source_ref="s")
     assert not next(c for c in checks2 if c.name == CHECK_BUTTON).passed
 
 
@@ -265,7 +272,7 @@ def test_all_four_checksums_pass_on_a_correctly_read_screen():
     checks = run_checks(export_reading(), raw, hero_check, extra)
     failed = [c.name for c in checks if not c.passed]
     assert failed == [], [c.detail for c in checks if not c.passed]
-    assert {CHECK_POT, CHECK_CARDS, CHECK_EQUITY, CHECK_HERO} <= {c.name for c in checks}
+    assert {CHECK_POT, CHECK_EQUITY, CHECK_HERO} <= {c.name for c in checks}
 
 
 def test_a_missing_ante_pool_is_caught_by_the_pot_checksum():
@@ -344,9 +351,9 @@ def test_a_suit_misread_under_the_win_banner_is_caught_by_the_equity_oracle():
 
     misread = export_reading(
         players=[
-            _player("N3", 17.51, cards_in_log=["Tc", "Th"], equity_shown_pct=57.28),
+            _player("N3", 17.51, cards_at_seat=["Tc", "Th"], equity_shown_pct=57.28),
             _player("N4", 14.89),
-            _player("N5", 0.0, cards_in_log=["Kd", "Ad"], equity_shown_pct=42.72),
+            _player("N5", 0.0, cards_at_seat=["Kd", "Ad"], equity_shown_pct=42.72),
             _player("N6", 33.09),
             _player("N7", 60.85),
             _player("N8", 2.66, has_button=True),
@@ -358,17 +365,6 @@ def test_a_suit_misread_under_the_win_banner_is_caught_by_the_equity_oracle():
     _hero, hero_check = match_hero(HERO_NICK, _nicknames(misread))
     equity = next(c for c in run_checks(misread, raw, hero_check, extra) if c.name == CHECK_EQUITY)
     assert not equity.passed
-
-
-def test_the_two_card_renderings_are_compared_and_a_disagreement_is_named():
-    from harness.parsers.vision_checks import cards_check
-
-    check = cards_check({"N5": ["Ks", "Ad"]}, {"N5": ["Kh", "Ad"]})
-    assert not check.passed
-    assert check.options == ["Ks Ad", "Kh Ad"]
-
-
-# --- герой -------------------------------------------------------------------
 
 
 def test_the_hero_is_found_by_the_profile_nickname_not_by_the_model():
@@ -627,7 +623,7 @@ def test_a_showdown_with_an_unread_card_is_named_as_completed_by_the_engine():
 
     hidden = export_reading(
         players=[
-            p.model_copy(update={"cards_in_log": [], "cards_at_seat": []})
+            p.model_copy(update={"cards_at_seat": []})
             if p.nickname == "N5"
             else p
             for p in export_reading().players
@@ -665,7 +661,7 @@ def test_the_payout_check_catches_a_showdown_decided_on_completed_cards():
     """
     hidden = export_reading(
         players=[
-            p.model_copy(update={"cards_in_log": [], "cards_at_seat": []})
+            p.model_copy(update={"cards_at_seat": []})
             if p.nickname == "N5"
             else p
             for p in export_reading().players
@@ -717,43 +713,27 @@ def _named_checks(reading: VisionReading) -> dict[str, bool]:
     return {c.name: c.passed for c in run_checks(reading, raw, hero_check, extra)}
 
 
-def test_a_phantom_actor_is_caught_by_the_table_size_and_by_the_printed_positions():
-    """Два дешёвых чека ловят лишнего участника раньше всех денежных сверок.
+def test_a_phantom_actor_is_caught_by_the_table_size():
+    """Размер стола ловит лишнего участника раньше всех денежных сверок.
 
     Ни банк, ни кнопка, ни эквити его не замечают: все три считаются по одному и
-    тому же неверному чтению — слепой угол D4 реестра. Метки позиций и размер
-    стола — независимые от него сигналы (ревью раунда 1, E).
+    тому же неверному чтению — слепой угол D4 реестра.
+
+    **Сигнал остался один.** Вторым была сверка напечатанных позиций, и она
+    убрана решением владельца 2026-09-12 (замер: валилась в каждом прогоне у
+    обеих проверенных моделей). Защита от фантомного участника тем самым
+    ополовинена осознанно, и это записано здесь, а не забыто.
     """
-    from harness.parsers.vision_checks import CHECK_POSITIONS, CHECK_SEATS
+    from harness.parsers.vision_checks import CHECK_SEATS
 
-    checks = _named_checks(_with_phantom_actor())
-    assert checks[CHECK_SEATS] is False
-    assert checks[CHECK_POSITIONS] is False
+    assert _named_checks(_with_phantom_actor())[CHECK_SEATS] is False
 
 
-def test_both_new_checks_stay_quiet_on_a_correctly_read_screen():
+def test_the_table_size_check_stays_quiet_on_a_correctly_read_screen():
     """Проверка, срабатывающая на верном чтении, — не проверка, а шум."""
-    from harness.parsers.vision_checks import CHECK_POSITIONS, CHECK_SEATS
+    from harness.parsers.vision_checks import CHECK_SEATS
 
-    checks = _named_checks(export_reading())
-    assert checks[CHECK_SEATS] is True
-    assert checks[CHECK_POSITIONS] is True
-
-
-def test_the_printed_positions_are_compared_and_not_merely_stored():
-    """Обещание контракта «код сверяет напечатанную метку» обязано быть правдой.
-
-    До ревью раунда 1 метка попадала только в `raw_line` и не сверялась ни с чем.
-    """
-    from harness.parsers.vision_checks import CHECK_POSITIONS
-
-    shifted = export_reading(
-        actions=[
-            a.model_copy(update={"position": "CO"}) if a.position == "UTG" else a
-            for a in export_reading().actions
-        ]
-    )
-    assert _named_checks(shifted)[CHECK_POSITIONS] is False
+    assert _named_checks(export_reading())[CHECK_SEATS] is True
 
 
 def test_the_table_size_check_is_silent_when_the_header_was_not_read():
@@ -788,39 +768,6 @@ def test_confirming_the_shown_pot_does_not_close_a_dispute_it_does_not_settle():
     agreeing = apply_vision_answer(raw, "pot", f"{contributions_bb(raw):.2f}")
     assert agreeing is not None and agreeing.vision is not None
     assert [c.passed for c in agreeing.vision.checks] == [True]
-
-
-def test_a_position_label_that_cannot_occur_in_this_ring_is_reported_not_failed():
-    """Метка, которой в круге этого стола не бывает, ничего не доказывает (F3).
-
-    Словарь позиций у рума и у нормалайзера совпадает не весь, и набор меток
-    зависит от числа мест. Роняя сверку на неопознанной метке, мы измеряли бы
-    полноту своей таблицы соответствий, а не чтение.
-    """
-    from harness.parsers.vision_checks import positions_check
-
-    check = positions_check({"N1": "MP+2"}, {"N1": "LJ", "N2": "HJ"})
-    assert check.passed
-    assert "не сопоставимо" in check.detail
-
-    both = positions_check({"N1": "MP+2", "N2": "LJ"}, {"N1": "LJ", "N2": "HJ"})
-    assert not both.passed  # сопоставимая метка всё-таки сравнивается
-    assert "не сопоставимо" in both.detail
-
-
-def test_the_room_middle_position_labels_are_only_aliased_where_measured():
-    """`MP`/`MP+1` наблюдались на 8-max; на других размерах соответствие не измерено.
-
-    На шестимаксе у нормалайзера нет `LJ` вовсе, и безусловный алиас ронял бы
-    сверку на каждом таком экспорте.
-    """
-    from harness.parsers.vision_adapter import _aliased_position
-
-    assert _aliased_position("MP", 8) == "LJ"
-    assert _aliased_position("MP", 6) == "MP"  # не опознано — и не сравнивается
-    for seats in (6, 8):
-        assert _aliased_position("ББ", seats) == "BB"
-        assert _aliased_position("МБ", seats) == "SB"
 
 
 def test_an_answer_off_by_exactly_the_tolerance_closes_the_dispute():
@@ -875,11 +822,11 @@ def _three_way_all_in(**over) -> VisionReading:
     return export_reading(
         board=["6s", "4h", "Jc", "Qh", "8d"],
         players=over.pop("players", None) or [
-            _player("N3", 0.0, cards_in_log=["Ad", "Kd"], equity_shown_pct=38.18),
+            _player("N3", 0.0, cards_at_seat=["Ad", "Kd"], equity_shown_pct=38.18),
             _player("N4", 14.89),
-            _player("N5", 0.0, cards_in_log=["Ah", "Kc"], equity_shown_pct=34.67),
+            _player("N5", 0.0, cards_at_seat=["Ah", "Kc"], equity_shown_pct=34.67),
             _player("N6", 33.09),
-            _player("N7", 0.0, cards_in_log=["As", "7d"], equity_shown_pct=27.14),
+            _player("N7", 0.0, cards_at_seat=["As", "7d"], equity_shown_pct=27.14),
             _player("N8", 2.66, has_button=True),
             _player("N1", 11.58),
             _player(HERO_NICK, 12.52, cards_at_seat=["8c", "3h"]),
@@ -888,35 +835,32 @@ def _three_way_all_in(**over) -> VisionReading:
             SeenAction(
                 street=Street.PREFLOP,
                 nickname="N3",
-                position="UTG",
                 kind=ActionKind.RAISE,
                 to_amount=32.14,
                 is_all_in=True,
             ),
             SeenAction(
-                street=Street.PREFLOP, nickname="N4", position="UTG+1", kind=ActionKind.FOLD
+                street=Street.PREFLOP, nickname="N4", kind=ActionKind.FOLD
             ),
             SeenAction(
                 street=Street.PREFLOP,
                 nickname="N5",
-                position="MP",
                 kind=ActionKind.CALL,
                 amount=32.14,
                 is_all_in=True,
             ),
             SeenAction(
-                street=Street.PREFLOP, nickname="N6", position="MP+1", kind=ActionKind.FOLD
+                street=Street.PREFLOP, nickname="N6", kind=ActionKind.FOLD
             ),
             SeenAction(
                 street=Street.PREFLOP,
                 nickname="N7",
-                position="CO",
                 kind=ActionKind.CALL,
                 amount=32.14,
                 is_all_in=True,
             ),
-            SeenAction(street=Street.PREFLOP, nickname="N8", position="BTN", kind=ActionKind.FOLD),
-            SeenAction(street=Street.PREFLOP, nickname="N1", position="SB", kind=ActionKind.FOLD),
+            SeenAction(street=Street.PREFLOP, nickname="N8", kind=ActionKind.FOLD),
+            SeenAction(street=Street.PREFLOP, nickname="N1", kind=ActionKind.FOLD),
             SeenAction(street=Street.PREFLOP, kind=ActionKind.FOLD),
         ],
         winners=[SeenWin(nickname="N3", amount=98.62, unit=Unit.BB)],
@@ -935,11 +879,11 @@ def test_a_suit_misread_in_a_three_way_all_in_is_still_caught():
 
     misread = _three_way_all_in(
         players=[
-            _player("N3", 0.0, cards_in_log=["Ad", "Kd"], equity_shown_pct=38.18),
+            _player("N3", 0.0, cards_at_seat=["Ad", "Kd"], equity_shown_pct=38.18),
             _player("N4", 14.89),
-            _player("N5", 0.0, cards_in_log=["Ah", "Kd"], equity_shown_pct=34.67),
+            _player("N5", 0.0, cards_at_seat=["Ah", "Kd"], equity_shown_pct=34.67),
             _player("N6", 33.09),
-            _player("N7", 0.0, cards_in_log=["As", "7d"], equity_shown_pct=27.14),
+            _player("N7", 0.0, cards_at_seat=["As", "7d"], equity_shown_pct=27.14),
             _player("N8", 2.66, has_button=True),
             _player("N1", 11.58),
             _player(HERO_NICK, 12.52, cards_at_seat=["8c", "3h"]),
@@ -949,3 +893,32 @@ def test_a_suit_misread_in_a_three_way_all_in_is_still_caught():
     _hero, hero_check = match_hero(HERO_NICK, _nicknames(misread))
     equity = next(c for c in run_checks(misread, raw, hero_check, extra) if c.name == CHECK_EQUITY)
     assert not equity.passed
+
+
+def test_one_printed_equity_on_a_three_way_all_in_is_still_checked_against_three_hands():
+    """Экран печатает долю не у всех — считать всё равно надо на всех вскрытых.
+
+    Измерено 2026-09-12: Sonnet читает процент только у героя, а вскрытых рук
+    три. Запасной вход оракула собирал из них ПАРУ и сравнивал трёхстороннюю
+    долю с посчитанной вдвоём — 27.14% против 25.40%, расхождение 1.74 п.п. на
+    экране, прочитанном ВЕРНО целиком. Это был тот же дефект, что чинился на
+    основном входе, спрятавшийся в запасном: допущение «участников ровно двое».
+    """
+    from harness.parsers.vision_adapter import run_checks
+
+    one_percent = _three_way_all_in(
+        players=[
+            _player("N3", 0.0, cards_at_seat=["Ad", "Kd"]),
+            _player("N4", 14.89),
+            _player("N5", 0.0, cards_at_seat=["Ah", "Kc"]),
+            _player("N6", 33.09),
+            _player("N7", 0.0, cards_at_seat=["As", "7d"], equity_shown_pct=27.14),
+            _player("N8", 2.66),
+            _player("N1", 11.58),
+            _player(HERO_NICK, 12.52, cards_at_seat=["8c", "3h"]),
+        ]
+    )
+    raw, extra = reading_to_raw(one_percent, hero_nickname=HERO_NICK, source_ref="s")
+    _hero, hero_check = match_hero(HERO_NICK, _nicknames(one_percent))
+    equity = next(c for c in run_checks(one_percent, raw, hero_check, extra) if c.name == CHECK_EQUITY)
+    assert equity.passed, equity.detail

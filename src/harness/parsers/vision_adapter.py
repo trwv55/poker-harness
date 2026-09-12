@@ -68,11 +68,8 @@ from harness.contracts import (
 from harness.parsers.vision_checks import (
     CHECK_BUTTON,
     POT_TOLERANCE_BB,
-    button_check,
-    cards_check,
     equity_check,
     match_hero,
-    positions_check,
     pot_check,
     seats_check,
     within_tolerance,
@@ -334,18 +331,26 @@ def _ring_from_seats(reading: VisionReading) -> list[str | None] | None:
     """Круг мест на живом столе: по нумерации мест, начиная со следующего за кнопкой.
 
     Логи улиц там не печатаются, и порядок хода взять неоткуда — остаётся
-    зрительный порядок мест по кругу плюс фишка дилера. Малый блайнд это
-    следующее место после кнопки (в хедз-апе — сама кнопка, и раскладку для него
-    делает нормалайзер).
+    зрительный порядок мест по кругу. Началом круга служит МАЛЫЙ БЛАЙНД, как и на
+    экспорте: фишку дилера мы больше не читаем (решение владельца 2026-09-12),
+    потому что кнопка выводится из блайндов арифметически — малый блайнд сидит
+    следом за ней. В хедз-апе малый блайнд и есть кнопка, и раскладку для него
+    делает нормалайзер.
+
+    `None` — круг не сложился: у кого-то нет номера места либо малый блайнд не
+    опознан. Тогда рассадку строить не из чего, и расхождение обязано дойти до
+    игрока, а не быть заполненным догадкой.
     """
     seated = [p for p in reading.players if p.seat is not None]
     if len(seated) != len(reading.players) or not seated:
         return None
-    ordered = sorted(seated, key=lambda p: p.seat or 0)
-    button = next((i for i, p in enumerate(ordered) if p.has_button), None)
-    if button is None:
+    sb_nick, _ = _blind_owner(reading, _SB_LABELS)
+    if sb_nick is None:
         return None
-    start = button if len(ordered) == 2 else (button + 1) % len(ordered)
+    ordered = sorted(seated, key=lambda p: p.seat or 0)
+    start = next((i for i, p in enumerate(ordered) if p.nickname == sb_nick), None)
+    if start is None:
+        return None
     return [ordered[(start + i) % len(ordered)].nickname for i in range(len(ordered))]
 
 
@@ -396,15 +401,16 @@ def _street_commits(
 
 
 def _cards(player: SeenPlayer) -> list[str]:
-    """Карты игрока для руки: из лога, если он их даёт, иначе из-под баннера.
+    """Карты игрока для руки — единственное прочтение, у места за столом.
 
-    Порядок предпочтения — вывод замера (реестр, «Карты отрисованы дважды»):
-    чистый рендер колонки лога читается безошибочно, карта у места бывает
-    перекрыта баннером WIN. Расхождение между этими двумя чтениями к этому
-    моменту уже названо отдельной контрольной суммой, и молчаливый выбор
-    лучшего источника её не подменяет.
+    Второго источника больше нет (решение владельца 2026-09-12): поле колонки
+    лога просило «независимое» наблюдение, которым оно не было, и расхождение
+    двух полей давало вопрос игроку в 12 прогонах из 13, ни разу не указав на
+    верное чтение. Карты теперь проверяет оракул эквити там, где рум напечатал
+    проценты (`vision_checks.equity_check`), а где не напечатал — ничто, и это
+    честнее ложной сверки.
     """
-    return player.cards_in_log or player.cards_at_seat
+    return player.cards_at_seat
 
 
 def reading_to_raw(
@@ -444,12 +450,6 @@ def reading_to_raw(
                 detail="рассадку не восстановить: лог префлопа не покрывает стол",
             )
         )
-    else:
-        marked = next((p.nickname for p in reading.players if p.has_button), None)
-        derived = ring[-1] if len(ring) > 2 else ring[0]
-        checks.append(
-            button_check(marked, hero_nickname if derived is None else derived)
-        )
 
     labels: dict[str | None, str] = {}
     for index, nickname in enumerate(ring, start=1):
@@ -459,11 +459,10 @@ def reading_to_raw(
 
     players_count = len(ring)
     ante_pool = _chips(reading.ante_pool_shown, reading.ante_unit, bb_chips)
-    ante_each = (
-        _chips(reading.ante_per_player_shown, reading.ante_unit, bb_chips)
-        if reading.ante_per_player_shown is not None
-        else (round(ante_pool / players_count) if players_count else 0)
-    )
+    # Подушевое анте считает КОД делением пула: на экране напечатан только пул
+    # («Все анте: N»), подушевого там нет нигде. Прежняя схема просила оба числа
+    # и получала одно, записанное дважды (решение владельца 2026-09-12).
+    ante_each = round(ante_pool / players_count) if players_count else 0
     _sb_nick, sb_shown = _blind_owner(reading, _SB_LABELS)
     _bb_nick, bb_shown = _blind_owner(reading, _BB_LABELS)
     blind_unit = next(
@@ -490,7 +489,7 @@ def reading_to_raw(
                 else None
             ),
             is_all_in=action.is_all_in,
-            raw_line=f"{action.position or ''} {action.kind.value}".strip(),
+            raw_line=action.kind.value,
         )
         for action in reading.actions
     ]
@@ -712,95 +711,47 @@ def _board_at_all_in(raw: RawHand) -> list[str]:
     return [card for s in _BOARD_AT_ALL_IN[street] for card in raw.boards.get(s, [])]
 
 
-def _showdown_pair(raw: RawHand) -> tuple[list[str], list[str]]:
-    """Две первые вскрытые руки — ЗАПАСНОЙ вход проверки эквити.
+def _equity_participants(
+    reading: VisionReading, raw: RawHand
+) -> list[tuple[list[str], float | None]]:
+    """Руки, над которыми рум считал напечатанные проценты, — вход оракула эквити.
 
-    Основной вход — игроки, чью долю подписал экран (`run_checks`): их бывает и
-    трое. Пара из вскрытия остаётся для экранов, где процент напечатан, а карты
-    читаются только из вскрытия, и там участников ровно двое.
+    Это НЕ «все, чью долю подписал экран»: измерено 2026-09-12, что на
+    трёхстороннем олл-ине модель читает процент только у героя, а считать всё
+    равно надо на всех участниках — доля в мультивее зависит от каждой руки.
+    Рука без подписанной доли в расчёт входит, но не сверяется: её карты влияют
+    на чужие доли, а своего числа с экрана у неё нет.
+
+    Это и НЕ «все, чьи карты вскрыты»: свои карты экспорт показывает герою даже
+    когда он сбросил, и лишняя рука в расчёте уводит все доли. Поэтому сбросившие
+    исключаются по уже РАЗМЕЧЕННЫМ действиям (`raw.actions`), а не по чтению: там
+    безымянная строка героя уже сопоставлена с его меткой.
     """
-    hands = [entry.cards for entry in raw.showdowns if len(entry.cards) == 2]
-    return (hands[0], hands[1]) if len(hands) >= 2 else ([], [])
-
-
-def _printed_positions(reading: VisionReading) -> dict[str, str]:
-    """Метки позиций, НАПЕЧАТАННЫЕ у строк лога, по нику — как прочитано."""
-    printed: dict[str, str] = {}
-    for action in reading.actions:
-        if action.nickname and action.position:
-            printed.setdefault(action.nickname, action.position.strip().upper())
-    return printed
-
-
-# Как GG подписывает позиции в логе против того, как их называет нормалайзер.
-# Эти три соответствия от размера стола не зависят: блайнды и кнопка есть в
-# любом круге.
-_GG_POSITION_ALIASES: dict[str, str] = {"ББ": "BB", "БТН": "BTN", "МБ": "SB"}
-
-# Середина стола подписана у рума иначе, и наблюдалось это только на 8-max
-# экспорте (реестр A3): там `MP`/`MP+1` стоят на местах, которые нормалайзер
-# зовёт `LJ`/`HJ`. На других размерах соответствие не измерено, поэтому там
-# метка остаётся неопознанной — и сверка её просто не сравнивает, а не роняет
-# (`vision_checks.positions_check`).
-_GG_POSITION_ALIASES_8MAX: dict[str, str] = {"MP": "LJ", "MP+1": "HJ"}
-
-
-def _aliased_position(label: str, seats: int) -> str:
-    """Метка рума в словаре нормалайзера — насколько соответствие измерено."""
-    if seats == 8 and label in _GG_POSITION_ALIASES_8MAX:
-        return _GG_POSITION_ALIASES_8MAX[label]
-    return _GG_POSITION_ALIASES.get(label, label)
-
-
-def _derived_positions(raw: RawHand) -> dict[str, str]:
-    """Позиции, ВОССТАНОВЛЕННЫЕ по кругу мест, по нику — вход сверки с печатью."""
-    from harness.normalizer import POSITIONS_BY_COUNT
-
-    order = POSITIONS_BY_COUNT.get(len(raw.seats))
-    if order is None or raw.vision is None:
-        return {}
-    by_label = dict(zip([seat.label for seat in raw.seats], order, strict=True))
-    return {
-        nickname: by_label[label]
-        for label, nickname in raw.vision.nicknames.items()
-        if label in by_label
+    labels = {
+        nickname: label for label, nickname in (raw.vision.nicknames if raw.vision else {}).items()
     }
+    shown = {
+        labels[p.nickname]: p.equity_shown_pct
+        for p in reading.players
+        if p.nickname in labels and p.equity_shown_pct is not None
+    }
+    folded = {action.label for action in raw.actions if action.kind is ActionKind.FOLD}
+    return [
+        (entry.cards, shown.get(entry.label))
+        for entry in raw.showdowns
+        if entry.label not in folded
+    ]
 
 
 def run_checks(
     reading: VisionReading, raw: RawHand, hero_check: VisionCheck, built: list[VisionCheck]
 ) -> list[VisionCheck]:
     """Все контрольные суммы по одному чтению — в порядке их доказательной силы."""
-    at_seat = {p.nickname or "": p.cards_at_seat for p in reading.players if p.cards_at_seat}
-    in_log = {p.nickname or "": p.cards_in_log for p in reading.players if p.cards_in_log}
-    hero_cards, villain_cards = _showdown_pair(raw)
-    # Участники олл-ина для оракула эквити — ВСЕ, чью долю экран подписал, а не
-    # первый из них: GG печатает долю каждого, и посчитанная на двоих доля
-    # трёхстороннего олл-ина расходится с экраном на десяток процентных единиц.
-    # Пара из вскрытия остаётся запасным входом для экранов, где процент
-    # напечатан, а карты читаются только из вскрытия.
-    equity_hands: list[tuple[list[str], float | None]] = [
-        (_cards(p), p.equity_shown_pct)
-        for p in reading.players
-        if p.equity_shown_pct is not None and len(_cards(p)) == 2
-    ]
-    if len(equity_hands) < 2:
-        shown_pct = next(
-            (p.equity_shown_pct for p in reading.players if p.equity_shown_pct is not None), None
-        )
-        equity_hero = equity_hands[0][0] if equity_hands else hero_cards
-        other = villain_cards if equity_hero == hero_cards else hero_cards
-        equity_hands = [(equity_hero, shown_pct), (other, None)]
-    printed = {
-        nick: _aliased_position(pos, len(raw.seats))
-        for nick, pos in _printed_positions(reading).items()
-    }
+    equity_hands = _equity_participants(reading, raw)
     return [
         hero_check,
         *built,
         seats_check(len(reading.players), reading.max_seats),
-        positions_check(printed, _derived_positions(raw)),
-        cards_check(at_seat, in_log),
         pot_check(
             (reading.pot_shown if reading.pot_unit is not Unit.CHIPS else None),
             contributions_bb(raw),

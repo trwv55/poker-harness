@@ -41,7 +41,7 @@ def test_a_misread_suit_shows_up_as_a_card_field_and_nothing_else():
     truth = _read()
     misread = _read(
         players=[
-            p.model_copy(update={"cards_in_log": ["Tc", "Td"]}) if p.nickname == "N3" else p
+            p.model_copy(update={"cards_at_seat": ["Tc", "Td"]}) if p.nickname == "N3" else p
             for p in export_reading().players
         ]
     )

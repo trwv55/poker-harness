@@ -144,24 +144,46 @@ def test_a_verdict_names_the_checks_it_could_not_run():
     assert named.not_checked == ["payouts"]
 
 
-def test_the_reading_keeps_the_two_card_renderings_apart():
-    """Карты у места и карты в логе — два независимых наблюдения, а не одно.
+def test_the_reading_asks_for_the_cards_once():
+    """Карты — ОДНО поле. Второе «независимое» наблюдение им не было.
 
-    Измерено (реестр, «Карты отрисованы дважды»): спрошенная один раз модель
-    схлопывает избыточность экрана и подставляет одно чтение в оба места.
+    Отмена решения о двойном чтении (владелец, 2026-09-12). Замер, который его
+    обосновал, сделан на ВЫРЕЗКЕ колонки лога; на полном экране модель либо
+    подставляла туда же, что у места, либо мусор — на тринадцати прогонах одного
+    экрана расхождение полей ни разу не указало на верное чтение, зато давало
+    вопрос игроку в двенадцати. Карты проверяет оракул эквити там, где рум
+    напечатал проценты; где не напечатал — ничто, и это честнее ложной сверки.
     """
     from harness.contracts import SeenPlayer
 
-    player = SeenPlayer(seat=1, cards_at_seat=["As", "5c"], cards_in_log=["As", "5s"])
-    assert player.cards_at_seat != player.cards_in_log
+    assert "cards_in_log" not in SeenPlayer.model_fields
+    assert SeenPlayer(seat=1, cards_at_seat=["As", "5s"]).cards_at_seat == ["As", "5s"]
 
 
-def test_the_reading_keeps_the_ante_pool_apart_from_the_per_player_ante():
-    """Пул анте и подушевое анте — разные поля: делит код, не модель (реестр B2)."""
+def test_the_reading_asks_for_the_printed_ante_only():
+    """Анте — ОДНО поле: на экране напечатан пул, подушевого там нет нигде.
+
+    Прежняя схема просила различить два числа, которых на экране одно («Все анте:
+    N»), и модель честно записывала напечатанное дважды. Это была ошибка схемы, а
+    не чтения (владелец, 2026-09-12, отмена реестра B2). Делит код —
+    `test_the_ante_pool_is_divided_by_the_code_not_by_the_model`.
+    """
     from harness.contracts import Unit, VisionReading
 
-    reading = VisionReading(ante_pool_shown=6800.0, ante_unit=Unit.CHIPS)
-    assert reading.ante_per_player_shown is None
+    assert "ante_per_player_shown" not in VisionReading.model_fields
+    assert VisionReading(ante_pool_shown=6800.0, ante_unit=Unit.CHIPS).ante_pool_shown == 6800.0
+
+
+def test_the_reading_does_not_ask_for_printed_positions():
+    """Напечатанной позиции в схеме нет: круг строит код по блайндам и порядку хода.
+
+    Метка под аватаром не добавляла независимого наблюдения — круг и так
+    восстанавливается из тех же строк лога, — зато добавляла поле, которое роняли
+    обе проверенные модели в каждом прогоне (владелец, 2026-09-12).
+    """
+    from harness.contracts import SeenAction
+
+    assert "position" not in SeenAction.model_fields
 
 
 def test_the_reading_can_refuse_a_screen_that_is_not_a_hand():
