@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from harness.contracts import (
     ActionKind,
     EnrichedHand,
+    PlayerStats,
     Post,
     PostKind,
     Provenance,
@@ -377,3 +378,38 @@ def test_a_measured_zero_cost_is_printed():
 
 def test_the_replay_without_a_cost_says_nothing_about_it():
     assert "Потеря" not in hand_replay(_postflop_hand()).plain
+
+
+# --- оппонент: метка и частоты ---------------------------------------------------------
+
+
+def test_an_opponent_carries_its_label_and_both_frequencies_once():
+    stats = {"P5": PlayerStats(hands=40, vpip=10, pfr=7)}
+    text = hand_replay(_postflop_hand(), stats=stats).plain
+    assert "CO (P5, VPIP 25%, PFR 18%) опен 2.5" in text
+    assert text.count("P5") == 1, "метка ставится один раз, не у каждого хода"
+
+
+def test_an_opponent_without_a_sample_carries_no_brackets():
+    """Скрин даёт одну руку, знаменателя нет. «VPIP 0%» никто не измерял;
+    пустая скобка не печатается вовсе."""
+    text = hand_replay(_postflop_hand(), stats={"P5": PlayerStats()}).plain
+    assert "VPIP" not in text and "(" not in text
+
+
+def test_a_measured_zero_is_printed_because_it_was_measured():
+    """У VPIP и PFR знаменатель ОБЩИЙ (`PlayerStats.hands`): появляются и
+    исчезают вместе. Ноль по сорока раздачам — измеренный."""
+    stats = {"P5": PlayerStats(hands=40, vpip=10, pfr=0)}
+    assert "VPIP 25%, PFR 0%" in hand_replay(_postflop_hand(), stats=stats).plain
+
+
+def test_a_frequency_rounds_half_up():
+    stats = {"P5": PlayerStats(hands=8, vpip=1, pfr=1)}  # 12.5%
+    assert "VPIP 13%, PFR 13%" in hand_replay(_postflop_hand(), stats=stats).plain
+
+
+def test_a_folding_opponent_gets_no_label():
+    """Слипшиеся фолды (`UTG/HJ фолд`) не несут ни метки, ни частот."""
+    stats = {"P3": PlayerStats(hands=40, vpip=10, pfr=7)}
+    assert "P3" not in hand_replay(_postflop_hand(), stats=stats).plain

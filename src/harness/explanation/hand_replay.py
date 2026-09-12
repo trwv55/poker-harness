@@ -24,7 +24,10 @@
   Точка решения героя при этом выделена (`spans`), то есть найти её в потоке
   можно без единого числа отсюда.
 * Ни одного числа, которого нет в руке: пришпилено
-  `test_the_replay_prints_no_number_the_hand_does_not_contain`.
+  `test_the_replay_prints_no_number_the_hand_does_not_contain`. Два числа
+  приходят аргументами и потому этому запрету не противоречат — цена решения
+  (`ev_loss_bb`) и префлоп-частоты оппонента (`stats`): обе величины посчитаны
+  снаружи, реплей их только печатает.
 
 **Форма — одна шапка и один абзац** (спека §5.6): позиция, карты и стек строкой,
 дальше ход раздачи прозой — действия через `→`, улицы разделены точкой, борд
@@ -49,6 +52,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from pydantic import BaseModel
 
 from harness.contracts import (
@@ -56,6 +61,7 @@ from harness.contracts import (
     CanonicalAction,
     CanonicalHand,
     EnrichedHand,
+    PlayerStats,
     Street,
 )
 
@@ -166,6 +172,29 @@ def _hero(hand: CanonicalHand):
     raise ValueError(f"в раздаче {hand.hand_no} нет места героя ({hand.hero_label})")
 
 
+def _half_up(pct: float) -> int:
+    """Половина — вверх: `:.0f` и `round` округляют банковски (12.5 → 12), и
+    правило нигде не было закреплено (`test_a_frequency_rounds_half_up`)."""
+    return int(pct + 0.5)
+
+
+def _opponent_mark(label: str, stats: Mapping[str, PlayerStats] | None) -> str:
+    """` (P5, VPIP 25%, PFR 18%)` — или пустая строка.
+
+    `vpip_pct`/`pfr_pct` возвращают `None` при `hands == 0`, и это единственно
+    честное поведение: «VPIP 0%» по нулю раздач никто не измерял. Знаменатель
+    у них общий, поэтому либо обе, либо ни одной; отдельной ветки «одна из
+    двух» нет — её не существует
+    (`test_an_opponent_without_a_sample_carries_no_brackets`).
+    """
+    if stats is None or label not in stats:
+        return ""
+    row = stats[label]
+    if row.vpip_pct is None or row.pfr_pct is None:
+        return ""
+    return f" ({label}, VPIP {_half_up(row.vpip_pct)}%, PFR {_half_up(row.pfr_pct)}%)"
+
+
 def _action_word(action: CanonicalAction, raise_ordinal: int) -> str:
     """Слово действия: рейзы на префлопе получают порядковое имя (опен, 3-бет)."""
     if action.is_all_in and action.kind in (ActionKind.BET, ActionKind.RAISE, ActionKind.CALL):
@@ -175,10 +204,28 @@ def _action_word(action: CanonicalAction, raise_ordinal: int) -> str:
     return _ACTION_WORD[action.kind]
 
 
-def _action_text(hand: CanonicalHand, action: CanonicalAction, raise_ordinal: int) -> str:
-    """Один ход: кто (позицией; герой — «вы»), что сделал и — у ставок — на сколько в ББ."""
+def _action_text(
+    hand: CanonicalHand,
+    action: CanonicalAction,
+    raise_ordinal: int,
+    stats: Mapping[str, PlayerStats] | None,
+    marked: set[str],
+) -> str:
+    """Один ход: кто (позицией; герой — «вы»), что сделал и — у ставок — на сколько в ББ.
+
+    Метка и частоты оппонента печатаются при его ПЕРВОМ ходе, дошедшем сюда, и
+    больше не повторяются: `marked` копит уже помеченных
+    (`test_an_opponent_carries_its_label_and_both_frequencies_once`). У героя
+    метки нет — к нему обращаются «вы».
+    """
     word = _action_word(action, raise_ordinal)
-    who = "вы" if action.label == hand.hero_label else _position(hand, action.label)
+    if action.label == hand.hero_label:
+        who = "вы"
+    else:
+        who = _position(hand, action.label)
+        if action.label not in marked:
+            who += _opponent_mark(action.label, stats)
+            marked.add(action.label)
     show_amount = action.is_all_in or action.kind in _ACTIONS_WITH_AMOUNT
     if not show_amount:
         return f"{who} {word}"
@@ -189,12 +236,19 @@ def _street_flow(
     hand: CanonicalHand,
     actions: list[tuple[int, CanonicalAction]],
     hero_decisions: set[int],
+    stats: Mapping[str, PlayerStats] | None,
+    marked: set[str],
 ) -> list[ReplaySpan]:
     """Поток действий улицы: шаги через `→`, слипшиеся фолды, выделенный герой.
 
     Подряд идущие пасы сливаются в один шаг (`UTG/HJ фолд`) — они одинаковы по
     смыслу и занимают место, которого у сообщения нет. Пас героя в слипание не
-    попадает: его решение обязано остаться видимым отдельно.
+    попадает: его решение обязано остаться видимым отдельно. Слипшийся пас не
+    доходит до `_action_text`, а значит и метки оппонента не несёт — у
+    пасующего сказать нечего (`test_a_folding_opponent_gets_no_label`).
+
+    `marked` живёт выше по стеку (`hand_replay`), потому что метка ставится
+    один раз на раздачу, а не один раз на улицу.
     """
     spans: list[ReplaySpan] = []
     folds: list[str] = []
@@ -219,7 +273,7 @@ def _street_flow(
             continue
         flush_folds()
         step(
-            _action_text(hand, action, raises_so_far),
+            _action_text(hand, action, raises_so_far, stats, marked),
             emphasis=is_hero and index in hero_decisions,
         )
     flush_folds()
@@ -274,13 +328,25 @@ def _showdown_line(hand: CanonicalHand) -> str | None:
     return f"Вскрытие: {' vs '.join(shown)}" if shown else None
 
 
-def hand_replay(en: EnrichedHand, *, ev_loss_bb: float | None = None) -> HandReplay:
+def hand_replay(
+    en: EnrichedHand,
+    *,
+    ev_loss_bb: float | None = None,
+    stats: Mapping[str, PlayerStats] | None = None,
+) -> HandReplay:
     """Реплей одной руки: шапка строкой, ход раздачи прозой одним абзацем.
 
     `ev_loss_bb` — `AnalysisResult.total_ev_loss_bb`; `None` значит «судимых
     точек нет», и фразы о потере не будет: нуля расчёт не выносил
     (`test_the_replay_without_a_cost_says_nothing_about_it`). Ноль при
     непустом `ranked` — измеренный и печатается.
+
+    `stats` — статистика мест по ключу `PlayerState.label` (тот же ключ, что у
+    `analysis.player_stats.player_stats_by_label`); её добывает вызывающий, и
+    правило зависимостей не нарушается — `explanation` не знает `memory`. У
+    оппонента, чья метка в словаре есть, при первом его ходе печатается скобка
+    с меткой и парой префлоп-частот
+    (`test_an_opponent_carries_its_label_and_both_frequencies_once`).
 
     Улица без ходов — прогон борда после олл-ина: печатается только борд, через
     ` · ` с соседними такими же (`test_a_run_out_street_prints_only_its_board`).
@@ -297,6 +363,7 @@ def hand_replay(en: EnrichedHand, *, ev_loss_bb: float | None = None) -> HandRep
     )
 
     decisions = _hero_decision_indices(en)
+    marked: set[str] = set()
     pot_before = _dead_before_deal(hand)
     quiet: list[str] = []
     first = True
@@ -325,7 +392,7 @@ def hand_replay(en: EnrichedHand, *, ev_loss_bb: float | None = None) -> HandRep
             spans.append(ReplaySpan(text=f"{sep()}{head}. "))
         else:
             spans.append(ReplaySpan(text=sep()))
-        flow = _street_flow(hand, actions, decisions)
+        flow = _street_flow(hand, actions, decisions, stats, marked)
         first_step = flow[0]
         flow[0] = first_step.model_copy(
             update={"text": first_step.text[:1].upper() + first_step.text[1:]}
