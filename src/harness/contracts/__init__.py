@@ -71,6 +71,7 @@ from harness.contracts.enriched import (
     SidePot,
     ValidationStatus,
     Verdict,
+    hero_stack_delta_bb,
 )
 from harness.contracts.explanation import (
     PointText,
@@ -224,6 +225,7 @@ __all__ = [
     "Zone",
     "all_classes",
     "class_of",
+    "hero_stack_delta_bb",
     "is_judged",
     "leak_rule_for",
     "leak_rule_of_point",

@@ -71,3 +71,35 @@ class EnrichedHand(BaseModel):
     hand: CanonicalHand
     report: EngineReport
     verdict: Verdict
+
+
+# Точность округления bb — та же, что у отчёта по турниру (`analysis.tournament.
+# _BB_PRECISION`): величина приходит делением фишек на bb, и двоичный хвост
+# деления не должен оседать в контракте.
+_DELTA_PRECISION = 6
+
+
+def hero_stack_delta_bb(en: EnrichedHand) -> float:
+    """Изменение стека героя за раздачу, в bb её уровня. Знак — его же.
+
+    Считается по стекам движка (`EngineReport.stacks_end`), а НЕ по строкам
+    выплат источника: движок проигрывает руку сам и записанным суммам не верит
+    (`engine.replay`, ARCHITECTURE.md). Расхождение между своим подсчётом и
+    источником обязано остаться видимым — оно и есть сигнал о битых данных.
+
+    Единственная формулировка на двух читателей: отчёт по турниру
+    (`analysis.tournament._delta_bb` — фишечное разбиение `EvSplit`) и блок
+    «Что было» (`explanation.hand_replay` — фраза исхода раздачи). Второй копии
+    формулы в системе быть не должно: разъехавшись, они дали бы игроку два
+    разных ответа на вопрос «сколько я потерял».
+
+    Отсутствие героя за столом — не пробел данных, а чужая раздача, и потому
+    исключение, а не ноль.
+    """
+    hand = en.hand
+    start = next(
+        (player.stack for player in hand.players if player.label == hand.hero_label), None
+    )
+    if start is None:
+        raise ValueError(f"в раздаче {hand.hand_no} нет места героя ({hand.hero_label})")
+    return round((en.report.stacks_end[hand.hero_label] - start) / hand.bb, _DELTA_PRECISION)

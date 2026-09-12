@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 
 from harness.contracts import (
     ActionKind,
+    Collected,
     EnrichedHand,
     PlayerStats,
     Post,
@@ -27,7 +28,9 @@ from harness.contracts import (
     SeatInfo,
     ShowdownEntry,
     Street,
+    Uncalled,
     ValidationStatus,
+    hero_stack_delta_bb,
 )
 from harness.engine import enrich
 from harness.explanation import hand_replay
@@ -357,6 +360,183 @@ def _river_fold_beside_a_showdown_hand() -> EnrichedHand:
     )
 
 
+def _folded_through_shove_hand() -> EnrichedHand:
+    """Рука владельца (2026-09-12) в синтетике: SB 24.6 ББ шовит, все пасуют.
+
+    Цифры взяты с его скрина: банк 8 800 при bb 3 000 — те самые 2.9 ББ, которые
+    блок обязан назвать. Сходятся они только так: 7 анте по 400 плюс большой
+    блайнд 3 000 плюс уравненные героем 3 000. Остальные 70 400 его шова
+    возвращаются непоколленной ставкой, и в банк не попадают.
+
+    Стол свой, не общий (`_SEATS`): общий не даёт ни этих блайндов, ни семи мест.
+    """
+    seats = [
+        SeatInfo(seat=1, label="Hero", stack=73_800),  # 24.6 ББ
+        *[SeatInfo(seat=n, label=f"P{n}", stack=100_000) for n in range(2, 8)],
+    ]
+    raw = RawHand(
+        provenance=Provenance.HAND_HISTORY,
+        source_ref="synthetic",
+        hand_no="SYN-SHOVE",
+        tournament_id="TSYN",
+        tournament_name="synthetic",
+        level=20,
+        sb=1_500,
+        bb=3_000,
+        ante=400,
+        timestamp=_START,
+        table_name="syn",
+        max_seats=8,
+        button_seat=7,
+        seats=seats,
+        posts=[Post(label=s.label, kind=PostKind.ANTE, amount=400) for s in seats]
+        + [
+            Post(label="Hero", kind=PostKind.SMALL_BLIND, amount=1_500),
+            Post(label="P2", kind=PostKind.BIG_BLIND, amount=3_000),
+        ],
+        dealt={"Hero": ["Ah", "Qs"]},
+        actions=[
+            *[_fold(f"P{n}") for n in (3, 4, 5, 6, 7)],
+            RawAction(
+                street=Street.PREFLOP,
+                label="Hero",
+                kind=ActionKind.RAISE,
+                to_amount=73_400,  # стек минус анте: больше поставить нечего
+                is_all_in=True,
+                raw_line="Hero: raises 71 900 to 73 400 and is all-in",
+            ),
+            _fold("P2"),
+        ],
+        uncalled=[Uncalled(label="Hero", amount=70_400)],
+        collected=[Collected(label="Hero", amount=8_800)],
+    )
+    return _enriched(raw)
+
+
+def _side_pot_loss_hand() -> EnrichedHand:
+    """Герой забирает сайд-пот, но за раздачу теряет: олл-ин UTG выигрывает мейн.
+
+    Ради знака фразы. У героя ЕСТЬ запись `collected` (380 фишек сайд-пота), а
+    стек всё равно уменьшился на 110 — потому что в мейн-пот он вложил 290 и
+    анте 10, а выиграл его не он. По записи выплат блок сказал бы «Забираете» на
+    проигранной раздаче; по стеку — «Отдаёте», и это правда.
+    """
+    seats = [
+        SeatInfo(seat=1, label="Hero", stack=1000),
+        SeatInfo(seat=2, label="P2", stack=5000),
+        SeatInfo(seat=3, label="P3", stack=300),  # короткий стек, олл-ин с UTG
+        SeatInfo(seat=4, label="P4", stack=5000),
+        SeatInfo(seat=5, label="P5", stack=5000),
+        SeatInfo(seat=6, label="P6", stack=5000),
+    ]
+    raw = RawHand(
+        provenance=Provenance.HAND_HISTORY,
+        source_ref="synthetic",
+        hand_no="SYN-SIDE",
+        tournament_id="TSYN",
+        tournament_name="synthetic",
+        level=12,
+        sb=50,
+        bb=100,
+        ante=10,
+        timestamp=_START,
+        table_name="syn",
+        max_seats=6,
+        button_seat=6,
+        seats=seats,
+        posts=[Post(label=s.label, kind=PostKind.ANTE, amount=10) for s in seats]
+        + [
+            Post(label="Hero", kind=PostKind.SMALL_BLIND, amount=50),
+            Post(label="P2", kind=PostKind.BIG_BLIND, amount=100),
+        ],
+        dealt={"Hero": ["Kh", "Ks"], "P3": ["Ah", "As"], "P5": ["Qh", "Qs"]},
+        actions=[
+            RawAction(
+                street=Street.PREFLOP,
+                label="P3",
+                kind=ActionKind.RAISE,
+                to_amount=290,  # весь стек за вычетом анте
+                is_all_in=True,
+                raw_line="P3: raises 190 to 290 and is all-in",
+            ),
+            _fold("P4"),
+            RawAction(
+                street=Street.PREFLOP,
+                label="P5",
+                kind=ActionKind.RAISE,
+                to_amount=480,
+                raw_line="P5: raises 190 to 480",
+            ),
+            _fold("P6"),
+            RawAction(
+                street=Street.PREFLOP,
+                label="Hero",
+                kind=ActionKind.CALL,
+                amount=430,
+                raw_line="Hero: calls 430",
+            ),
+            _fold("P2"),
+            *[
+                RawAction(
+                    street=street,
+                    label=label,
+                    kind=ActionKind.CHECK,
+                    raw_line=f"{label}: checks",
+                )
+                for street in (Street.FLOP, Street.TURN, Street.RIVER)
+                for label in ("Hero", "P5")
+            ],
+        ],
+        boards={
+            Street.FLOP: ["2c", "7d", "9h"],
+            Street.TURN: ["3s"],
+            Street.RIVER: ["4h"],
+        },
+        showdowns=[
+            ShowdownEntry(label="P3", cards=["Ah", "As"]),
+            ShowdownEntry(label="Hero", cards=["Kh", "Ks"]),
+            ShowdownEntry(label="P5", cards=["Qh", "Qs"]),
+        ],
+        collected=[Collected(label="P3", amount=1030), Collected(label="Hero", amount=380)],
+    )
+    return _enriched(raw)
+
+
+def _untouched_stack_hand() -> EnrichedHand:
+    """Раздача без анте: герой на BTN пасует, и стек его не меняется ни на фишку.
+
+    Единственный способ получить ровный ноль: анте платят все и всегда, поэтому
+    на столе с анте пас героя стоит ему как минимум анте.
+    """
+    seats = [
+        SeatInfo(seat=1, label="Hero", stack=1000),
+        *[SeatInfo(seat=n, label=f"P{n}", stack=5000) for n in range(2, 7)],
+    ]
+    raw = RawHand(
+        provenance=Provenance.HAND_HISTORY,
+        source_ref="synthetic",
+        hand_no="SYN-FLAT",
+        tournament_id="TSYN",
+        tournament_name="synthetic",
+        level=1,
+        sb=50,
+        bb=100,
+        ante=0,
+        timestamp=_START,
+        table_name="syn",
+        max_seats=6,
+        button_seat=1,  # кнопка у героя: блайнды платят P2 и P3
+        seats=seats,
+        posts=[
+            Post(label="P2", kind=PostKind.SMALL_BLIND, amount=50),
+            Post(label="P3", kind=PostKind.BIG_BLIND, amount=100),
+        ],
+        dealt={"Hero": ["7c", "2d"]},
+        actions=[_fold("P4"), _fold("P5"), _fold("P6"), _fold("Hero"), _fold("P2")],
+    )
+    return _enriched(raw)
+
+
 def _lines(text: str) -> list[str]:
     return [line for line in text.splitlines() if line.strip()]
 
@@ -503,6 +683,12 @@ def test_the_replay_prints_no_number_the_hand_does_not_contain():
     allowed |= {float(sum(post.amount for post in hand.posts))}
     allowed |= {round(sum(post.amount for post in hand.posts) / hand.bb, 1)}
     allowed |= {float(sum(p.amount for p in hand.posts if p.kind is PostKind.ANTE))}
+    # Исход раздачи — два числа из разных источников: убыль стека считает движок
+    # (`stacks_end`), банк записал рум (`collected`). Оба в руке есть.
+    allowed |= {abs(round(hero_stack_delta_bb(en), 1))}
+    allowed |= {
+        round(sum(c.amount for c in hand.collected if c.label == hand.hero_label) / hand.bb, 1)
+    }
     # Ранги карт — не деньги: те же карты, что в `dealt` и `boards`, только
     # символом масти вместо буквы.
     allowed |= {
@@ -516,7 +702,7 @@ def test_the_replay_prints_no_number_the_hand_does_not_contain():
     assert set(numbers) <= allowed, f"выдуманные числа: {set(numbers) - allowed}"
 
 
-# --- вскрытие и цена решения ----------------------------------------------------------
+# --- вскрытие и исход раздачи ----------------------------------------------------------
 
 
 def test_showdown_line_shows_the_cards_that_were_actually_shown():
@@ -571,14 +757,15 @@ def test_cards_of_a_folded_player_read_off_a_screenshot_are_not_printed():
 def test_a_show_without_a_showdown_is_not_called_a_showdown():
     """Рум назвал карту спасовавшего в раздаче, где до вскрытия не дошёл никто:
     карта печатается, а слово «Вскрытие» — нет, вскрытия не было. Показ героя —
-    фраза во втором лице и отдельное предложение, значит с заглавной буквы."""
+    фраза во втором лице и отдельное предложение, значит с заглавной буквы.
+    Последним предложением абзаца она больше не стоит: за ней идёт исход раздачи."""
     text = hand_replay(
         _river_fold_hand(
             provenance=Provenance.HAND_HISTORY,
             showdowns=[ShowdownEntry(label="Hero", cards=["Jh"])],
         )
     ).plain
-    assert text.rstrip().endswith("вы фолд. Вы показали J♥️.")
+    assert "вы фолд. Вы показали J♥️." in text
     assert "Вскрытие" not in text
 
 
@@ -595,17 +782,58 @@ def test_a_hand_without_a_showdown_says_nothing_about_one():
     assert "Вскрытие" not in hand_replay(_postflop_hand()).plain
 
 
-def test_the_replay_ends_with_the_cost_when_it_is_known():
-    text = hand_replay(_postflop_hand(), ev_loss_bb=-3.9).plain
-    assert text.rstrip().endswith("Потеря 3.9 ББ.")
+def test_a_won_hand_ends_with_the_whole_pot():
+    """Рука владельца: банк 8 800 при bb 3 000 — 2.9 ББ, а не чистый прирост стека.
+
+    Печатается банк ЦЕЛИКОМ, вместе с собственным вкладом героя (решение
+    владельца 2026-09-12): по стекам он прибавил 1.8 ББ, потому что 3 400 фишек
+    этого банка положил сам.
+    """
+    en = _folded_through_shove_hand()
+    assert hand_replay(en).plain.rstrip().endswith("Забираете 2.9 ББ.")
 
 
-def test_a_measured_zero_cost_is_printed():
-    """`ranked` непустой при сумме 0.0 — измеренный ноль, и он печатается."""
-    assert "Потеря 0.0 ББ." in hand_replay(_postflop_hand(), ev_loss_bb=0.0).plain
+def test_a_lost_hand_ends_with_the_chips_that_left_the_stack():
+    """Проигрыш — чистая убыль стека: колл до 250 плюс анте 10 при bb 100."""
+    text = hand_replay(_postflop_hand()).plain
+    assert text.rstrip().endswith("Отдаёте 2.6 ББ.")
 
 
-def test_the_replay_without_a_cost_says_nothing_about_it():
+def test_an_untouched_stack_ends_the_paragraph_without_an_outcome():
+    """Ноль движения — фразы нет вовсе: «Отдаёте 0.0 ББ» не событие раздачи."""
+    text = hand_replay(_untouched_stack_hand()).plain
+    assert text.rstrip().endswith("вы фолд → SB фолд."), "абзац кончился не ходом раздачи"
+    assert "Забираете" not in text and "Отдаёте" not in text
+
+
+def test_the_sign_comes_from_the_stack_not_from_the_payout_record():
+    """Сайд-пот герою, мейн-пот — олл-ину: запись `collected` есть, а раздача проиграна.
+
+    Знак берётся у движка (стек уменьшился на 110 фишек), и потому блок говорит
+    «Отдаёте». По наличию записи выплаты он сказал бы «Забираете 3.8 ББ» на
+    раздаче, которую герой проиграл.
+    """
+    text = hand_replay(_side_pot_loss_hand()).plain
+    assert text.rstrip().endswith("Отдаёте 1.1 ББ.")
+    assert "Забираете" not in text
+
+
+def test_a_win_the_source_did_not_record_stays_silent():
+    """Стек вырос, а записи о банке нет: сказать нечем, и блок молчит.
+
+    Взять сюда убыль по стеку значило бы напечатать под словом «Забираете»
+    величину из другого источника; напечатать ноль — назвать выигранную раздачу
+    нулевой. Обе цены хуже молчания (CLAUDE.md: никогда не выдумывать числа
+    о деньгах).
+    """
+    en = _folded_through_shove_hand()
+    en.hand.collected.clear()
+    assert "Забираете" not in hand_replay(en).plain
+
+
+def test_the_replay_no_longer_prints_the_cost_of_the_decision():
+    """Цена решения ушла из блока в разбор точки (решение владельца 2026-09-12):
+    она не движение фишек, а расчёт против диапазона, и месту «что было» чужая."""
     assert "Потеря" not in hand_replay(_postflop_hand()).plain
 
 

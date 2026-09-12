@@ -1164,13 +1164,7 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
                 await session.commit()
 
         quota_left, quota_total = await _quota_numbers(session, job.player_id)
-        replay = hand_replay(
-            enriched,
-            # Цена решения печатается, только если её кто-то вынес: у пустого
-            # `ranked` `total_ev_loss_bb` — умолчание 0.0, а не измеренный ноль.
-            ev_loss_bb=result.total_ev_loss_bb if result.ranked else None,
-            stats=None,  # скрин: одна рука, знаменателя нет
-        )
+        replay = hand_replay(enriched, stats=None)  # скрин: одна рука, знаменателя нет
         msg = deep_dive_msg(
             result,
             round(deps.clock() - started_at),
@@ -1266,7 +1260,6 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
         quota_left, quota_total = await _quota_numbers(session, job.player_id)
         replay = hand_replay(
             hand.enriched,
-            ev_loss_bb=result.total_ev_loss_bb if result.ranked else None,
             stats=await _tournament_stats(session, hand.tournament_id),
         )
         msg = deep_dive_msg(

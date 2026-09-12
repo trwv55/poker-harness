@@ -49,6 +49,7 @@ from harness.contracts import (
     TournamentReport,
     Zone,
     class_of,
+    hero_stack_delta_bb,
 )
 
 __all__ = ["tournament_report"]
@@ -79,11 +80,12 @@ def _bb(value: int, hand: CanonicalHand) -> float:
 def _delta_bb(en: EnrichedHand) -> float:
     """Изменение стека героя за раздачу, в bb её уровня.
 
-    Считается по стекам движка (`stacks_end`), а не по строкам выплат источника:
-    движок проигрывает руку сам и не верит записанным суммам (ARCHITECTURE.md).
+    Формулировка одна на всю систему и живёт в контрактах
+    (`contracts.hero_stack_delta_bb`), потому что читателей у неё два: это
+    разбиение и фраза исхода в блоке «Что было». Там же и причина считать по
+    стекам движка, а не по строкам выплат источника.
     """
-    hand = en.hand
-    return _bb(en.report.stacks_end[hand.hero_label] - _hero(hand).stack, hand)
+    return hero_stack_delta_bb(en)
 
 
 def _hero_class(hand: CanonicalHand) -> str:
