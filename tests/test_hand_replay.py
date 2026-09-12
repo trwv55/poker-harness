@@ -409,6 +409,26 @@ def test_a_frequency_rounds_half_up():
     assert "VPIP 13%, PFR 13%" in hand_replay(_postflop_hand(), stats=stats).plain
 
 
+def test_the_hero_gets_no_label_though_he_is_in_the_stats():
+    """«Герой не в словаре» — не данность, а решение реплея.
+
+    На пути hand history словарь строит `player_stats_by_label`, а он кладёт
+    туда ВСЕХ за столом, включая героя, под его меткой. Иначе игрок читал бы
+    про себя в третьем лице: `вы (Hero, VPIP 25%, PFR 18%)`.
+
+    Запрет держат два места сразу, и каждого хватает поодиночке: `_street_flow`
+    не считает метку герою, а `_action_text` приписывает скобку к позиции, а не
+    к «вы». Тест краснеет, только когда сняты оба, — на то он и про печатаемый
+    текст, а не про одно из условий. Метка оппонента проверяется здесь же:
+    иначе тест был бы зелёным и от того, что статистика вообще не доехала.
+    """
+    row = PlayerStats(hands=40, vpip=10, pfr=7)
+    text = hand_replay(_postflop_hand(), stats={"Hero": row, "P5": row}).plain
+    assert "CO (P5, VPIP 25%, PFR 18%) опен 2.5" in text
+    assert "Hero" not in text
+    assert "вы (" not in text.lower()
+
+
 def test_a_folding_opponent_gets_no_label():
     """Слипшиеся фолды (`UTG/HJ фолд`) не несут ни метки, ни частот."""
     stats = {"P3": PlayerStats(hands=40, vpip=10, pfr=7)}
