@@ -54,6 +54,7 @@ from harness.contracts import (
     Measurement,
     PlayerStats,
     Street,
+    went_to_showdown,
 )
 
 __all__ = [
@@ -79,9 +80,10 @@ class _HandView:
     """Раздача, разобранная один раз: всё, что не зависит от метки.
 
     Заведена ради `player_stats_by_label`: те же величины — улицы,
-    префлоп-агрессор, продолженная ставка, кто спасовал — спрашиваются у одной
-    раздачи столько раз, сколько за столом мест, и пересчитывать их на каждое
-    место незачем. Формулы ниже принимают вид, а не руку.
+    префлоп-агрессор, продолженная ставка, спасовавшие на префлопе —
+    спрашиваются у одной раздачи столько раз, сколько за столом мест, и
+    пересчитывать их на каждое место незачем. Формулы ниже принимают вид, а не
+    руку.
 
     `cbet_index` — позиция продолженной ставки в списке действий флопа либо
     `None`, если её нет. Определение продолженной ставки живёт здесь, в одном
@@ -94,8 +96,6 @@ class _HandView:
     aggressor: str | None
     cbet_index: int | None
     folded_preflop: frozenset[str]
-    folded: frozenset[str]
-    live_at_end: int
 
 
 def _view(hand: CanonicalHand) -> _HandView:
@@ -108,13 +108,10 @@ def _view(hand: CanonicalHand) -> _HandView:
     """
     streets: dict[Street, list[CanonicalAction]] = {street: [] for street in Street}
     folded_preflop: set[str] = set()
-    folded: set[str] = set()
     for action in hand.actions:
         streets[action.street].append(action)
-        if action.kind is ActionKind.FOLD:
-            folded.add(action.label)
-            if action.street is Street.PREFLOP:
-                folded_preflop.add(action.label)
+        if action.kind is ActionKind.FOLD and action.street is Street.PREFLOP:
+            folded_preflop.add(action.label)
 
     aggressor: str | None = None
     for action in streets[Street.PREFLOP]:
@@ -132,8 +129,6 @@ def _view(hand: CanonicalHand) -> _HandView:
         aggressor=aggressor,
         cbet_index=cbet_index,
         folded_preflop=frozenset(folded_preflop),
-        folded=frozenset(folded),
-        live_at_end=sum(1 for p in hand.players if p.label not in folded),
     )
 
 
@@ -253,20 +248,15 @@ def _saw_flop(view: _HandView, label: str) -> bool:
 
 
 def _went_to_showdown(view: _HandView, label: str) -> bool:
-    """Место дошло до вскрытия: доска доехала до ривера, оно не пасовало, и оно не одно.
+    """Место дошло до вскрытия — правилом `contracts.went_to_showdown`.
 
-    Считается по пасам и доске, а не по строкам показа карт: источник пишет
-    показ и за тем, кто спасовал, и такая строка вскрытием не является
-    (`test_cards_shown_after_a_fold_are_not_a_showdown`). Двое непасовавших —
-    условие того, что вскрытие вообще состоялось: когда последнюю ставку никто
-    не уравнял, до вскрытия не дошёл никто
-    (`test_a_river_fold_leaves_no_showdown_for_anyone`).
+    Своей формулировки здесь нет намеренно: то же правило читает строку вскрытия
+    в реплее (`explanation.hand_replay`), а две формулировки одного факта
+    расходятся молча. Тесты правила остались там же, где были
+    (`test_cards_shown_after_a_fold_are_not_a_showdown`,
+    `test_a_river_fold_leaves_no_showdown_for_anyone`).
     """
-    return (
-        Street.RIVER in view.hand.boards
-        and view.live_at_end >= 2
-        and label not in view.folded
-    )
+    return went_to_showdown(view.hand, label)
 
 
 def _accumulate(stats: PlayerStats, view: _HandView, label: str) -> None:

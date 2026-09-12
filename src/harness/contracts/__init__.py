@@ -62,6 +62,7 @@ from harness.contracts.canonical import (
     CanonicalHand,
     Identity,
     PlayerState,
+    went_to_showdown,
 )
 from harness.contracts.enriched import (
     DecisionPoint,
@@ -228,4 +229,5 @@ __all__ = [
     "leak_rule_of_point",
     "river_call_detail",
     "turn_flop_call_detail",
+    "went_to_showdown",
 ]

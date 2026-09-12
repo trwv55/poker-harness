@@ -16,7 +16,10 @@
 * Комбинации на вскрытии не называются («пара валетов») и эквити не печатается:
   и то и другое — оценка руки, то есть расчёт, а расчёт живёт в `analysis`.
   Печатаются только карты, которые игроки действительно показали
-  (`test_showdown_line_shows_the_cards_that_were_actually_shown`).
+  (`test_showdown_line_shows_the_cards_that_were_actually_shown`). Откуда взялась
+  запись о показанных картах — вскрытие, добровольный показ спасовавшего или
+  чтение карт героя с экрана — различает `_showdown_line`, и печатает их
+  по-разному.
 * Вердиктов словами здесь нет; цена решения в ББ печатается последней фразой —
   это число ядра (`AnalysisResult.total_ev_loss_bb`), а не суждение
   (`test_the_replay_ends_with_the_cost_when_it_is_known`). Чего с ходом руки не
@@ -62,7 +65,9 @@ from harness.contracts import (
     CanonicalHand,
     EnrichedHand,
     PlayerStats,
+    Provenance,
     Street,
+    went_to_showdown,
 )
 
 __all__ = ["HandReplay", "ReplaySpan", "bb", "chips", "hand_replay"]
@@ -320,16 +325,41 @@ def _dead_before_deal(hand: CanonicalHand) -> int:
 
 
 def _showdown_line(hand: CanonicalHand) -> str | None:
-    """Строка вскрытия: кто что показал. Комбинации не называются (см. докстринг)."""
-    if not hand.showdowns:
-        return None
-    shown = [
-        f"{'вы' if entry.label == hand.hero_label else _position(hand, entry.label)} "
-        f"{_cards(entry.cards)}"
-        for entry in hand.showdowns
-        if entry.cards
-    ]
-    return f"Вскрытие: {' vs '.join(shown)}" if shown else None
+    """Строка вскрытия: кто что показал. Комбинации не называются (см. докстринг).
+
+    Запись в `showdowns` бывает трёх происхождений, и печатаются они по-разному.
+    Дошедшие до вскрытия (правило `contracts.went_to_showdown` — оно же считает
+    долю вскрытий в статистике) стоят в ряд через ` vs `. Спасовавший, чью карту
+    источник назвал сам — GG пишет добровольный показ отдельной строкой, — идёт
+    после них с пометкой `(игрок показал)`: она принадлежит ИМЕННО ему, потому
+    что `vs` между ним и вскрывшимися утверждало бы, что он с ними мерился
+    (`test_a_card_shown_after_a_fold_is_marked_as_a_show`). Слово «Вскрытие»
+    поэтому стоит только там, где вскрытие было: показ без вскрытия печатается
+    сам по себе.
+
+    Третье происхождение — скриншот: карманные карты героя видны на экране
+    ВСЕГДА, в том числе в раздаче, где он спасовал, и зрение честно записывает
+    прочитанное. Карт спасовавшего соперника на экране не видно, поэтому запись
+    о спасовавшем на скрине показом быть не может — она не печатается вовсе
+    (`test_cards_of_a_folded_player_read_off_a_screenshot_are_not_printed`), а
+    карты героя и так стоят в шапке блока. Цена решения: скриншотная раздача с
+    настоящим добровольным показом потеряла бы строку; на базе, по которой
+    правило написано, таких раздач нет.
+    """
+    seen: list[str] = []
+    shown: list[str] = []
+    for entry in hand.showdowns:
+        if not entry.cards:
+            continue
+        who = "вы" if entry.label == hand.hero_label else _position(hand, entry.label)
+        if went_to_showdown(hand, entry.label):
+            seen.append(f"{who} {_cards(entry.cards)}")
+        elif hand.provenance is not Provenance.SCREENSHOT:
+            shown.append(f"{who} {_cards(entry.cards)} (игрок показал)")
+    if seen:
+        tail = f"; {', '.join(shown)}" if shown else ""
+        return f"Вскрытие: {' vs '.join(seen)}{tail}"
+    return ", ".join(shown) if shown else None
 
 
 def hand_replay(

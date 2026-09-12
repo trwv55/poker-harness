@@ -56,9 +56,10 @@ def _raw(
     dealt: dict[str, list[str]],
     boards: dict[Street, list[str]] | None = None,
     showdowns: list[ShowdownEntry] | None = None,
+    provenance: Provenance = Provenance.HAND_HISTORY,
 ) -> RawHand:
     return RawHand(
-        provenance=Provenance.HAND_HISTORY,
+        provenance=provenance,
         source_ref="synthetic",
         hand_no="SYN1",
         tournament_id="TSYN",
@@ -92,11 +93,14 @@ def _fold(label: str) -> RawAction:
     )
 
 
-def _preflop_shove_hand() -> EnrichedHand:
+def _preflop_shove_hand(showdowns: list[ShowdownEntry] | None = None) -> EnrichedHand:
     """Герой (SB, 10bb) шовит против рейза CO, тот коллирует. Постфлопа нет.
 
     Улицы после префлопа проходят без единого действия — на них и проверяется
     прогон борда: печатается борд, и никаких приписанных игрокам ходов.
+
+    `showdowns` — умолчание описывает настоящее вскрытие двоих дошедших; аргумент
+    нужен случаю «спасовавший показал карту», где к ним добавляется третья запись.
     """
     return _enriched(
         _raw(
@@ -134,7 +138,8 @@ def _preflop_shove_hand() -> EnrichedHand:
                 Street.TURN: ["7h"],
                 Street.RIVER: ["Ah"],
             },
-            showdowns=[
+            showdowns=showdowns
+            or [
                 ShowdownEntry(label="Hero", cards=["Jh", "9h"]),
                 ShowdownEntry(label="P5", cards=["Ks", "Kd"]),
             ],
@@ -187,6 +192,81 @@ def _postflop_hand() -> EnrichedHand:
             ],
             dealt={"Hero": ["Jh", "9h"]},
             boards={Street.FLOP: ["6s", "Jd", "Qd"]},
+        )
+    )
+
+
+def _river_fold_hand(
+    *, provenance: Provenance, showdowns: list[ShowdownEntry]
+) -> EnrichedHand:
+    """Герой доходит до ривера и пасует на ставку — до вскрытия не дошёл никто.
+
+    Живых мест на ривере остаётся одно, поэтому ЛЮБАЯ запись в `showdowns` этой
+    раздачи вскрытием быть не может, и различает их только провенанс: на скрине
+    карманные карты героя зрение читает всегда, а в hand history запись
+    появляется лишь тогда, когда игрок карту показал сам.
+    """
+    return _enriched(
+        _raw(
+            provenance=provenance,
+            actions=[
+                _fold("P3"),
+                _fold("P4"),
+                RawAction(
+                    street=Street.PREFLOP,
+                    label="P5",
+                    kind=ActionKind.RAISE,
+                    to_amount=250,
+                    raw_line="P5: raises 150 to 250",
+                ),
+                _fold("P6"),
+                RawAction(
+                    street=Street.PREFLOP,
+                    label="Hero",
+                    kind=ActionKind.CALL,
+                    amount=200,
+                    raw_line="Hero: calls 200",
+                ),
+                _fold("P2"),
+                RawAction(
+                    street=Street.FLOP, label="Hero", kind=ActionKind.CHECK, raw_line="Hero: checks"
+                ),
+                RawAction(
+                    street=Street.FLOP, label="P5", kind=ActionKind.CHECK, raw_line="P5: checks"
+                ),
+                RawAction(
+                    street=Street.TURN, label="Hero", kind=ActionKind.CHECK, raw_line="Hero: checks"
+                ),
+                RawAction(
+                    street=Street.TURN, label="P5", kind=ActionKind.CHECK, raw_line="P5: checks"
+                ),
+                RawAction(
+                    street=Street.RIVER,
+                    label="Hero",
+                    kind=ActionKind.CHECK,
+                    raw_line="Hero: checks",
+                ),
+                RawAction(
+                    street=Street.RIVER,
+                    label="P5",
+                    kind=ActionKind.BET,
+                    amount=300,
+                    raw_line="P5: bets 300",
+                ),
+                RawAction(
+                    street=Street.RIVER,
+                    label="Hero",
+                    kind=ActionKind.FOLD,
+                    raw_line="Hero: folds",
+                ),
+            ],
+            dealt={"Hero": ["Jh", "Ts"]},
+            boards={
+                Street.FLOP: ["6s", "Jd", "Qd"],
+                Street.TURN: ["7h"],
+                Street.RIVER: ["Ah"],
+            },
+            showdowns=showdowns,
         )
     )
 
@@ -360,6 +440,59 @@ def test_showdown_line_shows_the_cards_that_were_actually_shown():
         line for line in _lines(hand_replay(_preflop_shove_hand()).plain) if "Вскрытие" in line
     )
     assert "вы J♥️9♥️" in line and "K♠️K♦️" in line
+
+
+def test_players_who_reached_the_showdown_carry_no_show_mark():
+    """Дошедшие до вскрытия стоят в ряд через ` vs ` и пометки показа не несут:
+    пометка различает происхождение записи, а у этих двоих оно — вскрытие."""
+    line = next(
+        line for line in _lines(hand_replay(_preflop_shove_hand()).plain) if "Вскрытие" in line
+    )
+    assert "вы J♥️9♥️ vs CO K♠️K♦️" in line
+    assert "показал" not in line
+
+
+def test_a_card_shown_after_a_fold_is_marked_as_a_show():
+    """Спасовавший, чью карту назвал рум, стоит с пометкой и не попадает в ряд
+    вскрывшихся: `vs` между ним и ними утверждало бы, что он с ними мерился."""
+    en = _preflop_shove_hand(
+        [
+            ShowdownEntry(label="Hero", cards=["Jh", "9h"]),
+            ShowdownEntry(label="P5", cards=["Ks", "Kd"]),
+            ShowdownEntry(label="P6", cards=["As"]),  # BTN спасовал на префлопе
+        ]
+    )
+    line = next(line for line in _lines(hand_replay(en).plain) if "Вскрытие" in line)
+    assert "вы J♥️9♥️ vs CO K♠️K♦️" in line
+    assert "BTN A♠️ (игрок показал)" in line
+    assert "vs BTN" not in line
+
+
+def test_cards_of_a_folded_player_read_off_a_screenshot_are_not_printed():
+    """На скрине запись о спасовавшем родилась из чтения карт героя, а не из
+    показа: карт спасовавшего соперника на экране не видно. Строки нет вовсе, а
+    карты героя и так стоят в шапке блока."""
+    text = hand_replay(
+        _river_fold_hand(
+            provenance=Provenance.SCREENSHOT,
+            showdowns=[ShowdownEntry(label="Hero", cards=["Jh", "Ts"])],
+        )
+    ).plain
+    assert "Вскрытие" not in text and "показал" not in text
+    assert text.count("J♥️T♠️") == 1, "карты героя удвоились строкой вскрытия"
+
+
+def test_a_show_without_a_showdown_is_not_called_a_showdown():
+    """Рум назвал карту спасовавшего в раздаче, где до вскрытия не дошёл никто:
+    карта печатается с пометкой, а слово «Вскрытие» — нет, вскрытия не было."""
+    text = hand_replay(
+        _river_fold_hand(
+            provenance=Provenance.HAND_HISTORY,
+            showdowns=[ShowdownEntry(label="Hero", cards=["Jh"])],
+        )
+    ).plain
+    assert text.rstrip().endswith("вы J♥️ (игрок показал).")
+    assert "Вскрытие" not in text
 
 
 def test_a_hand_without_a_showdown_says_nothing_about_one():

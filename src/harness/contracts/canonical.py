@@ -86,3 +86,27 @@ class CanonicalHand(BaseModel):
     bounties: dict[str, int] | None = None
     bounty_source: str | None = None
     vision: VisionMeta | None = None
+
+
+def went_to_showdown(hand: CanonicalHand, label: str) -> bool:
+    """Дошло ли место до вскрытия: доска доехала до ривера, оно не пасовало, и оно не одно.
+
+    ЕДИНСТВЕННАЯ формулировка правила во всей системе — как `is_judged`
+    (`contracts.history`). Её зовут статистика (`analysis.player_stats`, доля
+    дошедших до вскрытия) и реплей (`explanation.hand_replay`, строка вскрытия);
+    двум формулировкам одного факта тут разойтись негде.
+
+    Считается по пасам и доске, а НЕ по строкам показа карт: источник пишет
+    показ и за тем, кто спасовал, и такая строка вскрытием не является
+    (`test_cards_shown_after_a_fold_are_not_a_showdown`). Двое непасовавших —
+    условие того, что вскрытие вообще состоялось: когда последнюю ставку никто
+    не уравнял, до вскрытия не дошёл никто
+    (`test_a_river_fold_leaves_no_showdown_for_anyone`).
+
+    Множество спасовавших считается на каждый вызов: раздача — это десятки
+    действий, а зовут предикат один раз на место. Против счёта эквити, который
+    стоит рядом, это ничего не стоит.
+    """
+    folded = {action.label for action in hand.actions if action.kind is ActionKind.FOLD}
+    live = sum(1 for player in hand.players if player.label not in folded)
+    return Street.RIVER in hand.boards and live >= 2 and label not in folded
