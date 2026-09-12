@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 
 from pydantic import BaseModel
@@ -162,31 +162,37 @@ class VisionMeta(BaseModel):  # только для скринов
     hero_candidates: list[str] = []
 
 
+# Умолчание `timestamp`: экран времени раздачи не печатает, а заведомо невозможная
+# дата честнее правдоподобной — подставить «сейчас» значило бы записать в поле
+# факта догадку (тот же довод, что в `parsers/vision_adapter._NO_TIMESTAMP`).
+_NO_TIMESTAMP = datetime(1, 1, 1, tzinfo=UTC)
+
+
 class RawHand(BaseModel):
     schema_version: int = 1
-    provenance: Provenance
+    provenance: Provenance = Provenance.SCREENSHOT
     # Полнота входа (см. `Completeness`). Умолчание — рука целиком: так читается
     # весь уже записанный jsonb HH-пути, где иначе и не бывает.
     completeness: Completeness = Completeness.HAND
-    source_ref: str
-    hand_no: str
-    tournament_id: str
-    tournament_name: str
-    level: int
-    sb: int
-    bb: int
-    ante: int
+    source_ref: str = ""
+    hand_no: str = ""
+    tournament_id: str = ""
+    tournament_name: str = ""
+    level: int = 0
+    sb: int = 0
+    bb: int = 0
+    ante: int = 0
     ante_type: str = "per_player"
-    timestamp: datetime
-    table_name: str
-    max_seats: int
-    button_seat: int
-    seats: list[SeatInfo]
+    timestamp: datetime = _NO_TIMESTAMP
+    table_name: str = ""
+    max_seats: int = 0
+    button_seat: int = 0
+    seats: list[SeatInfo] = []
     # Фишки, стоящие перед игроками в момент снимка, — наблюдение живого стола
     # (метка игрока -> фишки). У полной руки пусто: там ставки восстанавливает
     # лог действий, и второй источник тех же денег только разошёлся бы с первым.
     visible_bets: dict[str, int] = {}
-    posts: list[Post]
+    posts: list[Post] = []
     dealt: dict[str, list[str]] = {}  # пустой список = Dealt to без карт
     actions: list[RawAction] = []
     boards: dict[Street, list[str]] = {}
