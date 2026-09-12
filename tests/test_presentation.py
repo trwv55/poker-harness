@@ -49,9 +49,9 @@ from harness.presentation import (
     Btn,
     Msg,
     bot_failure_msg,
-    deep_dive_msg,
     escalation_msg,
     failed_msg,
+    hand_analysis_msgs,
     hh_accepted_msg,
     hh_scan_in_progress_msg,
     new_session_msg,
@@ -61,7 +61,7 @@ from harness.presentation import (
     start_msg,
     unsupported_document_msg,
 )
-from tests.test_hand_replay import _postflop_hand
+from tests.test_hand_replay import _postflop_hand, _two_side_pots_hand
 
 # --- progress_text -----------------------------------------------------------------
 
@@ -295,13 +295,13 @@ def test_the_scan_summary_counts_nothing_it_cannot_judge():
         hand_nos=["H1", "H2", "H3", "H4"],
     )
     text = scan_summary_msg(empty, quota_left=1, quota_total=5).text
-    assert text.startswith("Скан завершён: 4 рук.")
+    assert text.startswith("Скан завершён: 4 руки.")
     for gone in ("Оценено решений", "Суммарная потеря", "Решений без оценки", "с решением"):
         assert gone not in text, f"счётчик остался в сводке: «{gone}»"
     assert "Разобрать раздачу" in text, "дверь в разбор под каждой рукой обязана остаться"
 
 
-# --- deep_dive_msg -------------------------------------------------------------------
+# --- разбор раздачи -------------------------------------------------------------------
 
 
 def _point(
@@ -322,15 +322,21 @@ def _point(
 def _deep_dive(res: AnalysisResult, en=None, **kw) -> Msg:
     """Разбор раздачи в тестах: раздача обязательна, остальное — по умолчанию.
 
-    `deep_dive_msg` печатает сырые числа раздачи, и взять их неоткуда, кроме
+    `hand_analysis_msgs` печатает сырые числа раздачи, и взять их неоткуда, кроме
     `EnrichedHand`; тестам, которые проверяют не числа, а статус-строку или
-    кнопки, подставляется любая настоящая раздача.
+    кнопки, подставляется любая настоящая раздача. Возвращается ПЕРВОЕ сообщение:
+    про второе (хвост чисел) говорит отдельный тест.
     """
+    return _deep_dive_all(res, en, **kw)[0]
+
+
+def _deep_dive_all(res: AnalysisResult, en=None, **kw) -> list[Msg]:
+    """Все сообщения разбора — одно или два."""
     kw.setdefault("elapsed_s", 12)
     kw.setdefault("zone", Zone.STRICT)
     kw.setdefault("quota_left", 17)
     kw.setdefault("quota_total", 50)
-    return deep_dive_msg(res, en if en is not None else _postflop_hand(), **kw)
+    return hand_analysis_msgs(res, en if en is not None else _postflop_hand(), **kw)
 
 
 def _mixed_result(hand_no: str = "H42") -> AnalysisResult:
@@ -349,7 +355,7 @@ def _mixed_result(hand_no: str = "H42") -> AnalysisResult:
     )
 
 
-def test_deep_dive_msg_has_status_line_with_zone_time_and_quota():
+def test_the_hand_analysis_has_status_line_with_zone_time_and_quota():
     res = _mixed_result()
     msg = _deep_dive(res)
     assert "⏱ 12с" in msg.text
@@ -357,7 +363,7 @@ def test_deep_dive_msg_has_status_line_with_zone_time_and_quota():
     assert "разборов 17/50 за 24 ч" in msg.text
 
 
-def test_deep_dive_msg_status_line_shows_assuming_zone_word():
+def test_the_hand_analysis_status_line_shows_assuming_zone_word():
     res = _mixed_result()
     msg = _deep_dive(res, zone=Zone.ASSUMING, quota_left=1)
     assert "зона: предполагая" in msg.text
@@ -372,7 +378,7 @@ def test_the_verdict_buttons_are_two():
     assert [b.text for b in verdict_buttons("TM99")] == ["🎯 Диапазоны", "✋ Не согласен"]
 
 
-def test_deep_dive_msg_buttons_are_ranges_and_disagree_with_hand_no():
+def test_the_hand_analysis_buttons_are_ranges_and_disagree_with_hand_no():
     res = _mixed_result(hand_no="H99")
     msg = _deep_dive(res, elapsed_s=1, quota_left=1, quota_total=1)
     assert len(msg.buttons) == 1
@@ -381,7 +387,7 @@ def test_deep_dive_msg_buttons_are_ranges_and_disagree_with_hand_no():
     assert [b.callback_data for b in row] == ["ranges:H99", "disagree:H99"]
 
 
-def test_deep_dive_msg_dev_line_appears_only_when_passed():
+def test_the_hand_analysis_dev_line_appears_only_when_passed():
     res = _mixed_result()
     without = _deep_dive(res, quota_left=1, quota_total=1)
     with_dev = _deep_dive(
@@ -392,7 +398,7 @@ def test_deep_dive_msg_dev_line_appears_only_when_passed():
     assert "себестоимость: $0.0042, gpt-4o-mini" in with_dev.text
 
 
-def test_deep_dive_msg_with_no_points_at_all_still_shows_the_hand():
+def test_the_hand_analysis_with_no_points_at_all_still_shows_the_hand():
     res = AnalysisResult(hand_no="H0", points=[], ranked=[], total_ev_loss_bb=0.0)
     msg = _deep_dive(res, elapsed_s=3, quota_left=1, quota_total=1)
     assert "Рука H0" in msg.text
@@ -741,23 +747,50 @@ def test_without_a_replay_the_deep_dive_stays_plain():
     assert msg.parse_mode is None and "Что было" not in msg.text
 
 
-def test_the_raw_numbers_are_cut_before_the_replay_is():
-    """В тесноте режутся сырые числа, а не ход раздачи, и инвариант меряется по
-    ИТОГОВОМУ тексту — после экранирования и разметки."""
-    msg = _deep_dive(_padded_result("&"), replay=_replay())
-    assert len(msg.text) <= 4096
-    assert msg.text.startswith("Что было\n") and "<b>вы олл-ин 9.9</b>" in msg.text
-    assert "показано не целиком" in msg.text
-    assert "разборов 17/50" in msg.text, "статус-строка не режется"
-    assert "&am" not in msg.text.replace("&amp;", ""), "разрез не рвёт сущность"
+def test_a_hand_that_fits_goes_out_in_one_message():
+    en = _postflop_hand()
+    msgs = _deep_dive_all(analyze_hand(en), en, replay=_replay())
+    assert len(msgs) == 1
+    assert len(msgs[0].text) <= 4096
 
 
-def test_a_deep_dive_cut_to_the_bone_has_no_holes_where_the_numbers_were():
-    """Выброшенная строка уносит с собой и свою пустую строку-разделитель: две
-    пустые строки подряд — дыра в сообщении, а не след обрезки."""
-    msg = _deep_dive(_padded_result("я"), replay=_replay())
-    assert len(msg.text) <= 4096
-    assert "\n\n\n" not in msg.text
+def test_a_hand_too_long_for_one_message_goes_out_in_two():
+    """Резать разбор внутри точки нельзя, выбрасывать посчитанное — тоже: хвост
+    уезжает вторым сообщением, начинаясь с целой точки.
+
+    Реплей растянут искусственно, потому что настоящий в предел укладывается:
+    проверяется поведение при переполнении, а не длина конкретной раздачи.
+    """
+    from tests.test_river_analysis import _river_hand
+
+    en = _river_hand()
+    res = analyze_hand(en)
+    assert len(res.points) == 7, "фикстура перестала быть семиточечной"
+    long_replay = HandReplay(spans=[ReplaySpan(text="а" * 1500), ReplaySpan(text="шов", emphasis=True)])
+
+    msgs = _deep_dive_all(res, en, replay=long_replay)
+    assert len(msgs) == 2
+    first, second = msgs
+    assert len(first.text) <= 4096 and len(second.text) <= 4096
+    assert first.text.startswith("Что было\n")
+    assert "Сверка денег с источником" in first.text, "сверка несжимаема и живёт в первом"
+    assert "разборов 17/50" in first.text, "статус-строка не уезжает"
+    assert first.buttons and not second.buttons
+    assert re.match(r"^\d+\. (префлоп|флоп|тёрн|ривер)", second.text), (
+        "второе сообщение начинается с целой точки"
+    )
+    assert "\n\n\n" not in first.text
+
+
+def test_the_two_messages_together_carry_every_point_of_the_hand():
+    from tests.test_river_analysis import _river_hand
+
+    en = _river_hand()
+    res = analyze_hand(en)
+    long_replay = HandReplay(spans=[ReplaySpan(text="а" * 1500)])
+    whole = "\n".join(msg.text for msg in _deep_dive_all(res, en, replay=long_replay))
+    for point in res.points:
+        assert f"{point.dp_index + 1}. " in whole, f"точка {point.dp_index} потерялась"
 
 
 def test_the_deep_dive_escapes_a_nickname_that_looks_like_a_tag():
@@ -873,7 +906,7 @@ def test_an_unjudged_point_shows_the_reason_the_core_recorded():
     msg = _deep_dive(
         AnalysisResult(hand_no="TM1", points=[unpriced], ranked=[]), elapsed_s=5, zone=None
     )
-    assert "почему вердикта нет: перебор подмножеств" in msg.text
+    assert "    вердикта нет: перебор подмножеств" in msg.text
     assert "точек с вердиктом нет" not in msg.text
 
 
@@ -922,14 +955,18 @@ def _one_point_msg(point: PointVerdict, zone: Zone | None = None) -> str:
     ).text
 
 
-def test_the_river_line_shows_the_price_of_the_call_and_the_bluff_requirement():
-    """Форма, согласованная с владельцем, — дословно, включая слово «доставить»."""
+def test_the_river_line_shows_the_bluff_requirement():
+    """Форма, согласованная с владельцем, — дословно.
+
+    Банка, доплаты и требуемой эквити здесь нет: их печатает строка шансов банка
+    той же точки, и второй раз те же три числа были бы дублем.
+    """
     text = _one_point_msg(_river_point())
-    assert "Ривер: банк 398\u00a0000, доставить 169\u00a0000 — колл окупается от 29.8% эквити." in text
     assert (
         "    Чтобы колл вышел в ноль, на 94 комбинации несомненного вэлью ему нужно "
         "38 блефов — то есть блефом должно быть 28.9% его ставящего диапазона."
     ) in text
+    assert "Ривер: банк" not in text, "цена колла живёт в строке шансов банка"
     assert "к оплате" not in text
 
 
@@ -937,7 +974,7 @@ def test_a_river_point_alone_is_not_a_hand_without_a_verdict():
     """Точка без цены, но с числами, перестала быть молчанием."""
     text = _one_point_msg(_river_point())
     assert "точек с вердиктом нет" not in text
-    assert "Ривер:" in text
+    assert "несомненного вэлью" in text
 
 
 def test_a_proven_fold_names_the_line_and_its_single_assumption():
@@ -962,11 +999,11 @@ def test_a_proven_fold_names_the_line_even_without_the_bluff_line():
     assert "Лучше: фолд." in text
 
 
-def test_a_degenerate_river_requirement_prints_only_the_price_of_the_call():
+def test_a_degenerate_river_requirement_prints_no_requirement_at_all():
     """Ни вэлью старшего класса, ни блефов — «нужно 0 блефов» не утверждение."""
     text = _one_point_msg(_river_point(min_value_combos=0, bluffs_needed_min_value=0.0))
-    assert "Ривер: банк 398\u00a0000, доставить 169\u00a0000" in text
     assert "блеф" not in text
+    assert "Чтобы колл вышел в ноль" not in text
 
 
 def test_half_a_bluff_is_rounded_up_to_one():
@@ -998,7 +1035,7 @@ def test_the_river_block_shows_neither_the_enumeration_nor_the_missing_proof():
 
     # Проверяется блок САМОЙ точки, а не всё сообщение: шапка раздачи называет
     # улицы борда и банка по праву — это числа раздачи, а не рассказ о ривере.
-    block = _point_block(_one_point_msg(_river_point()), "Ривер: банк")
+    block = _point_block(_one_point_msg(_river_point()), "Чтобы колл вышел в ноль")
     for forbidden in ("доказать", "не удалось", "тёрн", "флоп", "990", "862"):
         assert forbidden not in block.lower()
     assert error_words_in(block) == []
@@ -1036,20 +1073,19 @@ def _turn_point(*, street: Street = Street.TURN, **over) -> PointVerdict:
 
 
 def test_the_turn_line_is_worded_exactly_like_the_river_line():
-    """Подписи у чисел одни и те же на обеих улицах — включая слово «доставить»."""
+    """Подписи у чисел одни и те же на обеих улицах."""
     text = _one_point_msg(_turn_point())
-    assert "Тёрн: банк 160\u00a0000, доставить 69\u00a0000 — колл окупается от 30.1% эквити." in text
     assert (
         "    Чтобы колл вышел в ноль, на 55 комбинаций несомненного вэлью ему нужно "
         "18 блефов — то есть блефом должно быть 24.7% его ставящего диапазона."
     ) in text
 
 
-def test_the_flop_line_names_its_own_street():
+def test_the_street_of_a_point_is_taken_from_its_own_data():
     """Улица берётся у точки, а не прибита к риверу."""
     text = _one_point_msg(_turn_point(street=Street.FLOP))
-    assert "Флоп: банк 160\u00a0000, доставить 69\u00a0000" in text
-    assert "Ривер" not in text and "Тёрн" not in text
+    assert "5. флоп" in text
+    assert "ривер" not in text and "тёрн" not in text
 
 
 def test_a_requirement_beyond_the_board_prints_no_number_of_bluffs():
@@ -1066,7 +1102,7 @@ def test_a_turn_point_names_no_better_line_and_no_reservations():
     """Лучшей линии на этих улицах нет, и рассказа о том, чего нет, — тоже."""
     from harness.explanation.faithfulness import error_words_in
 
-    block = _point_block(_one_point_msg(_turn_point()), "Тёрн: банк")
+    block = _point_block(_one_point_msg(_turn_point()), "Чтобы колл вышел в ноль")
     assert "Лучше:" not in block
     assert "Допущение" not in block
     assert "точек с вердиктом нет" not in block
@@ -1077,15 +1113,12 @@ def test_a_turn_point_names_no_better_line_and_no_reservations():
 
 def test_the_streets_are_printed_in_the_order_they_were_dealt():
     """Флоп, тёрн, ривер — в порядке раздачи, а не в порядке появления расчётов."""
+    flop = _turn_point(street=Street.FLOP).model_copy(update={"dp_index": 3})
     text = _deep_dive(
-        AnalysisResult(
-            hand_no="H8",
-            points=[_turn_point(street=Street.FLOP), _turn_point(), _river_point()],
-            ranked=[],
-        ),
+        AnalysisResult(hand_no="H8", points=[flop, _turn_point(), _river_point()], ranked=[]),
         zone=None,
     ).text
-    assert text.index("Флоп:") < text.index("Тёрн:") < text.index("Ривер:")
+    assert text.index("4. флоп") < text.index("5. тёрн") < text.index("7. ривер")
 
 
 # --- экраны нижнего меню (задача 23) -------------------------------------------------
@@ -1819,9 +1852,14 @@ def test_every_detail_key_the_analysis_produces_has_a_label():
         for point in analyze_hand(en).points:
             seen |= set(point.detail)
     assert seen, "ни один расчёт не положил ничего в detail — тест ничего не значит"
-    machine = {RIVER_CALL_DETAIL, TURN_FLOP_CALL_DETAIL}
-    assert not (seen - machine) - set(_DETAIL_LABELS), (
-        f"ключи без подписи: {sorted((seen - machine) - set(_DETAIL_LABELS))}"
+    # Ветки, до которых фикстуры не доходят: отказ солвера (`DidNotConverge`) и
+    # лукап по чарту (`cheap_fold_verdict`). Прогоном их не собрать, поэтому они
+    # перечислены здесь — второй половиной того же обещания.
+    seen |= {"solver_error", "push_weight", "lookup_depth_bb"}
+    # `unjudged` печатается своей строкой «вердикта нет: …», а не по таблице.
+    printed_elsewhere = {RIVER_CALL_DETAIL, TURN_FLOP_CALL_DETAIL, "unjudged"}
+    assert not (seen - printed_elsewhere) - set(_DETAIL_LABELS), (
+        f"ключи без подписи: {sorted((seen - printed_elsewhere) - set(_DETAIL_LABELS))}"
     )
 
 
@@ -1838,7 +1876,8 @@ def test_a_detail_value_that_is_empty_prints_a_dash_not_a_blank():
     assert _detail_value(False) == "нет"
     assert _detail_value(0) == "0"
     assert _detail_value(0.0) == "0.00"
-    assert _detail_value(0.0004) == "0.0004", "доля мельче сотой не округляется в ноль"
+    assert _detail_value(-0.96) == "−0.96", "минус типографский, как у всех чисел продукта"
+    assert _detail_value(0.000005) == "0.0000", "никакой экспоненциальной записи"
 
 
 def test_no_engine_token_reaches_the_player_in_the_raw_block():
@@ -1850,6 +1889,193 @@ def test_no_engine_token_reaches_the_player_in_the_raw_block():
     for token in ("сыграно: fold", "сыграно: check", "сыграно call", "сыграно check"):
         assert token not in head, f"токен движка дошёл до игрока: «{token}»"
     assert "сыграно: чек" in head
+
+
+def test_the_hand_with_one_pot_says_nothing_about_side_pots():
+    """`EngineReport.side_pots` держит ВСЕ поты PokerKit, включая главный, и на
+    обычной раздаче там один элемент, равный конечному банку. Печатать его как
+    «сайд-пот» значило бы утверждать деление, которого не было.
+    """
+    en = _postflop_hand()
+    assert len(en.report.side_pots) == 1, "фикстура перестала быть однопотовой"
+    assert "Банк делится на части" not in _deep_dive(analyze_hand(en), en).text
+
+
+def test_a_hand_with_two_pots_names_each_part_and_who_claims_it():
+    en = _two_side_pots_hand()
+    assert len(en.report.side_pots) == 2, "фикстура перестала быть двухпотовой"
+    line = next(
+        line
+        for line in _deep_dive(analyze_hand(en), en).text.splitlines()
+        if line.startswith("Банк делится на части")
+    )
+    for pot in en.report.side_pots:
+        assert f"{pot.amount / en.hand.bb:.1f} ББ (претендуют: {', '.join(pot.eligible)})" in line
+
+
+def test_a_point_without_a_verdict_gets_no_zone_no_price_and_no_better_line():
+    """`unjudged_point` конструирует `zone=strict, ev_diff_bb=0.0` как заглушки —
+    печатать их значило бы выдать отсутствие расчёта за строгий нулевой вердикт.
+    """
+    unjudged = _point(
+        spot=SpotKind.PREFLOP_OTHER, ev_diff_bb=0.0, zone=Zone.STRICT
+    ).model_copy(update={"best_action": "", "detail": {"unjudged": "лимп модель не считает"}})
+    text = _deep_dive(AnalysisResult(hand_no="TM1", points=[unjudged], ranked=[])).text
+    assert "    вердикта нет: лимп модель не считает" in text
+    assert "зона строго" not in text
+    assert "цена" not in text
+    assert "лучше" not in text
+    assert "почему вердикта нет" not in text, "ключ напечатан своей строкой, не дважды"
+
+
+def test_a_point_without_a_verdict_and_without_a_reason_still_says_so():
+    silent = _point(
+        spot=SpotKind.PREFLOP_OTHER, ev_diff_bb=0.0, zone=Zone.STRICT
+    ).model_copy(update={"best_action": "", "detail": {}})
+    text = _deep_dive(AnalysisResult(hand_no="TM1", points=[silent], ranked=[])).text
+    assert "    вердикта нет." in text
+
+
+def test_a_judged_point_keeps_its_zone_price_and_better_line():
+    """Вторая сторона: у судимой точки всё это печатается."""
+    text = _deep_dive(_mixed_result()).text
+    assert "вердикт: спот пуш-фолд · зона строго · сыграно фолд · лучше шов · цена −2.3 ББ" in text
+
+
+def test_the_price_of_a_point_never_renders_a_negative_zero():
+    """`−0.03` после округления до десятой — честный ноль, а «−0.0» читается как
+    отдельная (мнимая) отрицательная величина."""
+    cheap = _point(
+        spot=SpotKind.PUSHFOLD_UNOPENED, ev_diff_bb=-0.03, zone=Zone.STRICT
+    )
+    res = AnalysisResult(hand_no="TM1", points=[cheap], ranked=[0], total_ev_loss_bb=-0.03)
+    text = _deep_dive(res).text
+    assert "цена 0.0 ББ" in text
+    assert "Сумма цены расхождений: 0.0 ББ" in text
+    assert "−0.0" not in text
+
+
+def test_the_action_of_a_point_prints_the_number_that_belongs_to_it():
+    """`committed_after` — итог по улице, и у колла это не то число: доплата
+    лежит в `to_call`. Чек и фолд суммы не несут вовсе."""
+    en = _postflop_hand()
+    text = _deep_dive(analyze_hand(en), en).text
+    assert "сыграно: колл 2.0 ББ" in text, "колл печатает доплату"
+    assert "сыграно: чек" in text and "сыграно: чек 0.0" not in text
+    assert "сыграно: фолд" in text and "сыграно: фолд 0.0" not in text
+
+    shove = _two_side_pots_hand()
+    raise_text = _deep_dive(analyze_hand(shove), shove).text
+    assert "сыграно: колл 4.4 ББ, олл-ин" in raise_text
+
+
+def test_a_raise_prints_the_total_it_was_raised_to():
+    from tests.test_preflop_analysis import _make_multiway_shove_hand
+
+    en = _make_multiway_shove_hand(("7c", "2s"), 9.0, 3)
+    assert "сыграно: рейз до 9.0 ББ, олл-ин" in _deep_dive(analyze_hand(en), en).text
+
+
+def test_no_engine_token_of_the_analysis_reaches_the_player():
+    """Значения `detail`, которые ядро пишет токенами движка, переводятся: иначе
+    игрок читает `call_ev`, `unstable` и `fold` — язык расчёта, не его."""
+    from harness.presentation.messages import _AXIS_WORD, _BRACKET_WORD, _METHOD_WORD
+
+    assert _METHOD_WORD["call_ev"] == "EV колла против диапазона шовера"
+    assert _METHOD_WORD["subset_enumeration"] == "перебор подмножеств ответивших"
+    assert _METHOD_WORD["prefilter_chart_lookup"] == "лукап по чарту"
+    assert _BRACKET_WORD == {"stable": "устойчива", "unstable": "через ноль"}
+    assert set(_AXIS_WORD) == set(_BRACKET_WORD), "вторая ось говорит теми же значениями"
+
+    from tests.test_preflop_analysis import _make_facing_shove_hand
+
+    hands = [_make_facing_shove_hand(("Ah", "Ad"), 10.0, 10.0), _two_side_pots_hand()]
+    texts = [_deep_dive(analyze_hand(en), en).text for en in hands]
+    for text in texts:
+        for token in ("call_ev", "subset_enumeration", ": stable", ": unstable", ": call", ": fold"):
+            assert token not in text, f"токен движка дошёл до игрока: «{token}»"
+    assert "×0.14" in texts[0], "ключ ширины печатается знаком умножения, не латинской x"
+    assert "устойчивость к входу живых за вами: вердикт не меняется" in texts[1]
+
+
+def test_every_validation_status_has_a_word_of_its_own():
+    """Сверка денег печатается словом: `pass`/`reject` — это язык валидатора."""
+    from harness.contracts import ValidationStatus
+    from harness.presentation.messages import _VALIDATION_WORD
+
+    assert set(_VALIDATION_WORD) == set(ValidationStatus)
+    assert _VALIDATION_WORD[ValidationStatus.PASS] == "сошлась"
+    assert _VALIDATION_WORD[ValidationStatus.ESCALATE] == "требует ответа игрока"
+    assert _VALIDATION_WORD[ValidationStatus.REJECT] == "не сошлась"
+
+    en = _postflop_hand()
+    assert "Сверка денег с источником: сошлась." in _deep_dive(analyze_hand(en), en).text
+
+
+def test_a_share_is_printed_as_a_percentage_not_as_a_fraction():
+    """Доли и проценты в одном сообщении читатель принимает за разные величины."""
+    from tests.test_preflop_analysis import _make_facing_shove_hand
+
+    en = _make_facing_shove_hand(("Ah", "Ad"), 10.0, 10.0)
+    text = _deep_dive(analyze_hand(en), en).text
+    share_lines = [
+        line
+        for line in text.splitlines()
+        if line.lstrip().startswith(("требуемая эквити", "рук в диапазоне шова", "вероятность"))
+    ]
+    assert share_lines, "в фикстуре не оказалось ни одной доли — тест ничего не значит"
+    for line in share_lines:
+        assert "%" in line, f"доля напечатана дробью: {line}"
+
+
+def test_the_ceiling_of_the_choice_is_named_only_where_the_interval_crosses_zero():
+    """Потолок цены выбора отвечает на вопрос «сколько стоит ошибиться, когда оба
+    варианта допустимы»; у интервала по одну сторону нуля этого вопроса нет."""
+    across = _point(
+        spot=SpotKind.PUSHFOLD_UNOPENED, ev_diff_bb=0.0, zone=Zone.STRICT
+    ).model_copy(
+        update={"interval": EvInterval(point_bb=-0.2, low_bb=-0.6, high_bb=0.4, near_zero=True)}
+    )
+    one_sided = _point(
+        spot=SpotKind.PUSHFOLD_UNOPENED, ev_diff_bb=-1.0, zone=Zone.STRICT
+    ).model_copy(
+        update={"interval": EvInterval(point_bb=-1.0, low_bb=-1.4, high_bb=-0.6)}
+    )
+    text_across = _deep_dive(AnalysisResult(hand_no="A", points=[across], ranked=[0])).text
+    text_one = _deep_dive(AnalysisResult(hand_no="B", points=[one_sided], ranked=[0])).text
+    assert "потолок цены выбора 0.6 ББ" in text_across and "интервал через ноль" in text_across
+    assert "потолок цены выбора" not in text_one
+
+
+def test_a_stack_depth_is_printed_with_one_digit_like_every_other_stack():
+    """Два знака у глубины и один у стека в соседней строке читатель принимает за
+    разную точность измерения."""
+    en = _two_side_pots_hand()
+    text = _deep_dive(analyze_hand(en), en).text
+    assert "глубина стека шовера, ББ: 25.0" in text
+    assert "глубина стека шовера, ББ: 25.00" not in text
+
+
+def test_the_total_price_stands_next_to_the_money_check_not_above_the_points():
+    """Итог раздачи — итогом, а не шапкой: сумма и сверка денег стоят рядом, ниже
+    всех точек, и обе несжимаемы."""
+    lines = _deep_dive(_mixed_result()).text.splitlines()
+    assert lines.index("Сумма цены расхождений: −3.4 ББ — только по оценённым точкам.") + 1 == (
+        lines.index("Сверка денег с источником: сошлась.")
+    )
+    assert lines.index("Сверка денег с источником: сошлась.") > lines.index(
+        next(line for line in lines if line.startswith("1. "))
+    )
+
+
+def test_the_scan_summary_counts_hands_grammatically():
+    for total, word in ((1, "1 рука"), (4, "4 руки"), (7, "7 рук"), (11, "11 рук")):
+        summary = ScanSummary(
+            hands_total=total, hands_with_decision=0, items=[], total_loss_bb=0.0
+        )
+        assert scan_summary_msg(summary, quota_left=1, quota_total=5).text.startswith(
+            f"Скан завершён: {word}."
+        )
 
 
 def test_the_pot_odds_of_the_raw_block_agree_with_the_calculation_tool():
@@ -1895,11 +2121,11 @@ def test_the_deep_dive_carries_no_words_of_the_model():
     """Решение владельца 2026-09-12: в разборе раздачи модель не участвует вовсе.
 
     Проверяется не отсутствие конкретной фразы, а отсутствие места, куда её
-    можно было бы передать: у `deep_dive_msg` нет аргумента для текста модели.
+    можно было бы передать: у `hand_analysis_msgs` нет аргумента для текста модели.
     """
     from inspect import signature
 
-    assert "verdict" not in signature(deep_dive_msg).parameters
+    assert "verdict" not in signature(hand_analysis_msgs).parameters
 
 
 # --- дверь в разбор раздачи: кнопка под КАЖДОЙ рукой скана ----------------------------

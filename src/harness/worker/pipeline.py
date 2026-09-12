@@ -106,9 +106,9 @@ from harness.platform.trace import Clock, Trace
 from harness.presentation import (
     Msg,
     Photo,
-    deep_dive_msg,
     escalation_msg,
     failed_msg,
+    hand_analysis_msgs,
     hand_in_progress_msg,
     not_a_hand_msg,
     note_nicks_for_hand,
@@ -363,6 +363,7 @@ async def _send_idempotent(
     key: Literal[
         "progress_message_id",
         "result_message_id",
+        "raw_overflow_message_id",
         "escalation_message_id",
     ],
     chat_id: int,
@@ -496,6 +497,30 @@ async def _chat_id(session: AsyncSession, player_id: int) -> int:
     return player.tg_user_id
 
 
+async def _send_analysis(
+    deps: Deps,
+    session: AsyncSession,
+    job_id: int,
+    worker_id: str | None,
+    chat_id: int,
+    msgs: Sequence[Msg],
+) -> None:
+    """Разбор раздачи игроку: одно сообщение или два, каждое под своим ключом.
+
+    Второе — хвост сырых чисел, не влезший в предел `sendMessage`
+    (`presentation.hand_analysis_msgs`). Свой ключ, а не второй `result_message_id`:
+    повторная попытка обязана отредактировать оба, а не прислать хвост заново
+    (`test_a_repeat_attempt_does_not_send_the_overflow_twice`).
+    """
+    keys: tuple[Literal["result_message_id", "raw_overflow_message_id"], ...] = (
+        "result_message_id",
+        "raw_overflow_message_id",
+    )
+    for key, msg in zip(keys, msgs, strict=False):
+        await _send_idempotent(deps, session, job_id, worker_id, key, chat_id, msg)
+    await session.commit()
+
+
 async def _quota_numbers(session: AsyncSession, player_id: int) -> tuple[int, int]:
     """Числа для строки «разборов X/Y за 24ч» (спека §9: скользящее окно, SQL-счётчик
     интерактивных задач).
@@ -519,8 +544,11 @@ def _hand_analysis_msg(
     quota_left: int,
     quota_total: int,
     stats: Mapping[str, PlayerStats] | None,
-) -> Msg:
-    """Сообщение разбора ОДНОЙ раздачи — единственное место, где оно собирается.
+) -> list[Msg]:
+    """Сообщения разбора ОДНОЙ раздачи — единственное место, где они собираются.
+
+    Список длиной один или два: второе появляется, когда числа не влезли в
+    предел `sendMessage` (`presentation.hand_analysis_msgs`).
 
     **Развилка блока «Что было» (спека §5.6).** Ход раздачи принадлежит разбору
     раздачи и только ему: сюда заходят оба пути разбора (скриншот и кнопка
@@ -530,12 +558,12 @@ def _hand_analysis_msg(
     Развилка держится тем, что реплей строится ЗДЕСЬ, а не приходит аргументом
     (`test_a_hand_analysis_always_carries_the_what_happened_block`, парный ему
     `test_the_hh_scan_summary_never_carries_the_what_happened_block`). Прежде оба
-    пути звали `deep_dive_msg` напрямую, где `replay` — необязательный аргумент
-    со значением `None`: путь, забывший его передать, молча терял блок и не
-    ронял ни одного теста. Аргументом осталось только то, что у путей РАЗНОЕ:
-    `stats` (у скриншота нет турнира, а значит и частот).
+    пути звали сборщик сообщения напрямую, где `replay` — необязательный
+    аргумент со значением `None`: путь, забывший его передать, молча терял блок
+    и не ронял ни одного теста. Аргументом осталось только то, что у путей
+    РАЗНОЕ: `stats` (у скриншота нет турнира, а значит и частот).
     """
-    return deep_dive_msg(
+    return hand_analysis_msgs(
         result,
         enriched,
         elapsed_s,
@@ -1074,7 +1102,7 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
                 await session.commit()
 
             # Та же развилка, что в `_run_deep_dive`: картинки рисует код внутри
-            # `analyze`, станции `explain` на этом пути больше нет.
+            # `analyze`, отдельной станции у них больше нет.
             if existing is None or existing.range_images is None:
                 await analyses_repo.set_explanation(
                     hand_id=hand_id,
@@ -1083,7 +1111,7 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
                 await session.commit()
 
         quota_left, quota_total = await _quota_numbers(session, job.player_id)
-        msg = _hand_analysis_msg(
+        msgs = _hand_analysis_msg(
             result,
             enriched,
             elapsed_s=round(deps.clock() - started_at),
@@ -1091,8 +1119,7 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
             quota_total=quota_total,
             stats=None,  # скрин: турнира нет, а значит нет и знаменателя частот
         )
-        await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
-        await session.commit()
+        await _send_analysis(deps, session, job.id, worker_id, chat_id, msgs)
         await _send_range_photos(
             deps,
             session,
@@ -1163,7 +1190,7 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
                 await session.commit()
 
         quota_left, quota_total = await _quota_numbers(session, job.player_id)
-        msg = _hand_analysis_msg(
+        msgs = _hand_analysis_msg(
             result,
             hand.enriched,
             elapsed_s=round(deps.clock() - started_at),
@@ -1171,8 +1198,7 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
             quota_total=quota_total,
             stats=await _tournament_stats(session, hand.tournament_id),
         )
-        await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
-        await session.commit()
+        await _send_analysis(deps, session, job.id, worker_id, chat_id, msgs)
         await _send_range_photos(
             deps,
             session,

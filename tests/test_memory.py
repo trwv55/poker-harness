@@ -254,9 +254,9 @@ async def test_a_river_point_survives_the_round_trip_through_the_database(db):
 
 
 async def test_set_explanation_without_text_keeps_the_saved_one(db):
-    """Картинки диапазонов рисует код, и сохранить их надо даже когда модель не
-    ответила — но пустой текст не имеет права затереть уже сказанное
-    (`worker.pipeline`, станция explain)."""
+    """Картинки диапазонов рисует код, и сохранить их надо в любом случае — но
+    пустой текст не имеет права затереть уже сказанное
+    (`worker.pipeline._render_ranges`)."""
     session_id = await _make_session(db)
     raw = RawHand.model_validate(make_min_raw())
     hid = await HandsRepo(db).save_raw(session_id=session_id, raw=raw)

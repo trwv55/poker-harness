@@ -47,12 +47,6 @@ _SEATS = [
     SeatInfo(seat=5, label="P5", stack=5000),
     SeatInfo(seat=6, label="P6", stack=5000),
 ]
-_POSTS = [Post(label=s.label, kind=PostKind.ANTE, amount=10) for s in _SEATS] + [
-    Post(label="Hero", kind=PostKind.SMALL_BLIND, amount=50),
-    Post(label="P2", kind=PostKind.BIG_BLIND, amount=100),
-]
-
-
 def _raw(
     *,
     actions: list[RawAction],
@@ -60,7 +54,13 @@ def _raw(
     boards: dict[Street, list[str]] | None = None,
     showdowns: list[ShowdownEntry] | None = None,
     provenance: Provenance = Provenance.HAND_HISTORY,
+    seats: list[SeatInfo] | None = None,
 ) -> RawHand:
+    seats = seats or _SEATS
+    posts = [Post(label=s.label, kind=PostKind.ANTE, amount=10) for s in seats] + [
+        Post(label="Hero", kind=PostKind.SMALL_BLIND, amount=50),
+        Post(label="P2", kind=PostKind.BIG_BLIND, amount=100),
+    ]
     return RawHand(
         provenance=provenance,
         source_ref="synthetic",
@@ -75,8 +75,8 @@ def _raw(
         table_name="syn",
         max_seats=6,
         button_seat=6,
-        seats=_SEATS,
-        posts=_POSTS,
+        seats=seats,
+        posts=posts,
         dealt=dealt,
         actions=actions,
         boards=boards or {},
@@ -195,6 +195,67 @@ def _postflop_hand() -> EnrichedHand:
             ],
             dealt={"Hero": ["Jh", "9h"]},
             boards={Street.FLOP: ["6s", "Jd", "Qd"]},
+        )
+    )
+
+
+def _two_side_pots_hand() -> EnrichedHand:
+    """Три участника, два олл-ина разной глубины — банк делится на две части.
+
+    Единственная фикстура продукта, где `EngineReport.side_pots` длиннее одного
+    элемента: на всех остальных там лежит один пот, равный конечному банку
+    (движок кладёт в список ВСЕ поты PokerKit, включая главный).
+    """
+    seats = [
+        SeatInfo(seat=1, label="Hero", stack=500),
+        SeatInfo(seat=2, label="P2", stack=1500),
+        SeatInfo(seat=3, label="P3", stack=5000),
+        SeatInfo(seat=4, label="P4", stack=5000),
+        SeatInfo(seat=5, label="P5", stack=5000),
+        SeatInfo(seat=6, label="P6", stack=5000),
+    ]
+    return _enriched(
+        _raw(
+            seats=seats,
+            actions=[
+                _fold("P3"),
+                _fold("P4"),
+                RawAction(
+                    street=Street.PREFLOP,
+                    label="P5",
+                    kind=ActionKind.RAISE,
+                    to_amount=2000,
+                    raw_line="P5: raises 1900 to 2000",
+                ),
+                _fold("P6"),
+                RawAction(
+                    street=Street.PREFLOP,
+                    label="Hero",
+                    kind=ActionKind.CALL,
+                    amount=440,
+                    is_all_in=True,
+                    raw_line="Hero: calls 440 and is all-in",
+                ),
+                RawAction(
+                    street=Street.PREFLOP,
+                    label="P2",
+                    kind=ActionKind.CALL,
+                    amount=1390,
+                    is_all_in=True,
+                    raw_line="P2: calls 1390 and is all-in",
+                ),
+            ],
+            dealt={"Hero": ["Jh", "9h"], "P2": ["Ac", "Kc"], "P5": ["Qs", "Qc"]},
+            boards={
+                Street.FLOP: ["6s", "Jd", "2c"],
+                Street.TURN: ["7d"],
+                Street.RIVER: ["3h"],
+            },
+            showdowns=[
+                ShowdownEntry(label="Hero", cards=["Jh", "9h"]),
+                ShowdownEntry(label="P2", cards=["Ac", "Kc"]),
+                ShowdownEntry(label="P5", cards=["Qs", "Qc"]),
+            ],
         )
     )
 

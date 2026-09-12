@@ -80,7 +80,7 @@ from harness.parsers.vision_adapter import reading_to_raw
 from harness.platform.config import Config
 from harness.platform.llm import LLM
 from harness.platform.queue import JobsQueue
-from harness.presentation import Msg, Photo, deep_dive_msg, scan_summary_msg
+from harness.presentation import Msg, Photo, hand_analysis_msgs, scan_summary_msg
 from harness.worker import pipeline as pipeline_module
 from harness.worker.main import _payload, configure_logging
 from harness.worker.pipeline import (
@@ -172,8 +172,8 @@ def queue(db_factory) -> JobsQueue:
 
 @pytest.fixture
 def deps(db_factory, queue, fake_sender, process_pool) -> Deps:
-    # `model_override=TestModel()` — станция `explain` (задача 21) зовёт модель на
-    # обоих путях, а тесты в сеть не ходят (ограничение задачи 16). `TestModel`
+    # `model_override=TestModel()` — тесты в сеть не ходят (ограничение задачи 16),
+    # а модель в конвейере ещё зовут скриншот и вопрос игрока. `TestModel`
     # PydanticAI сам собирает валидный ответ по схеме, то есть проверяет ровно то,
     # что нужно здесь: что оркестрация умеет вызвать модель и разложить её ответ.
     llm = LLM(_TEST_CFG, db_factory, model_override=TestModel())
@@ -1021,8 +1021,8 @@ async def test_llm_call_from_inside_a_job_has_a_trace_row_to_reference(db_factor
     `traces` писалась только в `flush()`, то есть В КОНЦЕ попытки. Любая станция,
     позвавшая `deps.llm(...)`, ложилась нарушением внешнего ключа на ПЕРВОМ же
     вызове. Держалось это лишь тем, что станции v1-HH модель не зовут вовсе
-    (`grep 'deps\\.llm' src/harness/worker/` — пусто); задача 21 (`explain`)
-    упёрлась бы в это сразу.
+    (`grep 'deps\\.llm' src/harness/worker/` — пусто); первый же вызов модели из
+    станции упёрся бы в это сразу.
 
     Тест зовёт фасад из джоб-подобного контекста — изнутри `_dispatch`, с тем
     самым `trace`, который завёл `run_job`, — то есть ровно так, как это будет
@@ -1140,7 +1140,7 @@ def test_hand_zone_says_nothing_when_nothing_was_judged():
     """
     result = AnalysisResult(hand_no="TM1", points=[], ranked=[])
     assert _hand_zone(result) is None
-    msg = deep_dive_msg(result, _postflop_hand(), 3, None, 1, 5)
+    msg = hand_analysis_msgs(result, _postflop_hand(), 3, None, 1, 5)[0]
     assert "зона:" not in msg.text
     assert "строго" not in msg.text
 
@@ -1156,11 +1156,11 @@ def test_hand_zone_is_the_weakest_of_all_judged_points_not_the_first():
     mixed = AnalysisResult(hand_no="TM1", points=[strict_point, assuming_point], ranked=[0, 1])
     assert _hand_zone(mixed) is Zone.ASSUMING
     hand = _postflop_hand()
-    assert "зона: предполагая" in deep_dive_msg(mixed, hand, 1, _hand_zone(mixed), 1, 5).text
+    assert "зона: предполагая" in hand_analysis_msgs(mixed, hand, 1, _hand_zone(mixed), 1, 5)[0].text
 
     all_strict = AnalysisResult(hand_no="TM1", points=[strict_point], ranked=[0])
     assert _hand_zone(all_strict) is Zone.STRICT
-    assert "зона: строго" in deep_dive_msg(all_strict, hand, 1, _hand_zone(all_strict), 1, 5).text
+    assert "зона: строго" in hand_analysis_msgs(all_strict, hand, 1, _hand_zone(all_strict), 1, 5)[0].text
 
     # Незасуженные точки на зону руки не влияют — судится только `ranked`.
     unranked_assuming = AnalysisResult(
@@ -1200,7 +1200,7 @@ def test_a_proven_river_fold_puts_its_zone_in_the_status_line():
     assert _hand_zone(result) is Zone.STRICT
     assert (
         "зона: строго"
-        in deep_dive_msg(result, _postflop_hand(), 1, _hand_zone(result), 1, 5).text
+        in hand_analysis_msgs(result, _postflop_hand(), 1, _hand_zone(result), 1, 5)[0].text
     )
 
     # Та же точка без доказательства линии не называет — и зоне взяться неоткуда.
@@ -1208,7 +1208,7 @@ def test_a_proven_river_fold_puts_its_zone_in_the_status_line():
     assert _hand_zone(AnalysisResult(hand_no="TM1", points=[unproven], ranked=[])) is None
 
 
-# --- станция explain: слова поверх посчитанного (задача 21) -------------------------
+# --- станция analyze: числа и картинки диапазонов -----------------------------------
 
 
 async def _seed_hands_and_pick_a_judged_one(
@@ -1216,9 +1216,8 @@ async def _seed_hands_and_pick_a_judged_one(
 ) -> tuple[str, AnalysisResult]:
     """Разложить `n` раздач чекпоинтами и вернуть первую, у которой ЕСТЬ вердикт.
 
-    Судимая точка есть не у каждой раздачи (постфлоп и префлоп вне пуш-фолда
-    цены не получают), а станция explain на раздаче без вердикта модель не
-    зовёт вовсе — тест про текст модели на такой раздаче молча проверял бы
+    Судимая точка есть не у каждой раздачи: постфлоп и префлоп вне пуш-фолда
+    цены не получают, и тест про вердикт на такой раздаче молча проверял бы
     пустоту.
     """
     _tournament_id, raw_hands = await _seed_checkpointed_hands(
@@ -1882,6 +1881,60 @@ async def test_a_repeated_attempt_does_not_send_the_same_picture_twice(
     assert len(fake_sender.photos) == 2, "повтор попытки прислал картинки заново"
 
 
+async def test_a_repeat_attempt_does_not_send_the_overflow_twice(
+    db_factory, fake_sender, queue, deps
+):
+    """Хвост сырых чисел едет вторым сообщением под СВОИМ ключом.
+
+    Второй `result_message_id` был бы невозможен: ключ один, и повторная попытка
+    либо переписала бы разбор хвостом, либо прислала хвост заново.
+    """
+    from harness.worker.pipeline import _send_analysis
+
+    player_id, session_id = await _make_scope(db_factory)
+    job_id = await queue.enqueue(
+        type="deep_dive", player_id=player_id, session_id=session_id, payload={"hand_no": "X"}
+    )
+    job = await queue.claim("w1")
+    assert job is not None
+    msgs = [Msg(text="разбор раздачи"), Msg(text="1. ривер — хвост чисел")]
+
+    async with db_factory() as session:
+        await _send_analysis(deps, session, job_id, "w1", 777, msgs)
+    assert [msg.text for msg in fake_sender.sent] == [m.text for m in msgs]
+    async with db_factory() as session:
+        row = await session.get(Job, job_id)
+        assert row is not None
+        assert row.payload["result_message_id"] != row.payload["raw_overflow_message_id"]
+
+    async with db_factory() as session:
+        await _send_analysis(deps, session, job_id, "w1", 777, msgs)
+    assert len(fake_sender.sent) == 2, "повтор прислал сообщения заново"
+    assert len(fake_sender.edits) == 2, "повтор обязан отредактировать оба"
+
+
+async def test_a_hand_that_fits_sends_only_one_message(
+    db_factory, fake_sender, queue, deps
+):
+    """Обратная сторона: одного сообщения хватает — второй ключ не заводится."""
+    from harness.worker.pipeline import _send_analysis
+
+    player_id, session_id = await _make_scope(db_factory)
+    job_id = await queue.enqueue(
+        type="deep_dive", player_id=player_id, session_id=session_id, payload={"hand_no": "X"}
+    )
+    job = await queue.claim("w1")
+    assert job is not None
+
+    async with db_factory() as session:
+        await _send_analysis(deps, session, job_id, "w1", 777, [Msg(text="разбор раздачи")])
+    assert len(fake_sender.sent) == 1
+    async with db_factory() as session:
+        row = await session.get(Job, job_id)
+        assert row is not None
+        assert "raw_overflow_message_id" not in row.payload
+
+
 async def test_a_missing_picture_file_does_not_take_the_verdict_away(
     db_factory, fake_sender, queue, deps, tmp_path
 ):
@@ -1996,12 +2049,12 @@ def test_a_hand_analysis_always_carries_the_what_happened_block():
     реплей — забыть его нельзя, не удалив строку сознательно.
 
     До этого теста оба пути разбора (скрин и кнопка «разобрать») звали
-    `deep_dive_msg` напрямую, а `replay` был необязательным аргументом со
+    сборщик сообщения напрямую, а `replay` был необязательным аргументом со
     значением `None`: новый путь, забывший его передать, молча терял блок и не
     ронял ни одного теста.
     """
     enriched = _postflop_hand()
-    msg = _hand_analysis_msg(
+    msgs = _hand_analysis_msg(
         analyze_hand(enriched),
         enriched,
         elapsed_s=3,
@@ -2009,7 +2062,7 @@ def test_a_hand_analysis_always_carries_the_what_happened_block():
         quota_total=5,
         stats=None,
     )
-    assert "Что было" in msg.text
+    assert "Что было" in msgs[0].text
 
 
 def test_the_hh_scan_summary_never_carries_the_what_happened_block():
@@ -2086,7 +2139,7 @@ async def test_an_hh_scan_sends_the_summary_and_nothing_else(
     await run_job(job, deps)
 
     summary = fake_sender.sent[-1]
-    assert summary.text.startswith("Скан завершён: 1 рук.")
+    assert summary.text.startswith("Скан завершён: 1 рука.")
     assert "Турнир. Раздач" not in "".join(_all_texts(fake_sender)), "отчёт больше не шлётся"
     assert [b.callback_data for row in summary.buttons for b in row] == ["deep:SYNTH1"]
 
