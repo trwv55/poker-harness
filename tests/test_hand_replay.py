@@ -848,6 +848,9 @@ def test_a_won_hand_ends_with_the_whole_pot():
     """
     en = _folded_through_shove_hand()
     assert hand_replay(en).plain.rstrip().endswith("Забираете 2.9 ББ.")
+    # Асимметрия пришпилена парой, а не одним числом: печатается банк, а прирост
+    # стека у этой же руки другой, и докстринг `_outcome_line` ссылается на него.
+    assert hero_stack_delta_bb(en) == 1.8
 
 
 def test_a_lost_hand_ends_with_the_chips_that_left_the_stack():
