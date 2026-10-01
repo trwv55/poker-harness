@@ -1972,11 +1972,11 @@ def test_a_raise_prints_the_total_it_was_raised_to():
 
 def test_no_engine_token_of_the_analysis_reaches_the_player():
     """Значения `detail`, которые ядро пишет токенами движка, переводятся: иначе
-    игрок читает `call_ev`, `unstable` и `fold` — язык расчёта, не его."""
+    игрок читает `full_deal_call`, `unstable` и `fold` — язык расчёта, не его."""
     from harness.presentation.messages import _AXIS_WORD, _BRACKET_WORD, _METHOD_WORD
 
-    assert _METHOD_WORD["call_ev"] == "EV колла против диапазона шовера"
-    assert _METHOD_WORD["subset_enumeration"] == "перебор подмножеств ответивших"
+    assert _METHOD_WORD["full_deal_call"] == "симуляция полной раздачи: колл против диапазона шовера"
+    assert _METHOD_WORD["full_deal_shove"] == "симуляция полной раздачи: шов"
     assert _METHOD_WORD["prefilter_chart_lookup"] == "лукап по чарту"
     assert _BRACKET_WORD == {"stable": "устойчива", "unstable": "через ноль"}
     assert set(_AXIS_WORD) == set(_BRACKET_WORD), "вторая ось говорит теми же значениями"
@@ -1986,7 +1986,14 @@ def test_no_engine_token_of_the_analysis_reaches_the_player():
     hands = [_make_facing_shove_hand(("Ah", "Ad"), 10.0, 10.0), _two_side_pots_hand()]
     texts = [_deep_dive(analyze_hand(en), en).text for en in hands]
     for text in texts:
-        for token in ("call_ev", "subset_enumeration", ": stable", ": unstable", ": call", ": fold"):
+        for token in (
+            "full_deal_call",
+            "full_deal_shove",
+            ": stable",
+            ": unstable",
+            ": call",
+            ": fold",
+        ):
             assert token not in text, f"токен движка дошёл до игрока: «{token}»"
     assert "×0.14" in texts[0], "ключ ширины печатается знаком умножения, не латинской x"
     assert "устойчивость к входу живых за вами: вердикт не меняется" in texts[1]

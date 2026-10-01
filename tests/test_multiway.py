@@ -13,7 +13,7 @@ from harness.analysis.tools.pushfold import (
     nash_hu_regret_bb,
     shove_ev_bb,
 )
-from harness.contracts import all_classes
+from harness.contracts import Range, all_classes
 
 # Шесть пар «глубина, мёртвые деньги», на которых проверяется вырождение в
 # `nash_hu`: две глубины фикстуры с её анте, игра без анте, мелкий стек, глубокий
@@ -108,15 +108,21 @@ def reference_solution() -> MultiwaySolution:
 
 @pytest.mark.slow
 def test_reference_spot_call_widths(reference_solution):
-    """Числа референсного спота закреплены: шов героя и шесть колл-диапазонов.
+    """Числа референсного спота закреплены: шов героя, шесть холодных коллов и оверколлы.
 
-    Порядок мест — порядок хода, и он же порядок `calls`. Ширины различаются по
-    местам потому, что различаются посты: у SB в банке 0.65bb, у BB 1.15bb, у
-    остальных только анте, и колл им обходится дороже.
+    Порядок мест — порядок хода, и он же порядок `calls`. Холодные коллы растут
+    по ходу: чем меньше игроков позади, тем меньше риск оверколла, — и вдобавок
+    у блайндов колл дешевле на пост (SB 0.65bb, BB 1.15bb в банке). У места с
+    одинаковыми постами ширина больше не одна на всех: так выглядел решатель
+    без оверколлов, и это была половина переоценки пар против GTO (спека
+    2026-10-01-pushfold-overcalls-dead-cards, §1). У первого места позади
+    оверколла не бывает.
     """
     widths = [round(rng.fraction_of_hands() * 100, 2) for rng in reference_solution.calls]
-    assert widths == [11.50, 10.54, 10.54, 10.54, 12.30, 13.86]
-    assert round(reference_solution.push.fraction_of_hands() * 100, 2) == 18.82
+    assert widths == [8.35, 8.42, 9.80, 10.38, 12.17, 15.07]
+    overs = [round(rng.fraction_of_hands() * 100, 2) for rng in reference_solution.overcalls]
+    assert overs == [0.0, 5.71, 5.73, 5.80, 6.74, 7.24]
+    assert round(reference_solution.push.fraction_of_hands() * 100, 2) == 18.73
 
 
 @pytest.mark.slow
@@ -129,15 +135,15 @@ def test_reference_spot_is_less_exploitable_than_the_heads_up_equilibrium(refere
     достигается не слабее принятого в проекте.
     """
     assert reference_solution.hand_regret_bb <= nash_hu_regret_bb(12.0, dead_extra_bb=1.2)
-    assert reference_solution.hand_regret_bb == pytest.approx(0.004210, abs=5e-6)
+    assert reference_solution.hand_regret_bb == pytest.approx(0.002576, abs=5e-6)
 
 
 @pytest.mark.slow
 def test_reference_spot_table_model(reference_solution):
     """Вероятность общего паса и ожидаемое число коллеров — по тем же `CallerModel`.
 
-    Считается тем же `default_call_prob`, которым считает саму EV `shove_ev_bb`:
-    новых определений вероятности колла здесь не вводится.
+    Считается тем же `default_call_prob`, что и в `detail` вердикта
+    (`_call_model_detail`): новых определений вероятности колла здесь не вводится.
     """
     seats = [_reference_seat(name) for name in _REFERENCE_BEHIND]
     callers = [
@@ -149,8 +155,8 @@ def test_reference_spot_table_model(reference_solution):
     p_all_fold = 1.0
     for probability in probs:
         p_all_fold *= 1.0 - probability
-    assert round(p_all_fold * 100, 2) == 51.44
-    assert round(sum(probs), 3) == 0.629
+    assert round(p_all_fold * 100, 2) == 53.95
+    assert round(sum(probs), 3) == 0.585
 
 
 # --- Монотонность по числу игроков позади ---------------------------------------
@@ -237,3 +243,55 @@ def test_the_call_range_answers_the_shove_range_of_the_same_solution():
 
     assert solution.push.weight("AA") == 1.0 and inside > 0.0
     assert solution.push.weight("32o") == 0.0 and outside < 0.0
+
+
+# --- Оверколлы и вскрытие втроём -------------------------------------------------
+
+
+def test_with_one_player_behind_nobody_can_overcall():
+    """При N = 1 узла оверколла нет: диапазон пуст, игра — хедз-ап."""
+    solution = _heads_up(10.0, 0.0)
+    assert solution.overcalls == (Range(weights={}),)
+
+
+def test_three_way_share_of_three_equal_hands_is_a_third():
+    import numpy as np
+
+    from harness.analysis.tools.multiway import bradley_terry_three_way
+
+    assert bradley_terry_three_way(np.array([0.5]), np.array([0.5]))[0] == pytest.approx(1 / 3)
+
+
+@pytest.mark.slow  # Монте-Карло на 8 классах × 2 парах диапазонов
+def test_three_way_equity_matches_monte_carlo_on_held_out_ranges():
+    """Поправка, откалиброванная на одних диапазонах, держит допуск на других.
+
+    Пары ниже в калибровку `scripts/build_eq3_correction.py` не входили. Допуск
+    спеки — 2 п.п. эквити; к нему 0.5 п.п. на шум Монте-Карло (40 000 розыгрышей,
+    стандартная ошибка ≈ 0.25 п.п.).
+    """
+    import numpy as np
+
+    from harness.analysis.charts.notation import parse_range
+    from harness.analysis.tools.equity import equity_vs_ranges
+    from harness.analysis.tools.multiway import three_way_equity
+    from harness.analysis.tools.pushfold import equity_vs_range_classes, representative_combo
+    from harness.contracts import all_classes
+
+    pairs = [
+        (parse_range("66+, ATs+, KQs, ATo+, A9s:0.7"), parse_range("QQ+, AKs, AKo:0.5")),
+        (
+            parse_range("22+, A2s+, K5s+, Q8s+, J8s+, T7s+, 97s+, 87s, 76s, A2o+, KTo+, QTo+, JTo"),
+            parse_range("99+, AQs+, AKo"),
+        ),
+    ]
+    index = {cls: i for i, cls in enumerate(all_classes())}
+    for first, second in pairs:
+        x = np.array([equity_vs_range_classes(c, first) for c in all_classes()])
+        y = np.array([equity_vs_range_classes(c, second) for c in all_classes()])
+        model = three_way_equity(x, y)
+        for hero in ("AA", "TT", "66", "AKo", "AJo", "KQs", "T9s", "72o"):
+            measured = equity_vs_ranges(
+                representative_combo(hero), [first, second], iterations=40_000, seed=5
+            )
+            assert model[index[hero]] == pytest.approx(measured, abs=0.025), hero

@@ -433,8 +433,8 @@ def spot_for(dp: DecisionPoint, state: TableState) -> SpotKind:
         # третье действие (ре-шов), которого модель не считает.
         faces_shove = state.call_is_all_in or state.aggressor_all_in
         answered = folded or (taken.kind is ActionKind.CALL and state.hero_all_in_after)
-        # Модель держится на двух допущениях: `call_shove_ev_bb` берёт эквити
-        # против ОДНОГО диапазона, а равновесие подыгры шовера
+        # Модель держится на двух допущениях: цена колла считается против
+        # ОДНОГО диапазона шова, а равновесие подыгры шовера
         # (`preflop._shover_equilibrium`) описывает того, кто шовит ПЕРВЫМ в
         # неоткрытый банк. Каждое условие ниже проверяет одно из них; нарушено любое —
         # вердикта нет, а `unpriced_reason` называет, какое именно. Все четыре

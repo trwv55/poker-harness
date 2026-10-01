@@ -36,10 +36,12 @@
 на догадке, значит переоценить собственную уверенность. Решение о зоне целиком
 живёт в `zone_for` — снаружи его переопределить негде.
 
-**Живые игроки за героем при колле шова.** `call_shove_ev_bb` считает вскрытие
-один на один, поэтому вход живых позади в модель не входит. Он считается второй
-осью вилки (`ev_call_all_behind_bb`) и попадает в `zone_for`: если вердикт от неё
-меняется, зона `assuming`, а цена берётся по самому мягкому из двух сценариев.
+**Живые игроки за героем при колле шова.** Точечная цена колла считается
+симуляцией полной раздачи (`tools/full_deal.py`): живые за героем отвечают на шов
+и колл героя оверколл-диапазонами равновесия. Противоположный конец — входят все
+(`ev_call_all_behind_bb`, по `call_shove_ev_bb`) — считается второй осью вилки и
+попадает в `zone_for`: если вердикт от неё меняется, зона `assuming`, а цена
+берётся по самому мягкому из двух сценариев.
 Когда два сценария дают разный оптимум, цена по этому правилу равна нулю, и
 `best_action` называет развилку вместо одного действия (`_BEST_DEPENDS_ON_BEHIND`).
 Живой БЕЗ фишек за спиной так не считается — его вход не развилка, и такая точка
@@ -77,8 +79,7 @@
 без вердикта (`_too_wide_for_near_zero`). Порог взят из замера распределения
 ширин, а не назначен — числа в комментарии к константе.
 
-**Фолд-эквити.** `shove_ev_bb` гейта не ставит (сигнатура заморожена задачей 11),
-поэтому он стоит здесь: `fold_equity_ok` считается для каждого шова и попадает в
+**Фолд-эквити.** Расчёт EV шова гейта не ставит, поэтому он стоит здесь: `fold_equity_ok` считается для каждого шова и попадает в
 `detail`. Сама EV посчитана верно в любом случае — ветка «все сфолдили» получает
 свою (нулевую) вероятность, — но изложение (задача 21) не имеет права объяснять
 шов словами «оппоненты сфолдят», когда фолда в модели не существует.
@@ -105,6 +106,12 @@ from harness.analysis.classifier import (
 )
 from harness.analysis.river import river_verdict
 from harness.analysis.tools.equity import equity_vs_ranges
+from harness.analysis.tools.full_deal import (
+    Responder,
+    Shover,
+    call_ev_full_deal,
+    shove_ev_full_deal,
+)
 from harness.analysis.tools.multiway import (
     DidNotConverge,
     MultiwaySolution,
@@ -122,9 +129,6 @@ from harness.analysis.tools.pushfold import (
     fold_equity_ok,
     nash_hu,
     range_of_width_in_order,
-)
-from harness.analysis.tools.pushfold import (
-    shove_ev_bb as _shove_ev_bb,
 )
 from harness.analysis.turn_flop import turn_flop_verdict
 from harness.contracts import (
@@ -165,8 +169,8 @@ _DEPTH_STEP_BB = 0.25
 _MIN_MODEL_DEPTH_BB = 1.5
 _MAX_MODEL_DEPTH_BB = 25.0
 
-# Перебор подмножеств коллеров в `shove_ev_bb` ограничен семью игроками позади
-# (2^n веток). Спот с большим числом живых позади остаётся без вердикта — цена,
+# Решатель равновесия (`multiway._MAX_SEATS_BEHIND`) берёт не больше семи мест
+# позади. Спот с большим числом живых позади остаётся без вердикта — цена,
 # посчитанная по урезанному составу оппонентов, была бы правдоподобно неверной.
 _MAX_MODELLED_CALLERS = 7
 
@@ -325,9 +329,30 @@ _SHOVER_WIDTH_MULTIPLIERS: tuple[float, ...] = tuple(
 # ниже шкалы, на которой вердикт меняется.
 _MULTIWAY_ITERATIONS = 20_000
 
+# Симуляция полной раздачи (`tools/full_deal.py`) — точечный EV вердикта и сетка
+# ширин. Сетка считается той же симуляцией, а не аналитикой `shove_ev_bb`
+# (отступление от спеки 2026-10-01-pushfold-overcalls-dead-cards §3.2, записано
+# там же): аналитика без карт сбросивших завышает пары на 0.15–0.2bb, и полоса
+# другим методом стояла бы не вокруг точки, а рядом с ней.
+#
+# Стандартная ошибка (замер шестью сидами на UTG 10bb): точка на 100 000
+# раздач — 0.020–0.027bb, точка сетки на 40 000 — 0.037bb. У шова в
+# неоткрытый банк разность соседних ширин — 0.011bb (общие случайные числа: те
+# же карты и жребии при всех ширинах, см. `full_deal._respond`). У колла шова
+# общих чисел нет: сетка меняет диапазон шовера, из которого сдаётся его рука,
+# и поток расходится с первой раздачи — разность соседних ширин шумит на
+# ≈ 0.1bb (замер ревьюера: ATo против шова SB, 20 000 раздач). Отсюда граница
+# точности: при |EV| ≲ 0.07bb (у колла — ≲ 0.1bb) устойчивость полосы и
+# попадание модели в полосу решает шум — но это и есть зона «около нуля», где
+# упрекать игрока не за что. Холодный прогон
+# сетки 318 рук — 12 мин 46 с при бюджете 15 (спека §5).
+_FULL_DEAL_ITERATIONS = 100_000
+_FULL_DEAL_GRID_ITERATIONS = 40_000
+_FULL_DEAL_SEED = 20_261_001
+
 # Что стоит вместо одного действия, когда две точки модели дают разный оптимум:
-# `ev_call_bb` против одного диапазона и `ev_call_all_behind_bb` с вошедшими в
-# банк живыми позади. Цена такой точки — 0.0: правило самого мягкого упрёка
+# `ev_call_bb` (симуляция: живые позади оверколлируют по равновесию) и
+# `ev_call_all_behind_bb` (входят все). Цена такой точки — 0.0: правило самого мягкого упрёка
 # (см. `ev_diff_bb` в `_facing_shove_verdict`) берёт сценарий, в котором
 # сыгранное действие и есть лучшее. Оба вердикта по отдельности лежат в
 # `detail` (`best_vs_one`, `best_all_behind`) — это и закреплено
@@ -427,7 +452,7 @@ _EQUITY_MC_SEED = 42
 # Поэтому кэш точный — он меняет скорость, а не ответ, и не требует TTL или
 # инвалидации по времени; инвалидируется только явной сменой версии/итераций
 # в отпечатке.
-_EQUITY_CACHE_VERSION = 1
+_EQUITY_CACHE_VERSION = 3
 _EQUITY_CACHE_PATH = Path(__file__).parent / "tools" / "data" / "equity_mc_cache.json"
 _disk_equity_cache: dict[str, float] | None = None  # ленивая загрузка, None = не читали
 
@@ -440,7 +465,10 @@ def _equity_cache_fingerprint() -> str:
     на текущий запрос — тот же класс ошибки, что `_nash_fingerprint` закрывает
     для равновесий.
     """
-    return f"v{_EQUITY_CACHE_VERSION}-it{_MULTIWAY_ITERATIONS}-seed{_EQUITY_MC_SEED}"
+    return (
+        f"v{_EQUITY_CACHE_VERSION}-it{_MULTIWAY_ITERATIONS}-seed{_EQUITY_MC_SEED}"
+        f"-fd{_FULL_DEAL_ITERATIONS}-{_FULL_DEAL_GRID_ITERATIONS}-{_FULL_DEAL_SEED}"
+    )
 
 
 def _equity_cache_key(hero: _HeroCombo, range_key: tuple[_RangeKey, ...]) -> str:
@@ -453,6 +481,39 @@ def _equity_cache_key(hero: _HeroCombo, range_key: tuple[_RangeKey, ...]) -> str
     payload = {"hero": list(hero), "ranges": [[[c, w] for c, w in r] for r in range_key]}
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _full_deal_cached(payload: dict[str, object], compute: Callable[[], float]) -> float:
+    """EV симуляции полной раздачи — из того же дискового кэша, что и эквити.
+
+    Симуляция детерминирована по сиду (`full_deal.py`), поэтому кэш точный, как
+    и у эквити. Хранилище общее намеренно: воркер уже переносит его между
+    процессами через `calc_cache` (`equity_cache_seed`/`equity_cache_export`),
+    и второй канал для второго вида чисел был бы второй точкой рассинхрона.
+    Ключи двух видов не пересекаются по префиксу `fd:`; `kind` в ключе различает
+    шов и колл.
+    """
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    key = "fd:" + sha256(blob.encode("utf-8")).hexdigest()
+    cache = _load_disk_equity_cache()
+    cached = cache.get(key)
+    if cached is None:
+        cached = compute()
+        cache[key] = cached
+    return cached
+
+
+def _range_key(rng: Range) -> list[list[object]]:
+    return [[cls, weight] for cls, weight in sorted(rng.weights.items())]
+
+
+def _responder_key(responder: Responder) -> dict[str, object]:
+    return {
+        "posted": round(responder.posted_bb, 6),
+        "total": round(responder.total_bb, 6),
+        "cold": _range_key(responder.cold),
+        "over": _range_key(responder.over),
+    }
 
 
 def _load_disk_equity_cache() -> dict[str, float]:
@@ -543,10 +604,9 @@ def _model_equity(hero: _HeroCombo, ranges: Sequence[Range]) -> float:
     значит вносить шум и расходиться с диапазоном, против которого судим.
     Мультивей-веток в таблице нет — они идут через сэмплер, и их результат
     запоминается дважды: в памяти на весь процесс (`_equity_memo`) и на диске
-    между процессами (`_disk_equity_cache`, см. докстринг выше) — `shove_ev_bb`
-    перебирает 2^n подмножеств, но разных наборов диапазонов среди них всего
-    единицы, а те же наборы регулярно повторяются между руками одного скана и
-    между отдельными прогонами.
+    между процессами (`_disk_equity_cache`, см. докстринг выше): одни и те же
+    наборы диапазонов регулярно повторяются между руками одного скана и между
+    отдельными прогонами.
     """
     if len(ranges) == 1:
         return equity_vs_range_classes(class_of(*hero), ranges[0])
@@ -612,7 +672,7 @@ def _table_equilibrium(
 ) -> MultiwaySolution:
     """Равновесие подыгры «шов героя в неоткрытый банк» для ЭТОГО состава стола.
 
-    Деньги берутся ровно те же, что уходят в `shove_ev_bb`: банк `pot_before`,
+    Деньги берутся ровно те же, что уходят в симуляцию раздачи: банк `pot_before`,
     посты каждого места, урезанные потолком героя, и остатки за спиной. Одна
     точка решения стоит одного решения независимо от того, сколько раз её
     посчитали: результат запоминает сам решатель.
@@ -643,11 +703,12 @@ def _push_model(depth_bb: float, dead_bb: float) -> Range:
 def _call_model_detail(callers: Sequence[CallerModel], hero_cls: str) -> dict[str, object]:
     """Две сводные величины модели коллеров — в `detail` точки о шове в неоткрытый банк.
 
-    Считаются по тем же `CallerModel`, что уходят в `shove_ev_bb`, и той же
-    вероятностью колла (`default_call_prob`), которой считается сама EV:
-    `p_all_fold = Π(1 − p_i)`, `expected_callers = Σ p_i`. Вердикта они не
-    решают и игроку не показываются ничем — это описание решённого равновесия,
-    по которому видно, каким его увидел расчёт. Числа закреплены на настоящей
+    Считаются по холодным колл-диапазонам решения вероятностью колла
+    `default_call_prob` (снимаются только карты героя, коллы независимы):
+    `p_all_fold = Π(1 − p_i)`, `expected_callers = Σ p_i`. Саму EV шова считает
+    симуляция раздачи с картами всех мест и оверколлами, поэтому эти числа — не
+    её входы, а описание решённого равновесия, по которому видно, каким его
+    увидел расчёт. Вердикта они не решают. Числа закреплены на настоящей
     раздаче `test_the_reference_multiway_spot_reproduces_the_solved_table`.
     """
     probs = [default_call_prob(caller, hero_cls) for caller in callers]
@@ -754,11 +815,12 @@ def zone_for(
       задана (веса в ней дробные, и порядок классов у неё свой), поэтому её
       вердикт может не совпасть ни с одной точкой вилки — и тогда концы совпали
       бы между собой, противореча выданному вердикту;
-    * `best_behind` — вердикты по оси «живые за героем тоже входят в банк».
-      Ось существует там, где этих игроков в модели нет вовсе;
+    * `best_behind` — вердикты по оси «все живые за героем входят в банк своим
+      холодным коллом» — противоположный конец к модели, где они отвечают
+      оверколл-диапазоном;
     * `unmodelled` — непустая строка означает, что какое-то измерение задачи в
-      модель не попало вообще (живых позади больше, чем модель способна
-      перебрать). Тогда проверять нечего и `strict` заявлять не о чем.
+      модель не попало вообще (живых позади больше, чем берёт решатель
+      равновесия). Тогда проверять нечего и `strict` заявлять не о чем.
     """
     if unmodelled:
         return Zone.ASSUMING, unmodelled
@@ -975,14 +1037,17 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
             dp,
             spot,
             f"в руке живых без фишек за спиной помимо героя — {all_in_behind}: "
-            f"перебор подмножеств коллеров их не берёт, и цена шова посчитана "
-            f"против неполного состава",
+            f"выбора «колл или пас» у них нет, в модели шова их нет, и цена шова "
+            f"была бы посчитана против неполного состава",
         )
     if not behind:
         return unjudged_point(dp, spot, "позади героя некому коллировать")
     if len(behind) > _MAX_MODELLED_CALLERS:
         return unjudged_point(
-            dp, spot, f"игроков позади {len(behind)} — перебор подмножеств ограничен"
+            dp,
+            spot,
+            f"игроков позади {len(behind)} — решатель равновесия берёт не больше "
+            f"{_MAX_MODELLED_CALLERS}",
         )
     if state.hero.behind <= 0:
         return unjudged_point(dp, spot, "у героя не осталось фишек за спиной")
@@ -1006,14 +1071,35 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
             for seat, rng in zip(behind, ranges, strict=True)
         ]
 
-    def ev(ranges: Sequence[Range]) -> float:
-        return _shove_ev_bb(
-            hero_cls,
-            hero_behind_bb,
-            pot_dead_bb,
-            callers(ranges),
-            hero_posted_bb=hero_posted_bb,
-            equity_fn=_model_equity,
+    def ev(colds: Sequence[Range], overs: Sequence[Range], iterations: int) -> float:
+        responders = [
+            Responder(
+                posted_bb=min(seat.contributed, ceiling) / bb,
+                total_bb=(min(seat.contributed, ceiling) + seat.behind) / bb,
+                cold=cold,
+                over=over,
+            )
+            for seat, cold, over in zip(behind, colds, overs, strict=True)
+        ]
+        return _full_deal_cached(
+            {
+                "kind": "shove",
+                "hero": hero_cls,
+                "hero_posted": round(hero_posted_bb, 6),
+                "hero_total": round(hero_posted_bb + hero_behind_bb, 6),
+                "pot": round(pot_dead_bb, 6),
+                "responders": [_responder_key(r) for r in responders],
+                "iterations": iterations,
+            },
+            lambda: shove_ev_full_deal(
+                hero_cls,
+                hero_posted_bb,
+                hero_posted_bb + hero_behind_bb,
+                responders,
+                pot_dead_bb,
+                iterations=iterations,
+                seed=_FULL_DEAL_SEED,
+            ),
         )
 
     try:
@@ -1022,20 +1108,27 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
         return unjudged_point(dp, spot, _NO_EQUILIBRIUM, {"solver_error": str(failure)})
     model_ranges = list(solution.calls)
     model_callers = callers(model_ranges)
-    ev_model = ev(model_ranges)
+    ev_model = ev(model_ranges, solution.overcalls, _FULL_DEAL_ITERATIONS)
     # Опрашивается вся сетка множителей, а не два конца полосы: EV по ширине не
     # монотонна, и вердикт умеет перевернуться внутри интервала. Множитель
-    # применяется к СВОЕЙ равновесной ширине каждого места (места отличаются
-    # постами, и равновесные ширины у них разные), а порядок классов — по эквити
-    # против равновесного шова героя: коллер отвечает именно на этот шов.
+    # применяется к СВОЕЙ равновесной ширине каждого места и каждой его роли
+    # (холодный колл и оверколл — одним множителем), а порядок классов — по
+    # эквити против равновесного шова героя: коллер отвечает именно на этот шов.
     order = classes_by_equity_against(solution.push)
-    equilibrium_widths = [rng.fraction_of_hands() for rng in model_ranges]
+
+    def scaled(ranges: Sequence[Range], multiplier: float) -> list[Range]:
+        return [
+            range_of_width_in_order(order, min(1.0, rng.fraction_of_hands() * multiplier))
+            if rng.weights
+            else rng
+            for rng in ranges
+        ]
+
     ev_by_width = {
         _WIDTH_KEY(multiplier): ev(
-            [
-                range_of_width_in_order(order, min(1.0, width * multiplier))
-                for width in equilibrium_widths
-            ]
+            scaled(model_ranges, multiplier),
+            scaled(solution.overcalls, multiplier),
+            _FULL_DEAL_GRID_ITERATIONS,
         )
         for multiplier in _SHOVE_CALL_WIDTH_MULTIPLIERS
     }
@@ -1055,11 +1148,11 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
     best_tight, best_wide = by_width[0], by_width[-1]
     best = _best_of("shove", ev_model)
     bracket_shove = "stable" if {*by_width, best} == {best} else "unstable"
-    # Вторая ось (входят ли живые позади) здесь уже внутри модели: перебор
-    # подмножеств интегрирует их поведение с вероятностями, а сетка ширин двигает
-    # сами вероятности от «коллирует каждый пятый» до «коллируют все». Отдельного
-    # конца добавлять нечего — кроме случая, когда живой игрок позади в перебор не
-    # попал вовсе. Тогда измерение вне модели, и решает это `zone_for`.
+    # Вторая ось (входят ли живые позади) здесь уже внутри модели: симуляция
+    # раздачи разыгрывает их ответы по диапазонам, а сетка ширин двигает сами
+    # диапазоны от узкого края полосы до широкого. Отдельного конца добавлять
+    # нечего — кроме случая, когда живой игрок позади в модель не попал вовсе.
+    # Тогда измерение вне модели, и решает это `zone_for`.
     zone, why = zone_for(
         best_tight,
         best_wide,
@@ -1072,9 +1165,11 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
     folds_possible = fold_equity_ok(callers(model_ranges))
 
     detail: dict[str, object] = {
-        "method": "subset_enumeration",
+        "method": "full_deal_shove",
         "bracket": bracket_shove,
-        "branches": 2 ** len(behind),
+        "simulated_deals": _FULL_DEAL_ITERATIONS,
+        "simulated_deals_by_width": _FULL_DEAL_GRID_ITERATIONS,
+        "simulation_seed": _FULL_DEAL_SEED,
         "fold_equity_ok": folds_possible,
         "ev_shove_bb": round(ev_model, 4),
         "ev_shove_tight_bb": round(ev_tight, 4),
@@ -1087,6 +1182,9 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
         "model_within_bracket": best in set(by_width),
         "shove_range_fraction": round(solution.push.fraction_of_hands(), 6),
         "call_range_fractions": [round(rng.fraction_of_hands(), 6) for rng in model_ranges],
+        "overcall_range_fractions": [
+            round(rng.fraction_of_hands(), 6) for rng in solution.overcalls
+        ],
         "equilibrium_hand_regret_bb": round(solution.hand_regret_bb, 6),
         **_call_model_detail(model_callers, hero_cls),
     }
@@ -1127,7 +1225,7 @@ def _unopened_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) ->
             if zone is Zone.ASSUMING
             else None
         ),
-        tools=["multiway_pushfold", "shove_ev_bb", "fold_equity_ok"],
+        tools=["multiway_pushfold", "full_deal", "fold_equity_ok"],
         detail=detail,
     )
 
@@ -1147,10 +1245,10 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         return unjudged_point(dp, spot, "доплаты нет либо у героя не осталось фишек")
 
     # Живой без фишек за спиной (`behind == 0`) в модельный набор коллеров не
-    # входит: ось «войдёт или нет» для него пуста. Посчитать точку при этом
-    # нечем — `call_shove_ev_bb` берёт эквити против ОДНОГО диапазона и весь
-    # `pot_before` записывает герою, — поэтому вердикта здесь нет, как и у спота
-    # с уже ответившим на шов. Закреплено
+    # входит: выбора «колл или пас» у него нет, и стратегии в решателе ему не
+    # положено. Посчитать точку при этом нечем — ни симуляция, ни ось «входят
+    # все» его участия во вскрытии не разыгрывают, — поэтому вердикта здесь нет,
+    # как и у спота с уже ответившим на шов. Закреплено
     # `test_a_blind_all_in_behind_hero_is_not_priced`.
     live_behind = [
         seat
@@ -1164,8 +1262,8 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
             dp,
             spot,
             f"в руке живых без фишек за спиной помимо героя и шовера — "
-            f"{all_in_behind}: во вскрытии больше двух участников, а эквити "
-            f"считается против одного диапазона",
+            f"{all_in_behind}: выбора «колл или пас» у них нет, в модели их нет, "
+            f"а во вскрытии они участвуют",
         )
 
     dead_bb = _table_dead_bb(state)
@@ -1202,31 +1300,74 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
     to_call_bb = state.to_call / bb
     hero_bb = state.hero.behind / bb
 
-    def ev(rng: Range) -> float:
-        return call_shove_ev_bb(
-            hero_cls, hero_bb, rng, pot_bb, to_call_bb, equity_fn=_model_equity
+    # Места решения шовера по порядку хода: до героя — сбросившие (их сброс
+    # снимает карты из колоды), после — живые, которые ответят на шов и колл
+    # героя оверколл-диапазоном. Герой среди соперников шовера всегда: он жив
+    # и был жив, когда шов прозвучал.
+    rival_at = {seat.label: index for index, seat in enumerate(rivals)}
+    hero_at = rival_at[state.hero.label]
+    ceiling = state.hero.stack
+    responders = [
+        Responder(
+            posted_bb=min(seat.contributed, ceiling) / bb,
+            total_bb=(min(seat.contributed, ceiling) + seat.behind) / bb,
+            cold=solution.calls[rival_at[seat.label]],
+            over=solution.overcalls[rival_at[seat.label]],
+        )
+        for seat in behind
+    ]
+    folded_between = list(solution.calls[:hero_at])
+    hero_posted_bb = min(state.hero.contributed, ceiling) / bb
+    hero_total_bb = state.hero.stack / bb
+    shover_posted_bb = min(shover.contributed, ceiling) / bb
+    shover_total_bb = shover.contributed / bb
+
+    def ev(rng: Range, iterations: int) -> float:
+        return _full_deal_cached(
+            {
+                "kind": "call",
+                "hero": hero_cls,
+                "hero_posted": round(hero_posted_bb, 6),
+                "hero_total": round(hero_total_bb, 6),
+                "shover": [round(shover_posted_bb, 6), round(shover_total_bb, 6), _range_key(rng)],
+                "folded": [_range_key(r) for r in folded_between],
+                "pot": round(pot_bb, 6),
+                "responders": [_responder_key(r) for r in responders],
+                "iterations": iterations,
+            },
+            lambda: call_ev_full_deal(
+                hero_cls,
+                hero_posted_bb,
+                hero_total_bb,
+                Shover(posted_bb=shover_posted_bb, total_bb=shover_total_bb, push=rng),
+                folded_between,
+                responders,
+                pot_bb,
+                iterations=iterations,
+                seed=_FULL_DEAL_SEED,
+            ),
         )
 
     # Диапазон шова — пуш-сторона равновесия ЕГО стола, а не хедз-ап равновесия
     # его глубины: у шовера была своя позиция и своё число игроков позади, и
     # хедз-ап пуш-диапазон отвечает на другую игру.
     model_range = solution.push
-    ev_model = ev(model_range)
+    ev_model = ev(model_range, _FULL_DEAL_ITERATIONS)
     # Ширины опрашиваются множителями к равновесной ширине ЭТОГО шова, а не
     # абсолютными долями комбо: полоса замерена в множителях (`_SHOVE_WIDTH_BAND`),
     # и абсолютный край означал бы в разных спотах разное отклонение от модели.
     width_ranges = _shover_range_models(solution)
-    ev_by_width = {key: ev(rng) for key, rng in width_ranges.items()}
+    ev_by_width = {key: ev(rng, _FULL_DEAL_GRID_ITERATIONS) for key, rng in width_ranges.items()}
     ev_tight = ev_by_width[_WIDTH_KEY(_SHOVER_WIDTH_MULTIPLIERS[0])]
     ev_wide = ev_by_width[_WIDTH_KEY(_SHOVER_WIDTH_MULTIPLIERS[-1])]
 
-    # Вторая ось вилки: живые за героем. `call_shove_ev_bb` считает вскрытие один
-    # на один, поэтому их возможный вход в банк — величина, которой в модели нет
-    # вовсе. Считаем противоположный конец: все они коллируют. Эквити героя тогда
-    # делится на всех (хуже для него), но и банк растёт на их деньги (лучше), —
-    # обе поправки берутся вместе, иначе конец вилки был бы искусственно мрачным.
-    # Арифметика та же самая, из замороженного инструмента: подменяется только
-    # набор диапазонов на вскрытии и размер банка.
+    # Вторая ось вилки: живые за героем. В точечной модели они отвечают на шов и
+    # колл героя оверколл-диапазоном равновесия; ось берёт другой сценарий — все
+    # они входят своим холодным коллом. Эквити героя тогда делится на всех, но и
+    # банк растёт на их деньги — обе поправки берутся вместе. Пессимистичным
+    # концом ось не обязана быть: широкий холодный колл бывает выгоднее герою,
+    # чем тесный оверколл (на сетке 318 рук — 5 точек из 29). Арифметика —
+    # `call_shove_ev_bb`: подменяется только набор диапазонов и размер банка.
     behind_unmodelled = len(behind) > _MAX_MODELLED_CALLERS
     best_behind: list[str] = []
     ev_behind: float | None = None
@@ -1294,8 +1435,8 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         best_interior=by_width[1:-1],
         best_behind=best_behind,
         unmodelled=(
-            f"живых за героем {len(behind)} — больше, чем модель вскрытия способна "
-            f"перебрать, их влияние на вердикт не проверено"
+            f"живых за героем {len(behind)} — больше, чем берёт решатель "
+            f"равновесия, их влияние на вердикт не проверено"
             if behind_unmodelled
             else ""
         ),
@@ -1303,8 +1444,11 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
     taken = "call" if dp.action.kind is ActionKind.CALL else "fold"
 
     detail: dict[str, object] = {
-        "method": "call_ev",
+        "method": "full_deal_call",
         "bracket": bracket_call,
+        "simulated_deals": _FULL_DEAL_ITERATIONS,
+        "simulated_deals_by_width": _FULL_DEAL_GRID_ITERATIONS,
+        "simulation_seed": _FULL_DEAL_SEED,
         "ev_call_bb": round(ev_model, 4),
         "ev_call_tight_bb": round(ev_tight, 4),
         "ev_call_wide_bb": round(ev_wide, 4),
@@ -1321,9 +1465,10 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
         "rivals_when_shoved": len(rivals),
         "shove_range_fraction": round(model_range.fraction_of_hands(), 6),
         "call_range_fractions": [round(rng.fraction_of_hands(), 6) for rng in behind_ranges],
+        "overcall_range_fractions": [round(r.over.fraction_of_hands(), 6) for r in responders],
         "equilibrium_hand_regret_bb": round(solution.hand_regret_bb, 6),
-        # Обе точки модели по отдельности: против одного диапазона и с вошедшими
-        # в банк живыми позади. Когда они расходятся, `best_action` называет
+        # Обе точки модели по отдельности: симуляция по равновесию и вариант,
+        # где входят все живые позади. Когда они расходятся, `best_action` называет
         # развилку, а не одно из этих действий.
         "best_vs_one": best,
         "best_all_behind": best_all_behind,
@@ -1385,7 +1530,7 @@ def _facing_shove_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState
             if zone is Zone.ASSUMING
             else None
         ),
-        tools=["multiway_pushfold", "call_shove_ev_bb", "required_equity"],
+        tools=["multiway_pushfold", "full_deal", "call_shove_ev_bb", "required_equity"],
         detail=detail,
     )
 
@@ -1451,8 +1596,8 @@ def _taken_ev(taken: str, active: str, ev: float) -> float:
 # см. замер в комментарии к `_DEPTH_STEP_BB`: 72o/32o/83o на 10.25bb с тремя
 # позади дают ПОЛОЖИТЕЛЬНУЮ EV шова именно за счёт фолд-эквити более узкого
 # поля). Если даже на этой, самой щедрой к шову глубине чарт не даёт классу
-# героя веса больше десятой доли, дальше можно не считать: полный перебор
-# подмножеств с сеткой ширин колл-диапазона (`_unopened_verdict`) способен
+# героя веса больше десятой доли, дальше можно не считать: полный расчёт
+# с сеткой ширин колл-диапазона (`_unopened_verdict`) способен
 # только СУЗИТЬ обоснование шова относительно этой оценки — больше живых
 # позади означает больше шансов быть отвеченным, а не меньше, — и развернуть
 # вердикт в сторону шова он не может. Порог найден не подбором: 0.1 — это то
@@ -1466,8 +1611,8 @@ def cheap_fold_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | No
 
     Не альтернатива `verdict_for`, а обгон перед ним. Большинство рук турнирного
     файла — «сфолдил в неоткрытый банк, отдал блайнды» (SCALING.md §3), и для
-    них дорогая часть расчёта (`shove_ev_bb`: перебор 2^n подмножеств коллеров
-    на КАЖДОЙ из точек сетки ширин, с Монте-Карло на мультивее) ничего не меняет
+    них дорогая часть расчёта (решатель равновесия и симуляция раздачи на
+    КАЖДОЙ из точек сетки ширин) ничего не меняет
     в выводе — чарт уже уверенно говорит «фолд». Эта функция закрывает именно
     такую точку одним попаданием в закешированный равновесный push-чарт
     (`_push_model`, тот же самый, которым уже пользуется `_unopened_verdict`),
@@ -1507,8 +1652,8 @@ def cheap_fold_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | No
     if not behind or state.hero.behind <= 0:
         return None
     if len(behind) > _MAX_MODELLED_CALLERS:
-        # Перебор подмножеств в `_unopened_verdict` на таком числе коллеров сам
-        # не считается (2^n веток) и возвращает точку БЕЗ вердикта — дешёвый
+        # `_unopened_verdict` на таком числе коллеров сам не считается (решатель
+        # равновесия их не берёт) и возвращает точку БЕЗ вердикта — дешёвый
         # лукап не имеет права быть увереннее полного расчёта там, где тот
         # прямо отказывается судить.
         return None

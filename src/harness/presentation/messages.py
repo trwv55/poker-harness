@@ -742,8 +742,8 @@ _ANTE_TYPE_WORD: dict[str, str] = {"per_player": "с каждого"}
 # Слова игрока для машинных значений `detail`. Значение без перевода печатается
 # как есть — по той же причине, что и ключ без подписи.
 _METHOD_WORD: dict[str, str] = {
-    "subset_enumeration": "перебор подмножеств ответивших",
-    "call_ev": "EV колла против диапазона шовера",
+    "full_deal_shove": "симуляция полной раздачи: шов",
+    "full_deal_call": "симуляция полной раздачи: колл против диапазона шовера",
     "prefilter_chart_lookup": "лукап по чарту",
 }
 _BRACKET_WORD: dict[str, str] = {"stable": "устойчива", "unstable": "через ноль"}
@@ -778,7 +778,9 @@ _VALIDATION_WORD: dict[ValidationStatus, str] = {
 _DETAIL_LABELS: dict[str, str] = {
     "method": "метод расчёта",
     "bracket": "вилка по ширине диапазона",
-    "branches": "перебранных веток вскрытия",
+    "simulated_deals": "раздач в симуляции",
+    "simulated_deals_by_width": "раздач в симуляции на каждую ширину",
+    "simulation_seed": "сид симуляции",
     "fold_equity_ok": "фолд-эквити возможна",
     "ev_shove_bb": "EV шова, ББ",
     "ev_shove_tight_bb": "EV шова против узкого диапазона, ББ",
@@ -796,6 +798,7 @@ _DETAIL_LABELS: dict[str, str] = {
     "model_within_bracket": "модель попала в вилку",
     "shove_range_fraction": "рук в диапазоне шова",
     "call_range_fractions": "рук в диапазонах колла",
+    "overcall_range_fractions": "рук в диапазонах оверколла",
     "equilibrium_hand_regret_bb": "отклонение этой руки от равновесия, ББ",
     "p_all_fold": "вероятность, что все спасуют",
     "expected_callers": "ожидаемое число ответивших",
@@ -804,7 +807,7 @@ _DETAIL_LABELS: dict[str, str] = {
     "live_others": "живых за вами в переборе",
     "behind_axis": "устойчивость к входу живых за вами",
     "rivals_when_shoved": "соперников на момент шова",
-    "best_vs_one": "лучше против одного диапазона",
+    "best_vs_one": "лучше по модели",
     "best_all_behind": "лучше, если входят все живые за вами",
     "push_weight": "вес руки в чарте шова",
     "lookup_depth_bb": "глубина лукапа по чарту, ББ",
@@ -819,6 +822,7 @@ _SHARE_KEYS = frozenset(
         "required_equity",
         "shove_range_fraction",
         "call_range_fractions",
+        "overcall_range_fractions",
         "push_weight",
         "p_all_fold",
     }

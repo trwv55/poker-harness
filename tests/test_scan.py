@@ -360,7 +360,7 @@ def _make_fold_with_short_allin_bb(hero_cards: tuple[str, str], eff_bb: float):
     BB посажен со стеком РОВНО в блайнд: пост забирает стек целиком, и BB живой,
     но `behind == 0` — тот самый случай, на котором `_unopened_verdict` снимает
     вердикт целиком (`test_a_blind_all_in_behind_the_hero_shove_is_not_priced`).
-    Полный перебор подмножеств коллеров этого игрока просто не видит; префильтр
+    Полный расчёт шова этого игрока в модель не берёт; префильтр
     не имеет права быть увереннее него.
     """
     hero_stack = round(eff_bb * _BB)
