@@ -131,7 +131,7 @@ def test_shipped_file_serves_the_owner_charts_and_no_example():
     book = load_chart_book()
     keys = book.all_keys()
     rfi_positions = {"UTG", "UTG+1", "LJ", "HJ", "CO", "BTN", "SB"}
-    for bucket in ("15-20", "20-30", "30-40", "40-60"):
+    for bucket in BUCKET_NAMES:
         assert {k.position for k in keys if k.depth_bucket == bucket} == rfi_positions
     for key in keys:
         assert book.get(key).opening.weights, key
