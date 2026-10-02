@@ -122,6 +122,79 @@
       "open_pct": "35.0% (raise+allin), 83.0% с лимпом",
       "source": "коммерческий солвер, 8-max MTT, 15bb, SB open 2.5bb, анте 1bb на стол per_player (0.125bb с места), chipEV",
       "revised_at": "2026-10-02"
+    },
+    {
+      "seats": 8,
+      "position": "UTG",
+      "depth_bucket": "20-30",
+      "ante_type": "per_player",
+      "raise": "AA, KK, QQ, JJ, TT, 99, 88, 77, 66, 55:0.34, AKs, AQs, AJs, ATs, A9s, A8s, A7s, A6s, A5s, A4s, A3s, KQs, KJs, KTs, K9s, K8s, QJs, QTs, Q9s, JTs, J9s, T9s, T8s:0.3, 98s:0.91, AKo, AQo, AJo, ATo, A9o:0.08, KQo, KJo, KTo:0.06, QJo:0.45",
+      "open_pct": "17.2%",
+      "source": "коммерческий солвер, 8-max MTT, 20bb, open 2bb, анте 1bb на стол per_player (0.125bb с места), chipEV",
+      "revised_at": "2026-10-02"
+    },
+    {
+      "seats": 8,
+      "position": "UTG+1",
+      "depth_bucket": "20-30",
+      "ante_type": "per_player",
+      "raise": "AA, KK, QQ, JJ, TT, 99, 88, 77, 66, 55:0.77, AKs, AQs, AJs, ATs, A9s, A8s, A7s, A6s, A5s, A4s, A3s, KQs, KJs, KTs, K9s, K8s, K7s:0.42, QJs, QTs, Q9s, Q8s:0.61, JTs, J9s, T9s, T8s:0.99, 98s, AKo, AQo, AJo, ATo, A9o:0.83, KQo, KJo, KTo:0.33, QJo",
+      "open_pct": "19.4%",
+      "source": "коммерческий солвер, 8-max MTT, 20bb, open 2bb, анте 1bb на стол per_player (0.125bb с места), chipEV",
+      "revised_at": "2026-10-02"
+    },
+    {
+      "seats": 8,
+      "position": "LJ",
+      "depth_bucket": "20-30",
+      "ante_type": "per_player",
+      "raise": "AA, KK, QQ, JJ, TT, 99, 88, 77, 66, 55, AKs, AQs, AJs, ATs, A9s, A8s, A7s, A6s, A5s, A4s, A3s, A2s, KQs, KJs, KTs, K9s, K8s, K7s, K6s:0.03, QJs, QTs, Q9s, Q8s, JTs, J9s, J8s:0.88, T9s, T8s, 98s, 87s:0.6, AKo, AQo, AJo, ATo, A9o, A8o:0.29, KQo, KJo, KTo:0.89, QJo, QTo:0.6, JTo:0.07",
+      "open_pct": "22.0%",
+      "source": "коммерческий солвер, 8-max MTT, 20bb, open 2bb, анте 1bb на стол per_player (0.125bb с места), chipEV",
+      "revised_at": "2026-10-02"
+    },
+    {
+      "seats": 8,
+      "position": "HJ",
+      "depth_bucket": "20-30",
+      "ante_type": "per_player",
+      "raise": "AA, KK, QQ, JJ, TT, 99, 88, 77, 66, 55, 44:0.41, AKs, AQs, AJs, ATs, A9s, A8s, A7s, A6s, A5s, A4s, A3s, A2s, KQs, KJs, KTs, K9s, K8s, K7s, K6s, K5s:0.95, QJs, QTs, Q9s, Q8s, Q7s, JTs, J9s, J8s, T9s, T8s, 98s, 97s:0.5, 87s, AKo, AQo, AJo, ATo, A9o, A8o, A7o:0.34, A5o:0.29, KQo, KJo, KTo, QJo, QTo, JTo:0.97",
+      "open_pct": "25.9%",
+      "source": "коммерческий солвер, 8-max MTT, 20bb, open 2bb, анте 1bb на стол per_player (0.125bb с места), chipEV",
+      "revised_at": "2026-10-02"
+    },
+    {
+      "seats": 8,
+      "position": "CO",
+      "depth_bucket": "20-30",
+      "ante_type": "per_player",
+      "raise": "AA, KK, QQ, JJ, TT, 99, 88, 77, 66, 55, 44, AKs, AQs, AJs, ATs, A9s, A8s, A7s, A6s, A5s, A4s, A3s, A2s, KQs, KJs, KTs, K9s, K8s, K7s, K6s, K5s, K4s, QJs, QTs, Q9s, Q8s, Q7s, Q6s, Q5s:0.99, JTs, J9s, J8s, J7s, T9s, T8s, T7s:0.94, 98s, 97s, 87s, 76s:0.12, AKo, AQo, AJo, ATo, A9o, A8o, A7o, A6o:0.98, A5o, A4o:0.01, KQo, KJo, KTo, K9o, QJo, QTo, Q9o:0.57, JTo, J9o:0.32, T9o:0.03",
+      "open_pct": "31.8%",
+      "source": "коммерческий солвер, 8-max MTT, 20bb, open 2bb, анте 1bb на стол per_player (0.125bb с места), chipEV",
+      "revised_at": "2026-10-02"
+    },
+    {
+      "seats": 8,
+      "position": "BTN",
+      "depth_bucket": "20-30",
+      "ante_type": "per_player",
+      "raise": "AA, KK, QQ, JJ, TT, 99, 88, 77, 66, 55, AKs, AQs, AJs, ATs, A9s, A8s, A7s, A6s, A5s:0.84, KQs, KJs, KTs, K9s, K8s, K7s, K6s, K5s, K4s, K3s, K2s:0.23, QJs, QTs:0.37, Q9s, Q8s, Q7s, Q6s, Q5s, Q4s, JTs:0.8, J9s, J8s, J7s, J6s, J5s, T9s, T8s, T7s, T6s, 98s, 97s, 87s, 86s, 76s, 65s:0.11, AKo, AQo, AJo, ATo, A9o:0.89, A8o:0.14, A7o:0.3, A6o, A5o, A4o, A3o, A2o, KQo:0.93, KJo:0.81, KTo, K9o, K8o, K7o:0.3, QJo, QTo, Q9o, Q8o:0.48, JTo, J9o, J8o:0.41, T9o, T8o:0.03",
+      "allin": "44, 33, 22, A5s:0.16, A4s, A3s, A2s, QTs:0.63, JTs:0.2, A9o:0.11, A8o:0.86, A7o:0.7, KQo:0.07, KJo:0.19",
+      "open_pct": "41.5%",
+      "source": "коммерческий солвер, 8-max MTT, 20bb, open 2bb, анте 1bb на стол per_player (0.125bb с места), chipEV",
+      "revised_at": "2026-10-02"
+    },
+    {
+      "seats": 8,
+      "position": "SB",
+      "depth_bucket": "20-30",
+      "ante_type": "per_player",
+      "raise": "AA, KK, QQ, JJ:0.71, TT:0.74, 99:0.68, 88:0.38, 77:0.22, 66:0.39, 55:0.21, AKs:0.98, AQs:0.97, AJs:0.31, ATs:0.46, A9s:0.28, A8s:0.79, A7s:0.7, A6s:0.56, A5s:0.01, KQs, KJs:0.22, KTs:0.23, JTs:0.06, J9s:0.85, J4s:0.29, J3s:0.39, J2s:0.39, T9s, T4s:0.71, T3s:0.34, T2s:0.51, 95s:0.21, 94s:0.26, 93s:0.25, 92s:0.35, 84s:0.7, 83s:0.07, 74s:0.14, 73s:0.69, 64s:0.2, 63s:0.04, 53s:0.21, 52s:0.22, 43s:0.1, 32s:0.38, AKo:0.3, AQo:0.04, A4o:0.28, A3o:0.11, KQo:0.46, KJo:0.52, KTo:0.6, K9o:0.6, K8o:0.63, K7o:0.68, K6o:0.07, K5o:0.42, K4o:0.32, K3o:0.34, K2o:0.39, QJo:0.4, QTo:0.31, Q9o:0.43, Q8o:0.41, Q7o:0.33, Q6o:0.09, Q5o:0.7, Q4o:0.46, JTo:0.32, J9o:0.12, J8o:0.33, J7o:0.66, J6o:0.14, J5o:0.07, T9o:0.2, T8o:0.42, T7o:0.69, T6o:0.1, 98o:0.15, 97o:0.47, 96o:0.19, 87o:0.08, 86o:0.35, 76o:0.27, 65o:0.31, 54o:0.15",
+      "allin": "44, 33, 22, T7s:0.08, 98s:0.98, 87s:0.98, AJo:0.35, ATo:0.43, A9o, A8o, A7o, A6o, A5o, A4o:0.72, A3o:0.89, A2o, KJo:0.2, K6o:0.49, K5o:0.11, Q6o:0.47, 98o:0.01",
+      "limp": "JJ:0.29, TT:0.26, 99:0.32, 88:0.62, 77:0.78, 66:0.61, 55:0.79, AKs:0.02, AQs:0.03, AJs:0.69, ATs:0.54, A9s:0.72, A8s:0.21, A7s:0.3, A6s:0.44, A5s:0.99, A4s, A3s, A2s, KJs:0.78, KTs:0.77, K9s, K8s, K7s, K6s, K5s, K4s, K3s, K2s, QJs, QTs, Q9s, Q8s, Q7s, Q6s, Q5s, Q4s, Q3s, Q2s, JTs:0.94, J9s:0.15, J8s, J7s, J6s, J5s, J4s:0.71, J3s:0.61, J2s:0.61, T8s, T7s:0.92, T6s, T5s, T4s:0.29, T3s:0.66, T2s:0.49, 98s:0.02, 97s, 96s, 95s:0.79, 94s:0.74, 93s:0.75, 92s:0.65, 87s:0.02, 86s, 85s, 84s:0.3, 83s:0.93, 82s, 76s, 75s, 74s:0.86, 73s:0.31, 72s, 65s, 64s:0.8, 63s:0.96, 62s, 54s, 53s:0.79, 52s:0.78, 43s:0.9, 42s, 32s:0.62, AKo:0.7, AQo:0.96, AJo:0.65, ATo:0.57, KQo:0.54, KJo:0.28, KTo:0.4, K9o:0.4, K8o:0.37, K7o:0.32, K6o:0.44, K5o:0.47, K4o:0.68, K3o:0.66, K2o:0.61, QJo:0.6, QTo:0.69, Q9o:0.57, Q8o:0.59, Q7o:0.67, Q6o:0.44, Q5o:0.29, Q4o:0.54, Q3o, Q2o, JTo:0.68, J9o:0.88, J8o:0.67, J7o:0.34, J6o:0.86, J5o:0.93, J4o, J3o, J2o, T9o:0.8, T8o:0.58, T7o:0.31, T6o:0.9, T5o, T4o, T3o:0.78, 98o:0.83, 97o:0.53, 96o:0.81, 95o, 87o:0.92, 86o:0.65, 85o, 76o:0.73, 75o, 74o:0.35, 65o:0.69, 64o:0.8, 54o:0.85, 53o:0.39",
+      "open_pct": "30.6% (raise+allin), 84.9% с лимпом",
+      "source": "коммерческий солвер, 8-max MTT, 20bb, SB open 3bb, анте 1bb на стол per_player (0.125bb с места), chipEV",
+      "revised_at": "2026-10-02"
     }
   ]
 }

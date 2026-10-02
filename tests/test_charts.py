@@ -123,13 +123,16 @@ def test_all_expanded_classes_are_among_the_169():
 def test_shipped_file_serves_the_owner_charts_and_no_example():
     """Файл в репозитории читается целиком, и каждая его запись — настоящий чарт.
 
-    Образцов формата в нём больше нет: с 2026-10-02 там чарты владельца на 15bb.
+    Образцов формата в нём больше нет: с 2026-10-02 там чарты владельца на 15bb
+    и 20bb (корзины 15-20 и 20-30).
     Загрузка уже прогнала все проверки формы, включая сверку заявленного
     `open_pct` с диапазонами, — здесь закрепляется, что отдаётся каждая запись.
     """
     book = load_chart_book()
     keys = book.all_keys()
-    assert {k.position for k in keys} == {"UTG", "UTG+1", "LJ", "HJ", "CO", "BTN", "SB"}
+    rfi_positions = {"UTG", "UTG+1", "LJ", "HJ", "CO", "BTN", "SB"}
+    for bucket in ("15-20", "20-30"):
+        assert {k.position for k in keys if k.depth_bucket == bucket} == rfi_positions
     for key in keys:
         assert book.get(key).opening.weights, key
 
