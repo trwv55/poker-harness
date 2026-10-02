@@ -412,17 +412,16 @@ def test_a_broken_chart_book_is_named_in_the_words_of_the_player(
     assert point.action_taken == "fold"
 
 
-def test_a_table_without_a_chart_keeps_the_push_fold_verdict_up_to_15bb(monkeypatch):
+def test_a_table_without_a_chart_keeps_the_push_fold_verdict_up_to_15bb(tmp_path, monkeypatch):
     """Чарта для стола нет — шов на 14bb судит равновесие, как до справочника."""
-    monkeypatch.setattr(open_chart, "load_chart_book", lambda: load_chart_book(_empty_book()))
+    book = _other_table_book(tmp_path)
+    monkeypatch.setattr(open_chart, "load_chart_book", lambda: load_chart_book(book))
     point = _point(_hand("CO", ("Ah", "Ad"), 14.0, "shove"))
     assert point.spot == SpotKind.PUSHFOLD_UNOPENED and point.best_action == "shove"
 
 
-def _empty_book() -> Path:
-    import tempfile
-
-    path = Path(tempfile.mkdtemp()) / "charts.json"
+def _other_table_book(tmp_path: Path) -> Path:
+    path = tmp_path / "charts.json"
     entry = {
         "seats": 9,
         "position": "CO",
