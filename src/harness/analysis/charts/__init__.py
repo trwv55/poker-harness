@@ -33,10 +33,12 @@ from harness.analysis.charts.lookup import (
     ChartMissing,
     ChartPlaceholder,
     DepthNotCharted,
+    OpenStrategy,
     chart_keys,
     depth_bucket_for,
     load_chart_book,
     open_range,
+    open_strategy,
 )
 from harness.analysis.charts.notation import NotationError, parse_range, to_notation
 
@@ -55,10 +57,12 @@ __all__ = [
     "ChartPlaceholder",
     "DepthNotCharted",
     "NotationError",
+    "OpenStrategy",
     "chart_keys",
     "depth_bucket_for",
     "load_chart_book",
     "open_range",
+    "open_strategy",
     "parse_range",
     "to_notation",
 ]

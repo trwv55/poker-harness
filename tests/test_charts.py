@@ -26,6 +26,7 @@ from harness.analysis.charts import (
     depth_bucket_for,
     load_chart_book,
     open_range,
+    open_strategy,
     parse_range,
     to_notation,
 )
@@ -119,17 +120,18 @@ def test_all_expanded_classes_are_among_the_169():
 # --- файл справочника, который лежит в репозитории -------------------------------
 
 
-def test_shipped_file_loads_and_serves_nothing():
-    """Файл в репозитории читается, но ни одной записи не отдаёт: там только образцы.
+def test_shipped_file_serves_the_owner_charts_and_no_example():
+    """Файл в репозитории читается целиком, и каждая его запись — настоящий чарт.
 
-    Это и есть гарантия «ничего выдуманного не уехало в прод»: пока владелец не
-    положил настоящие чарты, любой ключ шипованного файла — отказ.
+    Образцов формата в нём больше нет: с 2026-10-02 там чарты владельца на 15bb.
+    Загрузка уже прогнала все проверки формы, включая сверку заявленного
+    `open_pct` с диапазонами, — здесь закрепляется, что отдаётся каждая запись.
     """
     book = load_chart_book()
-    assert book.all_keys(), "в файле должны быть образцы формата"
-    for key in book.all_keys():
-        with pytest.raises(ChartPlaceholder):
-            book.get(key)
+    keys = book.all_keys()
+    assert {k.position for k in keys} == {"UTG", "UTG+1", "LJ", "HJ", "CO", "BTN", "SB"}
+    for key in keys:
+        assert book.get(key).opening.weights, key
 
 
 def test_shipped_examples_use_the_ante_type_vocabulary_of_the_pipeline():
@@ -185,7 +187,7 @@ def test_bucket_names_match_the_specification():
 
 
 def _write(tmp_path: Path, entries: list[dict[str, object]], **file_fields: object) -> Path:
-    payload: dict[str, object] = {"schema_version": 1, "entries": entries}
+    payload: dict[str, object] = {"schema_version": 2, "entries": entries}
     payload.update(file_fields)
     path = tmp_path / "charts.json"
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -201,7 +203,7 @@ def _entry(**over: object) -> dict[str, object]:
         "source": "тестовый источник",
         "revised_at": "2026-09-06",
         "status": "chart",
-        "hands": "66+, ATs+, KQs, AJo+",
+        "raise": "66+, ATs+, KQs, AJo+",
     }
     entry.update(over)
     return entry
@@ -210,20 +212,39 @@ def _entry(**over: object) -> dict[str, object]:
 def test_exact_key_returns_the_range_of_that_entry(tmp_path: Path):
     path = _write(
         tmp_path,
-        [
-            _entry(),
-            _entry(depth_bucket="30-40", hands="AA"),
-            _entry(position="BTN", weights={"AA": 1.0, "AKs": 0.5}, hands=None),
-        ],
+        [_entry(), _entry(depth_bucket="30-40", **{"raise": "AA"})],
     )
     assert open_range(8, "CO", "20-30", "per_player", path=path).weights == parse_range(
         "66+, ATs+, KQs, AJo+"
     ).weights
     assert set(open_range(8, "CO", "30-40", "per_player", path=path).weights) == {"AA"}
-    assert open_range(8, "BTN", "20-30", "per_player", path=path).weights == {
-        "AA": 1.0,
-        "AKs": 0.5,
-    }
+
+
+def test_a_hand_split_between_actions_keeps_each_share_and_folds_the_rest(tmp_path: Path):
+    """AJo наполовину рейзом, на треть олл-ином: открытие 5/6, фолд 1/6."""
+    path = _write(
+        tmp_path,
+        [
+            _entry(
+                **{"raise": "AA, AJo:0.5"},
+                allin="KK, AJo:0.33",
+                limp="QQ:0.25",
+            )
+        ],
+    )
+    strategy = open_strategy(8, "CO", "20-30", "per_player", path=path)
+    assert strategy.raise_range.weight("AJo") == 0.5
+    assert strategy.allin_range.weight("AJo") == 0.33
+    assert strategy.opening.weights == {"AA": 1.0, "KK": 1.0, "AJo": 0.83}
+    assert strategy.fold_weight("AJo") == pytest.approx(0.17)
+    assert strategy.fold_weight("QQ") == pytest.approx(0.75)
+    assert strategy.fold_weight("72o") == 1.0
+
+
+def test_a_declared_open_share_that_matches_the_ranges_is_accepted(tmp_path: Path):
+    # 66+ (54) + ATs+ (16) + KQs (4) + AJo+ (36) = 110 комбо = 8.30%.
+    path = _write(tmp_path, [_entry(open_pct="8.3%")])
+    assert open_range(8, "CO", "20-30", "per_player", path=path).weights
 
 
 def test_entry_returns_the_provenance_and_refuses_the_same_way(tmp_path: Path):
@@ -265,9 +286,9 @@ def test_placeholder_entry_is_refused_even_on_an_exact_key(tmp_path: Path):
 
 
 def test_rewritten_file_is_reread_not_served_from_cache(tmp_path: Path):
-    path = _write(tmp_path, [_entry(hands="AA")])
+    path = _write(tmp_path, [_entry(**{"raise": "AA"})])
     assert set(open_range(8, "CO", "20-30", "per_player", path=path).weights) == {"AA"}
-    _write(tmp_path, [_entry(hands="KK")])
+    _write(tmp_path, [_entry(**{"raise": "KK"})])
     assert set(open_range(8, "CO", "20-30", "per_player", path=path).weights) == {"KK"}
 
 
@@ -283,15 +304,20 @@ def test_absent_file_is_a_clear_error(tmp_path: Path):
         pytest.param([_entry(seats=12)], {}, id="нет раскладки для такого стола"),
         pytest.param([_entry(position="MP")], {}, id="неизвестная позиция"),
         pytest.param([_entry(depth_bucket="10-15")], {}, id="неизвестная корзина"),
-        pytest.param([_entry(hands="Zs")], {}, id="битая запись диапазона"),
-        pytest.param([_entry(hands=None)], {}, id="ни одной формы диапазона"),
-        pytest.param([_entry(weights={"AA": 1.0})], {}, id="обе формы сразу"),
+        pytest.param([_entry(**{"raise": "Zs"})], {}, id="битая запись диапазона"),
+        pytest.param([_entry(allin="AA:1.4")], {}, id="вес вне [0,1]"),
+        pytest.param([_entry(**{"raise": ""})], {}, id="открытия нет: пусты raise и allin"),
         pytest.param(
-            [_entry(hands=None, weights={"AA": 1.4})], {}, id="вес вне [0,1] в карте весов"
+            [_entry(**{"raise": "AA, AJo:0.6"}, allin="AJo:0.5")], {}, id="доли руки больше 1"
         ),
         pytest.param(
-            [_entry(hands=None, weights={"AAs": 1.0})], {}, id="неизвестный класс в карте весов"
+            [_entry(**{"raise": "AJo:0.5"}, allin="AJo:0.3", limp="AJo:0.21")],
+            {},
+            id="доли руки больше 1 вместе с лимпом",
         ),
+        pytest.param([_entry(open_pct="9.5%")], {}, id="open_pct расходится с диапазонами"),
+        pytest.param([_entry(open_pct="много")], {}, id="open_pct без процента"),
+        pytest.param([_entry(hands="AA")], {}, id="поле схемы 1"),
         pytest.param([_entry(source="")], {}, id="пустой source"),
         pytest.param([_entry(ante_type=" ")], {}, id="пустой ante_type"),
         pytest.param([_entry(revised_at="вчера")], {}, id="дата не ISO"),
@@ -299,7 +325,7 @@ def test_absent_file_is_a_clear_error(tmp_path: Path):
         pytest.param([_entry(comment="лишнее поле")], {}, id="опечатка в имени поля"),
         pytest.param([_entry(), _entry()], {}, id="ключ дважды"),
         pytest.param([], {}, id="ни одной записи"),
-        pytest.param([_entry()], {"schema_version": 2}, id="чужая версия схемы"),
+        pytest.param([_entry()], {"schema_version": 1}, id="чужая версия схемы"),
         pytest.param([_entry()], {"unexpected": 1}, id="лишнее поле файла"),
     ],
 )

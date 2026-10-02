@@ -1,4 +1,4 @@
-"""Лукап опен-чартов: точный ключ `(seats, position, depth_bucket, ante_type)` → `Range`.
+"""Лукап опен-чартов: точный ключ `(seats, position, depth_bucket, ante_type)` → стратегия.
 
 Чарт — **эталон**, а не результат обучения на руках игрока: он известен до первой
 загруженной руки, и выводить его из сыгранных рук нельзя (это зафиксировало бы
@@ -19,28 +19,53 @@
 (`analysis.tools.pushfold`), справочник не нужен. `depth_bucket_for` на такой
 глубине поднимает `DepthNotCharted`, а не возвращает нижнюю корзину.
 
+**Стратегия открытия — три действия, не одно** (схема 2, решение владельца
+2026-10-02). На 15–20bb солвер открывает часть рук мин-рейзом, часть олл-ином, а
+SB вдобавок лимпует; один диапазон «открытия» потерял бы, КАК рука открывается.
+Запись несёт `raise`, `allin` и `limp` в компактной записи; рука, которой нет ни в
+одном, — фолд. Доли одной руки по трём действиям в сумме не больше 1.
+
 Что этот модуль НЕ проверяет: разумность самого чарта. Монотонность по глубине, по
 позиции, ширина диапазона — не его дело: чарты владельца, код их не судит.
-Проверяется только форма: известный ключ, известные классы, вес в [0,1],
-заполненные `source` и `revised_at` — список проверок пинит параметризованный
+Проверяется только форма: известный ключ, известные классы, вес в [0,1], сумма
+долей руки не больше 1, заявленный `open_pct` совпадает с посчитанным, заполненные
+`source` и `revised_at` — список проверок пинит параметризованный
 `test_malformed_file_is_rejected`.
 """
 
 from __future__ import annotations
 
 import json
+import re
+from dataclasses import dataclass
 from datetime import date
 from math import inf
 from pathlib import Path
 from typing import Literal, NamedTuple
 
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from harness.analysis.charts.notation import NotationError, parse_range
 from harness.contracts import Range
 from harness.normalizer import POSITIONS_BY_COUNT
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# Сумма долей руки по трём действиям допускает округление записи до сотых.
+_SUM_TOLERANCE = 1e-9
+
+# Заявленный `open_pct` сверяется с посчитанной долей «рейз + олл-ин» до десятой
+# процента — так он записан в солвере. Это ловит опечатку при переносе чарта, а не
+# судит сам чарт.
+_OPEN_PCT_TOLERANCE = 0.1
+_PERCENT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 
 DEFAULT_CHART_PATH = Path(__file__).parent / "data" / "open_8max.json"
 
@@ -103,15 +128,46 @@ def depth_bucket_for(eff_bb: float) -> str:
     raise DepthNotCharted(f"глубина {eff_bb} не попала ни в одну корзину {BUCKET_NAMES}")
 
 
+@dataclass(frozen=True)
+class OpenStrategy:
+    """Эталонная стратегия открытия: доля каждого действия для каждого класса.
+
+    Класс, не названный ни одним действием, — фолд целиком.
+    """
+
+    raise_range: Range
+    allin_range: Range
+    limp_range: Range
+
+    @property
+    def opening(self) -> Range:
+        """Открытие с агрессией: рейз и олл-ин вместе (лимп сюда не входит)."""
+        classes = {*self.raise_range.weights, *self.allin_range.weights}
+        return Range(
+            weights={
+                cls: min(1.0, round(self.raise_range.weight(cls) + self.allin_range.weight(cls), 6))
+                for cls in classes
+            }
+        )
+
+    def fold_weight(self, cls: str) -> float:
+        """Доля фолда класса: всё, что не рейз, не олл-ин и не лимп."""
+        played = (
+            self.raise_range.weight(cls) + self.allin_range.weight(cls) + self.limp_range.weight(cls)
+        )
+        return max(0.0, 1.0 - played)
+
+
 class ChartEntry(BaseModel):
-    """Одна запись файла: ключ, провенанс и диапазон в одной из двух форм.
+    """Одна запись файла: ключ, провенанс и три действия в компактной записи.
 
     `extra="forbid"`: опечатка в имени поля — ошибка загрузки, а не тихо
     проигнорированное поле (пин `test_malformed_file_is_rejected`, случай
-    «опечатка в имени поля»).
+    «опечатка в имени поля»). Поле `raise` в файле — `raise_` в коде: `raise` —
+    ключевое слово Python.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     seats: int
     position: str
@@ -120,8 +176,10 @@ class ChartEntry(BaseModel):
     source: str
     revised_at: date
     status: Literal["chart", "example"] = "chart"
-    hands: str | None = None
-    weights: dict[str, float] | None = None
+    raise_: str = Field(default="", alias="raise")
+    allin: str = ""
+    limp: str = ""
+    open_pct: str | None = None
 
     @field_validator("ante_type", "source")
     @classmethod
@@ -146,8 +204,8 @@ class ChartEntry(BaseModel):
                 f"позиция {self.position!r} не встречается за столом на {self.seats} мест: "
                 f"{POSITIONS_BY_COUNT[self.seats]}"
             )
-        if (self.hands is None) == (self.weights is None):
-            raise ValueError("нужно ровно одно из полей: hands (запись) либо weights (карта весов)")
+        if not (self.raise_.strip() or self.allin.strip()):
+            raise ValueError("открытия нет: пусты и raise, и allin")
         return self
 
     @property
@@ -166,7 +224,9 @@ class ChartFileModel(BaseModel):
 class ChartBook:
     """Разобранный файл чартов. Отдаёт диапазон только по точному ключу."""
 
-    def __init__(self, path: Path, entries: dict[ChartKey, tuple[ChartEntry, Range]]) -> None:
+    def __init__(
+        self, path: Path, entries: dict[ChartKey, tuple[ChartEntry, OpenStrategy]]
+    ) -> None:
         self.path = path
         self._entries = entries
 
@@ -179,16 +239,16 @@ class ChartBook:
         entry, _ = self._require(key)
         return entry
 
-    def get(self, key: ChartKey) -> Range:
-        """Диапазон по ТОЧНОМУ ключу.
+    def get(self, key: ChartKey) -> OpenStrategy:
+        """Стратегия открытия по ТОЧНОМУ ключу.
 
         `ChartMissing` — записи нет (соседняя не подставляется);
         `ChartPlaceholder` — запись помечена образцом формата.
         """
-        _, rng = self._require(key)
-        return rng
+        _, strategy = self._require(key)
+        return strategy
 
-    def _require(self, key: ChartKey) -> tuple[ChartEntry, Range]:
+    def _require(self, key: ChartKey) -> tuple[ChartEntry, OpenStrategy]:
         found = self._entries.get(key)
         if found is None:
             raise ChartMissing(
@@ -198,13 +258,13 @@ class ChartBook:
                 f"ante_type={key.ante_type!r}) в файле есть корзины: "
                 f"{self._buckets_for(key) or 'ни одной'}"
             )
-        entry, rng = found
+        entry, strategy = found
         if entry.status == "example":
             raise ChartPlaceholder(
                 f"запись {tuple(key)} помечена status='example' — это образец формата, "
                 f"а не чарт (source: {entry.source!r}); загрузчик её не отдаёт"
             )
-        return entry, rng
+        return entry, strategy
 
     def _buckets_for(self, key: ChartKey) -> list[str]:
         return sorted(
@@ -243,6 +303,18 @@ def chart_keys(path: Path | None = None) -> list[ChartKey]:
     return load_chart_book(path).all_keys()
 
 
+def open_strategy(
+    seats: int,
+    position: str,
+    depth_bucket: str,
+    ante_type: str,
+    *,
+    path: Path | None = None,
+) -> OpenStrategy:
+    """Эталонная стратегия открытия по точному ключу. Отказы — см. `ChartBook.get`."""
+    return load_chart_book(path).get(ChartKey(seats, position, depth_bucket, ante_type))
+
+
 def open_range(
     seats: int,
     position: str,
@@ -251,8 +323,8 @@ def open_range(
     *,
     path: Path | None = None,
 ) -> Range:
-    """Эталонный опен-диапазон по точному ключу. Отказы — см. `ChartBook.get`."""
-    return load_chart_book(path).get(ChartKey(seats, position, depth_bucket, ante_type))
+    """Открытие с агрессией (рейз + олл-ин) по точному ключу — `OpenStrategy.opening`."""
+    return open_strategy(seats, position, depth_bucket, ante_type, path=path).opening
 
 
 def _parse_file(path: Path) -> ChartBook:
@@ -273,27 +345,62 @@ def _parse_file(path: Path) -> ChartBook:
             f"версия схемы файла {model.schema_version}, код читает {SCHEMA_VERSION}: {path}"
         )
 
-    entries: dict[ChartKey, tuple[ChartEntry, Range]] = {}
+    entries: dict[ChartKey, tuple[ChartEntry, OpenStrategy]] = {}
     for entry in model.entries:
         if entry.key in entries:
             raise ChartFileError(f"ключ {tuple(entry.key)} встречается дважды: {path}")
-        entries[entry.key] = (entry, _range_of(entry, path))
+        entries[entry.key] = (entry, _strategy_of(entry, path))
     if not entries:
         raise ChartFileError(f"в файле чартов нет ни одной записи: {path}")
     return ChartBook(path, entries)
 
 
-def _range_of(entry: ChartEntry, path: Path) -> Range:
-    """Диапазон записи из любой из двух форм — с контекстом ключа в сообщении.
+def _strategy_of(entry: ChartEntry, path: Path) -> OpenStrategy:
+    """Три действия записи — с проверкой суммы долей и заявленного процента."""
+    where = f"запись {tuple(entry.key)} ({path})"
+    strategy = OpenStrategy(
+        raise_range=_range_of(entry.raise_, "raise", where),
+        allin_range=_range_of(entry.allin, "allin", where),
+        limp_range=_range_of(entry.limp, "limp", where),
+    )
+    over = sorted(
+        cls
+        for cls in {
+            *strategy.raise_range.weights,
+            *strategy.allin_range.weights,
+            *strategy.limp_range.weights,
+        }
+        if strategy.raise_range.weight(cls)
+        + strategy.allin_range.weight(cls)
+        + strategy.limp_range.weight(cls)
+        > 1.0 + _SUM_TOLERANCE
+    )
+    if over:
+        raise ChartFileError(f"{where}: доли действий в сумме больше 1 у {', '.join(over)}")
+    if entry.open_pct is not None:
+        declared = _PERCENT.search(entry.open_pct)
+        if declared is None:
+            raise ChartFileError(f"{where}: open_pct {entry.open_pct!r} не содержит процента")
+        counted = 100.0 * (
+            strategy.raise_range.fraction_of_hands() + strategy.allin_range.fraction_of_hands()
+        )
+        if abs(float(declared.group(1)) - counted) > _OPEN_PCT_TOLERANCE:
+            raise ChartFileError(
+                f"{where}: заявлено открытие {declared.group(1)}%, по диапазонам "
+                f"raise + allin выходит {counted:.2f}% — опечатка при переносе?"
+            )
+    return strategy
 
-    Обе формы проходят валидатор `Range`: неизвестный класс и вес вне [0,1] —
-    отказ загрузки. Класс, не названный записью, имеет вес 0 (контракт `Range`).
+
+def _range_of(text: str, field: str, where: str) -> Range:
+    """Диапазон одного действия; пустая строка — действие не используется.
+
+    Неизвестный класс, вес вне [0,1], повтор класса — отказ загрузки (грамматика
+    `parse_range`). Класс, не названный записью, имеет вес 0 (контракт `Range`).
     """
+    if not text.strip():
+        return Range(weights={})
     try:
-        if entry.hands is not None:
-            return parse_range(entry.hands)
-        return Range(weights=entry.weights or {})
+        return parse_range(text)
     except (NotationError, ValidationError, ValueError) as exc:
-        raise ChartFileError(
-            f"диапазон записи {tuple(entry.key)} не принят ({path}): {exc}"
-        ) from exc
+        raise ChartFileError(f"{where}: диапазон {field} не принят: {exc}") from exc
