@@ -1,4 +1,4 @@
-"""Лукап опен-чартов: точный ключ `(seats, position, depth_bucket, ante_type)` → стратегия.
+"""Лукап опен-чартов: `(seats, position, ante_type)` и стек → стратегия ближайшей глубины.
 
 Чарт — **эталон**, а не результат обучения на руках игрока: он известен до первой
 загруженной руки, и выводить его из сыгранных рук нельзя (это зафиксировало бы
@@ -7,17 +7,23 @@
 чем эталон сравнивают, а не то, из чего его получают.
 
 Механика ровно такая: структурный лукап по файлу в репозитории. Ни эмбеддингов,
-ни поиска похожего, ни расчёта — файл читается, ключ ищется точным сравнением.
+ни поиска похожего, ни расчёта — файл читается, ключ ищется сравнением.
 
-**Подстановки соседнего чарта нет и не будет.** Нет записи по ключу — `ChartMissing`
-с названным ключом; вызывающая сторона обязана отказаться от вердикта, а не
-получить «похожий» диапазон. Отдать чарт с соседней глубины или с соседней позиции
-значило бы выдать за эталон то, чего в справочнике нет, — ровно тот отказ, ради
-предотвращения которого продукт и существует.
+**Глубина — ближайшая снятая, всё остальное — точно** (схема 3, решение владельца
+2026-10-02). Каждая запись несёт `depth_bb` — стек, на котором чарт снят в
+солвере. Для стека игрока берётся запись той же раскладки, позиции и типа анте с
+ближайшей `depth_bb`; при равном расстоянии — меньшая глубина. Чарт не
+интерполируется: между 30 и 40bb ширина открытия у солвера не монотонна, и
+усреднение двух чартов выдало бы за эталон стратегию, которой солвер не давал.
+Стек глубже самого глубокого чарта судится самым глубоким.
 
-Глубины ≤ 15bb здесь нет по построению: там эталон вычисляется равновесием
-(`analysis.tools.pushfold`), справочник не нужен. `depth_bucket_for` на такой
-глубине поднимает `DepthNotCharted`, а не возвращает нижнюю корзину.
+**Подстановки соседней позиции, раскладки или типа анте нет и не будет.** Нет
+записи с такими `(seats, position, ante_type)` — `ChartMissing`; вызывающая сторона
+обязана отказаться от вердикта, а не получить «похожий» диапазон.
+
+Глубины ниже 15bb здесь нет по построению: там эталон вычисляется равновесием
+(`analysis.tools.pushfold`), справочник не нужен. Лукап на такой глубине поднимает
+`DepthNotCharted`, а не возвращает самый мелкий чарт.
 
 **Стратегия открытия — три действия, не одно** (схема 2, решение владельца
 2026-10-02). На 15–20bb солвер открывает часть рук мин-рейзом, часть олл-ином, а
@@ -39,7 +45,6 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import date
-from math import inf
 from pathlib import Path
 from typing import Literal, NamedTuple
 
@@ -56,7 +61,7 @@ from harness.analysis.charts.notation import NotationError, parse_range
 from harness.contracts import Range
 from harness.normalizer import POSITIONS_BY_COUNT
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Сумма долей руки по трём действиям допускает округление записи до сотых.
 _SUM_TOLERANCE = 1e-9
@@ -69,18 +74,8 @@ _PERCENT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 
 DEFAULT_CHART_PATH = Path(__file__).parent / "data" / "open_8max.json"
 
-# Корзины глубины — из спецификации владельца, границы полуоткрытые: [lo, hi).
-# Стек ровно на границе уходит в ВЕРХНЮЮ корзину (20.0 → "20-30"), иначе 20bb
-# принадлежал бы двум корзинам сразу.
-DEPTH_BUCKETS: tuple[tuple[str, float, float], ...] = (
-    ("15-20", 15.0, 20.0),
-    ("20-30", 20.0, 30.0),
-    ("30-40", 30.0, 40.0),
-    ("40-60", 40.0, 60.0),
-    ("60+", 60.0, inf),
-)
-BUCKET_NAMES: tuple[str, ...] = tuple(name for name, _, _ in DEPTH_BUCKETS)
-MIN_CHART_DEPTH_BB: float = DEPTH_BUCKETS[0][1]
+# Ниже — зона пуш-фолда: эталон там считается равновесием, а не берётся из чарта.
+MIN_CHART_DEPTH_BB: float = 15.0
 
 
 class ChartError(Exception):
@@ -92,7 +87,7 @@ class ChartFileError(ChartError):
 
 
 class ChartMissing(ChartError):
-    """Записи по точному ключу нет. Похожая НЕ подставляется."""
+    """Записи для таких раскладки, позиции и анте нет. Соседняя НЕ подставляется."""
 
 
 class ChartPlaceholder(ChartError):
@@ -100,32 +95,14 @@ class ChartPlaceholder(ChartError):
 
 
 class DepthNotCharted(ChartError):
-    """Глубина вне корзин справочника (≤ 15bb — зона пуш-фолда, там равновесие)."""
+    """Стек ниже 15bb — зона пуш-фолда, там эталон — равновесие, а не чарт."""
 
 
 class ChartKey(NamedTuple):
     seats: int
     position: str
-    depth_bucket: str
+    depth_bb: float
     ante_type: str
-
-
-def depth_bucket_for(eff_bb: float) -> str:
-    """Имя корзины по эффективному стеку; границы полуоткрытые: [lo, hi).
-
-    Пины теста `test_depth_bucket_edges_are_half_open`: 15.0 → "15-20", 19.99 →
-    "15-20", 20.0 → "20-30", 60.0 и 1000.0 → "60+". Ниже 15bb — `DepthNotCharted`.
-    """
-    if eff_bb < MIN_CHART_DEPTH_BB:
-        raise DepthNotCharted(
-            f"{eff_bb}bb ниже {MIN_CHART_DEPTH_BB}bb — это зона пуш-фолда, "
-            f"эталон там считается равновесием (analysis.tools.pushfold), а не чартом"
-        )
-    for name, lo, hi in DEPTH_BUCKETS:
-        if lo <= eff_bb < hi:
-            return name
-    # Сюда попадает только не-число: NaN ложен во всех сравнениях выше.
-    raise DepthNotCharted(f"глубина {eff_bb} не попала ни в одну корзину {BUCKET_NAMES}")
 
 
 @dataclass(frozen=True)
@@ -171,7 +148,7 @@ class ChartEntry(BaseModel):
 
     seats: int
     position: str
-    depth_bucket: str
+    depth_bb: float
     ante_type: str
     source: str
     revised_at: date
@@ -188,11 +165,14 @@ class ChartEntry(BaseModel):
             raise ValueError("поле обязательно и не может быть пустым")
         return value
 
-    @field_validator("depth_bucket")
+    @field_validator("depth_bb")
     @classmethod
-    def _known_bucket(cls, value: str) -> str:
-        if value not in BUCKET_NAMES:
-            raise ValueError(f"неизвестная корзина глубины {value!r}, известны {BUCKET_NAMES}")
+    def _charted_depth(cls, value: float) -> float:
+        if not value >= MIN_CHART_DEPTH_BB:
+            raise ValueError(
+                f"глубина чарта {value}bb ниже {MIN_CHART_DEPTH_BB}bb — там эталон "
+                f"считается равновесием пуш-фолда"
+            )
         return value
 
     @model_validator(mode="after")
@@ -210,7 +190,7 @@ class ChartEntry(BaseModel):
 
     @property
     def key(self) -> ChartKey:
-        return ChartKey(self.seats, self.position, self.depth_bucket, self.ante_type)
+        return ChartKey(self.seats, self.position, self.depth_bb, self.ante_type)
 
 
 class ChartFileModel(BaseModel):
@@ -222,7 +202,7 @@ class ChartFileModel(BaseModel):
 
 
 class ChartBook:
-    """Разобранный файл чартов. Отдаёт диапазон только по точному ключу."""
+    """Разобранный файл чартов: точный ключ либо ближайшая снятая глубина."""
 
     def __init__(
         self, path: Path, entries: dict[ChartKey, tuple[ChartEntry, OpenStrategy]]
@@ -233,6 +213,31 @@ class ChartBook:
     def all_keys(self) -> list[ChartKey]:
         """Все ключи файла, включая образцы формата (их `get` не отдаёт)."""
         return list(self._entries)
+
+    def nearest(self, seats: int, position: str, eff_bb: float, ante_type: str) -> ChartKey:
+        """Ключ чарта той же раскладки, позиции и анте с глубиной, ближайшей к стеку.
+
+        При равном расстоянии — меньшая глубина. `DepthNotCharted` — стек ниже
+        15bb (или не число); `ChartMissing` — для такой раскладки, позиции и анте
+        нет ни одной глубины.
+        """
+        if not eff_bb >= MIN_CHART_DEPTH_BB:
+            raise DepthNotCharted(
+                f"{eff_bb}bb ниже {MIN_CHART_DEPTH_BB}bb — это зона пуш-фолда, "
+                f"эталон там считается равновесием (analysis.tools.pushfold), а не чартом"
+            )
+        candidates = [
+            key
+            for key in self._entries
+            if key.seats == seats and key.position == position and key.ante_type == ante_type
+        ]
+        if not candidates:
+            raise ChartMissing(
+                f"нет ни одного чарта для (seats={seats}, position={position!r}, "
+                f"ante_type={ante_type!r}) в {self.path}; соседняя позиция, раскладка "
+                f"или тип анте не подставляются"
+            )
+        return min(candidates, key=lambda key: (abs(key.depth_bb - eff_bb), key.depth_bb))
 
     def entry(self, key: ChartKey) -> ChartEntry:
         """Запись по ключу — вместе с провенансом. Отказы те же, что у `get`."""
@@ -255,8 +260,8 @@ class ChartBook:
                 f"нет чарта по ключу {tuple(key)} в {self.path}; "
                 f"подстановка похожего чарта запрещена. "
                 f"Для (seats={key.seats}, position={key.position!r}, "
-                f"ante_type={key.ante_type!r}) в файле есть корзины: "
-                f"{self._buckets_for(key) or 'ни одной'}"
+                f"ante_type={key.ante_type!r}) в файле есть глубины: "
+                f"{self._depths_for(key) or 'ни одной'}"
             )
         entry, strategy = found
         if entry.status == "example":
@@ -266,9 +271,9 @@ class ChartBook:
             )
         return entry, strategy
 
-    def _buckets_for(self, key: ChartKey) -> list[str]:
+    def _depths_for(self, key: ChartKey) -> list[float]:
         return sorted(
-            k.depth_bucket
+            k.depth_bb
             for k in self._entries
             if k.seats == key.seats
             and k.position == key.position
@@ -306,25 +311,30 @@ def chart_keys(path: Path | None = None) -> list[ChartKey]:
 def open_strategy(
     seats: int,
     position: str,
-    depth_bucket: str,
+    eff_bb: float,
     ante_type: str,
     *,
     path: Path | None = None,
 ) -> OpenStrategy:
-    """Эталонная стратегия открытия по точному ключу. Отказы — см. `ChartBook.get`."""
-    return load_chart_book(path).get(ChartKey(seats, position, depth_bucket, ante_type))
+    """Эталонная стратегия открытия для стека: чарт ближайшей снятой глубины.
+
+    Отказы — см. `ChartBook.nearest` и `ChartBook.get`. Какой чарт взят, называет
+    `ChartBook.nearest` — вызывающая сторона показывает его глубину игроку.
+    """
+    book = load_chart_book(path)
+    return book.get(book.nearest(seats, position, eff_bb, ante_type))
 
 
 def open_range(
     seats: int,
     position: str,
-    depth_bucket: str,
+    eff_bb: float,
     ante_type: str,
     *,
     path: Path | None = None,
 ) -> Range:
-    """Открытие с агрессией (рейз + олл-ин) по точному ключу — `OpenStrategy.opening`."""
-    return open_strategy(seats, position, depth_bucket, ante_type, path=path).opening
+    """Открытие с агрессией (рейз + олл-ин) для стека — `OpenStrategy.opening`."""
+    return open_strategy(seats, position, eff_bb, ante_type, path=path).opening
 
 
 def _parse_file(path: Path) -> ChartBook:

@@ -5,7 +5,8 @@
 * **пуш-фолд (≤ 15bb)** — вычисляется равновесием (`analysis.tools.pushfold`),
   ввод владельца не требуется, зона доверия `strict`;
 * **опен на глубоких стеках (15bb+)** — справочник: чарты пишет владелец, код их
-  читает и никогда не выводит из сыгранных рук.
+  читает и никогда не выводит из сыгранных рук; стек судится чартом ближайшей
+  снятой глубины.
 
 Публичный API — реэкспорт из `notation` (запись диапазона) и `lookup` (файл, ключ,
 отказы), чтобы вызывающая сторона импортировала из `harness.analysis.charts`.
@@ -20,9 +21,7 @@
 from __future__ import annotations
 
 from harness.analysis.charts.lookup import (
-    BUCKET_NAMES,
     DEFAULT_CHART_PATH,
-    DEPTH_BUCKETS,
     MIN_CHART_DEPTH_BB,
     SCHEMA_VERSION,
     ChartBook,
@@ -35,7 +34,6 @@ from harness.analysis.charts.lookup import (
     DepthNotCharted,
     OpenStrategy,
     chart_keys,
-    depth_bucket_for,
     load_chart_book,
     open_range,
     open_strategy,
@@ -43,9 +41,7 @@ from harness.analysis.charts.lookup import (
 from harness.analysis.charts.notation import NotationError, parse_range, to_notation
 
 __all__ = [
-    "BUCKET_NAMES",
     "DEFAULT_CHART_PATH",
-    "DEPTH_BUCKETS",
     "MIN_CHART_DEPTH_BB",
     "SCHEMA_VERSION",
     "ChartBook",
@@ -59,7 +55,6 @@ __all__ = [
     "NotationError",
     "OpenStrategy",
     "chart_keys",
-    "depth_bucket_for",
     "load_chart_book",
     "open_range",
     "open_strategy",

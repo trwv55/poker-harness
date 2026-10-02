@@ -14,7 +14,6 @@ from pathlib import Path
 import pytest
 
 from harness.analysis.charts import (
-    BUCKET_NAMES,
     DEFAULT_CHART_PATH,
     ChartFileError,
     ChartKey,
@@ -23,7 +22,6 @@ from harness.analysis.charts import (
     DepthNotCharted,
     NotationError,
     chart_keys,
-    depth_bucket_for,
     load_chart_book,
     open_range,
     open_strategy,
@@ -123,16 +121,16 @@ def test_all_expanded_classes_are_among_the_169():
 def test_shipped_file_serves_the_owner_charts_and_no_example():
     """Файл в репозитории читается целиком, и каждая его запись — настоящий чарт.
 
-    Образцов формата в нём больше нет: с 2026-10-02 там чарты владельца на 15,
-    20, 30, 40 и 60bb — по одному на каждую корзину, все позиции RFI.
-    Загрузка уже прогнала все проверки формы, включая сверку заявленного
-    `open_pct` с диапазонами, — здесь закрепляется, что отдаётся каждая запись.
+    Образцов формата в нём больше нет: с 2026-10-02 там чарты владельца на 15, 20,
+    30, 40, 50 и 60bb, все позиции RFI на каждой глубине. Загрузка уже прогнала
+    все проверки формы, включая сверку `open_pct`, — здесь закрепляется, что
+    отдаётся каждая запись.
     """
     book = load_chart_book()
     keys = book.all_keys()
     rfi_positions = {"UTG", "UTG+1", "LJ", "HJ", "CO", "BTN", "SB"}
-    for bucket in BUCKET_NAMES:
-        assert {k.position for k in keys if k.depth_bucket == bucket} == rfi_positions
+    for depth in (15.0, 20.0, 30.0, 40.0, 50.0, 60.0):
+        assert {k.position for k in keys if k.depth_bb == depth} == rfi_positions
     for key in keys:
         assert book.get(key).opening.weights, key
 
@@ -152,45 +150,52 @@ def test_shipped_file_documents_itself():
         assert entry["source"] and entry["revised_at"]
 
 
-# --- корзины глубины --------------------------------------------------------------
+# --- выбор глубины ----------------------------------------------------------------
+
+
+def _depths_file(tmp_path: Path) -> Path:
+    return _write(
+        tmp_path,
+        [_entry(depth_bb=d, **{"raise": r}) for d, r in ((15, "AA"), (20, "KK"), (30, "QQ"))],
+    )
 
 
 @pytest.mark.parametrize(
-    ("eff_bb", "bucket"),
+    ("eff_bb", "depth"),
     [
-        (15.0, "15-20"),
-        (19.99, "15-20"),
-        (20.0, "20-30"),
-        (29.99, "20-30"),
-        (30.0, "30-40"),
-        (39.99, "30-40"),
-        (40.0, "40-60"),
-        (59.99, "40-60"),
-        (60.0, "60+"),
-        (1000.0, "60+"),
+        (15.0, 15.0),
+        (17.4, 15.0),
+        (17.5, 15.0),  # ровно посередине — меньшая глубина
+        (17.6, 20.0),
+        (24.9, 20.0),
+        (25.0, 20.0),
+        (25.1, 30.0),
+        (300.0, 30.0),  # глубже самого глубокого чарта — самый глубокий
     ],
 )
-def test_depth_bucket_edges_are_half_open(eff_bb: float, bucket: str):
-    assert depth_bucket_for(eff_bb) == bucket
+def test_the_nearest_charted_depth_is_taken(tmp_path: Path, eff_bb: float, depth: float):
+    book = load_chart_book(_depths_file(tmp_path))
+    assert book.nearest(8, "CO", eff_bb, "per_player").depth_bb == depth
+
+
+def test_the_stack_is_judged_by_the_chart_of_that_depth(tmp_path: Path):
+    path = _depths_file(tmp_path)
+    assert set(open_range(8, "CO", 19.0, "per_player", path=path).weights) == {"KK"}
 
 
 @pytest.mark.parametrize("eff_bb", [14.99, 5.0, 0.0, -1.0, float("nan")])
-def test_depth_below_the_charts_is_refused_not_clamped(eff_bb: float):
-    # Ниже 15bb эталон считается равновесием; вернуть нижнюю корзину значило бы
+def test_a_stack_below_the_charts_is_refused_not_clamped(tmp_path: Path, eff_bb: float):
+    # Ниже 15bb эталон считается равновесием; вернуть самый мелкий чарт значило бы
     # выдать чарт там, где справочник не применим.
     with pytest.raises(DepthNotCharted):
-        depth_bucket_for(eff_bb)
-
-
-def test_bucket_names_match_the_specification():
-    assert BUCKET_NAMES == ("15-20", "20-30", "30-40", "40-60", "60+")
+        load_chart_book(_depths_file(tmp_path)).nearest(8, "CO", eff_bb, "per_player")
 
 
 # --- лукап по файлу ---------------------------------------------------------------
 
 
 def _write(tmp_path: Path, entries: list[dict[str, object]], **file_fields: object) -> Path:
-    payload: dict[str, object] = {"schema_version": 2, "entries": entries}
+    payload: dict[str, object] = {"schema_version": 3, "entries": entries}
     payload.update(file_fields)
     path = tmp_path / "charts.json"
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -201,7 +206,7 @@ def _entry(**over: object) -> dict[str, object]:
     entry: dict[str, object] = {
         "seats": 8,
         "position": "CO",
-        "depth_bucket": "20-30",
+        "depth_bb": 20,
         "ante_type": "per_player",
         "source": "тестовый источник",
         "revised_at": "2026-09-06",
@@ -215,12 +220,12 @@ def _entry(**over: object) -> dict[str, object]:
 def test_exact_key_returns_the_range_of_that_entry(tmp_path: Path):
     path = _write(
         tmp_path,
-        [_entry(), _entry(depth_bucket="30-40", **{"raise": "AA"})],
+        [_entry(), _entry(depth_bb=30, **{"raise": "AA"})],
     )
-    assert open_range(8, "CO", "20-30", "per_player", path=path).weights == parse_range(
+    assert open_range(8, "CO", 20.0, "per_player", path=path).weights == parse_range(
         "66+, ATs+, KQs, AJo+"
     ).weights
-    assert set(open_range(8, "CO", "30-40", "per_player", path=path).weights) == {"AA"}
+    assert set(open_range(8, "CO", 30.0, "per_player", path=path).weights) == {"AA"}
 
 
 def test_a_hand_split_between_actions_keeps_each_share_and_folds_the_rest(tmp_path: Path):
@@ -235,7 +240,7 @@ def test_a_hand_split_between_actions_keeps_each_share_and_folds_the_rest(tmp_pa
             )
         ],
     )
-    strategy = open_strategy(8, "CO", "20-30", "per_player", path=path)
+    strategy = open_strategy(8, "CO", 20.0, "per_player", path=path)
     assert strategy.raise_range.weight("AJo") == 0.5
     assert strategy.allin_range.weight("AJo") == 0.33
     assert strategy.opening.weights == {"AA": 1.0, "KK": 1.0, "AJo": 0.83}
@@ -247,7 +252,7 @@ def test_a_hand_split_between_actions_keeps_each_share_and_folds_the_rest(tmp_pa
 def test_a_declared_open_share_that_matches_the_ranges_is_accepted(tmp_path: Path):
     # 66+ (54) + ATs+ (16) + KQs (4) + AJo+ (36) = 110 комбо = 8.30%.
     path = _write(tmp_path, [_entry(open_pct="8.3%")])
-    assert open_range(8, "CO", "20-30", "per_player", path=path).weights
+    assert open_range(8, "CO", 20.0, "per_player", path=path).weights
 
 
 def test_entry_returns_the_provenance_and_refuses_the_same_way(tmp_path: Path):
@@ -256,43 +261,41 @@ def test_entry_returns_the_provenance_and_refuses_the_same_way(tmp_path: Path):
         tmp_path,
         [_entry(source="солвер X, настройки Y"), _entry(position="BTN", status="example")],
     )
-    entry = load_chart_book(path).entry(ChartKey(8, "CO", "20-30", "per_player"))
+    entry = load_chart_book(path).entry(ChartKey(8, "CO", 20.0, "per_player"))
     assert entry.source == "солвер X, настройки Y"
     assert entry.revised_at.isoformat() == "2026-09-06"
     with pytest.raises(ChartPlaceholder):
-        load_chart_book(path).entry(ChartKey(8, "BTN", "20-30", "per_player"))
+        load_chart_book(path).entry(ChartKey(8, "BTN", 20.0, "per_player"))
     with pytest.raises(ChartMissing):
-        load_chart_book(path).entry(ChartKey(8, "HJ", "20-30", "per_player"))
+        load_chart_book(path).entry(ChartKey(8, "HJ", 20.0, "per_player"))
 
 
 def test_missing_key_raises_and_no_neighbour_is_substituted(tmp_path: Path):
-    # В файле есть соседняя корзина той же позиции и та же корзина соседней позиции —
-    # ни та, ни другая подставляться не должны.
+    # Глубина берётся ближайшая, но соседняя позиция, раскладка и тип анте — никогда.
     path = _write(tmp_path, [_entry(), _entry(position="BTN")])
+    with pytest.raises(ChartMissing):
+        open_range(8, "HJ", 20.0, "per_player", path=path)
+    with pytest.raises(ChartMissing):
+        open_range(9, "CO", 20.0, "per_player", path=path)
+    with pytest.raises(ChartMissing):
+        open_range(8, "CO", 20.0, "bb_ante", path=path)
     with pytest.raises(ChartMissing) as missing:
-        open_range(8, "CO", "40-60", "per_player", path=path)
-    assert "40-60" in str(missing.value)
-
-    with pytest.raises(ChartMissing):
-        open_range(8, "HJ", "20-30", "per_player", path=path)
-    with pytest.raises(ChartMissing):
-        open_range(9, "CO", "20-30", "per_player", path=path)
-    with pytest.raises(ChartMissing):
-        open_range(8, "CO", "20-30", "bb_ante", path=path)
+        load_chart_book(path).get(ChartKey(8, "CO", 40.0, "per_player"))
+    assert "20.0" in str(missing.value)
 
 
 def test_placeholder_entry_is_refused_even_on_an_exact_key(tmp_path: Path):
     path = _write(tmp_path, [_entry(status="example")])
-    assert ChartKey(8, "CO", "20-30", "per_player") in load_chart_book(path).all_keys()
+    assert ChartKey(8, "CO", 20.0, "per_player") in load_chart_book(path).all_keys()
     with pytest.raises(ChartPlaceholder):
-        open_range(8, "CO", "20-30", "per_player", path=path)
+        open_range(8, "CO", 20.0, "per_player", path=path)
 
 
 def test_rewritten_file_is_reread_not_served_from_cache(tmp_path: Path):
     path = _write(tmp_path, [_entry(**{"raise": "AA"})])
-    assert set(open_range(8, "CO", "20-30", "per_player", path=path).weights) == {"AA"}
+    assert set(open_range(8, "CO", 20.0, "per_player", path=path).weights) == {"AA"}
     _write(tmp_path, [_entry(**{"raise": "KK"})])
-    assert set(open_range(8, "CO", "20-30", "per_player", path=path).weights) == {"KK"}
+    assert set(open_range(8, "CO", 20.0, "per_player", path=path).weights) == {"KK"}
 
 
 def test_absent_file_is_a_clear_error(tmp_path: Path):
@@ -306,7 +309,8 @@ def test_absent_file_is_a_clear_error(tmp_path: Path):
         pytest.param([_entry(seats=3, position="CO")], {}, id="позиции нет за таким столом"),
         pytest.param([_entry(seats=12)], {}, id="нет раскладки для такого стола"),
         pytest.param([_entry(position="MP")], {}, id="неизвестная позиция"),
-        pytest.param([_entry(depth_bucket="10-15")], {}, id="неизвестная корзина"),
+        pytest.param([_entry(depth_bb=10)], {}, id="глубина чарта ниже 15bb"),
+        pytest.param([_entry(depth_bucket="20-30")], {}, id="поле схемы 2"),
         pytest.param([_entry(**{"raise": "Zs"})], {}, id="битая запись диапазона"),
         pytest.param([_entry(allin="AA:1.4")], {}, id="вес вне [0,1]"),
         pytest.param([_entry(**{"raise": ""})], {}, id="открытия нет: пусты raise и allin"),
@@ -328,7 +332,7 @@ def test_absent_file_is_a_clear_error(tmp_path: Path):
         pytest.param([_entry(comment="лишнее поле")], {}, id="опечатка в имени поля"),
         pytest.param([_entry(), _entry()], {}, id="ключ дважды"),
         pytest.param([], {}, id="ни одной записи"),
-        pytest.param([_entry()], {"schema_version": 1}, id="чужая версия схемы"),
+        pytest.param([_entry()], {"schema_version": 2}, id="чужая версия схемы"),
         pytest.param([_entry()], {"unexpected": 1}, id="лишнее поле файла"),
     ],
 )
