@@ -124,14 +124,14 @@ def test_shipped_file_serves_the_owner_charts_and_no_example():
     """Файл в репозитории читается целиком, и каждая его запись — настоящий чарт.
 
     Образцов формата в нём больше нет: с 2026-10-02 там чарты владельца на 15bb
-    20bb и 30bb (корзины 15-20, 20-30, 30-40).
+    20bb, 30bb и 40bb (корзины 15-20, 20-30, 30-40, 40-60).
     Загрузка уже прогнала все проверки формы, включая сверку заявленного
     `open_pct` с диапазонами, — здесь закрепляется, что отдаётся каждая запись.
     """
     book = load_chart_book()
     keys = book.all_keys()
     rfi_positions = {"UTG", "UTG+1", "LJ", "HJ", "CO", "BTN", "SB"}
-    for bucket in ("15-20", "20-30", "30-40"):
+    for bucket in ("15-20", "20-30", "30-40", "40-60"):
         assert {k.position for k in keys if k.depth_bucket == bucket} == rfi_positions
     for key in keys:
         assert book.get(key).opening.weights, key
