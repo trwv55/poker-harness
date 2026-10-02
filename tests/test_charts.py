@@ -122,14 +122,14 @@ def test_shipped_file_serves_the_owner_charts_and_no_example():
     """Файл в репозитории читается целиком, и каждая его запись — настоящий чарт.
 
     Образцов формата в нём больше нет: с 2026-10-02 там чарты владельца на 15, 20,
-    30, 35, 40, 50 и 60bb, все позиции RFI на каждой глубине. Загрузка уже прогнала
+    25, 30, 35, 40, 50 и 60bb, все позиции RFI на каждой глубине. Загрузка уже прогнала
     все проверки формы, включая сверку `open_pct`, — здесь закрепляется, что
     отдаётся каждая запись.
     """
     book = load_chart_book()
     keys = book.all_keys()
     rfi_positions = {"UTG", "UTG+1", "LJ", "HJ", "CO", "BTN", "SB"}
-    for depth in (15.0, 20.0, 30.0, 35.0, 40.0, 50.0, 60.0):
+    for depth in (15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 50.0, 60.0):
         assert {k.position for k in keys if k.depth_bb == depth} == rfi_positions
     for key in keys:
         assert book.get(key).opening.weights, key
