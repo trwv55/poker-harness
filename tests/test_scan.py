@@ -162,6 +162,24 @@ def _make_multiway_fold_hand(hero_cards: tuple[str, str], eff_bb: float, players
 # --- Тесты плана (брифа) ---------------------------------------------------------
 
 
+def _assert_the_list_of_mismatches_is_ordered_and_honest(s) -> None:
+    """Инварианты списка расхождений на реальном файле.
+
+    Ценовые идут первыми, дороже первым, и каждая дороже порога 0.1bb; за ними
+    расхождения по чарту — без цены, с частотой сыгранного у чарта ниже 30%,
+    реже первым (`scan._item_order`).
+    """
+    from harness.analysis.open_chart import MISMATCH_BELOW
+    from harness.analysis.scan import _item_order
+
+    assert [_item_order(it) for it in s.items] == sorted(_item_order(it) for it in s.items)
+    priced = [it for it in s.items if it.taken_frequency is None]
+    charted = [it for it in s.items if it.taken_frequency is not None]
+    assert all(it.ev_diff_bb < -0.1 for it in priced)
+    assert all(it.ev_diff_bb == 0.0 and it.taken_frequency < MISMATCH_BELOW for it in charted)
+    assert s.items == priced + charted
+
+
 @requires_fixtures
 @pytest.mark.slow  # полный скан 146 реальных рук — минуты, не секунды (задача 13, рулинг)
 def test_scan_daily_classic_runs():
@@ -169,8 +187,7 @@ def test_scan_daily_classic_runs():
     s = scan_tournament(ens)
     assert s.hands_total == 146
     assert 0 < s.hands_with_decision <= 146  # префильтр отсёк тривиальные фолды
-    assert all(s.items[i].ev_diff_bb <= s.items[i + 1].ev_diff_bb for i in range(len(s.items) - 1))
-    assert all(it.ev_diff_bb < -0.1 for it in s.items)
+    _assert_the_list_of_mismatches_is_ordered_and_honest(s)
 
 
 def test_prefilter_cheap(monkeypatch):
@@ -218,8 +235,7 @@ def test_scan_pko_bounty_runs():
     s = scan_tournament(ens)
     assert s.hands_total == 172
     assert 0 < s.hands_with_decision <= 172
-    assert all(s.items[i].ev_diff_bb <= s.items[i + 1].ev_diff_bb for i in range(len(s.items) - 1))
-    assert all(it.ev_diff_bb < -0.1 for it in s.items)
+    _assert_the_list_of_mismatches_is_ordered_and_honest(s)
 
 
 # --- Беспроигрышность фильтра на реальных фикстурах (рулинг владельца) ----------

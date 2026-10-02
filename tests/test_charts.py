@@ -183,10 +183,16 @@ def test_the_stack_is_judged_by_the_chart_of_that_depth(tmp_path: Path):
     assert set(open_range(8, "CO", 19.0, "per_player", path=path).weights) == {"KK"}
 
 
-@pytest.mark.parametrize("eff_bb", [14.99, 5.0, 0.0, -1.0, float("nan")])
+def test_a_stack_between_13_and_15bb_is_judged_by_the_shallowest_chart(tmp_path: Path):
+    # Решение владельца 2026-10-03: открытие на 13–15bb судит чарт 15bb.
+    book = load_chart_book(_depths_file(tmp_path))
+    assert book.nearest(8, "CO", 13.0, "per_player").depth_bb == 15.0
+
+
+@pytest.mark.parametrize("eff_bb", [12.99, 5.0, 0.0, -1.0, float("nan")])
 def test_a_stack_below_the_charts_is_refused_not_clamped(tmp_path: Path, eff_bb: float):
-    # Ниже 15bb эталон считается равновесием; вернуть самый мелкий чарт значило бы
-    # выдать чарт там, где справочник не применим.
+    # Ниже 13bb эталон считается равновесием пуш-фолда; вернуть самый мелкий чарт
+    # значило бы выдать чарт там, где справочник не применим.
     with pytest.raises(DepthNotCharted):
         load_chart_book(_depths_file(tmp_path)).nearest(8, "CO", eff_bb, "per_player")
 

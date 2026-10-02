@@ -219,11 +219,13 @@ def test_every_leak_rule_recognises_its_own_point():
     Правило заводится строкой, и строка обязана быть достаточной: точка,
     собранная ИЗ правила, обязана этим же правилом и опознаться.
     """
-    from harness.contracts import LEAK_RULES, leak_rule_of_point
+    from harness.contracts import LEAK_RULES, SpotKind, leak_rule_of_point
 
     for rule in LEAK_RULES:
+        # Точка по чарту обязана назвать расхождение сама: цены у неё нет.
+        chart = {"mismatch": True, "ev_diff_bb": 0.0} if rule.spot is SpotKind.OPEN_CHART else {}
         point = _leak_point(
-            spot=rule.spot, action_taken=rule.action_taken, best_action=rule.best_action
+            spot=rule.spot, action_taken=rule.action_taken, best_action=rule.best_action, **chart
         )
         assert leak_rule_of_point(point) is rule
 
@@ -264,17 +266,47 @@ def test_an_unjudged_point_matches_no_leak_rule():
     assert leak_rule_of_point(point) is None
 
 
-def test_the_reserved_open_raise_leak_matches_nothing_the_core_judges_today():
-    """«Открывает слишком широко» зарезервирован под чарты и сегодня пуст.
+def test_a_chart_point_within_the_chart_is_not_a_leak():
+    """Смешанная рука, сыгранная не самым частым действием, — не лик.
 
-    Держится не намерением, а тем, что судимых спотов ровно два
-    (`JUDGED_SPOTS`), и спот этого правила в них не входит: вердикта с таким
-    спотом ядро не выносит, значит и совпасть правилу не с чем.
+    Тройка `fold → raise` есть в таблице, но точка по чарту с `mismatch=False`
+    (частота сыгранного у чарта не ниже порога) правилу не совпадает.
     """
-    from harness.contracts import JUDGED_SPOTS, LEAK_RULES
+    from harness.contracts import SpotKind, leak_rule_of_point
 
-    reserved = next(rule for rule in LEAK_RULES if rule.key == "open_too_wide")
-    assert reserved.spot not in JUDGED_SPOTS
+    common = {"spot": SpotKind.OPEN_CHART, "action_taken": "fold", "best_action": "raise"}
+    assert leak_rule_of_point(_leak_point(**common, ev_diff_bb=0.0, mismatch=False)) is None
+    assert leak_rule_of_point(_leak_point(**common, ev_diff_bb=0.0, mismatch=True)) is not None
+
+
+@pytest.mark.parametrize(
+    ("spot", "best_action", "mismatch"),
+    [
+        ("open_chart", "raise", None),  # судимая точка по чарту без mismatch
+        ("pushfold_unopened", "shove", True),  # mismatch у ценовой точки
+        ("open_chart", "", True),  # mismatch у точки без вердикта
+    ],
+)
+def test_mismatch_is_named_exactly_by_a_judged_chart_point(spot, best_action, mismatch):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="mismatch"):
+        _leak_point(
+            spot=spot, action_taken="fold", best_action=best_action, ev_diff_bb=0.0,
+            mismatch=mismatch,
+        )
+
+
+def test_a_mismatch_is_the_price_or_the_word_of_the_chart():
+    """Ценовая точка — расхождение дороже 0.1bb; точка по чарту — по своему слову."""
+    from harness.contracts import SpotKind, is_mismatch
+
+    priced = {"spot": SpotKind.PUSHFOLD_UNOPENED, "action_taken": "fold", "best_action": "shove"}
+    assert is_mismatch(_leak_point(**priced, ev_diff_bb=-0.11))
+    assert not is_mismatch(_leak_point(**priced, ev_diff_bb=-0.1))
+    chart = {"spot": SpotKind.OPEN_CHART, "action_taken": "fold", "best_action": "raise"}
+    assert is_mismatch(_leak_point(**chart, ev_diff_bb=0.0, mismatch=True))
+    assert not is_mismatch(_leak_point(**chart, ev_diff_bb=0.0, mismatch=False))
 
 
 def test_the_core_judges_a_point_by_the_predicate_of_the_contracts():

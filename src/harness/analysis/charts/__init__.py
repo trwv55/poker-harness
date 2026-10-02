@@ -23,6 +23,7 @@ from __future__ import annotations
 from harness.analysis.charts.lookup import (
     DEFAULT_CHART_PATH,
     MIN_CHART_DEPTH_BB,
+    MIN_LOOKUP_DEPTH_BB,
     SCHEMA_VERSION,
     ChartBook,
     ChartEntry,
@@ -43,6 +44,7 @@ from harness.analysis.charts.notation import NotationError, parse_range, to_nota
 __all__ = [
     "DEFAULT_CHART_PATH",
     "MIN_CHART_DEPTH_BB",
+    "MIN_LOOKUP_DEPTH_BB",
     "SCHEMA_VERSION",
     "ChartBook",
     "ChartEntry",

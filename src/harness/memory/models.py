@@ -222,7 +222,7 @@ class DecisionPointRow(Base):
 
     * `point_no`, `dp_index`, `street`, `spot`, `zone`, `action_taken`,
       `best_action`, `ev_diff_bb`, `ev_interval`, `assumption`, `tools`,
-      `detail` — `PointVerdict` целиком, поле в поле
+      `detail`, `mismatch` — `PointVerdict` целиком, поле в поле
       (`test_every_field_of_a_point_verdict_has_its_column`). Единственное
       переименование — `interval` → `ev_interval`: `interval` в Postgres
       зарезервировано, и колонка с таким именем требовала бы кавычек в каждом
@@ -286,6 +286,8 @@ class DecisionPointRow(Base):
     best_action: Mapped[str] = mapped_column(String, nullable=False)
     ev_diff_bb: Mapped[float] = mapped_column(Double, nullable=False)
     judged: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    # Расхождение, названное ядром без цены (точка по чарту); у ценовых — NULL.
+    mismatch: Mapped[bool | None] = mapped_column(Boolean)
     position: Mapped[str | None] = mapped_column(String(16))
     to_call: Mapped[int | None] = mapped_column(BigInteger)
     pot_before: Mapped[int | None] = mapped_column(BigInteger)

@@ -701,6 +701,7 @@ _POINT_COLUMNS: Mapping[str, str] = {
     "assumption": "assumption",
     "tools": "tools",
     "detail": "detail",
+    "mismatch": "mismatch",
 }
 
 # Обстановка точки из `DecisionPoint` (`hands.enriched`): имя поля и имя колонки
@@ -1288,7 +1289,8 @@ class LeaksRepo:
 
         Пара, которую экран печатает строкой «оценено N из M решений»: без неё
         список ликов читается как полная картина игры, хотя судится сегодня
-        только префлоп-пуш-фолд. Судимость читается колонкой `judged`, а не
+        только префлоп: пуш-фолд и открытие первым по чарту. Судимость читается
+        колонкой `judged`, а не
         условием: правило записано один раз, в `contracts.is_judged`.
 
         Фильтр по умолчанию пуст — вся история игрока.
@@ -1353,7 +1355,12 @@ class LeaksRepo:
                 func.count().label("n"),
                 _negative_loss().label("loss"),
             )
-            .where(*_points_of(player_id, filters or PointFilter()))
+            .where(
+                *_points_of(player_id, filters or PointFilter()),
+                # Точка по чарту в пределах чарта лика не даёт, даже если её
+                # тройка есть в таблице (`contracts.leak_rule_of_point`).
+                DecisionPointRow.mismatch.is_not(False),
+            )
             .group_by(
                 DecisionPointRow.spot,
                 DecisionPointRow.action_taken,

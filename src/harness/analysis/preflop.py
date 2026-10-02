@@ -95,6 +95,7 @@ from math import prod
 from pathlib import Path
 
 from harness.analysis.classifier import (
+    PUSHFOLD_MAX_EFF_BB,
     SeatSnapshot,
     TableState,
     action_index,
@@ -104,6 +105,7 @@ from harness.analysis.classifier import (
     unjudged_point,
     unpriced_reason,
 )
+from harness.analysis.open_chart import chart_exists, open_chart_verdict, taken_token
 from harness.analysis.river import river_verdict
 from harness.analysis.tools.equity import equity_vs_ranges
 from harness.analysis.tools.full_deal import (
@@ -1741,4 +1743,15 @@ def verdict_for(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict:
         return _unopened_verdict(dp, en, state)
     if spot is SpotKind.PUSHFOLD_FACING_SHOVE:
         return _facing_shove_verdict(dp, en, state)
+    if spot is SpotKind.OPEN_CHART:
+        # Стол без чарта (хедз-ап финалки, 6-, 7-, 9-max) на 13–15bb: шов и фолд
+        # судит равновесие пуш-фолда, как до справочника. Это другой эталон, а не
+        # подстановка соседнего чарта; рейз здесь вердикта не получает, как и раньше.
+        if (
+            not chart_exists(state, en.hand.ante_type)
+            and dp.eff_stack_bb <= PUSHFOLD_MAX_EFF_BB
+            and taken_token(dp, state) in ("fold", "shove")
+        ):
+            return _unopened_verdict(dp, en, state)
+        return open_chart_verdict(dp, en, state)
     return unjudged_point(dp, spot, unpriced_reason(dp, state))

@@ -422,13 +422,19 @@ def test_no_llm_and_no_result_bias():
 # --- Классификация --------------------------------------------------------------
 
 
-def test_classify_deep_stack_is_preflop_other():
-    """40bb — не пуш-фолд-зона: вердикт не выносится, цена нулевая."""
+def test_classify_deep_unopened_shove_goes_to_the_chart_and_names_a_missing_one():
+    """40bb в неоткрытом банке — открытие по чарту, а не пуш-фолд.
+
+    Стол синтетики — 6 мест, а чарты владельца есть только для 8-max: точка
+    остаётся без вердикта и называет, какого чарта нет. Соседний стол не
+    подставляется.
+    """
     en = _make_multiway_shove_hand(hero_cards=("Ac", "Ts"), eff_bb=40.0, players_behind=3)
     dp = en.report.decision_points[0]
-    assert classify(dp, en) == "preflop_other"
+    assert classify(dp, en) == "open_chart"
     p = analyze_hand(en).points[0]
-    assert p.best_action == "" and p.ev_diff_bb == 0.0 and p.assumption is None
+    assert p.best_action == "" and p.mismatch is None and p.ev_diff_bb == 0.0
+    assert "6 мест" in p.detail["unjudged"]
 
 
 def test_classify_limp_in_pushfold_zone_is_not_priced():

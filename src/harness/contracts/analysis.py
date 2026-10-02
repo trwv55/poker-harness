@@ -32,6 +32,7 @@ class Zone(StrEnum):
 class SpotKind(StrEnum):
     PUSHFOLD_UNOPENED = "pushfold_unopened"
     PUSHFOLD_FACING_SHOVE = "pushfold_facing_shove"
+    OPEN_CHART = "open_chart"
     PREFLOP_OTHER = "preflop_other"
     POSTFLOP = "postflop"
 
@@ -195,6 +196,27 @@ class PointVerdict(BaseModel):
     assumption: Assumption | None = None
     tools: list[str] = []
     detail: dict[str, Any] = {}
+    # Расхождение, названное ядром без цены (спот `open_chart`: сверка с чартом).
+    # `None` — точка ценовая, и расхождение выводится из `ev_diff_bb`
+    # (`contracts.is_mismatch`). У точки с `mismatch` число `ev_diff_bb` — не цена.
+    mismatch: bool | None = None
+
+    @model_validator(mode="after")
+    def _mismatch_only_where_there_is_no_price(self) -> PointVerdict:
+        """`mismatch` заполнен ровно у судимой точки по чарту.
+
+        Чарт цену не даёт, и ноль в `ev_diff_bb` читался бы как «сыграно верно»;
+        расхождение такой точки обязано быть названо явно. У ценовой точки
+        `mismatch` нет: её расхождение — цена, и второго источника правды быть
+        не должно.
+        """
+        chart_judged = self.spot is SpotKind.OPEN_CHART and self.best_action != ""
+        if chart_judged != (self.mismatch is not None):
+            raise ValueError(
+                f"mismatch заполняется ровно у судимой точки по чарту: спот {self.spot}, "
+                f"best_action {self.best_action!r}, mismatch {self.mismatch}"
+            )
+        return self
 
     @model_validator(mode="after")
     def _assumption_matches_zone(self) -> PointVerdict:
@@ -259,9 +281,12 @@ class ScanItem(BaseModel):
     spot: SpotKind
     action_taken: str
     best_action: str
-    ev_diff_bb: float  # < -0.1bb для расхождения; 0.0 для точки «около нуля»
+    ev_diff_bb: float  # < -0.1bb для расхождения; 0.0 для точки «около нуля» и по чарту
     zone: Zone
     interval: EvInterval | None = None
+    # Только у расхождения по чарту: частота сыгранного действия в чарте — по ней
+    # такие строки упорядочены (реже у солвера — выше). У ценовых — `None`.
+    taken_frequency: float | None = None
 
 
 class ScanSummary(BaseModel):

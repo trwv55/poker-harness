@@ -84,7 +84,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from math import ceil, floor
 from typing import Any, Literal, NamedTuple
 
@@ -267,11 +267,13 @@ _ACTION_WORD: dict[str, str] = {
     "check": "чек",
     "bet": "бет",
     "raise": "рейз",
+    "limp": "лимп",
 }
 
 _SPOT_WORD: dict[SpotKind, str] = {
     SpotKind.PUSHFOLD_UNOPENED: "пуш-фолд",
     SpotKind.PUSHFOLD_FACING_SHOVE: "колл шова",
+    SpotKind.OPEN_CHART: "открытие по чарту",
     SpotKind.PREFLOP_OTHER: "префлоп",
     SpotKind.POSTFLOP: "постфлоп",
 }
@@ -482,6 +484,22 @@ def progress_text(
     return _STATION_TEXT[station]
 
 
+def _scan_item_line(item: ScanItem) -> str:
+    """Строка расхождения сводки: ценовая — с ценой, по чарту — с частотой у чарта."""
+    head = f"№{item.hand_no} · {item.hero_class} · {_spot_word(item.spot)}: "
+    if item.taken_frequency is not None:
+        return (
+            f"{head}{_action_word(item.action_taken)} — у чарта "
+            f"{_fmt_pct(100.0 * item.taken_frequency)}, чаще всего "
+            f"{_action_word(item.best_action)}"
+        )
+    marker = f" ({_ASSUMING_MARKER})" if item.zone is Zone.ASSUMING else ""
+    return (
+        f"{head}{_action_word(item.action_taken)} (лучше: {_action_word(item.best_action)}) "
+        f"— {_fmt_bb(item.ev_diff_bb)}{marker}"
+    )
+
+
 def scan_summary_msg(s: ScanSummary, quota_left: int, quota_total: int) -> Msg:
     """Сводка префлоп-скана: список расхождений по цене, кнопка разбора под каждым.
 
@@ -514,19 +532,19 @@ def scan_summary_msg(s: ScanSummary, quota_left: int, quota_total: int) -> Msg:
         lines.append("")
         if len(shown) < len(s.items):
             lines.append(
-                f"Топ расхождений — показаны {len(shown)} самых дорогих "
+                f"Топ расхождений — показаны первые {len(shown)} "
                 f"из {len(s.items)} найденных:"
             )
         else:
             lines.append("Топ расхождений:")
         for item in shown:
-            marker = f" ({_ASSUMING_MARKER})" if item.zone is Zone.ASSUMING else ""
-            lines.append(
-                f"№{item.hand_no} · {item.hero_class} · {_spot_word(item.spot)}: "
-                f"{_action_word(item.action_taken)} (лучше: {_action_word(item.best_action)}) "
-                f"— {_fmt_bb(item.ev_diff_bb)}{marker}"
-            )
+            lines.append(_scan_item_line(item))
             buttons.append([deep_dive_button(item.hand_no)])
+        # Расхождения по чарту идут в конце списка, и обрезка срезает их первыми;
+        # сколько их не вошло, сказано прямо (решение владельца 2026-10-03).
+        cut_chart = sum(1 for item in s.items[len(shown) :] if item.taken_frequency is not None)
+        if cut_chart:
+            lines.append(f"…и ещё {cut_chart} {_plural_form(cut_chart, 'расхождение', 'расхождения', 'расхождений')} по чарту.")
 
     if s.close_calls:
         shown_close = s.close_calls[:_MAX_RENDERED_CLOSE_CALLS]
@@ -744,6 +762,7 @@ _ANTE_TYPE_WORD: dict[str, str] = {"per_player": "с каждого"}
 _METHOD_WORD: dict[str, str] = {
     "full_deal_shove": "симуляция полной раздачи: шов",
     "full_deal_call": "симуляция полной раздачи: колл против диапазона шовера",
+    "open_chart": "сверка с чартом солвера",
     "prefilter_chart_lookup": "лукап по чарту",
 }
 _BRACKET_WORD: dict[str, str] = {"stable": "устойчива", "unstable": "через ноль"}
@@ -812,6 +831,11 @@ _DETAIL_LABELS: dict[str, str] = {
     "push_weight": "вес руки в чарте шова",
     "lookup_depth_bb": "глубина лукапа по чарту, ББ",
     "solver_error": "сбой расчёта",
+    "chart_depth_bb": "глубина чарта, ББ",
+    "open_depth_bb": "ваша глубина в мерах чарта (стек до анте), ББ",
+    "taken_frequency": "частота сыгранного по чарту",
+    "chart_source": "источник чарта",
+    "chart_revised_at": "чарт сверен с источником",
 }
 
 # Ключи `detail`, чьё значение — доля единицы: печатаются процентом, как все
@@ -824,6 +848,7 @@ _SHARE_KEYS = frozenset(
         "call_range_fractions",
         "overcall_range_fractions",
         "push_weight",
+        "taken_frequency",
         "p_all_fold",
     }
 )
@@ -840,7 +865,14 @@ _PROSE_KEYS = frozenset({"zone_reason", "unmodelled"})
 # Ключи, чьё значение — глубина стека в ББ: печатается одним знаком, как все
 # стеки продукта. Два знака у глубины и один у стека в соседней строке читатель
 # принимает за разную точность измерения.
-_STACK_KEYS = frozenset({"depths_bb", "shover_depth_bb", "lookup_depth_bb"})
+_STACK_KEYS = frozenset(
+    {"depths_bb", "shover_depth_bb", "lookup_depth_bb", "chart_depth_bb", "open_depth_bb"}
+)
+
+# Частоты чарта точки открытия печатаются в строке вердикта словами
+# (`_chart_verdict_line`) и в общем переборе `detail` не повторяются.
+_CHART_FREQUENCIES_KEY = "chart_frequencies"
+_CHART_ACTION_ORDER = ("raise", "shove", "limp", "fold")
 
 # Ключ, под которым ядро пишет причину отказа. Печатается отдельной строкой
 # «вердикта нет: …» (`_verdict_lines`), а в общем переборе `detail`
@@ -945,7 +977,7 @@ def _detail_lines(point: PointVerdict) -> list[str]:
     первыми словами игрока; причина отказа ядра стоит строкой «вердикта нет: …»
     выше; остальные ключи печатаются по таблице подписей.
     """
-    skip = (RIVER_CALL_DETAIL, TURN_FLOP_CALL_DETAIL, _UNJUDGED_KEY)
+    skip = (RIVER_CALL_DETAIL, TURN_FLOP_CALL_DETAIL, _UNJUDGED_KEY, _CHART_FREQUENCIES_KEY)
     lines = _postflop_call_lines(point)
     for key, value in point.detail.items():
         if key in skip:
@@ -1048,6 +1080,33 @@ def _decision_lines(dp: DecisionPoint, big_blind: int) -> list[str]:
     return lines
 
 
+def _chart_frequencies_text(frequencies: Mapping[str, float]) -> str:
+    """Ненулевые частоты чарта словами: «рейз 40%, фолд 60%»."""
+    return ", ".join(
+        f"{_action_word(action)} {_fmt_pct(100.0 * frequencies[action])}"
+        for action in _CHART_ACTION_ORDER
+        if frequencies.get(action, 0.0) > 0.0
+    )
+
+
+def _chart_verdict_line(point: PointVerdict) -> str:
+    """Вердикт точки открытия по чарту: частоты вместо цены и «лучше».
+
+    Цены у такой точки нет, и строки «цена» нет; «лучше» не печатается — у чарта
+    нет лучшего, есть частоты (спека 2026-10-03-open-chart-verdict, §6). Частоты
+    печатаются и тогда, когда расхождения нет: смешанная рука видна как смешанная.
+    """
+    depth = float(point.detail["chart_depth_bb"])
+    verdict = "расхождение" if point.mismatch else "в пределах чарта"
+    return (
+        f"    вердикт: {_spot_word(point.spot)} {depth:.0f}bb · "
+        f"зона {_ZONE_WORD.get(point.zone, str(point.zone))} · "
+        f"сыграно {_action_word(point.action_taken)} · "
+        f"по чарту: {_chart_frequencies_text(point.detail[_CHART_FREQUENCIES_KEY])} · "
+        f"{verdict}"
+    )
+
+
 def _verdict_lines(point: PointVerdict) -> list[str]:
     """Вердикт точки — или одна строка о том, что его нет.
 
@@ -1060,6 +1119,8 @@ def _verdict_lines(point: PointVerdict) -> list[str]:
     if not is_judged(point):
         reason = point.detail.get(_UNJUDGED_KEY)
         return [f"    вердикта нет: {reason}" if reason else "    вердикта нет."]
+    if point.mismatch is not None:
+        return [_chart_verdict_line(point)]
     lines = [
         (
             f"    вердикт: спот {_spot_word(point.spot)} · "
@@ -1134,13 +1195,14 @@ def _raw_blocks(res: AnalysisResult, en: EnrichedHand) -> list[list[str]]:
 def _raw_tail_lines(res: AnalysisResult, en: EnrichedHand) -> list[str]:
     """Итог раздачи: сумма цены расхождений и чем кончилась сверка денег.
 
-    Сумма печатается только там, где есть хотя бы одна судимая точка: ноль
-    несчитанной точки означает «не посчитано», а не «сыграно верно», и подпись
-    под ним читалась бы как «потерь не было»
-    (`test_the_price_is_summed_only_where_something_was_judged`).
+    Сумма печатается только там, где есть хотя бы одна судимая точка С ЦЕНОЙ:
+    ноль несчитанной точки означает «не посчитано», а не «сыграно верно», и
+    подпись под ним читалась бы как «потерь не было»
+    (`test_the_price_is_summed_only_where_something_was_judged`). Точка по чарту
+    судима, но цены не имеет (`mismatch` не `None`) — одна она суммы не открывает.
     """
     lines: list[str] = []
-    if any(is_judged(point) for point in res.points):
+    if any(is_judged(point) and point.mismatch is None for point in res.points):
         lines.append(
             f"Сумма цены расхождений: {_raw_signed_bb(res.total_ev_loss_bb)} — "
             f"только по оценённым точкам."
@@ -1543,11 +1605,15 @@ def _times_word(count: int) -> str:
 
 
 def _leak_line(stat: LeakStat) -> str:
-    """Строка типа лика: подпись, частота, цена. Ровно то, что просил владелец."""
-    return (
-        f"{stat.rule.title} — {stat.count} {_times_word(stat.count)}, "
-        f"{_fmt_bb(-stat.loss_bb)}"
-    )
+    """Строка типа лика: подпись, частота, цена. Ровно то, что просил владелец.
+
+    У лика по чарту цены нет, и «0.0 bb» читалось бы как «не потеряно»: вместо
+    цены строка говорит, что это сверка с чартом.
+    """
+    head = f"{stat.rule.title} — {stat.count} {_times_word(stat.count)}"
+    if stat.rule.spot is SpotKind.OPEN_CHART:
+        return f"{head}, по чарту, без цены"
+    return f"{head}, {_fmt_bb(-stat.loss_bb)}"
 
 
 def leaks_msg(overview: LeaksOverview) -> Msg:
@@ -1650,7 +1716,12 @@ def session_summary_msg(summary: SessionSummary) -> Msg:
     if summary.top_leak is None:
         lines.append("Повторяющегося расхождения за этот вечер расчёт не нашёл.")
     else:
-        lines.append(f"Дороже всего за вечер: {_leak_line(summary.top_leak)}.")
+        head = (
+            "Чаще всего за вечер (по чарту)"
+            if summary.top_leak.rule.spot is SpotKind.OPEN_CHART
+            else "Дороже всего за вечер"
+        )
+        lines.append(f"{head}: {_leak_line(summary.top_leak)}.")
     return Msg(text="\n".join(lines))
 
 

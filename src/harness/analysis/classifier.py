@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from harness.analysis.charts import MIN_LOOKUP_DEPTH_BB
 from harness.contracts import (
     ActionKind,
     CanonicalHand,
@@ -36,6 +37,13 @@ from harness.normalizer import POSITIONS_BY_COUNT
 # Порог пуш-фолд парадигмы (спека §5.5): глубже решение перестаёт сводиться к
 # «шов или фолд», и модель к нему неприменима.
 PUSHFOLD_MAX_EFF_BB = 15.0
+
+# С этой глубины открытие первым судит чарт владельца (`analysis.open_chart`):
+# и рейз, и шов, и фолд. Ниже — шов и фолд судит равновесие пуш-фолда. Число одно
+# на классификатор и справочник (`charts.MIN_LOOKUP_DEPTH_BB`): спот, отправленный
+# в чарт, справочник обязан принять (решение владельца 2026-10-03; позже граница
+# опустится до 10–12bb).
+OPEN_CHART_MIN_EFF_BB = MIN_LOOKUP_DEPTH_BB
 
 
 @dataclass(frozen=True)
@@ -395,14 +403,30 @@ def classify(dp: DecisionPoint, en: EnrichedHand) -> SpotKind:
     """Вид спота в точке решения героя.
 
     Класс отвечает на вопрос «какой моделью эта точка оценивается», а не «как она
-    выглядит на столе». Поэтому лимп или мин-рейз в пуш-фолд-зоне — это
+    выглядит на столе». Поэтому мин-рейз в неоткрытый банк ниже 13bb — это
     `preflop_other`: моделью «шов или фолд» такое решение не оценивается, и
     выдавать его цену за посчитанную было бы враньём. Спот при этом не теряется —
-    он попадает в результат без вердикта.
+    он попадает в результат без вердикта. От 13bb открытие первым — любое, и
+    рейз, и лимп SB — `open_chart`: его судит чарт.
     """
     if dp.street is not Street.PREFLOP:
         return SpotKind.POSTFLOP
     return spot_for(dp, table_state(dp, en))
+
+
+def open_depth_bb(state: TableState) -> float:
+    """Глубина открытия первым в мерах чарта: стек ДО анте, в bb.
+
+    Чарты владельца сняты со стеком до анте («15bb (стек до анте)» в `source`),
+    а `DecisionPoint.eff_stack_bb` считается по остатку после постов: на одном и
+    том же столе они расходятся на анте с блайндом, и граница чарта по одной мере
+    с выбором глубины по другой судили бы точку не тем эталоном. Смысл тот же,
+    что у движка в неоткрытом банке (`engine.replay._effective_stack`, случай 2):
+    стек героя, но не больше, чем у самого глубокого живого соперника.
+    """
+    others = [s.stack for s in state.seats if s.live and s.label != state.hero.label]
+    depth = min(state.hero.stack, max(others)) if others else state.hero.stack
+    return depth / state.bb
 
 
 def spot_for(dp: DecisionPoint, state: TableState) -> SpotKind:
@@ -411,6 +435,16 @@ def spot_for(dp: DecisionPoint, state: TableState) -> SpotKind:
     Отдельная функция, чтобы анализ не переигрывал восстановление дважды: сначала
     ради класса спота, потом ради его оценки.
     """
+    # Открытие первым: до героя никто не вошёл по своей воле, герой ещё не
+    # действовал, он не BB (BB первым не открывает) и стек не короче границы
+    # чарта. Любое его действие здесь — фолд, рейз, шов или лимп SB — судит чарт.
+    if (
+        not state.opened_voluntarily
+        and not state.hero.acted
+        and state.hero.position != "BB"
+        and open_depth_bb(state) >= OPEN_CHART_MIN_EFF_BB
+    ):
+        return SpotKind.OPEN_CHART
     if dp.eff_stack_bb > PUSHFOLD_MAX_EFF_BB:
         return SpotKind.PREFLOP_OTHER
     # Герой, уже вложившийся на этой улице по своей воле, стоит не перед выбором

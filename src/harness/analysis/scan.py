@@ -11,10 +11,11 @@
 не по факту выигрыша раздачи, поэтому в сводке — «расхождение», а не «ошибка»:
 осознанный эксплуатирующий отход от модели может быть верным решением, и это
 показывает подробный разбор конкретной руки (не в этом модуле), а не скан.
-Только точки, по которым есть вердикт (`error_cost.is_judged`), и только те из
-них, что дороже 0.1bb, попадают в список — точка без вердикта (постфлоп, прочий
-префлоп) не идёт в сводку вовсе: «неизвестно» не выдаётся ни за «верно», ни за
-«ошибка» (тот же принцип, что в `error_cost.py`).
+В список попадают расхождения (`contracts.is_mismatch`): ценовые точки дороже
+0.1bb и точки открытия, которые чарт назвал расхождением (без цены, в конце
+списка). Точка без вердикта (постфлоп, прочий префлоп) не идёт в сводку вовсе:
+«неизвестно» не выдаётся ни за «верно», ни за «ошибка» (тот же принцип, что в
+`error_cost.py`).
 
 **Второй список — точки «около нуля» (`close_calls`).** Их интервал EV лежит по
 обе стороны нуля И достаточно узок, чтобы у точки были знак, порядок величины и
@@ -65,15 +66,9 @@ from __future__ import annotations
 
 from harness.analysis.error_cost import is_judged, total_ev_loss_bb
 from harness.analysis.preflop import cheap_fold_verdict, verdict_for
-from harness.contracts import EnrichedHand, PointVerdict, ScanItem, ScanSummary
+from harness.contracts import EnrichedHand, PointVerdict, ScanItem, ScanSummary, is_mismatch
 
 __all__ = ["scan_tournament"]
-
-# Порог, дороже которого расхождение попадает в список (спека задачи 13).
-# Ниже — сумма всё равно учтена в `total_loss_bb`, но строкой сводки не
-# становится: цена в копейки не то, ради чего игрок кликает в разбор.
-_MIN_REPORTED_LOSS_BB = 0.1
-
 
 def _hand_points(en: EnrichedHand) -> list[PointVerdict]:
     """Вердикты по всем точкам решения героя в руке — с префильтром перед каждой.
@@ -107,7 +102,17 @@ def _item(en: EnrichedHand, point: PointVerdict) -> ScanItem:
         ev_diff_bb=point.ev_diff_bb,
         zone=point.zone,
         interval=point.interval,
+        taken_frequency=(
+            float(point.detail["taken_frequency"]) if point.mismatch is not None else None
+        ),
     )
+
+
+def _item_order(item: ScanItem) -> tuple[int, float, int]:
+    """Порядок списка расхождений: ценовые по цене, затем по чарту по частоте."""
+    if item.taken_frequency is None:
+        return (0, item.ev_diff_bb, item.hand_index or 0)
+    return (1, item.taken_frequency, item.hand_index or 0)
 
 
 def _ceiling_of(item: ScanItem) -> float:
@@ -149,12 +154,19 @@ def scan_tournament(enriched: list[EnrichedHand]) -> ScanSummary:
 
         for point in judged:
             item = _item(en, point)
-            if point.ev_diff_bb < -_MIN_REPORTED_LOSS_BB:
+            # Расхождение — ценовое дороже порога или названное чартом
+            # (`contracts.is_mismatch`, порог — `MISMATCH_LOSS_BB`). Дешевле порога
+            # цена всё равно учтена в `total_loss_bb`, но строкой сводки не
+            # становится.
+            if is_mismatch(point):
                 items.append(item)
             elif point.interval is not None and point.interval.near_zero:
                 close_calls.append(item)
 
-    items.sort(key=lambda it: it.ev_diff_bb)
+    # Ценовые — по цене, дороже первым; за ними расхождения по чарту — по частоте
+    # сыгранного действия у солвера, реже первым (решение владельца 2026-10-03:
+    # один общий список). Номер руки — вторичный ключ, как у `close_calls`.
+    items.sort(key=_item_order)
     # Точки «около нуля» — по потолку цены, ДЕШЕВЛЕ первым. Каждая такая строка
     # делает игроку ровно одно обещание — «выбор стоит не больше стольки-то», — и
     # потолок есть единственное, чем они отличаются друг от друга: расхождения нет

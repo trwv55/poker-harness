@@ -771,6 +771,34 @@ async def test_leaks_ignore_near_zero_and_unjudged_points(db):
     assert await LeaksRepo(db).by_type(player_id) == []
 
 
+async def test_a_chart_point_within_the_chart_is_not_a_leak_and_costs_nothing(db):
+    """Точка по чарту даёт лик только при расхождении и в цену вечера не входит.
+
+    Обе точки несут одну тройку `fold → raise`; различает их колонка `mismatch`,
+    записанная из `PointVerdict.mismatch`.
+    """
+    from harness.contracts import SpotKind
+    from harness.memory.repos import LeaksRepo
+
+    player_id, session_id = await _player_with_session(db, tg_user_id=5009)
+    await _save_analysis(
+        db,
+        session_id=session_id,
+        hand_no="C1",
+        points=[
+            _verdict(SpotKind.OPEN_CHART, "fold", "raise", 0.0, mismatch=True),
+            _verdict(SpotKind.OPEN_CHART, "fold", "raise", 0.0, mismatch=False),
+        ],
+    )
+
+    leaks = await LeaksRepo(db).by_type(player_id)
+    assert [(stat.rule.key, stat.count, stat.loss_bb) for stat in leaks] == [
+        ("open_not_opened_raise", 1, 0.0)
+    ]
+    cost = await LeaksRepo(db).coverage_and_cost(player_id)
+    assert cost.judged.numerator == 2 and cost.priced.numerator == 0 and cost.loss_bb == 0.0
+
+
 async def test_leak_coverage_counts_every_point_of_the_history(db):
     """Строка «оценено N из M решений» — по тому же правилу, что покрытие скана."""
     from harness.contracts import SpotKind
@@ -1938,9 +1966,12 @@ def test_the_judged_rule_is_pinned_because_the_column_freezes_it():
 
     # Спот → судится ли точка с НЕПУСТЫМ `best_action`. С пустым не судится ни
     # одна: пустая строка и означает «не посчитано».
+    # `OPEN_CHART` добавлен 2026-10-03 без переливки: это новый спот, строк с ним
+    # до ревизии 0012 не было, а ответ правила для прежних спотов не изменился.
     pinned = {
         SpotKind.PUSHFOLD_UNOPENED: True,
         SpotKind.PUSHFOLD_FACING_SHOVE: True,
+        SpotKind.OPEN_CHART: True,
         SpotKind.PREFLOP_OTHER: False,
         SpotKind.POSTFLOP: False,
     }
@@ -1958,6 +1989,7 @@ def test_the_judged_rule_is_pinned_because_the_column_freezes_it():
             action_taken="fold",
             best_action=best_action,
             ev_diff_bb=-1.0,
+            mismatch=True if spot is SpotKind.OPEN_CHART and best_action else None,
         )
 
     answers = {
@@ -2101,7 +2133,9 @@ def _plant_before_0008(conn) -> dict:
                 "enriched": enriched.model_dump_json() if with_enriched else None,
             },
         ).scalar_one()
-        document = result.model_dump(mode="json")
+        # Документ в той форме, какой он был до 0008: поле `mismatch` появилось
+        # позже (0012), и откат 0008 его не знает.
+        document = result.model_dump(mode="json", exclude={"points": {"__all__": {"mismatch"}}})
         conn.execute(
             text("insert into analyses (hand_id, result) values (:hand, :result)"),
             {"hand": hand_id, "result": json.dumps(document)},
@@ -2198,7 +2232,10 @@ async def test_migration_0008_moves_points_without_changing_a_single_number(pg_b
     finally:
         engine.dispose()
 
-    command.upgrade(alembic_config(dsn), "0008")
+    # До головы, а не до 0008: модели читают колонки всех ревизий (0012 добавила
+    # `decision_points.mismatch`), а ревизии после 0008 только добавляют пустые
+    # колонки и чисел переливки не трогают.
+    command.upgrade(alembic_config(dsn), "head")
 
     engine = create_async_engine(pg_before_0008.get_connection_url(driver="asyncpg"))
     try:

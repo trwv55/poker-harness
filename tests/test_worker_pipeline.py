@@ -1823,9 +1823,11 @@ async def test_the_rendered_range_pictures_reach_the_player(
     player_id, session_id = await _make_scope(db_factory)
     # Раздача с ДОПУЩЕНИЕМ: рисуются только такие точки (`_render_ranges`), и на
     # раздаче без них тест проверял бы пустоту (та же ловушка, что у теста про
-    # текст модели, — см. `_seed_hands_and_pick_a_judged_one`).
+    # текст модели, — см. `_seed_hands_and_pick_a_judged_one`). С 2026-10-03
+    # открытие первым от 13bb судит чарт в зоне «строго», и первая точка с
+    # допущением в фикстуре — 51-я раздача.
     hand_no, _result = await _seed_hands_and_pick_an_assuming_one(
-        db_factory, session_id=session_id, n=20
+        db_factory, session_id=session_id, n=60
     )
     jid = await enqueue_deep_dive(queue, hand_no, player_id=player_id, session_id=session_id)
 
