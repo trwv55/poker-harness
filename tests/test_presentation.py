@@ -27,6 +27,10 @@
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from harness.contracts import NoteColorRecord
 
 from harness.analysis import analyze_hand
 from harness.contracts import (
@@ -1365,13 +1369,30 @@ def test_note_nicks_for_hand_leaves_the_hero_out():
     assert note_nicks_for_hand(_canonical_with_nicks("villain", "fish")) == ["villain", "fish"]
 
 
-def _note(note_id: int = 1, *, nick: str = "villain", color: str = "red", text: str = "фолдит на опен"):
+def _colour(color_id: int = 3, name: str = "красный", meaning: str = "агрессор"):
+    from harness.contracts import NoteColorRecord
+
+    return NoteColorRecord(color_id=color_id, name=name, meaning=meaning)
+
+
+def _note(
+    note_id: int = 1,
+    *,
+    nick: str = "villain",
+    color: NoteColorRecord | None | Literal["red"] = "red",
+    text: str = "фолдит на опен",
+):
+    """Заметка для экрана; `color="red"` — цвет по умолчанию из `_colour()`."""
     from datetime import UTC, datetime
 
     from harness.contracts import NoteRecord
 
     return NoteRecord(
-        note_id=note_id, nick=nick, color=color, text=text, updated_at=datetime.now(UTC)
+        note_id=note_id,
+        nick=nick,
+        color=_colour() if color == "red" else color,
+        text=text,
+        updated_at=datetime.now(UTC),
     )
 
 
@@ -1380,9 +1401,10 @@ def test_notes_msg_shows_the_colour_the_nick_and_the_observation():
 
     msg = notes_msg([_note()], 1)
 
-    assert "🔴 агрессор · villain" in msg.text
+    assert "красный — агрессор · villain" in msg.text
     assert "фолдит на опен" in msg.text
     assert [btn.callback_data for btn in msg.buttons[0]] == [
+        "noteappend:1",
         "noteedit:1",
         "notecolor:1",
         "notedel:1",
@@ -1390,14 +1412,17 @@ def test_notes_msg_shows_the_colour_the_nick_and_the_observation():
 
 
 def test_notes_msg_says_where_a_new_note_starts():
-    """Экран правит, но не заводит: путь заметки начинается из разбора руки."""
+    """Экран правит, но не заводит: новую заметку заводит команда `/note`, и
+    пустой и заполненный экран её называют. Скриншоты не принимаются, поэтому
+    путём для новой заметки кнопка под разбором скриншота не названа."""
     from harness.presentation import notes_msg
 
     empty = notes_msg([], 0)
     filled = notes_msg([_note()], 1)
 
     for msg in (empty, filled):
-        assert "из разбора раздачи" in msg.text
+        assert "Новая заметка — командой /note Ник." in msg.text
+        assert "скриншот" not in msg.text
 
 
 def test_notes_msg_of_the_longest_notes_still_fits_one_telegram_message():
@@ -1407,11 +1432,23 @@ def test_notes_msg_of_the_longest_notes_still_fits_one_telegram_message():
     правки и удаления: не открывшись, он не оставляет игроку выхода — убрать
     заметку, из-за которой он не открывается, больше неоткуда.
     """
-    from harness.contracts import MAX_NOTE_TEXT_CHARS
+    from harness.contracts import (
+        MAX_NOTE_COLOR_MEANING_CHARS,
+        MAX_NOTE_COLOR_NAME_CHARS,
+        MAX_NOTE_TEXT_CHARS,
+    )
     from harness.presentation import notes_msg
 
+    longest_colour = _colour(
+        name="ц" * MAX_NOTE_COLOR_NAME_CHARS, meaning="п" * MAX_NOTE_COLOR_MEANING_CHARS
+    )
     long_notes = [
-        _note(note_id=i, nick=f"opponent_{i}" * 3, text="ы" * MAX_NOTE_TEXT_CHARS)
+        _note(
+            note_id=i,
+            nick=f"opponent_{i}" * 3,
+            color=longest_colour,
+            text="ы" * MAX_NOTE_TEXT_CHARS,
+        )
         for i in range(1, 41)
     ]
 
@@ -1470,6 +1507,80 @@ def test_note_prompt_msg_shows_what_is_already_written():
     assert "Сейчас записано: донкает флоп" in editing.text
 
 
+def test_note_prompt_msg_of_an_append_says_the_entry_goes_on_top():
+    """Дополнение — путь по умолчанию: игрок должен знать, что прежнее останется."""
+    from harness.presentation import note_prompt_msg
+
+    msg = note_prompt_msg("villain", _note(text="18.09: фолдит на опен"), append=True)
+
+    assert "Сейчас записано: 18.09: фолдит на опен" in msg.text
+    assert "встанет сверху" in msg.text
+    assert "самые старые" in msg.text
+    assert "заменит прежний" not in msg.text
+
+
+def test_note_prompt_msg_of_an_append_to_a_long_note_still_fits_one_telegram_message():
+    from harness.presentation import note_prompt_msg
+
+    msg = note_prompt_msg("villain", _note(text="я" * 9000), append=True)
+
+    assert len(msg.text) <= 4096
+    assert "встанет сверху" in msg.text
+
+
+def test_a_note_row_offers_to_append_to_replace_to_recolour_and_to_delete():
+    """Дописать — первой кнопкой: это основной путь; заменить — для опечаток."""
+    from harness.presentation import (
+        NOTE_APPEND_PREFIX,
+        NOTE_COLOR_PREFIX,
+        NOTE_DELETE_PREFIX,
+        NOTE_EDIT_PREFIX,
+    )
+    from harness.presentation.keyboards import note_row
+
+    row = note_row(7)
+
+    assert [button.callback_data for button in row] == [
+        f"{NOTE_APPEND_PREFIX}7",
+        f"{NOTE_EDIT_PREFIX}7",
+        f"{NOTE_COLOR_PREFIX}7",
+        f"{NOTE_DELETE_PREFIX}7",
+    ]
+    assert [button.text for button in row][:2] == ["➕ Дописать", "✏️ Заменить"]
+
+
+def test_the_append_prefix_is_not_mistaken_for_another_note_button():
+    """Разбор кнопок идёт по началу строки: новый префикс не должен совпасть началом
+    ни с одним прежним, иначе нажатие ушло бы не в тот обработчик."""
+    from harness.presentation import (
+        NOTE_ADD_PREFIX,
+        NOTE_APPEND_PREFIX,
+        NOTE_COLOR_DELETE_PREFIX,
+        NOTE_COLOR_PREFIX,
+        NOTE_COLOR_SET_PREFIX,
+        NOTE_DELETE_PREFIX,
+        NOTE_EDIT_PREFIX,
+    )
+
+    others = (
+        NOTE_ADD_PREFIX,
+        NOTE_COLOR_PREFIX,
+        NOTE_COLOR_SET_PREFIX,
+        NOTE_COLOR_DELETE_PREFIX,
+        NOTE_DELETE_PREFIX,
+        NOTE_EDIT_PREFIX,
+    )
+    data = f"{NOTE_APPEND_PREFIX}7"
+    assert not any(data.startswith(prefix) for prefix in others)
+    assert not any(prefix.startswith(NOTE_APPEND_PREFIX) for prefix in others)
+
+
+def test_note_appended_msg_names_the_opponent():
+    from harness.presentation import note_appended_msg
+
+    assert "villain" in note_appended_msg("villain").text
+
+
 def test_settings_msg_shows_the_nickname_the_quota_and_a_button_to_change_it():
     from harness.presentation import settings_msg
 
@@ -1515,6 +1626,24 @@ def test_help_msg_names_the_question_command():
     from harness.presentation import help_msg
 
     assert "/ask" in help_msg().text
+
+
+def test_help_msg_names_the_note_command():
+    from harness.presentation import help_msg
+
+    assert "/note" in help_msg().text
+
+
+def test_note_usage_msg_shows_both_forms_of_the_command():
+    from harness.presentation import note_usage_msg
+
+    text = note_usage_msg().text
+
+    lines = text.splitlines()
+    assert "/note Vasya" in lines
+    assert "/note Vasya фолдит на опен" in lines
+    assert "/note Big Fish\nфолдит на опен" in text
+    assert "всю первую строку" in text
 
 
 def test_help_msg_carries_the_bottom_menu_and_names_every_button():
@@ -2211,3 +2340,133 @@ def test_the_door_prefix_matches_the_one_the_router_listens_to():
     from harness.presentation.messages import _DEEP_PREFIX
 
     assert _DEEP_PREFIX == DEEP_DIVE_PREFIX
+
+
+# --- цвета заметок (спека 2026-10-03, §7) ------------------------------------
+
+
+def test_a_note_line_without_a_colour_is_the_nick_alone():
+    from harness.presentation import notes_msg
+
+    msg = notes_msg([_note(color=None)], 1)
+
+    assert "\nvillain\n" in msg.text
+    assert " · villain" not in msg.text
+
+
+def test_the_colours_screen_lists_the_colours_with_a_delete_button_each():
+    from harness.presentation import NOTE_COLOR_DELETE_PREFIX, note_colors_msg
+
+    msg = note_colors_msg(
+        [_colour(4, "зелёный", "слабый, коллер"), _colour(5, "красный", "агрессор")]
+    )
+
+    lines = msg.text.splitlines()
+    assert lines[0] == "Цвета заметок"
+    assert "зелёный — слабый, коллер" in lines
+    assert "красный — агрессор" in lines
+    assert "«цвет — что он значит»" in msg.text
+    assert [[(b.text, b.callback_data) for b in row] for row in msg.buttons] == [
+        [("🗑 зелёный", f"{NOTE_COLOR_DELETE_PREFIX}4")],
+        [("🗑 красный", f"{NOTE_COLOR_DELETE_PREFIX}5")],
+    ]
+
+
+def test_the_colours_screen_without_colours_says_so_and_still_asks():
+    from harness.presentation import note_colors_msg
+
+    msg = note_colors_msg([])
+
+    assert "Цветов пока нет." in msg.text
+    assert "«цвет — что он значит»" in msg.text
+    assert msg.buttons == []
+    assert "Не больше 12 цветов." in msg.text
+
+
+def test_the_colours_screen_after_a_save_says_how_many_were_written():
+    from harness.presentation import note_colors_msg
+
+    assert note_colors_msg([_colour()], saved=1).text.startswith("Записал 1 цвет\n")
+    assert note_colors_msg([_colour()], saved=2).text.startswith("Записал 2 цвета\n")
+    assert note_colors_msg([_colour()], saved=5).text.startswith("Записал 5 цветов\n")
+
+
+def test_the_colours_screen_of_the_longest_colours_fits_one_telegram_message():
+    """Двенадцать цветов на пределах длины — экран обязан уйти одним сообщением,
+    а ни одна кнопка удаления — уложиться в 64 байта `callback_data`."""
+    from harness.contracts import (
+        MAX_NOTE_COLOR_MEANING_CHARS,
+        MAX_NOTE_COLOR_NAME_CHARS,
+        MAX_NOTE_COLORS,
+    )
+    from harness.presentation import note_colors_msg
+
+    colours = [
+        _colour(
+            10**18 + i,
+            f"{i:02d}" + "ц" * (MAX_NOTE_COLOR_NAME_CHARS - 2),
+            "п" * MAX_NOTE_COLOR_MEANING_CHARS,
+        )
+        for i in range(MAX_NOTE_COLORS)
+    ]
+
+    msg = note_colors_msg(colours, saved=MAX_NOTE_COLORS)
+
+    assert len(msg.text) <= 4096
+    assert len(msg.buttons) == MAX_NOTE_COLORS
+    assert all(len(b.callback_data.encode()) <= 64 for row in msg.buttons for b in row)
+
+
+def test_the_colour_prompt_offers_the_players_colours_and_no_colour():
+    from harness.presentation import note_color_prompt_msg
+
+    msg = note_color_prompt_msg(_note(note_id=7), [_colour(4, "зелёный", "слабый")])
+
+    assert [[(b.text, b.callback_data) for b in row] for row in msg.buttons] == [
+        [("зелёный — слабый", "notecolorset:7:4")],
+        [("⚪️ без цвета", "notecolorset:7:none")],
+    ]
+    assert all(
+        len(b.callback_data.encode()) <= 64
+        for row in note_color_prompt_msg(_note(note_id=10**18), [_colour(10**18)]).buttons
+        for b in row
+    )
+
+
+def test_the_colour_prompt_without_colours_points_at_settings():
+    from harness.presentation import note_color_prompt_msg
+
+    msg = note_color_prompt_msg(_note(color=None), [])
+
+    assert msg.buttons == []
+    assert "Цвета ещё не заданы: задайте их в ⚙️ Настройки → 🎨 Цвета заметок." in msg.text
+
+
+def test_a_refused_colour_line_is_named_by_its_number_and_text():
+    from harness.presentation import note_colors_refused_msg
+
+    for problem in ("no_separator", "empty_half", "name_too_long", "meaning_too_long"):
+        msg = note_colors_refused_msg(2, "красный агрессор", problem)
+        assert "2" in msg.text and "«красный агрессор»" in msg.text, problem
+
+
+def test_a_refused_colour_line_of_any_length_fits_one_telegram_message():
+    from harness.presentation import note_colors_refused_msg
+
+    assert len(note_colors_refused_msg(1, "я" * 5000, "name_too_long").text) <= 4096
+
+
+def test_the_colour_ceiling_refusal_names_the_ceiling():
+    from harness.presentation import note_colors_too_many_msg
+
+    assert "12" in note_colors_too_many_msg(12).text
+
+
+def test_settings_msg_offers_the_note_colours():
+    from harness.presentation import SETTINGS_COLORS_DATA, settings_msg
+
+    msg = settings_msg("nick", 1, 50)
+
+    assert ("🎨 Цвета заметок", SETTINGS_COLORS_DATA) in [
+        (b.text, b.callback_data) for row in msg.buttons for b in row
+    ]

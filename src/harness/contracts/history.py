@@ -21,7 +21,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel
 
@@ -30,22 +30,27 @@ from harness.contracts.analysis import PointVerdict, SpotKind
 __all__ = [
     "JUDGED_SPOTS",
     "LEAK_RULES",
+    "MAX_NOTE_COLORS",
+    "MAX_NOTE_COLOR_MEANING_CHARS",
+    "MAX_NOTE_COLOR_NAME_CHARS",
+    "MAX_NOTE_ENTRY_CHARS",
     "MAX_NOTE_TEXT_CHARS",
     "MISMATCH_LOSS_BB",
-    "NOTE_COLORS",
-    "NOTE_COLOR_NONE",
     "LeakRule",
     "LeakStat",
     "LeaksOverview",
-    "NoteColor",
+    "NoteColorLineError",
+    "NoteColorRecord",
     "NoteRecord",
     "OpponentRecord",
     "SessionLine",
     "SessionSummary",
+    "append_note_entry",
     "is_judged",
     "is_mismatch",
     "leak_rule_for",
     "leak_rule_of_point",
+    "parse_note_colors",
 ]
 
 
@@ -302,27 +307,83 @@ class SessionSummary(BaseModel):
     top_leak: LeakStat | None = None
 
 
-class NoteColor(BaseModel, frozen=True):
-    """Цветовой архетип заметки: ключ в БД и то, как он выглядит на экране."""
+class NoteColorRecord(BaseModel, frozen=True):
+    """Цвет заметки, названный игроком: имя и подпись его словами.
 
-    key: str
-    label: str
+    Набора по умолчанию нет: у нового игрока цветов нет вовсе, каждый игрок
+    называет свои (`memory.repos.NoteColorsRepo`).
+    """
+
+    color_id: int
+    name: str
+    meaning: str
 
 
-# Цветовая разметка заметок (ARCHITECTURE §6: «двухслойная разметка — цветовые
-# архетипы плюс текстовые аннотации»). Набор — решение реализации, не владельца:
-# четыре архетипа плюс «без цвета» покрывают то, ради чего цвет и заводится —
-# узнать оппонента за секунду до решения. `NOTE_COLOR_NONE` — значение по
-# умолчанию: заметка создаётся одним сообщением, цвет ставится потом.
-NOTE_COLOR_NONE = "none"
+# Пределы одного цвета — те же, что у колонок `note_colors.name`/`meaning`.
+MAX_NOTE_COLOR_NAME_CHARS = 32
+MAX_NOTE_COLOR_MEANING_CHARS = 120
 
-NOTE_COLORS: tuple[NoteColor, ...] = (
-    NoteColor(key=NOTE_COLOR_NONE, label="⚪️ без цвета"),
-    NoteColor(key="red", label="🔴 агрессор"),
-    NoteColor(key="yellow", label="🟡 лузовый"),
-    NoteColor(key="green", label="🟢 слабый"),
-    NoteColor(key="blue", label="🔵 тайтовый"),
-)
+# Сколько цветов у игрока самое большее: экран «Цвета заметок» с кнопкой
+# удаления на каждый обязан уйти одним сообщением
+# (`test_the_colours_screen_of_the_longest_colours_fits_one_telegram_message`).
+MAX_NOTE_COLORS = 12
+
+# Разделители имени и подписи. Дефис — только с пробелами по бокам: иначе
+# «тёмно-зелёный — слабый» резалось бы по дефису
+# (`test_a_hyphen_inside_a_word_does_not_split_the_colour`).
+_NOTE_COLOR_SEPARATORS = ("—", "–", ":", " - ")
+
+
+class NoteColorLineError(ValueError):
+    """Строка цветов, которую разбор не принял: её номер, текст и что с ней не так.
+
+    `problem` — `no_separator`, `empty_half`, `name_too_long` или
+    `meaning_too_long`; слова игроку подбирает `presentation`.
+    """
+
+    def __init__(self, line_no: int, line: str, problem: str) -> None:
+        super().__init__(f"строка {line_no} ({problem}): {line!r}")
+        self.line_no = line_no
+        self.line = line
+        self.problem = problem
+
+
+def parse_note_colors(text: str) -> list[tuple[str, str]]:
+    """Цвета из сообщения игрока: по одному в строке, «имя — подпись».
+
+    Пустые строки пропускаются; строку режет первое по месту вхождение любого
+    из `_NOTE_COLOR_SEPARATORS` (`test_the_first_separator_of_a_line_wins`), обе
+    половины обрезаются от пробелов. Плохая строка — `NoteColorLineError` на
+    весь набор: из сообщения не возвращается ничего
+    (`test_a_line_without_a_separator_is_refused_with_its_number_and_text`).
+
+    Одно имя дважды без учёта регистра — последняя подпись, первые место и
+    написание (`test_the_same_colour_twice_in_one_message_keeps_the_last_meaning`).
+    """
+    parsed: dict[str, tuple[str, str]] = {}
+    for line_no, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line:
+            continue
+        cuts = [
+            (position, separator)
+            for separator in _NOTE_COLOR_SEPARATORS
+            if (position := line.find(separator)) >= 0
+        ]
+        if not cuts:
+            raise NoteColorLineError(line_no, line, "no_separator")
+        position, separator = min(cuts)
+        name = line[:position].strip()
+        meaning = line[position + len(separator) :].strip()
+        if not name or not meaning:
+            raise NoteColorLineError(line_no, line, "empty_half")
+        if len(name) > MAX_NOTE_COLOR_NAME_CHARS:
+            raise NoteColorLineError(line_no, line, "name_too_long")
+        if len(meaning) > MAX_NOTE_COLOR_MEANING_CHARS:
+            raise NoteColorLineError(line_no, line, "meaning_too_long")
+        first = parsed.get(name.lower())
+        parsed[name.lower()] = (first[0] if first else name, meaning)
+    return list(parsed.values())
 
 
 # Потолок длины одной заметки. Экран «Заметки» — одно сообщение Телеграма, а
@@ -333,13 +394,50 @@ NOTE_COLORS: tuple[NoteColor, ...] = (
 # чем заметка является: одно наблюдение об оппоненте, а не запись раздачи.
 MAX_NOTE_TEXT_CHARS = 500
 
+# Запись дополнения начинается с даты «ДД.ММ: » — семь знаков из того же потолка.
+_NOTE_ENTRY_DATE_CHARS = len("00.00: ")
+
+# Предел одной записи: столько остаётся от заметки после даты. Длиннее запись не
+# поместилась бы в заметку даже одна, без единой старой строки рядом.
+MAX_NOTE_ENTRY_CHARS = MAX_NOTE_TEXT_CHARS - _NOTE_ENTRY_DATE_CHARS
+
+
+def append_note_entry(existing: str | None, entry: str, day: date) -> str:
+    """Дописать наблюдение в заметку: новая строка с датой сверху, старые под ней.
+
+    Запись сводится к одной строке (пробелы и переносы внутри — в один пробел),
+    потому что вытесняются заметки построчно: перенос внутри записи разрезал бы
+    её надвое, и половина ушла бы раньше другой
+    (`test_a_note_entry_is_kept_on_one_line`).
+
+    Не влезает в `MAX_NOTE_TEXT_CHARS` — уходят нижние строки, то есть самые
+    старые записи, пока остальное не поместится
+    (`test_the_oldest_lines_leave_when_the_note_outgrows_its_limit`). Текст,
+    записанный заменой целиком, оказывается под датированными строками и
+    вытесняется так же, построчно снизу — многострочный уходит по частям
+    (`test_a_replaced_text_sits_under_the_entries_and_leaves_line_by_line`).
+
+    Дата — день `day` как есть; какой это день, решает вызывающий.
+    """
+    line_body = " ".join(entry.split())
+    if not line_body:
+        raise ValueError("запись заметки не может быть пустой")
+    if len(line_body) > MAX_NOTE_ENTRY_CHARS:
+        raise ValueError(f"запись заметки длиннее {MAX_NOTE_ENTRY_CHARS} символов")
+    lines = [f"{day:%d.%m}: {line_body}"]
+    if existing:
+        lines.extend(existing.splitlines())
+    while len("\n".join(lines)) > MAX_NOTE_TEXT_CHARS:
+        lines.pop()
+    return "\n".join(lines)
+
 
 class NoteRecord(BaseModel):
-    """Заметка на оппонента: ник, цвет, текст, когда обновлена."""
+    """Заметка на оппонента: ник, цвет (`None` — без цвета), текст, когда обновлена."""
 
     note_id: int
     nick: str
-    color: str
+    color: NoteColorRecord | None
     text: str
     updated_at: datetime
 

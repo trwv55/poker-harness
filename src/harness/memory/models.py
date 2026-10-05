@@ -1,8 +1,8 @@
-"""ORM-модели БД: 12 таблиц спеки §6, две таблицы оппонента и точки решения.
+"""ORM-модели БД: 12 таблиц спеки §6, две таблицы оппонента, точки решения, цвета заметок.
 
 Источник — `docs/superpowers/specs/2026-08-28-poker-harness-tech-spec-design.md`,
 раздел "6. Схема БД". Колонки — по табличным строкам спеки дословно; `?` у поля в
-спеке значит nullable, отсутствие `?` — `NOT NULL`. Шесть отступлений от этого
+спеке значит nullable, отсутствие `?` — `NOT NULL`. Семь отступлений от этого
 правила и почему они не нарушают "дословно":
 
 1. `llm_calls.started_at` — таблица §6 её не называет среди "ключевых полей", но §7
@@ -40,6 +40,12 @@
    цена вечера, — а каждое новое условие писалось выражением по jsonb руками.
    Отступление здесь в том, что таблицы нет в §6, а не в том, что она спорит с
    правилом.
+7. `note_colors` и `notes.color_id` (миграция 0013) — в исходной таблице §6
+   цвет был колонкой `notes.color` с ключом из набора, зашитого в код, одним на
+   всех игроков. Теперь цвета у каждого игрока свои и названы им, заметка
+   ссылается на цвет своего владельца составным внешним ключом
+   (`NoteColor`, `Note`); строки `notes` и `note_colors` в §6 приведены к этой
+   схеме.
 
 jsonb-колонки хранят `model_dump(mode="json")` пайплайн-контрактов (`RawHand`,
 `CanonicalHand`, `EnrichedHand`, `AnalysisResult`) — уже JSON-совместимые
@@ -301,9 +307,7 @@ class DecisionPointRow(Base):
 
 
 class Note(Base):
-    """Заметки на игроков: `notes`. Только через vision — в HH ники анонимны.
-
-    Заметка на оппонента одна и накапливается (SESSIONS_UX: «оппонент
+    """Заметка на оппонента одна и накапливается (SESSIONS_UX: «оппонент
     встречается в разных сессиях, заметка должна накапливаться»), поэтому
     уникален `opponent_id` — не пара с владельцем: владелец у оппонента один и
     тот же, и второй раз в ключе он ничего не добавляет (миграция 0007).
@@ -318,6 +322,11 @@ class Note(Base):
     по нему сверяется владелец во всех методах `NotesRepo`, а составной внешний
     ключ на `opponents(id, owner_player_id)` не даёт ему разойтись с владельцем
     самого оппонента — тот же приём, что в `OpponentLink`.
+
+    `color_id` — цвет из `note_colors` того же владельца: составной внешний ключ
+    на `note_colors(id, player_id)` чужого цвета не принимает. Каскада нет:
+    удаление цвета обнуляет ссылку кодом (`NoteColorsRepo.delete`), а каскад
+    удалил бы заметку (миграция 0013).
     """
 
     __tablename__ = "notes"
@@ -328,6 +337,11 @@ class Note(Base):
             ["opponents.id", "opponents.owner_player_id"],
             name="fk_notes_opponent_opponents",
         ),
+        ForeignKeyConstraint(
+            ["color_id", "owner_player_id"],
+            ["note_colors.id", "note_colors.player_id"],
+            name="fk_notes_color_note_colors",
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -335,9 +349,39 @@ class Note(Base):
         BigInteger, ForeignKey("players.id"), nullable=False
     )
     opponent_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    color: Mapped[str] = mapped_column(String(32), nullable=False)
+    color_id: Mapped[int | None] = mapped_column(BigInteger)
     text: Mapped[str] = mapped_column(Text, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class NoteColor(Base):
+    """`note_colors`: цвет заметки, названный игроком, — имя и подпись его словами.
+
+    У каждого игрока свои цвета; у нового их нет. Имя без учёта регистра
+    уникально у игрока, написание хранится первое — тот же функциональный
+    индекс, что у `opponents`
+    (`test_the_same_colour_in_another_case_updates_the_meaning_and_keeps_the_first_spelling`).
+
+    `uq_note_colors_id_player` не проверяет ничего сам: это цель составного
+    внешнего ключа из `notes`.
+    """
+
+    __tablename__ = "note_colors"
+    __table_args__ = (
+        Index(
+            "uq_note_colors_player_id_lower_name",
+            "player_id",
+            func.lower(text("name")),
+            unique=True,
+        ),
+        UniqueConstraint("id", "player_id", name="uq_note_colors_id_player"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    player_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("players.id"), nullable=False)
+    name: Mapped[str] = mapped_column(String(32), nullable=False)
+    meaning: Mapped[str] = mapped_column(String(120), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class Opponent(Base):

@@ -488,3 +488,206 @@ def test_every_schema_the_model_fills_survives_the_container_key(schema_path: st
     schema = getattr(importlib.import_module(module_name), class_name)
 
     assert schema.model_validate({"params": payload}) == schema.model_validate(payload)
+
+
+# --- заметка: дополнение поверх старого ---------------------------------------------
+
+
+def test_a_note_entry_goes_on_top_with_its_date():
+    """Новая запись встаёт НАД прежними: свежее наблюдение видно первым."""
+    from datetime import date
+
+    from harness.contracts import append_note_entry
+
+    text = append_note_entry("18.09: фолдит на опен", "донкает флоп", date(2026, 9, 25))
+
+    assert text == "25.09: донкает флоп\n18.09: фолдит на опен"
+
+
+def test_the_first_entry_of_a_note_is_just_its_dated_line():
+    from datetime import date
+
+    from harness.contracts import append_note_entry
+
+    assert append_note_entry(None, "донкает флоп", date(2026, 9, 5)) == "05.09: донкает флоп"
+
+
+def test_a_note_entry_is_kept_on_one_line():
+    """Запись — одна строка: по строкам потом вытесняются самые старые записи, и
+    перенос внутри записи разрезал бы её надвое."""
+    from datetime import date
+
+    from harness.contracts import append_note_entry
+
+    text = append_note_entry(None, "  донкает\n\n флоп  ", date(2026, 9, 25))
+
+    assert text == "25.09: донкает флоп"
+
+
+def test_the_oldest_lines_leave_when_the_note_outgrows_its_limit():
+    """Переполнение вытесняет снизу, то есть самое старое; порядок остального цел."""
+    from datetime import date
+
+    from harness.contracts import MAX_NOTE_TEXT_CHARS, append_note_entry
+
+    old_lines = [f"{day:02}.09: " + "ы" * 90 for day in (20, 19, 18, 17, 16)]
+    old = "\n".join(old_lines)
+    assert len(old) <= MAX_NOTE_TEXT_CHARS
+
+    lines = append_note_entry(old, "ю" * 50, date(2026, 9, 25)).splitlines()
+
+    assert len("\n".join(lines)) <= MAX_NOTE_TEXT_CHARS
+    assert lines[0] == "25.09: " + "ю" * 50
+    assert lines[1:] == old_lines[: len(lines) - 1]
+    assert len(lines) - 1 < len(old_lines)
+
+
+def test_an_entry_fills_the_whole_note_but_not_more():
+    """Предел записи — предел заметки минус дата: длиннее записать некуда."""
+    from datetime import date
+
+    from harness.contracts import MAX_NOTE_ENTRY_CHARS, MAX_NOTE_TEXT_CHARS, append_note_entry
+
+    day = date(2026, 9, 25)
+    full = append_note_entry("18.09: фолдит на опен", "я" * MAX_NOTE_ENTRY_CHARS, day)
+    assert full == "25.09: " + "я" * MAX_NOTE_ENTRY_CHARS
+    assert len(full) == MAX_NOTE_TEXT_CHARS
+
+    with pytest.raises(ValueError, match="длиннее"):
+        append_note_entry(None, "я" * (MAX_NOTE_ENTRY_CHARS + 1), day)
+
+
+def test_an_empty_note_entry_is_refused():
+    from datetime import date
+
+    from harness.contracts import append_note_entry
+
+    with pytest.raises(ValueError, match="пуст"):
+        append_note_entry("18.09: фолдит на опен", " \n\xa0", date(2026, 9, 25))
+
+
+def test_a_replaced_text_sits_under_the_entries_and_leaves_line_by_line():
+    """Текст замены не датирован и многострочен: он встаёт под новую запись, а при
+    переполнении уходит по одной строке снизу, а не целиком."""
+    from datetime import date
+
+    from harness.contracts import MAX_NOTE_TEXT_CHARS, append_note_entry
+
+    replaced = "лимпит всё\n" + "ы" * 240 + "\n" + "ю" * 240
+    assert len(replaced) <= MAX_NOTE_TEXT_CHARS
+
+    lines = append_note_entry(replaced, "донкает флоп", date(2026, 9, 25)).splitlines()
+
+    assert lines == ["25.09: донкает флоп", "лимпит всё", "ы" * 240]
+
+
+# --- цвета заметок: разбор строки игрока (спека 2026-10-03, §5) ----------------
+
+
+def test_note_colours_are_parsed_one_per_line_with_every_separator():
+    """Длинное и короткое тире, двоеточие и дефис с пробелами — каждый режет строку;
+    пустые строки пропускаются, обе половины обрезаются от пробелов."""
+    from harness.contracts import parse_note_colors
+
+    text = (
+        "зелёный — слабый, коллер\n"
+        "\n"
+        "  красный – агрессор  \n"
+        "синий: тайтовый\n"
+        "жёлтый - лузовый\n"
+    )
+
+    assert parse_note_colors(text) == [
+        ("зелёный", "слабый, коллер"),
+        ("красный", "агрессор"),
+        ("синий", "тайтовый"),
+        ("жёлтый", "лузовый"),
+    ]
+
+
+def test_a_hyphen_inside_a_word_does_not_split_the_colour():
+    """Дефис режет только с пробелами по бокам: иначе «тёмно-зелёный» резалось бы."""
+    from harness.contracts import parse_note_colors
+
+    assert parse_note_colors("тёмно-зелёный — слабый, кол-коллер") == [
+        ("тёмно-зелёный", "слабый, кол-коллер")
+    ]
+
+
+def test_the_first_separator_of_a_line_wins():
+    from harness.contracts import parse_note_colors
+
+    assert parse_note_colors("красный: агрессор — 3бет лайт") == [
+        ("красный", "агрессор — 3бет лайт")
+    ]
+
+
+def test_a_line_without_a_separator_is_refused_with_its_number_and_text():
+    from harness.contracts import NoteColorLineError, parse_note_colors
+
+    with pytest.raises(NoteColorLineError) as caught:
+        parse_note_colors("зелёный — слабый\nкрасный агрессор")
+
+    assert isinstance(caught.value, ValueError)
+    assert (caught.value.line_no, caught.value.line, caught.value.problem) == (
+        2,
+        "красный агрессор",
+        "no_separator",
+    )
+
+
+@pytest.mark.parametrize("line", ["— слабый", "зелёный —", "зелёный :", ":"])
+def test_an_empty_half_is_refused(line):
+    from harness.contracts import NoteColorLineError, parse_note_colors
+
+    with pytest.raises(NoteColorLineError) as caught:
+        parse_note_colors(line)
+
+    assert caught.value.problem == "empty_half"
+    assert caught.value.line_no == 1
+
+
+def test_the_length_limits_of_a_colour_hold_at_the_edge():
+    from harness.contracts import (
+        MAX_NOTE_COLOR_MEANING_CHARS,
+        MAX_NOTE_COLOR_NAME_CHARS,
+        NoteColorLineError,
+        parse_note_colors,
+    )
+
+    name = "ц" * MAX_NOTE_COLOR_NAME_CHARS
+    meaning = "п" * MAX_NOTE_COLOR_MEANING_CHARS
+    assert parse_note_colors(f"{name} — {meaning}") == [(name, meaning)]
+
+    with pytest.raises(NoteColorLineError) as long_name:
+        parse_note_colors(f"{name}ц — {meaning}")
+    assert long_name.value.problem == "name_too_long"
+
+    with pytest.raises(NoteColorLineError) as long_meaning:
+        parse_note_colors(f"{name} — {meaning}п")
+    assert long_meaning.value.problem == "meaning_too_long"
+
+
+def test_the_same_colour_twice_in_one_message_keeps_the_last_meaning():
+    """Игрок правит себя в том же сообщении: имя без учёта регистра то же —
+    побеждает последняя подпись, место и написание — первые."""
+    from harness.contracts import parse_note_colors
+
+    assert parse_note_colors("Зелёный — слабый\nкрасный — агрессор\nзелёный — коллер") == [
+        ("Зелёный", "коллер"),
+        ("красный", "агрессор"),
+    ]
+
+
+def test_note_colour_limits_are_the_ones_of_the_spec():
+    from harness.contracts import (
+        MAX_NOTE_COLOR_MEANING_CHARS,
+        MAX_NOTE_COLOR_NAME_CHARS,
+        MAX_NOTE_COLORS,
+    )
+
+    assert (MAX_NOTE_COLOR_NAME_CHARS, MAX_NOTE_COLOR_MEANING_CHARS, MAX_NOTE_COLORS) == (
+        32,
+        120,
+        12,
+    )

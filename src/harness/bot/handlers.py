@@ -37,7 +37,14 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from harness.bot.menus import render_menu_screen, session_summary_screen
-from harness.contracts import MAX_NOTE_TEXT_CHARS, NOTE_COLORS, CanonicalHand
+from harness.contracts import (
+    MAX_NOTE_COLORS,
+    MAX_NOTE_ENTRY_CHARS,
+    MAX_NOTE_TEXT_CHARS,
+    CanonicalHand,
+    NoteColorLineError,
+    parse_note_colors,
+)
 from harness.memory.models import Job, Player
 from harness.memory.repos import (
     AnalysesRepo,
@@ -45,6 +52,7 @@ from harness.memory.repos import (
     HandsRepo,
     InvitesRepo,
     JobsRepo,
+    NoteColorsRepo,
     NotesRepo,
     OpponentsRepo,
     PlayersRepo,
@@ -54,19 +62,22 @@ from harness.memory.repos import (
     TournamentsRepo,
 )
 from harness.parsers.vision_adapter import apply_vision_answer
-from harness.platform.llm import MAX_IMAGE_BYTES, MAX_IMAGE_MB
 from harness.platform.queue import JobsQueue
 from harness.presentation import (
     DISAGREE_PREFIX,
     NEW_SESSION_DATA,
     NOTE_ADD_PREFIX,
+    NOTE_APPEND_PREFIX,
+    NOTE_COLOR_DELETE_PREFIX,
     NOTE_COLOR_PREFIX,
     NOTE_COLOR_SET_PREFIX,
+    NOTE_COLOR_UNSET,
     NOTE_DELETE_PREFIX,
     NOTE_EDIT_PREFIX,
     RANGES_PREFIX,
     SESSION_PREFIX,
     SET_NICKNAME_DATA,
+    SETTINGS_COLORS_DATA,
     Msg,
     alias_bound_msg,
     alias_no_analysis_msg,
@@ -87,20 +98,25 @@ from harness.presentation import (
     invite_created_msg,
     invite_required_msg,
     new_session_msg,
+    note_appended_msg,
     note_color_prompt_msg,
     note_color_saved_msg,
+    note_colors_msg,
+    note_colors_refused_msg,
+    note_colors_too_many_msg,
     note_deleted_msg,
     note_gone_msg,
     note_nicks_for_hand,
     note_prompt_msg,
     note_saved_msg,
     note_too_long_msg,
+    note_usage_msg,
     owner_admitted_msg,
     question_too_long_msg,
     question_usage_msg,
     quota_exceeded_msg,
     ranges_msg,
-    screenshot_too_large_msg,
+    screenshots_not_supported_msg,
     session_unavailable_msg,
     start_msg,
     unknown_text_msg,
@@ -147,6 +163,14 @@ MANUAL_ANSWER = "manual"
 # состояние продукт больше не входит (решение владельца 2026-09-07).
 _INPUT_NICKNAME = "gg_nickname"
 _INPUT_NOTE = "note"
+_INPUT_NOTE_COLOR = "note_color"
+
+# Что делает текст, набранный в ввод заметки (`pending_input["mode"]`): дописывает
+# строку поверх прежнего или заменяет всё. Ввод без этого поля открыт до того, как
+# появилось дополнение, — под подсказкой «Новый текст заменит прежний», и он
+# заменяет: обещанное игроку не меняется у него за спиной.
+_NOTE_APPEND = "append"
+_NOTE_REPLACE = "replace"
 
 # Предел длины вопроса. Он стоит на том, что игрок печатает руками, и защищает
 # не базу (`jobs.payload` — JSONB), а промпт: вопрос едет в него целиком.
@@ -163,10 +187,13 @@ _MAX_NICKNAME = 64
 UI_CALLBACK_PREFIXES: tuple[str, ...] = (
     SESSION_PREFIX,
     NEW_SESSION_DATA,
+    SETTINGS_COLORS_DATA,
     NOTE_COLOR_SET_PREFIX,
+    NOTE_COLOR_DELETE_PREFIX,
     NOTE_COLOR_PREFIX,
     NOTE_EDIT_PREFIX,
     NOTE_DELETE_PREFIX,
+    NOTE_APPEND_PREFIX,
     NOTE_ADD_PREFIX,
     SET_NICKNAME_DATA,
     RANGES_PREFIX,
@@ -186,12 +213,6 @@ _SCAN_IN_FLIGHT = frozenset({"queued", "running", "awaiting_user"})
 # сюда попадает только то, чем бывает сохранённый экран.
 _IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
 _IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
-
-# Скрины кладутся рядом с раздачами, тем же правилом имени: содержимое решает,
-# как файл называется. Расширение условное — формат определяется по магическим
-# байтам при вызове модели (`platform/llm.py`), а не по имени.
-_SCREEN_SUFFIX = ".img"
-
 
 @dataclass(frozen=True, slots=True)
 class BotDeps:
@@ -233,20 +254,6 @@ def _store_hh_file(data_dir: Path, file_bytes: bytes) -> Path:
     path = directory / f"{hashlib.sha256(file_bytes).hexdigest()}{_HH_SUFFIX}"
     path.write_bytes(file_bytes)
     return path
-
-
-def _store_screenshot(data_dir: Path, file_bytes: bytes) -> tuple[Path, str]:
-    """Скрин на диск под именем-хэшем содержимого — как и файл раздач.
-
-    Хэш возвращается отдельно: он же едет в `hands.image_hash`, и считать его
-    дважды значило бы завести второй источник одного значения.
-    """
-    digest = hashlib.sha256(file_bytes).hexdigest()
-    directory = data_dir / "screens"
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{digest}{_SCREEN_SUFFIX}"
-    path.write_bytes(file_bytes)
-    return path, digest
 
 
 async def check_quota(deps: BotDeps, player_id: int) -> QuotaCheck:
@@ -397,6 +404,60 @@ async def handle_alias_command(deps: BotDeps, tg_user_id: int, args: str = "") -
     return reply
 
 
+async def handle_note_command(deps: BotDeps, tg_user_id: int, args: str = "") -> Msg:
+    """`/note`: заметка на оппонента по нику, набранному руками, — без скриншота.
+
+    Без слов — подсказка формата (`test_the_note_command_without_words_explains_both_forms`).
+    С переносом строки ник — вся первая строка, запись — остальное
+    (`test_a_note_command_takes_the_whole_first_line_as_a_nick_of_several_words`).
+    Без переноса ник — первое слово, запись — остальное
+    (`test_a_note_command_without_a_line_break_splits_at_the_first_space`,
+    `test_a_note_command_without_a_line_break_splits_at_any_whitespace`).
+    Без записи ставится тот же ввод, что у кнопки под разбором
+    (`test_the_note_command_with_a_nick_opens_the_same_input_as_the_button`), и он
+    заменяет начатый ввод другого рода
+    (`test_the_note_command_with_a_nick_replaces_another_pending_input`).
+    Запись дописывается сразу
+    (`test_the_note_command_with_a_nick_and_text_appends_on_top_with_a_date`) и
+    начатый ввод другого рода не гасит
+    (`test_a_note_command_with_text_leaves_another_pending_input_waiting`).
+
+    Ник длиннее `_MAX_NICKNAME` отвергается тем же текстом, что в `/alias`
+    (`test_a_note_command_nick_longer_than_the_limit_is_refused_without_writing`).
+    """
+    async with deps.db_factory() as db:
+        player = await _known_player(db, tg_user_id)
+        if player is None:
+            await db.commit()
+            return invite_required_msg()
+        reply = await _note_command_reply(db, player, args.strip())
+        await db.commit()
+    return reply
+
+
+async def _note_command_reply(db: AsyncSession, player: Player, args: str) -> Msg:
+    """Разбор аргументов `/note`: пусто, `«НИК»`, `«НИК ЗАПИСЬ»` или `«НИК\\nЗАПИСЬ»`."""
+    if not args:
+        return note_usage_msg()
+    if "\n" in args:
+        nick, _, entry = args.partition("\n")
+    else:
+        nick, entry = [*args.split(maxsplit=1), ""][:2]
+    nick, entry = nick.strip(), entry.strip()
+    if len(nick) > _MAX_NICKNAME:
+        return gg_nickname_too_long_msg(_MAX_NICKNAME)
+    notes = NotesRepo(db)
+    if not entry:
+        await PlayersRepo(db).set_pending_input(
+            player.id, {"kind": _INPUT_NOTE, "nick": nick, "mode": _NOTE_APPEND}
+        )
+        return note_prompt_msg(nick, await notes.find_by_nick(player.id, nick), append=True)
+    if len(entry) > MAX_NOTE_ENTRY_CHARS:
+        return note_too_long_msg(MAX_NOTE_ENTRY_CHARS)
+    await notes.append(owner_player_id=player.id, nick=nick, entry=entry)
+    return note_appended_msg(nick)
+
+
 async def _alias_reply(db: AsyncSession, player: Player, args: str) -> Msg:
     """Разбор аргументов команды: `«МЕСТО НИК»` либо пусто.
 
@@ -470,10 +531,10 @@ async def handle_document(
     """`.txt` из PokerCraft: файл на диск → сессия (молча) → турнир → `hh_scan`.
 
     **Документом приходит и картинка.** «Отправить без сжатия» — это документ, а
-    не фото, и именно так продукт сам просит прислать скрин, когда масти не
-    прочитались (`send_as_file_msg`). Такой документ уходит в тот же путь зрения,
-    что и фотография (`_accept_screenshot`), и потому возвращает `Msg | None`:
-    успешная постановка задачи молчит.
+    не фото, и распознаётся он здесь ради отказа: скрин-вход отложен, и такой
+    документ получает тот же ответ, что фотография (`handle_photo`). Отличать его
+    от мусора всё равно надо — «такой файл я не разберу» игроку, приславшему
+    экран, не объясняет ничего.
 
     **Молчаливое создание сессии — здесь** (спека §6/§13 шаг 6). Игрок, приславший
     файл, не просил открывать сессию и не должен быть к этому принуждён: сессия
@@ -519,7 +580,10 @@ async def handle_document(
     """
     if not filename.lower().endswith(_HH_SUFFIX):
         if _is_image_document(mime_type, filename):
-            return await _accept_screenshot(deps, tg_user_id, file_bytes)
+            # «Отправить без сжатия» — тот же экран, что и фотографией, и дверь
+            # ему закрыта та же: иначе отказ на фото игрок обошёл бы, прислав
+            # тот же скрин файлом.
+            return screenshots_not_supported_msg()
         # Отказ до всякой записи: ни файла на диске, ни сессии, ни задачи. Ждать
         # 20 секунд ради «не получилось разобрать» из воркера игроку незачем.
         return unsupported_document_msg()
@@ -702,70 +766,24 @@ def _is_image_document(mime_type: str | None, filename: str) -> bool:
     return filename.lower().endswith(_IMAGE_SUFFIXES)
 
 
-async def _accept_screenshot(deps: BotDeps, tg_user_id: int, file_bytes: bytes) -> Msg | None:
-    """Общий путь зрения: скрин на диск -> сессия (молча) -> `screenshot_analyze`.
+async def handle_photo(deps: BotDeps, tg_user_id: int) -> Msg:
+    """Фотография в чат — отказ: скрин-вход отложен решением владельца 2026-09-12.
 
-    Один на оба входа — фотографию и документ-картинку. Дублировать эту
-    последовательность на второй вход значило бы завести второе место, где
-    порядок проверок может разойтись, а порядок здесь и есть гарантия: ни байта
-    на диск раньше `_known_player`
-    (`test_a_stranger_sending_a_picture_as_a_document_leaves_nothing_in_the_volume`).
+    Байты фотографии сюда не приезжают вовсе: роутер их не скачивает
+    (`bot/router.py`, `on_photo`). Это и есть отключение — не проверка флага
+    внутри разбора, а отсутствие пути: ни файла в томе, ни строки `jobs`, ни
+    вызова модели, ни даже загрузки картинки из Телеграма.
 
-    **Сначала ник в руме.** Героя на экране определяет код, сопоставляя
-    прочитанные ники с ником из профиля; без него разбирать некого, и честнее
-    спросить сразу, чем заплатить за чтение и упереться в вопрос после него.
+    Отказ, а не молчание: продукт до сих пор звал прислать экран, и игрок,
+    приславший его, обязан узнать, что разбора не будет, и чем это заменить
+    (`presentation.screenshots_not_supported_msg`).
 
-    **Предел размера — до очереди.** Картинка тяжелее `MAX_IMAGE_BYTES` до модели
-    не доедет (`platform/llm.py`), и узнать об этом игрок должен сразу, а не через
-    двадцать секунд отказом воркера.
-
-    `None` в успешном случае — то же сознательное молчание, что у кнопки
-    «разобрать»: дальше говорит воркер одним редактируемым сообщением прогресса
-    (SESSIONS_UX), и второй текст от бота стал бы дублем.
+    Инвайт здесь не проверяется, и это не дыра: дверь закрыта для всех одинаково,
+    в базу этот путь не ходит и строку `players` завести не может. Тот же порядок
+    у документа, который не похож ни на что: `unsupported_document_msg` тоже
+    уходит незнакомцу до проверки игрока.
     """
-    async with deps.db_factory() as db:
-        player = await _known_player(db, tg_user_id)
-        if player is None:
-            await db.commit()
-            return invite_required_msg()
-        if len(file_bytes) > MAX_IMAGE_BYTES:
-            # После проверки игрока, а не до неё: посторонний не должен узнавать
-            # из отказа ничего сверх того, что узнавал раньше.
-            await db.commit()
-            return screenshot_too_large_msg(MAX_IMAGE_MB)
-        player_id, nickname = player.id, player.gg_nickname
-        if not nickname:
-            # Вопрос задан — значит следующий текст и есть ответ на него. Это не
-            # возврат к «первому тексту = ник» (тот срабатывал на любую реплику
-            # без всякого вопроса): состояние ставится ровно потому, что бот
-            # только что спросил, и снимается любым нажатием меню.
-            await PlayersRepo(db).set_pending_input(player_id, {"kind": _INPUT_NICKNAME})
-            await db.commit()
-            return ask_gg_nickname_msg()
-        await db.commit()
-
-    quota = await check_quota(deps, player_id)
-    if not quota.allowed:
-        return quota_exceeded_msg(quota.hours_to_free)
-
-    path, digest = _store_screenshot(deps.data_dir, file_bytes)
-    async with deps.db_factory() as db:
-        session_row = await SessionsRepo(db).active_or_create(player_id)
-        await db.commit()
-        session_id = session_row.id
-
-    await deps.queue.enqueue(
-        type="screenshot_analyze",
-        player_id=player_id,
-        session_id=session_id,
-        payload={"image_file": str(path), "image_hash": digest},
-    )
-    return None
-
-
-async def handle_photo(deps: BotDeps, tg_user_id: int, file_bytes: bytes) -> Msg | None:
-    """Фотография в чат — главный вход продукта; вся работа в `_accept_screenshot`."""
-    return await _accept_screenshot(deps, tg_user_id, file_bytes)
+    return screenshots_not_supported_msg()
 
 
 def _parse_escalation(data: str) -> tuple[int, str, str] | None:
@@ -776,9 +794,19 @@ def _parse_escalation(data: str) -> tuple[int, str, str] | None:
     чужой руке (ревью раунда 1, R2).
     """
     parts = data.removeprefix(ESCALATION_PREFIX).split(":")
-    if len(parts) != 3 or not parts[0].isdigit():
+    job_id = _button_number(parts[0]) if len(parts) == 3 else None
+    if job_id is None:
         return None
-    return int(parts[0]), parts[1], parts[2]
+    return job_id, parts[1], parts[2]
+
+
+def _button_number(raw: str) -> int | None:
+    """Номер из `callback_data` — только ASCII-цифры, иначе это не номер.
+
+    `str.isdigit()` пропускает и цифры вроде «²», на которых `int()` падает
+    (`test_unicode_digits_in_button_numbers_break_nothing_and_change_nothing`).
+    """
+    return int(raw) if raw.isascii() and raw.isdigit() else None
 
 
 def _chosen_option(job: Job, raw_value: str) -> str | None:
@@ -788,9 +816,9 @@ def _chosen_option(job: Job, raw_value: str) -> str | None:
     кнопка несёт номер, а не текст (`presentation.keyboards.escalation_buttons`).
     """
     options = list((job.payload or {}).get("escalation_options") or [])
-    if not raw_value.isdigit():
+    index = _button_number(raw_value)
+    if index is None:
         return None
-    index = int(raw_value)
     return options[index] if 0 <= index < len(options) else None
 
 
@@ -911,7 +939,7 @@ async def handle_text(deps: BotDeps, tg_user_id: int, text: str) -> Msg | None:
 async def _apply_pending_input(
     db: AsyncSession, player: Player, pending: dict, answer: str
 ) -> Msg:
-    """Текст в начатый ввод: ник в руме или заметка на оппонента.
+    """Текст в начатый ввод: ник в руме, заметка на оппонента или цвета заметок.
 
     Пустое сообщение ввод не закрывает и не сбрасывает: игрок, приславший одни
     пробелы, получает ту же просьбу, с которой ввод и начался
@@ -921,9 +949,15 @@ async def _apply_pending_input(
     if not answer:
         if kind == _INPUT_NICKNAME:
             return ask_gg_nickname_msg()
+        if kind == _INPUT_NOTE_COLOR:
+            return note_colors_msg(await NoteColorsRepo(db).list_for_player(player.id))
         if kind == _INPUT_NOTE:
             nick = str(pending.get("nick", ""))
-            return note_prompt_msg(nick, await NotesRepo(db).find_by_nick(player.id, nick))
+            return note_prompt_msg(
+                nick,
+                await NotesRepo(db).find_by_nick(player.id, nick),
+                append=pending.get("mode") == _NOTE_APPEND,
+            )
         return unknown_text_msg()
     if kind == _INPUT_NICKNAME:
         if len(answer) > _MAX_NICKNAME:
@@ -933,15 +967,45 @@ async def _apply_pending_input(
         return gg_nickname_saved_msg(answer)
     if kind == _INPUT_NOTE:
         nick = str(pending.get("nick", ""))
-        if len(answer) > MAX_NOTE_TEXT_CHARS:
+        appending = pending.get("mode") == _NOTE_APPEND
+        # У дополнения предел меньше на дату, которая встанет перед записью.
+        limit = MAX_NOTE_ENTRY_CHARS if appending else MAX_NOTE_TEXT_CHARS
+        if len(answer) > limit:
             # Ввод НЕ закрывается: игрок дописывает короче, а не начинает путь
             # заново
             # (`test_a_note_longer_than_the_screen_can_show_is_refused_in_words`).
-            return note_too_long_msg(MAX_NOTE_TEXT_CHARS)
-        await NotesRepo(db).upsert(owner_player_id=player.id, nick=nick, text_=answer)
+            return note_too_long_msg(limit)
+        notes = NotesRepo(db)
+        if appending:
+            await notes.append(owner_player_id=player.id, nick=nick, entry=answer)
+        else:
+            await notes.upsert(owner_player_id=player.id, nick=nick, text_=answer)
         await PlayersRepo(db).set_pending_input(player.id, None)
-        return note_saved_msg(nick)
+        return note_appended_msg(nick) if appending else note_saved_msg(nick)
+    if kind == _INPUT_NOTE_COLOR:
+        return await _apply_note_colors(db, player, answer)
     return unknown_text_msg()
+
+
+async def _apply_note_colors(db: AsyncSession, player: Player, answer: str) -> Msg:
+    """Цвета из сообщения игрока — в его набор; ответ — экран цветов.
+
+    Плохая строка или потолок — отказ, ничего не записано, ввод НЕ закрывается:
+    игрок правит строку, а не начинает путь заново
+    (`test_a_colour_line_that_does_not_parse_keeps_the_input_open`,
+    `test_colours_over_the_ceiling_are_refused_and_the_input_stays_open`).
+    """
+    try:
+        pairs = parse_note_colors(answer)
+    except NoteColorLineError as error:
+        return note_colors_refused_msg(error.line_no, error.line, error.problem)
+    colors = NoteColorsRepo(db)
+    try:
+        await colors.upsert_many(player.id, pairs)
+    except ValueError:
+        return note_colors_too_many_msg(MAX_NOTE_COLORS)
+    await PlayersRepo(db).set_pending_input(player.id, None)
+    return note_colors_msg(await colors.list_for_player(player.id), saved=len(pairs))
 
 
 def _question_of(job: Job) -> str:
@@ -1018,33 +1082,55 @@ _NEW_SESSION_REQUESTED = Msg(text="")
 
 
 async def _dispatch_ui(deps: BotDeps, db: AsyncSession, player: Player, data: str) -> Msg | None:
-    """Разбор `callback_data` по префиксам. Порядок проверок значим: `notecolorset:`
-    и `notecolor:` начинаются одинаково, и общий префикс обязан проверяться позже.
+    """Разбор `callback_data` по префиксам. Порядок проверок значим: `notecolorset:`,
+    `notecolordel:` и `notecolor:` начинаются одинаково, и общий префикс обязан
+    проверяться позже. `notecolors` — начало `notecolorset:`, поэтому экран цветов
+    сверяется равенством
+    (`test_the_colours_screen_and_the_colour_buttons_reach_their_own_handlers`).
     """
     if data == NEW_SESSION_DATA:
         return _NEW_SESSION_REQUESTED
     if data == SET_NICKNAME_DATA:
         await PlayersRepo(db).set_pending_input(player.id, {"kind": _INPUT_NICKNAME})
         return ask_gg_nickname_msg()
+    if data == SETTINGS_COLORS_DATA:
+        return await _note_colors_screen(db, player)
     if data.startswith(SESSION_PREFIX):
-        rest = data.removeprefix(SESSION_PREFIX)
-        if not rest.isdigit():
+        session_id = _button_number(data.removeprefix(SESSION_PREFIX))
+        if session_id is None:
             return session_unavailable_msg()
-        screen = await session_summary_screen(db, player, int(rest))
+        screen = await session_summary_screen(db, player, session_id)
         return session_unavailable_msg() if screen is None else screen
     if data.startswith(NOTE_COLOR_SET_PREFIX):
         return await _set_note_color(db, player, data.removeprefix(NOTE_COLOR_SET_PREFIX))
+    if data.startswith(NOTE_COLOR_DELETE_PREFIX):
+        color_id = _button_number(data.removeprefix(NOTE_COLOR_DELETE_PREFIX))
+        if color_id is not None:
+            await NoteColorsRepo(db).delete(color_id, player.id)
+        return await _note_colors_screen(db, player)
     if data.startswith(NOTE_COLOR_PREFIX):
         note = await _note_by_data(db, player, data.removeprefix(NOTE_COLOR_PREFIX))
-        return note_gone_msg() if note is None else note_color_prompt_msg(note)
+        if note is None:
+            return note_gone_msg()
+        return note_color_prompt_msg(
+            note, await NoteColorsRepo(db).list_for_player(player.id)
+        )
     if data.startswith(NOTE_EDIT_PREFIX):
         note = await _note_by_data(db, player, data.removeprefix(NOTE_EDIT_PREFIX))
         if note is None:
             return note_gone_msg()
         await PlayersRepo(db).set_pending_input(
-            player.id, {"kind": _INPUT_NOTE, "nick": note.nick}
+            player.id, {"kind": _INPUT_NOTE, "nick": note.nick, "mode": _NOTE_REPLACE}
         )
         return note_prompt_msg(note.nick, note)
+    if data.startswith(NOTE_APPEND_PREFIX):
+        note = await _note_by_data(db, player, data.removeprefix(NOTE_APPEND_PREFIX))
+        if note is None:
+            return note_gone_msg()
+        await PlayersRepo(db).set_pending_input(
+            player.id, {"kind": _INPUT_NOTE, "nick": note.nick, "mode": _NOTE_APPEND}
+        )
+        return note_prompt_msg(note.nick, note, append=True)
     if data.startswith(NOTE_DELETE_PREFIX):
         note = await _note_by_data(db, player, data.removeprefix(NOTE_DELETE_PREFIX))
         if note is None or not await NotesRepo(db).delete(note.note_id, player.id):
@@ -1067,41 +1153,64 @@ async def _note_prompt_from_button(db: AsyncSession, player: Player, rest: str) 
     кнопок: два разных порядка дали бы заметку не на того оппонента.
     """
     hand_no, _, raw_index = rest.rpartition(":")
-    if not hand_no or not raw_index.isdigit():
+    index = _button_number(raw_index)
+    if not hand_no or index is None:
         return analysis_unavailable_msg()
     hand, _analysis = await _hand_with_analysis(db, player, hand_no)
     if hand is None or hand.canonical is None:
         return analysis_unavailable_msg()
     nicks = note_nicks_for_hand(hand.canonical)
-    index = int(raw_index)
     if index >= len(nicks):
         return analysis_unavailable_msg()
     nick = nicks[index]
-    await PlayersRepo(db).set_pending_input(player.id, {"kind": _INPUT_NOTE, "nick": nick})
-    return note_prompt_msg(nick, await NotesRepo(db).find_by_nick(player.id, nick))
+    # Из разбора — дополнение: заметка копит наблюдения от вечера к вечеру
+    # (SESSIONS_UX), и новое наблюдение не стирает прежних.
+    await PlayersRepo(db).set_pending_input(
+        player.id, {"kind": _INPUT_NOTE, "nick": nick, "mode": _NOTE_APPEND}
+    )
+    return note_prompt_msg(
+        nick, await NotesRepo(db).find_by_nick(player.id, nick), append=True
+    )
 
 
 async def _note_by_data(db: AsyncSession, player: Player, raw_id: str):
     """Заметка по номеру из кнопки — только своя. Нецифровой номер это не заметка."""
-    if not raw_id.isdigit():
+    note_id = _button_number(raw_id)
+    if note_id is None:
         return None
-    return await NotesRepo(db).get(int(raw_id), player.id)
+    return await NotesRepo(db).get(note_id, player.id)
 
 
 async def _set_note_color(db: AsyncSession, player: Player, rest: str) -> Msg:
-    """`notecolorset:{id}:{цвет}` — цвет ставится только из известного набора.
+    """`notecolorset:{id}:{номер цвета | none}` — только свой цвет на свою заметку.
 
-    Ключ цвета сверяется с `NOTE_COLORS`, а не пишется как есть: `callback_data`
-    приходит из внешнего мира, и в колонке `notes.color` не должно оказаться
-    значения, которого экран не умеет показать.
+    Номер цвета приходит из внешнего мира: нецифровой, чужой или удалённый —
+    `note_gone_msg`, и в заметку не пишется ничего
+    (`test_a_colour_of_another_player_is_not_put_on_a_note_by_a_button`,
+    `test_an_unknown_colour_from_a_button_is_not_written_to_the_note`).
     """
     raw_id, _, key = rest.partition(":")
-    color = next((item for item in NOTE_COLORS if item.key == key), None)
     note = await _note_by_data(db, player, raw_id)
-    if note is None or color is None:
+    if note is None:
         return note_gone_msg()
-    await NotesRepo(db).set_color(note.note_id, player.id, color.key)
-    return note_color_saved_msg(note.nick, color.label)
+    if key == NOTE_COLOR_UNSET:
+        color = None
+    else:
+        wanted = _button_number(key)
+        colors = await NoteColorsRepo(db).list_for_player(player.id)
+        color = next((item for item in colors if item.color_id == wanted), None)
+        if color is None:
+            return note_gone_msg()
+    chosen = None if color is None else color.color_id
+    if not await NotesRepo(db).set_color(note.note_id, player.id, chosen):
+        return note_gone_msg()
+    return note_color_saved_msg(note.nick, color)
+
+
+async def _note_colors_screen(db: AsyncSession, player: Player) -> Msg:
+    """Экран «Цвета заметок»; он же открывает ввод — следующий текст и есть цвета."""
+    await PlayersRepo(db).set_pending_input(player.id, {"kind": _INPUT_NOTE_COLOR})
+    return note_colors_msg(await NoteColorsRepo(db).list_for_player(player.id))
 
 
 async def _hand_with_analysis(db: AsyncSession, player: Player, hand_no: str):
