@@ -53,8 +53,18 @@ SESSION_PREFIX = "session:"
 NEW_SESSION_DATA = "newsession"
 NOTE_ADD_PREFIX = "note:"
 NOTE_EDIT_PREFIX = "noteedit:"
+# Дописать строку поверх заметки. Префикс не совпадает началом ни с одним
+# соседним: разбор `callback_data` идёт по `startswith`.
+NOTE_APPEND_PREFIX = "noteappend:"
 NOTE_COLOR_PREFIX = "notecolor:"
 NOTE_COLOR_SET_PREFIX = "notecolorset:"
+# Значение кнопки «без цвета» на месте номера цвета в `notecolorset:`.
+NOTE_COLOR_UNSET = "none"
+NOTE_COLOR_DELETE_PREFIX = "notecolordel:"
+# Экран «Цвета заметок» из «Настроек». Начало `notecolorset:` совпадает с этой
+# строкой, поэтому разбор сверяет её равенством, а не `startswith`
+# (`test_the_colours_screen_and_the_colour_buttons_reach_their_own_handlers`).
+SETTINGS_COLORS_DATA = "notecolors"
 NOTE_DELETE_PREFIX = "notedel:"
 SET_NICKNAME_DATA = "setnick"
 RANGES_PREFIX = "ranges:"
@@ -152,20 +162,42 @@ def session_buttons(sessions: Sequence[tuple[int, str]]) -> list[list[Btn]]:
 
 
 def note_row(note_id: int) -> list[Btn]:
-    """Три действия над одной заметкой: правка текста, цвет, удаление."""
+    """Действия над одной заметкой: дописать, заменить текст, цвет, удаление.
+
+    «Дописать» первой: заметка копит наблюдения, и это основной путь; замена
+    целиком — для опечаток и чистки.
+    """
     return [
-        Btn(text="✏️ Изменить", callback_data=f"{NOTE_EDIT_PREFIX}{note_id}"),
+        Btn(text="➕ Дописать", callback_data=f"{NOTE_APPEND_PREFIX}{note_id}"),
+        Btn(text="✏️ Заменить", callback_data=f"{NOTE_EDIT_PREFIX}{note_id}"),
         Btn(text="🎨 Цвет", callback_data=f"{NOTE_COLOR_PREFIX}{note_id}"),
         Btn(text="🗑 Удалить", callback_data=f"{NOTE_DELETE_PREFIX}{note_id}"),
     ]
 
 
 def note_color_buttons(note_id: int, colors: Sequence[tuple[str, str]]) -> list[list[Btn]]:
-    """Кнопка на каждый цветовой архетип — по одной в ряд, чтобы подпись влезла."""
+    """Кнопка на каждый цвет — по одной в ряд, чтобы подпись влезла.
+
+    `colors` — пары «значение в `callback_data`, подпись»; значение — номер
+    цвета или `NOTE_COLOR_UNSET`.
+    """
     return [
         [Btn(text=label, callback_data=f"{NOTE_COLOR_SET_PREFIX}{note_id}:{key}")]
         for key, label in colors
     ]
+
+
+def note_color_delete_buttons(colors: Sequence[tuple[int, str]]) -> list[list[Btn]]:
+    """«🗑 имя» на каждый цвет игрока — по одной в ряд; значение — номер цвета."""
+    return [
+        [Btn(text=f"🗑 {name}", callback_data=f"{NOTE_COLOR_DELETE_PREFIX}{color_id}")]
+        for color_id, name in colors
+    ]
+
+
+def note_colors_button() -> Btn:
+    """Вход на экран «Цвета заметок» из «Настроек»."""
+    return Btn(text="🎨 Цвета заметок", callback_data=SETTINGS_COLORS_DATA)
 
 
 def set_nickname_button(known: bool) -> Btn:
@@ -213,18 +245,24 @@ __all__ = [
     "MENU_TOURNAMENT",
     "NEW_SESSION_DATA",
     "NOTE_ADD_PREFIX",
+    "NOTE_APPEND_PREFIX",
+    "NOTE_COLOR_DELETE_PREFIX",
     "NOTE_COLOR_PREFIX",
     "NOTE_COLOR_SET_PREFIX",
+    "NOTE_COLOR_UNSET",
     "NOTE_DELETE_PREFIX",
     "NOTE_EDIT_PREFIX",
     "RANGES_PREFIX",
     "SESSION_PREFIX",
+    "SETTINGS_COLORS_DATA",
     "SET_NICKNAME_DATA",
     "Btn",
     "deep_dive_button",
     "escalation_buttons",
     "note_buttons_for_hand",
     "note_color_buttons",
+    "note_color_delete_buttons",
+    "note_colors_button",
     "note_nicks_for_hand",
     "note_row",
     "session_buttons",

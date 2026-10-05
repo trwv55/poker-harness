@@ -124,10 +124,13 @@ from harness.contracts.enriched import (
     hero_stack_delta_bb,
 )
 from harness.contracts.history import (
+    MAX_NOTE_COLOR_MEANING_CHARS,
+    MAX_NOTE_COLOR_NAME_CHARS,
+    MAX_NOTE_COLORS,
     MAX_NOTE_TEXT_CHARS,
-    NOTE_COLORS,
     LeaksOverview,
     LeakStat,
+    NoteColorRecord,
     NoteRecord,
     OpponentRecord,
     SessionLine,
@@ -143,11 +146,14 @@ from harness.presentation.keyboards import (
     MENU_SESSIONS,
     MENU_SETTINGS,
     MENU_TOURNAMENT,
+    NOTE_COLOR_UNSET,
     Btn,
     deep_dive_button,
     escalation_buttons,
     note_buttons_for_hand,
     note_color_buttons,
+    note_color_delete_buttons,
+    note_colors_button,
     note_row,
     session_buttons,
     set_nickname_button,
@@ -176,12 +182,17 @@ __all__ = [
     "leaks_msg",
     "new_session_msg",
     "not_a_hand_msg",
+    "note_appended_msg",
     "note_color_prompt_msg",
     "note_color_saved_msg",
+    "note_colors_msg",
+    "note_colors_refused_msg",
+    "note_colors_too_many_msg",
     "note_deleted_msg",
     "note_gone_msg",
     "note_prompt_msg",
     "note_saved_msg",
+    "note_usage_msg",
     "notes_msg",
     "progress_text",
     "question_msg",
@@ -194,6 +205,7 @@ __all__ = [
     "ranges_msg",
     "scan_summary_msg",
     "screenshot_too_large_msg",
+    "screenshots_not_supported_msg",
     "send_as_file_msg",
     "session_summary_msg",
     "session_unavailable_msg",
@@ -1423,19 +1435,42 @@ def bot_failure_msg() -> Msg:
 
 
 def unsupported_document_msg() -> Msg:
-    """Документ ни на что не похож — отказ сразу, с называнием ОБЕИХ дверей.
+    """Документ ни на что не похож — отказ сразу, с называнием ЕДИНСТВЕННОЙ двери.
 
-    Дверей в продукт две, и текст обязан назвать обе: раздачи приходят файлом
-    `.txt`, экран стола — картинкой (в том числе файлом, без сжатия). Пока текст
-    предлагал только `.txt`, игрок, приславший скрин файлом, читал это как «зрения
-    здесь нет» (`test_a_document_that_is_neither_hands_nor_a_picture_names_both_
-    doors`).
+    Дверь в продукт одна: раздачи приходят файлом `.txt` из PokerCraft. Вторую
+    (скриншот стола картинкой) текст называл, пока она была открыта; со скрин-входом
+    за границами v1 приглашать в неё значило бы обещать разбор, которого не будет —
+    картинка получает свой отказ (`screenshots_not_supported_msg`).
     """
     return Msg(
         text=(
             "Такой файл я не разберу. Раздачи из PokerCraft присылайте файлом .txt "
-            "— запущу скан. Скриншот стола — картинкой: обычной фотографией или "
-            "файлом png, jpg, webp."
+            "— запущу скан."
+        )
+    )
+
+
+def screenshots_not_supported_msg() -> Msg:
+    """Экран стола прислан — разбора не будет, и причина названа вслух.
+
+    Скрин-вход отложен решением владельца: ни одна протестированная модель не
+    читает стол достаточно точно, чтобы на её числах строить расчёт
+    (`docs/superpowers/specs/2026-09-04-vision-open-problems.md`). Отказ говорит
+    об этом прямо, потому что продукт продаёт проверенный расчёт: молчаливое
+    «не умею» игрок прочёл бы как поломку, а разбор по неверно прочитанным
+    числам противоречил бы самому обещанию.
+
+    Следующий шаг назван обязательно — отказ без него оставляет игрока с той же
+    картинкой в руках (SESSIONS_UX).
+    """
+    return Msg(
+        text=(
+            "Скриншоты столов я не разбираю. Прочитать экран настолько точно, "
+            "чтобы считать по нему, пока не выходит ни у одной модели, а считать "
+            "по неверным числам хуже, чем не считать вовсе.\n\n"
+            "Пришлите файл раздач из PokerCraft (.txt) — по нему разбор точный: "
+            f"суммы и карты там записал сам рум. Где взять файл, покажет "
+            f"{MENU_TOURNAMENT}."
         )
     )
 
@@ -1737,11 +1772,13 @@ def _fitted(text: str, budget: int) -> str:
     return text[: max(0, budget - len(_MARKER))] + _MARKER
 
 
+def _color_label(color: NoteColorRecord) -> str:
+    return f"{color.name} — {color.meaning}"
+
+
 def _note_lines(note: NoteRecord) -> list[str]:
-    label = next(
-        (color.label for color in NOTE_COLORS if color.key == note.color), note.color
-    )
-    return [f"{label} · {note.nick}", _fitted(note.text, MAX_NOTE_TEXT_CHARS)]
+    head = note.nick if note.color is None else f"{_color_label(note.color)} · {note.nick}"
+    return [head, _fitted(note.text, MAX_NOTE_TEXT_CHARS)]
 
 
 def _notes_cut_line(shown: int, total: int) -> str:
@@ -1751,10 +1788,9 @@ def _notes_cut_line(shown: int, total: int) -> str:
 def notes_msg(notes: Sequence[NoteRecord], total: int) -> Msg:
     """Экран «Заметки»: наблюдения об оппонентах, свежие первыми.
 
-    Экран показывает и правит, но НЕ заводит новых: заметка ценна скоростью
-    записи в момент наблюдения, поэтому путь «добавить» начинается из разбора
-    руки с уже подставленным оппонентом (решение владельца 2026-09-04). Об этом
-    прямо сказано текстом — иначе экран выглядел бы сломанным.
+    Экран показывает и правит, но НЕ заводит новых (решение владельца
+    2026-09-04): новую заводит команда `/note`, и экран её называет
+    (`test_notes_msg_says_where_a_new_note_starts`).
 
     `total` — сколько заметок у игрока ВСЕГО (`NotesRepo.count_for_player`), а
     не длина `notes`: список приходит уже с потолком запроса, и знаменатель по
@@ -1769,9 +1805,7 @@ def notes_msg(notes: Sequence[NoteRecord], total: int) -> Msg:
     """
     head = "Заметки на оппонентов — то, чего не показывает HUD."
     tail = (
-        "Новая заметка начинается из разбора раздачи: под вердиктом есть кнопка "
-        "с ником оппонента. Заметки живут только на скринах — в файлах PokerCraft "
-        "ники обезличены."
+        "Новая заметка — командой /note Ник."
     )
     if not notes:
         return Msg(text=f"{head}\n\nПока пусто.\n\n{tail}")
@@ -1802,7 +1836,9 @@ def notes_msg(notes: Sequence[NoteRecord], total: int) -> Msg:
     )
 
 
-def note_prompt_msg(nick: str, existing: NoteRecord | None = None) -> Msg:
+def note_prompt_msg(
+    nick: str, existing: NoteRecord | None = None, *, append: bool = False
+) -> Msg:
     """Просьба написать наблюдение об оппоненте — вход FSM заметки.
 
     Примеры в тексте — из решения владельца 2026-09-04 дословно: заметка
@@ -1814,9 +1850,15 @@ def note_prompt_msg(nick: str, existing: NoteRecord | None = None) -> Msg:
     (`test_note_prompt_msg_of_a_long_note_still_fits_one_telegram_message`).
     """
     head = f"Заметка на {nick}."
+    effect = (
+        "Запись встанет сверху с сегодняшней датой; если место кончится, "
+        "уйдут самые старые записи."
+        if append
+        else "Новый текст заменит прежний."
+    )
     ask = (
         "Напишите наблюдение одним сообщением — то, чего не покажет HUD: "
-        "«фолдит на опен», «донкает флоп». Новый текст заменит прежний."
+        f"«фолдит на опен», «донкает флоп». {effect}"
     )
     lines = [head]
     if existing is not None:
@@ -1831,21 +1873,97 @@ def note_saved_msg(nick: str) -> Msg:
     return Msg(text=f"Записал заметку на {nick}.")
 
 
+def note_appended_msg(nick: str) -> Msg:
+    return Msg(text=f"Дописал в заметку на {nick}.")
+
+
 def note_deleted_msg(nick: str) -> Msg:
     return Msg(text=f"Удалил заметку на {nick}.")
 
 
-def note_color_prompt_msg(note: NoteRecord) -> Msg:
-    """Выбор цветового архетипа — вторая половина двухслойной разметки заметок."""
+def note_color_prompt_msg(note: NoteRecord, colors: Sequence[NoteColorRecord]) -> Msg:
+    """Выбор цвета заметки из цветов игрока плюс «без цвета».
+
+    Цветов нет — ни одной кнопки и подсказка, где их задать
+    (`test_the_colour_prompt_without_colours_points_at_settings`).
+    """
+    if not colors:
+        return Msg(
+            text=(
+                f"Цвет заметки на {note.nick}.\n"
+                f"Цвета ещё не заданы: задайте их в {MENU_SETTINGS} → "
+                f"{note_colors_button().text}."
+            )
+        )
+    choices = [(str(color.color_id), _color_label(color)) for color in colors]
+    choices.append((NOTE_COLOR_UNSET, "⚪️ без цвета"))
     return Msg(
-        text=f"Цвет заметки на {note.nick}: выберите архетип.",
-        buttons=note_color_buttons(
-            note.note_id, [(color.key, color.label) for color in NOTE_COLORS]
-        ),
+        text=f"Цвет заметки на {note.nick}: выберите.",
+        buttons=note_color_buttons(note.note_id, choices),
     )
 
 
-def note_color_saved_msg(nick: str, label: str) -> Msg:
+_NOTE_COLORS_HINT = (
+    "Напишите свои цвета, по одному в строке: «цвет — что он значит».\n"
+    "Например: зелёный — слабый, коллер. Тот же цвет новой строкой меняет подпись. "
+    f"Не больше {MAX_NOTE_COLORS} цветов."
+)
+
+
+def note_colors_msg(colors: Sequence[NoteColorRecord], *, saved: int | None = None) -> Msg:
+    """Экран «Цвета заметок»: цвета игрока, «🗑» на каждый и просьба написать свои.
+
+    Экран открывает ввод цветов (`bot.handlers`), поэтому подсказка формата на
+    нём и есть просьба. `saved` — сколько цветов записал только что принятый
+    ввод. Двенадцать самых длинных цветов укладываются в одно сообщение
+    (`test_the_colours_screen_of_the_longest_colours_fits_one_telegram_message`).
+    """
+    lines: list[str] = []
+    if saved is not None:
+        lines += [f"Записал {saved} {_plural_form(saved, 'цвет', 'цвета', 'цветов')}", ""]
+    lines += ["Цвета заметок", ""]
+    lines += [_color_label(color) for color in colors] or ["Цветов пока нет."]
+    lines += ["", _NOTE_COLORS_HINT]
+    return Msg(
+        text="\n".join(lines),
+        buttons=note_color_delete_buttons([(color.color_id, color.name) for color in colors]),
+    )
+
+
+_NOTE_COLOR_PROBLEMS = {
+    "no_separator": "не вижу, где кончается цвет и начинается подпись — поставьте между ними «—»",
+    "empty_half": "нужны и цвет, и подпись — одна половина пустая",
+    "name_too_long": f"цвет длиннее {MAX_NOTE_COLOR_NAME_CHARS} знаков",
+    "meaning_too_long": f"подпись длиннее {MAX_NOTE_COLOR_MEANING_CHARS} знаков",
+}
+
+# Сколько знаков отказанной строки показывать: строка приходит из сообщения
+# игрока и сама может быть длиннее `_TELEGRAM_TEXT_LIMIT`.
+_REFUSED_LINE_CHARS = 200
+
+
+def note_colors_refused_msg(line_no: int, line: str, problem: str) -> Msg:
+    """Строка цветов не разобралась: её номер и текст; не записано ничего."""
+    reason = _NOTE_COLOR_PROBLEMS.get(problem, "не разобрал")
+    return Msg(
+        text=(
+            f"Строка {line_no} «{_fitted(line, _REFUSED_LINE_CHARS)}»: {reason}. "
+            "Ничего не записал — пришлите цвета ещё раз, исправив эту строку."
+        )
+    )
+
+
+def note_colors_too_many_msg(limit: int) -> Msg:
+    return Msg(
+        text=(
+            f"Цветов может быть не больше {limit}. Ничего не записал — удалите лишние "
+            "кнопкой «🗑» или пришлите меньше."
+        )
+    )
+
+
+def note_color_saved_msg(nick: str, color: NoteColorRecord | None) -> Msg:
+    label = "без цвета" if color is None else _color_label(color)
     return Msg(text=f"{nick} — {label}.")
 
 
@@ -1860,6 +1978,29 @@ def note_too_long_msg(limit: int) -> Msg:
         text=(
             f"Слишком длинная заметка: принимаю не длиннее {limit} символов. "
             f"Заметка — одно наблюдение об оппоненте; пришлите короче."
+        )
+    )
+
+
+def note_usage_msg() -> Msg:
+    """`/note` без слов: формат обеих форм команды.
+
+    Правило ника — то, по которому команду разбирает `handlers.handle_note_command`
+    (`test_a_note_command_takes_the_whole_first_line_as_a_nick_of_several_words`,
+    `test_a_note_command_without_a_line_break_splits_at_the_first_space`).
+    """
+    return Msg(
+        text=(
+            "Заметка на оппонента без скриншота.\n\n"
+            "Показать заметку и дописать наблюдение следующим сообщением:\n"
+            "/note Vasya\n\n"
+            "Сразу дописать наблюдение:\n"
+            "/note Vasya фолдит на опен\n\n"
+            "Без переноса строки ник — первое слово после /note. Ник из нескольких "
+            "слов — на первой строке, наблюдение — со второй:\n"
+            "/note Big Fish\nфолдит на опен\n\n"
+            "Перенос строки делает ником всю первую строку, поэтому наблюдение в "
+            "несколько строк начинайте со второй строки, а на первой оставьте только ник."
         )
     )
 
@@ -1898,7 +2039,10 @@ def settings_msg(
     if is_dev:
         lines.append("")
         lines.append("Режим разработчика включён. /invite — выпустить инвайт-код.")
-    return Msg(text="\n".join(lines), buttons=[[set_nickname_button(bool(nickname))]])
+    return Msg(
+        text="\n".join(lines),
+        buttons=[[set_nickname_button(bool(nickname))], [note_colors_button()]],
+    )
 
 
 def help_msg() -> Msg:
@@ -1921,6 +2065,7 @@ def help_msg() -> Msg:
             "/new — начать новую сессию.\n"
             "/nick — указать ник в руме.\n"
             "/alias — назвать участника разбора ником в руме.\n"
+            "/note НИК — заметка на оппонента без скриншота.\n"
             "/ask ВОПРОС — спросить о своей игре; отвечаю только посчитанным."
         ),
         menu=MAIN_MENU,

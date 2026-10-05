@@ -47,6 +47,7 @@ from harness.bot.handlers import (
     handle_invite_command,
     handle_new_session,
     handle_nickname_command,
+    handle_note_command,
     handle_photo,
     handle_question_command,
     handle_start,
@@ -165,6 +166,14 @@ def build_router(deps: BotDeps) -> Router:
         msg = await handle_alias_command(deps, message.from_user.id, command.args or "")
         await _deliver(bot, message.chat.id, msg)
 
+    @router.message(Command("note"))
+    async def on_note(message: Message, bot: Bot, command: CommandObject) -> None:
+        """`/note НИК` — открыть ввод заметки; `/note НИК ЗАПИСЬ` — дописать сразу."""
+        if message.from_user is None:
+            return
+        msg = await handle_note_command(deps, message.from_user.id, command.args or "")
+        await _deliver(bot, message.chat.id, msg)
+
     @router.message(Command("ask"))
     async def on_ask(message: Message, bot: Bot, command: CommandObject) -> None:
         """`/ask ВОПРОС` — вопрос о своей игре. `None` значит, что дальше говорит воркер."""
@@ -217,19 +226,17 @@ def build_router(deps: BotDeps) -> Router:
 
     @router.message(F.photo)
     async def on_photo(message: Message, bot: Bot) -> None:
-        """Фото — главный вход продукта. Берём САМЫЙ КРУПНЫЙ из присланных размеров.
+        """Фото — отказ, и картинка ради него НЕ скачивается.
 
-        Телеграм отдаёт одно фото несколькими превью, от самого мелкого к самому
-        крупному; читать надо последнее. Мелкое превью «прочиталось бы» тоже — и
-        выдало бы уверенно неверные числа, потому что цифры на нём не различимы.
+        Скрин-вход отложен (решение владельца 2026-09-12), и отключён он именно
+        здесь: `_download` больше не зовётся, поэтому за отказ не платится ни
+        байтом трафика — Телеграм отдаёт фото до 20 МБ. Обработчик при этом
+        остаётся: без него бот на присланный экран промолчал бы, а молчание
+        игрок читает как поломку.
         """
         if message.from_user is None or not message.photo:
             return
-        file_bytes = await _download(bot, message.photo[-1].file_id)
-        msg = await handle_photo(deps, message.from_user.id, file_bytes)
-        if msg is None:
-            return
-        await _deliver(bot, message.chat.id, msg)
+        await _deliver(bot, message.chat.id, await handle_photo(deps, message.from_user.id))
 
     @router.callback_query(F.data.startswith(DEEP_DIVE_PREFIX))
     async def on_deep_dive(callback: CallbackQuery, bot: Bot) -> None:

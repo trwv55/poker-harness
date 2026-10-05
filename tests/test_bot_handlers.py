@@ -583,12 +583,15 @@ async def test_an_invite_lets_exactly_one_stranger_in(db_factory, deps):
 async def test_a_stranger_without_an_invite_is_refused_on_every_entry(db_factory, deps):
     """Вход закрыт на всех дверях сразу, а не только в `/start`.
 
-    Иначе незнакомец, приславший файл или скрин первым сообщением, заводил бы
-    себе `players`-строку в обход инвайта — то есть инвайта бы не было.
+    Иначе незнакомец, приславший файл первым сообщением, заводил бы себе
+    `players`-строку в обход инвайта — то есть инвайта бы не было.
+
+    Фото в этом списке нет с тех пор, как скрин-вход отключён: та дверь не ходит
+    в базу вовсе и строку игрока завести не может
+    (`test_a_photo_is_refused_and_never_reaches_the_queue`).
     """
     from harness.bot.handlers import (
         handle_alias_command,
-        handle_photo,
         handle_text,
         handle_ui_callback,
     )
@@ -600,7 +603,6 @@ async def test_a_stranger_without_an_invite_is_refused_on_every_entry(db_factory
     assert await handle_document(
         deps, tg_user_id=stranger, file_bytes=_HH_BYTES, filename="t.txt"
     ) == refusal
-    assert await handle_photo(deps, stranger, _SCREEN_BYTES) == refusal
     assert await handle_text(deps, stranger, "привет") == refusal
     assert await handle_new_session(deps, stranger) == refusal
     assert await handle_deep_dive_callback(deps, stranger, "TM1") == refusal
@@ -1045,18 +1047,48 @@ async def test_every_verdict_button_is_routed_to_a_real_handler(deps):
 _SCREEN_BYTES = b"\x89PNG\r\n\x1a\n synthetic screenshot bytes"
 
 
-async def test_a_screenshot_from_a_player_without_a_room_nickname_asks_for_it_first(deps, db_factory, invited):
-    """Героя на экране опознаёт код по нику из профиля — без ника разбирать некого.
+async def test_a_photo_is_refused_and_never_reaches_the_queue(deps, db_factory, invited):
+    """Скрин-вход отключён (решение владельца): фото не читают и не ставят в очередь.
 
-    Спросить сразу дешевле, чем заплатить за чтение и упереться в вопрос после
-    него: модель всё равно не имеет права угадывать, кто из игроков — вы.
+    Отказ приходит на само фото, а не молчанием: игрок, приславший экран, должен
+    узнать, что его не разберут, и чем это заменить — отказ без следующего шага
+    оставляет игрока с той же картинкой в руках (SESSIONS_UX).
     """
     from harness.bot.handlers import handle_photo
-    from harness.presentation import ask_gg_nickname_msg
+    from harness.presentation import screenshots_not_supported_msg
 
-    msg = await handle_photo(deps, _TG_USER_ID, _SCREEN_BYTES)
-    assert msg == ask_gg_nickname_msg()
-    assert await fetch_all(db_factory, "select id from jobs") == []
+    await _with_nickname(deps)
+
+    msg = await handle_photo(deps, _TG_USER_ID)
+
+    assert msg == screenshots_not_supported_msg()
+    assert ".txt" in msg.text
+    assert await fetch_all(db_factory, "select * from jobs") == []
+    assert not (deps.data_dir / "screens").exists()
+
+
+async def test_a_picture_sent_as_a_document_is_refused_the_same_way(deps, db_factory, invited):
+    """«Отправить без сжатия» — тот же экран, и дверь ему закрыта та же.
+
+    Вход у фотографии и у картинки-документа был общий; закрыт он тоже общим,
+    иначе игрок, получив отказ на фото, прислал бы тот же экран файлом и попал
+    бы в разбор, которого больше нет.
+    """
+    from harness.presentation import screenshots_not_supported_msg
+
+    await _with_nickname(deps)
+
+    msg = await handle_document(
+        deps,
+        tg_user_id=_TG_USER_ID,
+        file_bytes=_SCREEN_BYTES,
+        filename="table.png",
+        mime_type="image/png",
+    )
+
+    assert msg == screenshots_not_supported_msg()
+    assert await fetch_all(db_factory, "select * from jobs") == []
+    assert not (deps.data_dir / "screens").exists()
 
 
 async def test_a_plain_message_no_longer_becomes_the_room_nickname(deps, db_factory, invited):
@@ -1081,35 +1113,6 @@ async def test_a_plain_message_no_longer_becomes_the_room_nickname(deps, db_fact
     assert row["pending_input"] is None
 
 
-async def test_a_screenshot_lands_on_disk_and_becomes_a_job_the_worker_can_read(
-    deps, db_factory, invited
-):
-    """Контракт стыка с воркером: путь к файлу и хэш картинки в `jobs.payload`."""
-    from harness.bot.handlers import handle_nickname_command, handle_photo, handle_text
-
-    await handle_nickname_command(deps, _TG_USER_ID)
-    await handle_text(deps, _TG_USER_ID, "screen_nick")
-    assert await handle_photo(deps, _TG_USER_ID, _SCREEN_BYTES) is None
-
-    job = await fetch_one(db_factory, "select type, payload, status from jobs")
-    assert job["type"] == "screenshot_analyze"
-    assert job["status"] == "queued"
-    digest = hashlib.sha256(_SCREEN_BYTES).hexdigest()
-    assert job["payload"]["image_hash"] == digest
-    assert Path(job["payload"]["image_file"]).read_bytes() == _SCREEN_BYTES
-
-
-async def test_the_same_screenshot_twice_does_not_occupy_the_disk_twice(deps, invited):
-    """Имя файла — хэш содержимого, поэтому вторая присылка перезаписывает ту же."""
-    from harness.bot.handlers import handle_nickname_command, handle_photo, handle_text
-
-    await handle_nickname_command(deps, _TG_USER_ID)
-    await handle_text(deps, _TG_USER_ID, "screen_nick")
-    await handle_photo(deps, _TG_USER_ID, _SCREEN_BYTES)
-    await handle_photo(deps, _TG_USER_ID, _SCREEN_BYTES)
-    assert len(list((deps.data_dir / "screens").iterdir())) == 1
-
-
 # --- скрин, присланный файлом («отправить без сжатия») ------------------------
 
 
@@ -1121,34 +1124,17 @@ async def _with_nickname(deps) -> None:
     await handle_text(deps, _TG_USER_ID, "screen_nick")
 
 
-async def test_a_picture_sent_as_a_document_goes_to_vision(deps, db_factory, invited):
-    """«Отправить без сжатия» — это документ, и до сих пор он получал отказ.
-
-    Продукт сам просит прислать скрин файлом, когда масти не прочитались
-    (`send_as_file_msg`), поэтому вход обязан быть тем же, что у фотографии:
-    задача `screenshot_analyze` с файлом на диске и хэшем в `payload`.
-    """
-    await _with_nickname(deps)
-
-    msg = await handle_document(
-        deps,
-        tg_user_id=_TG_USER_ID,
-        file_bytes=_SCREEN_BYTES,
-        filename="table.png",
-        mime_type="image/png",
-    )
-
-    assert msg is None  # молчит: дальше говорит воркер
-    job = await fetch_one(db_factory, "select type, payload from jobs")
-    assert job["type"] == "screenshot_analyze"
-    assert job["payload"]["image_hash"] == hashlib.sha256(_SCREEN_BYTES).hexdigest()
-    assert Path(job["payload"]["image_file"]).read_bytes() == _SCREEN_BYTES
-
-
 async def test_a_picture_document_is_recognised_by_name_when_the_type_is_useless(
     deps, db_factory, invited
 ):
-    """Телеграм ставит `application/octet-stream` охотно — имя файла тут запасная примета."""
+    """Телеграм ставит `application/octet-stream` охотно — имя файла тут запасная примета.
+
+    Картинку и после отключения скрин-входа надо узнавать: игроку, приславшему
+    экран, «такой файл я не разберу» не объясняет ничего, а отказ про скрины —
+    объясняет и называет следующий шаг.
+    """
+    from harness.presentation import screenshots_not_supported_msg
+
     await _with_nickname(deps)
 
     assert (
@@ -1159,7 +1145,7 @@ async def test_a_picture_document_is_recognised_by_name_when_the_type_is_useless
             filename="Screenshot 2026-09-08.JPEG",
             mime_type="application/octet-stream",
         )
-        is None
+        == screenshots_not_supported_msg()
     )
     assert (
         await handle_document(
@@ -1169,17 +1155,18 @@ async def test_a_picture_document_is_recognised_by_name_when_the_type_is_useless
             filename="stol.webp",
             mime_type=None,
         )
-        is None
+        == screenshots_not_supported_msg()
     )
 
-    types = {row["type"] for row in await fetch_all(db_factory, "select type from jobs")}
-    assert types == {"screenshot_analyze"}
+    assert await fetch_all(db_factory, "select type from jobs") == []
 
 
-async def test_a_document_that_is_neither_hands_nor_a_picture_names_both_doors(deps):
-    """Отказ называет обе двери: раздачи `.txt` и скрин картинкой.
+async def test_a_document_that_is_neither_hands_nor_a_picture_names_the_only_door(deps):
+    """Отказ называет дверь, которая открыта, и не зовёт в ту, что закрыта.
 
-    Пока текст предлагал только `.txt`, игрок читал его как «зрения здесь нет».
+    Пока скрин-вход работал, текст звал обе: `.txt` и картинку. Сейчас звать в
+    картинку значило бы пообещать разбор, которого не будет, — экран получает
+    свой отказ (`screenshots_not_supported_msg`), а этот текст молчит о нём.
     """
     msg = await handle_document(
         deps, tg_user_id=_TG_USER_ID, file_bytes=b"PK\x03\x04zip", filename="hands.zip"
@@ -1187,13 +1174,20 @@ async def test_a_document_that_is_neither_hands_nor_a_picture_names_both_doors(d
 
     assert msg is not None and msg == unsupported_document_msg()
     assert ".txt" in msg.text
-    assert "картинкой" in msg.text
+    assert "картинк" not in msg.text
 
 
 async def test_a_stranger_sending_a_picture_as_a_document_leaves_nothing_in_the_volume(
     deps, db_factory
 ):
-    """Новый вход соблюдает тот же порядок: ни байта на диск раньше проверки игрока."""
+    """Закрытая дверь не пишет ничего и незнакомцу: ни байта, ни задачи, ни игрока.
+
+    Раньше порядок держала проверка игрока внутри приёма скрина; теперь держать
+    нечего — приёма нет. Гарантия от этого не ослабла, а стала безусловной, и
+    проверяется она по следам, а не по тексту ответа.
+    """
+    from harness.presentation import screenshots_not_supported_msg
+
     msg = await handle_document(
         deps,
         tg_user_id=999007,
@@ -1202,72 +1196,10 @@ async def test_a_stranger_sending_a_picture_as_a_document_leaves_nothing_in_the_
         mime_type="image/png",
     )
 
-    assert msg == invite_required_msg()
+    assert msg == screenshots_not_supported_msg()
     assert not (deps.data_dir / "screens").exists()
     assert await fetch_all(db_factory, "select * from jobs") == []
     assert await fetch_all(db_factory, "select * from players") == []
-
-
-async def test_an_oversized_picture_is_refused_before_the_queue(deps, db_factory, invited):
-    """Предел размера называется числом и проверяется ДО постановки задачи.
-
-    Телеграм отдаёт документы до 20 МБ, а модель принимает картинку сильно
-    меньше (`platform/llm.py`): без этой проверки игрок ждал бы двадцать секунд
-    ради ошибки провайдера.
-    """
-    from harness.platform.llm import MAX_IMAGE_BYTES, MAX_IMAGE_MB
-    from harness.presentation import screenshot_too_large_msg
-
-    await _with_nickname(deps)
-    huge = b"\x89PNG\r\n\x1a\n" + b"\x00" * MAX_IMAGE_BYTES
-
-    msg = await handle_document(
-        deps, tg_user_id=_TG_USER_ID, file_bytes=huge, filename="huge.png", mime_type="image/png"
-    )
-
-    assert msg is not None and msg == screenshot_too_large_msg(MAX_IMAGE_MB)
-    assert str(MAX_IMAGE_MB) in msg.text
-    assert await fetch_all(db_factory, "select * from jobs") == []
-    assert not (deps.data_dir / "screens").exists()
-
-
-async def test_the_size_limit_is_not_what_a_stranger_learns(deps, db_factory):
-    """Порядок проверок: незнакомцу с огромным файлом отвечают про инвайт, не про предел."""
-    from harness.platform.llm import MAX_IMAGE_BYTES
-
-    huge = b"\x89PNG\r\n\x1a\n" + b"\x00" * MAX_IMAGE_BYTES
-
-    msg = await handle_document(
-        deps, tg_user_id=999008, file_bytes=huge, filename="huge.png", mime_type="image/png"
-    )
-
-    assert msg == invite_required_msg()
-    assert await fetch_all(db_factory, "select * from players") == []
-
-
-async def test_the_same_screen_by_photo_and_by_document_is_one_file(deps, db_factory, invited):
-    """Дедупликация — по содержимому, и оба входа кладут одинаковые байты одинаково.
-
-    Разными скринами один экран становится не от входа, а от того, что Телеграм
-    отдаёт сжатое фото и несжатый файл как РАЗНЫЕ байты; при одинаковых байтах
-    путь и `image_hash` совпадают.
-    """
-    from harness.bot.handlers import handle_photo
-
-    await _with_nickname(deps)
-    await handle_photo(deps, _TG_USER_ID, _SCREEN_BYTES)
-    await handle_document(
-        deps,
-        tg_user_id=_TG_USER_ID,
-        file_bytes=_SCREEN_BYTES,
-        filename="table.png",
-        mime_type="image/png",
-    )
-
-    assert len(list((deps.data_dir / "screens").iterdir())) == 1
-    jobs = await fetch_all(db_factory, "select payload from jobs")
-    assert len(jobs) == 2  # оба входа дошли до очереди
-    assert {j["payload"]["image_hash"] for j in jobs} == {hashlib.sha256(_SCREEN_BYTES).hexdigest()}
 
 
 async def _awaiting_job(
@@ -1417,8 +1349,10 @@ async def test_a_note_typed_while_an_escalation_waits_lands_in_the_note(deps, db
     незакрытый ручной ввод перехватывал ВСЁ: игрок, нажавший «Изменить» у
     заметки, получал «Это не похоже на число», а заметка не менялась.
     """
+    import re
+
     from harness.bot.handlers import handle_escalation_callback, handle_text, handle_ui_callback
-    from harness.presentation import note_saved_msg
+    from harness.presentation import note_appended_msg
 
     job_id, _hand_id = await _awaiting_job(db_factory, deps)
     session_row = await fetch_one(db_factory, "select id from sessions")
@@ -1426,13 +1360,14 @@ async def test_a_note_typed_while_an_escalation_waits_lands_in_the_note(deps, db
     await handle_escalation_callback(deps, _TG_USER_ID, f"escalate:{job_id}:pot:manual")
 
     await handle_ui_callback(deps, _TG_USER_ID, f"note:{hand_no}:0")
-    assert await handle_text(deps, _TG_USER_ID, "донкает флоп") == note_saved_msg("villain")
+    assert await handle_text(deps, _TG_USER_ID, "донкает флоп") == note_appended_msg("villain")
 
     note = await fetch_one(
         db_factory,
         "select o.opponent_nick, n.text from notes n join opponents o on o.id = n.opponent_id",
     )
-    assert (note["opponent_nick"], note["text"]) == ("villain", "донкает флоп")
+    assert note["opponent_nick"] == "villain"
+    assert re.fullmatch(r"\d{2}\.\d{2}: донкает флоп", note["text"])
     job = await fetch_one(db_factory, f"select status from jobs where id = {job_id}")
     assert job["status"] == "awaiting_user"
 
@@ -1644,11 +1579,11 @@ async def test_a_blank_message_repeats_the_request_that_was_made(deps, db_factor
 
     hand_no = await _hand_with_opponents(deps, db_factory)
     await handle_ui_callback(deps, _TG_USER_ID, f"note:{hand_no}:0")
-    assert await handle_text(deps, _TG_USER_ID, "   ") == note_prompt_msg("villain")
+    assert await handle_text(deps, _TG_USER_ID, "   ") == note_prompt_msg("villain", append=True)
 
     row = await fetch_one(db_factory, "select gg_nickname, pending_input from players")
     assert row["gg_nickname"] is None
-    assert row["pending_input"] == {"kind": "note", "nick": "villain"}
+    assert row["pending_input"] == {"kind": "note", "nick": "villain", "mode": "append"}
 
 
 async def _seed_screenshot_hand(
@@ -1711,9 +1646,12 @@ async def test_a_note_starts_from_the_hand_with_the_opponent_already_filled_in(
 
     Кнопка несёт ник, ввод открывается ею, и следующий текст становится
     наблюдением об этом оппоненте — без единого экрана выбора между ними.
+    Из разбора наблюдение дописывается строкой с датой.
     """
+    import re
+
     from harness.bot.handlers import handle_text, handle_ui_callback
-    from harness.presentation import note_saved_msg
+    from harness.presentation import note_appended_msg
 
     hand_no = await _hand_with_opponents(deps, db_factory)
     prompt = await handle_ui_callback(deps, _TG_USER_ID, f"note:{hand_no}:0")
@@ -1721,13 +1659,14 @@ async def test_a_note_starts_from_the_hand_with_the_opponent_already_filled_in(
 
     saved = await handle_text(deps, _TG_USER_ID, "фолдит на опен")
 
-    assert saved == note_saved_msg("villain")
+    assert saved == note_appended_msg("villain")
     note = await fetch_one(
         db_factory,
-        "select o.opponent_nick, n.text, n.color from notes n "
+        "select o.opponent_nick, n.text, n.color_id from notes n "
         "join opponents o on o.id = n.opponent_id",
     )
-    assert (note["opponent_nick"], note["text"]) == ("villain", "фолдит на опен")
+    assert note["opponent_nick"] == "villain"
+    assert re.fullmatch(r"\d{2}\.\d{2}: фолдит на опен", note["text"])
 
 
 async def test_a_note_longer_than_the_screen_can_show_is_refused_in_words(
@@ -1735,17 +1674,17 @@ async def test_a_note_longer_than_the_screen_can_show_is_refused_in_words(
 ):
     """Отказ словами, а не тихое обрезание, и ввод при этом остаётся открытым."""
     from harness.bot.handlers import handle_text, handle_ui_callback
-    from harness.contracts import MAX_NOTE_TEXT_CHARS
-    from harness.presentation import note_saved_msg, note_too_long_msg
+    from harness.contracts import MAX_NOTE_ENTRY_CHARS
+    from harness.presentation import note_appended_msg, note_too_long_msg
 
     hand_no = await _hand_with_opponents(deps, db_factory)
     await handle_ui_callback(deps, _TG_USER_ID, f"note:{hand_no}:0")
 
-    refused = await handle_text(deps, _TG_USER_ID, "я" * (MAX_NOTE_TEXT_CHARS + 1))
-    assert refused == note_too_long_msg(MAX_NOTE_TEXT_CHARS)
+    refused = await handle_text(deps, _TG_USER_ID, "я" * (MAX_NOTE_ENTRY_CHARS + 1))
+    assert refused == note_too_long_msg(MAX_NOTE_ENTRY_CHARS)
     assert await fetch_all(db_factory, "select * from notes") == []
 
-    assert await handle_text(deps, _TG_USER_ID, "донкает флоп") == note_saved_msg("villain")
+    assert await handle_text(deps, _TG_USER_ID, "донкает флоп") == note_appended_msg("villain")
 
 
 async def test_the_notes_screen_counts_every_note_not_the_page_it_shows(
@@ -1783,14 +1722,14 @@ async def test_a_long_nick_in_a_note_button_still_opens_the_right_note(
     ВСЁ сообщение вердикта, а не одну кнопку.
     """
     from harness.bot.handlers import handle_text, handle_ui_callback
-    from harness.presentation import note_saved_msg
+    from harness.presentation import note_appended_msg
 
     long_nick = "оппонентсдлиннымименем" * 3
     hand_no = await _hand_with_opponents(deps, db_factory, nicks=("villain", long_nick))
 
     prompt = await handle_ui_callback(deps, _TG_USER_ID, f"note:{hand_no}:1")
     assert prompt is not None and long_nick in prompt.text
-    assert await handle_text(deps, _TG_USER_ID, "донкает флоп") == note_saved_msg(long_nick)
+    assert await handle_text(deps, _TG_USER_ID, "донкает флоп") == note_appended_msg(long_nick)
 
     note = await fetch_one(
         db_factory,
@@ -1822,16 +1761,18 @@ async def test_a_note_can_be_edited_recoloured_and_deleted(deps, db_factory, inv
     await handle_text(deps, _TG_USER_ID, "фолдит на опен")
     note_id = (await fetch_one(db_factory, "select id from notes"))["id"]
 
+    red = await _own_colour(db_factory, invited, "красный", "агрессор")
+
     await handle_ui_callback(deps, _TG_USER_ID, f"noteedit:{note_id}")
     await handle_text(deps, _TG_USER_ID, "донкает флоп")
-    await handle_ui_callback(deps, _TG_USER_ID, f"notecolorset:{note_id}:red")
+    await handle_ui_callback(deps, _TG_USER_ID, f"notecolorset:{note_id}:{red}")
 
     listed = await handle_text(deps, _TG_USER_ID, MENU_NOTES)
     assert listed is not None
     assert "донкает флоп" in listed.text
-    assert "villain" in listed.text
-    row = await fetch_one(db_factory, "select text, color from notes")
-    assert (row["text"], row["color"]) == ("донкает флоп", "red")
+    assert "красный — агрессор · villain" in listed.text
+    row = await fetch_one(db_factory, "select text, color_id from notes")
+    assert (row["text"], row["color_id"]) == ("донкает флоп", red)
 
     assert await handle_ui_callback(deps, _TG_USER_ID, f"notedel:{note_id}") == note_deleted_msg(
         "villain"
@@ -1839,12 +1780,62 @@ async def test_a_note_can_be_edited_recoloured_and_deleted(deps, db_factory, inv
     assert await fetch_all(db_factory, "select * from notes") == []
 
 
+async def test_a_note_is_appended_on_top_from_its_button_and_replaced_by_the_other(
+    deps, db_factory, invited
+):
+    """«Дописать» кладёт строку с датой поверх прежних, «Заменить» пишет заново.
+
+    Оба пути — тем же маршрутом, каким их пройдёт игрок: кнопка, затем текст.
+    """
+    import re
+
+    from harness.bot.handlers import handle_text, handle_ui_callback
+    from harness.presentation import note_appended_msg, note_saved_msg
+
+    hand_no = await _hand_with_opponents(deps, db_factory)
+    await handle_ui_callback(deps, _TG_USER_ID, f"note:{hand_no}:0")
+    await handle_text(deps, _TG_USER_ID, "фолдит на опен")
+    note_id = (await fetch_one(db_factory, "select id from notes"))["id"]
+
+    prompt = await handle_ui_callback(deps, _TG_USER_ID, f"noteappend:{note_id}")
+    assert prompt is not None and "встанет сверху" in prompt.text
+    assert await handle_text(deps, _TG_USER_ID, "донкает флоп") == note_appended_msg("villain")
+
+    lines = (await fetch_one(db_factory, "select text from notes"))["text"].splitlines()
+    assert len(lines) == 2
+    assert re.fullmatch(r"\d{2}\.\d{2}: донкает флоп", lines[0])
+    assert re.fullmatch(r"\d{2}\.\d{2}: фолдит на опен", lines[1])
+
+    await handle_ui_callback(deps, _TG_USER_ID, f"noteedit:{note_id}")
+    assert await handle_text(deps, _TG_USER_ID, "лимпит всё") == note_saved_msg("villain")
+    assert (await fetch_one(db_factory, "select text from notes"))["text"] == "лимпит всё"
+
+
+async def test_a_note_input_opened_before_appending_existed_still_replaces(
+    deps, db_factory, invited
+):
+    """Ввод без режима открыт под подсказкой «Новый текст заменит прежний» —
+    он и заменяет: обещанное игроку не меняется у него за спиной после выкладки.
+    """
+    from harness.bot.handlers import handle_text, handle_ui_callback
+    from harness.memory.repos import PlayersRepo
+    from harness.presentation import note_saved_msg
+
+    hand_no = await _hand_with_opponents(deps, db_factory)
+    await handle_ui_callback(deps, _TG_USER_ID, f"note:{hand_no}:0")
+    await handle_text(deps, _TG_USER_ID, "фолдит на опен")
+    async with db_factory() as db:
+        await PlayersRepo(db).set_pending_input(invited, {"kind": "note", "nick": "villain"})
+        await db.commit()
+
+    assert await handle_text(deps, _TG_USER_ID, "донкает флоп") == note_saved_msg("villain")
+    assert (await fetch_one(db_factory, "select text from notes"))["text"] == "донкает флоп"
+
+
 async def test_an_unknown_colour_from_a_button_is_not_written_to_the_note(
     deps, db_factory, invited
 ):
-    """`callback_data` приходит из внешнего мира: в колонку цвета попадает только
-    ключ из известного набора, иначе экран показал бы то, чего не умеет.
-    """
+    """`callback_data` приходит из внешнего мира: нецифровой номер цвета — не цвет."""
     from harness.bot.handlers import handle_text, handle_ui_callback
     from harness.presentation import note_gone_msg
 
@@ -1856,7 +1847,7 @@ async def test_an_unknown_colour_from_a_button_is_not_written_to_the_note(
     assert await handle_ui_callback(
         deps, _TG_USER_ID, f"notecolorset:{note_id}:фиолетовый"
     ) == note_gone_msg()
-    assert (await fetch_one(db_factory, "select color from notes"))["color"] == "none"
+    assert (await fetch_one(db_factory, "select color_id from notes"))["color_id"] is None
 
 
 async def test_a_button_of_another_players_note_changes_nothing(deps, db_factory, invited):
@@ -2322,3 +2313,509 @@ async def test_a_stranger_gets_no_answer_and_leaves_no_job(db_factory, deps):
     assert msg is not None
     assert msg.text == invite_required_msg().text
     assert await fetch_all(db_factory, "select id from jobs") == []
+
+
+# --- /note: заметка без скриншота (спека 2026-10-03 §3) -----------------------
+
+
+async def _pending_input(db_factory, player_id: int):
+    row = await fetch_one(db_factory, f"select pending_input from players where id = {player_id}")
+    return row["pending_input"]
+
+
+async def test_the_note_command_without_words_explains_both_forms(deps, db_factory, invited):
+    """Без слов команда только подсказывает формат: не пишет и начатый ввод не трогает."""
+    from harness.bot.handlers import handle_note_command
+    from harness.presentation import note_usage_msg
+
+    waiting = {"kind": "gg_nickname"}
+    async with db_factory() as db:
+        await PlayersRepo(db).set_pending_input(invited, waiting)
+        await db.commit()
+
+    assert await handle_note_command(deps, _TG_USER_ID, "   ") == note_usage_msg()
+    assert await fetch_all(db_factory, "select * from notes") == []
+    assert await _pending_input(db_factory, invited) == waiting
+
+
+async def test_the_note_command_with_a_nick_opens_the_same_input_as_the_button(
+    deps, db_factory, invited
+):
+    """`/note Ник` ставит тот же ввод, что кнопка под разбором на том же нике,
+    показывает прежний текст, и следующий текст дописывается сверху.
+    """
+    import re
+
+    from harness.bot.handlers import handle_note_command, handle_text, handle_ui_callback
+    from harness.memory.repos import NotesRepo
+    from harness.presentation import note_appended_msg, note_prompt_msg
+
+    hand_no = await _hand_with_opponents(deps, db_factory)
+    await handle_ui_callback(deps, _TG_USER_ID, f"note:{hand_no}:0")
+    by_button = await _pending_input(db_factory, invited)
+    await handle_text(deps, _TG_USER_ID, "фолдит на опен")
+    async with db_factory() as db:
+        existing = await NotesRepo(db).find_by_nick(invited, "villain")
+
+    prompt = await handle_note_command(deps, _TG_USER_ID, "villain")
+
+    assert await _pending_input(db_factory, invited) == by_button
+    assert prompt == note_prompt_msg("villain", existing, append=True)
+    assert "фолдит на опен" in prompt.text
+    assert await handle_text(deps, _TG_USER_ID, "донкает флоп") == note_appended_msg("villain")
+    lines = (await fetch_one(db_factory, "select text from notes"))["text"].splitlines()
+    assert re.fullmatch(r"\d{2}\.\d{2}: донкает флоп", lines[0])
+    assert re.fullmatch(r"\d{2}\.\d{2}: фолдит на опен", lines[1])
+
+
+async def test_the_note_command_with_a_nick_replaces_another_pending_input(
+    deps, db_factory, invited
+):
+    from harness.bot.handlers import handle_note_command
+
+    async with db_factory() as db:
+        await PlayersRepo(db).set_pending_input(invited, {"kind": "gg_nickname"})
+        await db.commit()
+
+    await handle_note_command(deps, _TG_USER_ID, "Villain")
+
+    assert await _pending_input(db_factory, invited) == {
+        "kind": "note",
+        "nick": "Villain",
+        "mode": "append",
+    }
+
+
+async def test_the_note_command_with_a_nick_and_text_appends_on_top_with_a_date(
+    deps, db_factory, invited
+):
+    """Первое слово — ник, остальное — запись; вторая запись встаёт поверх первой."""
+    import re
+
+    from harness.bot.handlers import handle_note_command
+    from harness.presentation import note_appended_msg
+
+    first = await handle_note_command(deps, _TG_USER_ID, "villain фолдит на опен")
+    second = await handle_note_command(deps, _TG_USER_ID, "  Villain   донкает флоп  ")
+
+    assert first == note_appended_msg("villain")
+    assert second == note_appended_msg("Villain")
+    note = await fetch_one(
+        db_factory,
+        "select o.opponent_nick, n.text from notes n join opponents o on o.id = n.opponent_id",
+    )
+    assert note["opponent_nick"] == "villain"
+    lines = note["text"].splitlines()
+    assert len(lines) == 2
+    assert re.fullmatch(r"\d{2}\.\d{2}: донкает флоп", lines[0])
+    assert re.fullmatch(r"\d{2}\.\d{2}: фолдит на опен", lines[1])
+    assert await _pending_input(db_factory, invited) is None
+
+
+async def test_a_note_command_nick_longer_than_the_limit_is_refused_without_writing(
+    deps, db_factory, invited
+):
+    """Тот же предел и тот же отказ, что у `/alias`: ник набран руками."""
+    from harness.bot.handlers import _MAX_NICKNAME, handle_note_command
+    from harness.presentation import gg_nickname_too_long_msg
+
+    long_nick = "я" * (_MAX_NICKNAME + 1)
+
+    assert await handle_note_command(deps, _TG_USER_ID, long_nick) == gg_nickname_too_long_msg(
+        _MAX_NICKNAME
+    )
+    assert await handle_note_command(
+        deps, _TG_USER_ID, f"{long_nick} фолдит на опен"
+    ) == gg_nickname_too_long_msg(_MAX_NICKNAME)
+    assert await fetch_all(db_factory, "select * from notes") == []
+    assert await fetch_all(db_factory, "select * from opponents") == []
+    assert await _pending_input(db_factory, invited) is None
+
+
+async def test_a_note_command_entry_longer_than_the_limit_is_refused_without_writing(
+    deps, db_factory, invited
+):
+    from harness.bot.handlers import handle_note_command
+    from harness.contracts import MAX_NOTE_ENTRY_CHARS
+    from harness.presentation import note_too_long_msg
+
+    msg = await handle_note_command(deps, _TG_USER_ID, "villain " + "я" * (MAX_NOTE_ENTRY_CHARS + 1))
+
+    assert msg == note_too_long_msg(MAX_NOTE_ENTRY_CHARS)
+    assert await fetch_all(db_factory, "select * from notes") == []
+    assert await fetch_all(db_factory, "select * from opponents") == []
+
+
+async def test_a_note_command_with_text_leaves_another_pending_input_waiting(
+    deps, db_factory, invited
+):
+    """Запись командой идёт мимо начатого ввода другого рода и не гасит его, как `/ask`."""
+    from harness.bot.handlers import handle_note_command
+    from harness.presentation import note_appended_msg
+
+    waiting = {"kind": "gg_nickname"}
+    async with db_factory() as db:
+        await PlayersRepo(db).set_pending_input(invited, waiting)
+        await db.commit()
+
+    msg = await handle_note_command(deps, _TG_USER_ID, "villain фолдит на опен")
+
+    assert msg == note_appended_msg("villain")
+    assert await _pending_input(db_factory, invited) == waiting
+
+
+async def test_a_stranger_cannot_write_a_note_by_command(deps, db_factory):
+    from harness.bot.handlers import handle_note_command
+
+    msg = await handle_note_command(deps, 909090, "villain фолдит на опен")
+
+    assert msg == invite_required_msg()
+    assert await fetch_all(db_factory, "select * from notes") == []
+    assert await fetch_all(db_factory, "select * from players") == []
+
+
+async def test_a_note_command_takes_the_whole_first_line_as_a_nick_of_several_words(
+    deps, db_factory, invited
+):
+    """С переносом строки ник — вся первая строка, запись — со второй."""
+    import re
+
+    from harness.bot.handlers import handle_note_command
+    from harness.presentation import note_appended_msg
+
+    msg = await handle_note_command(deps, _TG_USER_ID, "Big Fish\nдонкает флоп")
+
+    assert msg == note_appended_msg("Big Fish")
+    note = await fetch_one(
+        db_factory,
+        "select o.opponent_nick, n.text from notes n join opponents o on o.id = n.opponent_id",
+    )
+    assert note["opponent_nick"] == "Big Fish"
+    assert re.fullmatch(r"\d{2}\.\d{2}: донкает флоп", note["text"])
+
+
+async def test_a_note_command_without_a_line_break_splits_at_the_first_space(
+    deps, db_factory, invited
+):
+    """Без переноса строки «Big Fish» — ник Big и запись Fish."""
+    from harness.bot.handlers import handle_note_command
+    from harness.presentation import note_appended_msg
+
+    assert await handle_note_command(deps, _TG_USER_ID, "Big Fish") == note_appended_msg("Big")
+    note = await fetch_one(
+        db_factory,
+        "select o.opponent_nick, n.text from notes n join opponents o on o.id = n.opponent_id",
+    )
+    assert note["opponent_nick"] == "Big"
+    assert note["text"].endswith(": Fish")
+
+
+async def test_a_note_command_nick_line_longer_than_the_limit_is_refused_without_writing(
+    deps, db_factory, invited
+):
+    from harness.bot.handlers import _MAX_NICKNAME, handle_note_command
+    from harness.presentation import gg_nickname_too_long_msg
+
+    long_nick = "Big " + "я" * _MAX_NICKNAME
+
+    msg = await handle_note_command(deps, _TG_USER_ID, f"{long_nick}\nдонкает флоп")
+
+    assert msg == gg_nickname_too_long_msg(_MAX_NICKNAME)
+    assert await fetch_all(db_factory, "select * from notes") == []
+    assert await fetch_all(db_factory, "select * from opponents") == []
+
+
+async def test_a_note_command_without_a_line_break_splits_at_any_whitespace(
+    deps, db_factory, invited
+):
+    """Ник от записи отделяет любой пробельный знак, как у aiogram при разборе команды."""
+    from harness.bot.handlers import handle_note_command
+    from harness.presentation import note_appended_msg
+
+    msg = await handle_note_command(deps, _TG_USER_ID, "villain\tфолдит на опен")
+
+    assert msg == note_appended_msg("villain")
+    note = await fetch_one(db_factory, "select opponent_nick from opponents")
+    assert note["opponent_nick"] == "villain"
+
+
+# --- цвета заметок (спека 2026-10-03, §7) ------------------------------------
+
+
+async def _own_colour(db_factory, player_id: int, name: str, meaning: str) -> int:
+    """Номер цвета игрока, записанного тем же репозиторием, что ввод в «Настройках»."""
+    from harness.memory.repos import NoteColorsRepo
+
+    async with db_factory() as session:
+        colours = NoteColorsRepo(session)
+        await colours.upsert_many(player_id, [(name, meaning)])
+        await session.commit()
+        return next(
+            c.color_id for c in await colours.list_for_player(player_id) if c.name == name
+        )
+
+
+async def _own_note(db_factory, player_id: int, nick: str = "villain") -> int:
+    from harness.memory.repos import NotesRepo
+
+    async with db_factory() as session:
+        note_id = await NotesRepo(session).upsert(
+            owner_player_id=player_id, nick=nick, text_="фолдит на опен"
+        )
+        await session.commit()
+        return note_id
+
+
+async def test_the_colours_screen_in_settings_opens_the_input_and_writes_the_colours(
+    deps, db_factory, invited
+):
+    """«Настройки» → «🎨 Цвета заметок»: экран сам открывает ввод, следующий текст
+    и есть цвета (решение владельца 2026-10-03)."""
+    from harness.bot.handlers import handle_text, handle_ui_callback
+    from harness.presentation import MENU_SETTINGS, SETTINGS_COLORS_DATA, note_colors_msg
+
+    settings = await handle_text(deps, _TG_USER_ID, MENU_SETTINGS)
+    assert settings is not None
+    assert SETTINGS_COLORS_DATA in [b.callback_data for row in settings.buttons for b in row]
+
+    screen = await handle_ui_callback(deps, _TG_USER_ID, SETTINGS_COLORS_DATA)
+    assert screen == note_colors_msg([])
+    row = await fetch_one(db_factory, "select pending_input from players")
+    assert row["pending_input"] == {"kind": "note_color"}
+
+    saved = await handle_text(deps, _TG_USER_ID, "зелёный — слабый, коллер\nкрасный: агрессор")
+
+    assert saved is not None
+    assert saved.text.startswith("Записал 2 цвета")
+    assert "зелёный — слабый, коллер" in saved.text
+    assert await fetch_all(
+        db_factory, "select name, meaning from note_colors order by id"
+    ) == [
+        {"name": "зелёный", "meaning": "слабый, коллер"},
+        {"name": "красный", "meaning": "агрессор"},
+    ]
+    row = await fetch_one(db_factory, "select pending_input from players")
+    assert row["pending_input"] is None
+
+
+async def test_a_colour_line_that_does_not_parse_keeps_the_input_open(
+    deps, db_factory, invited
+):
+    """Ошибка в строке — отказ с её номером; ничего не записано, ввод открыт."""
+    from harness.bot.handlers import handle_text, handle_ui_callback
+    from harness.presentation import SETTINGS_COLORS_DATA, note_colors_refused_msg
+
+    await handle_ui_callback(deps, _TG_USER_ID, SETTINGS_COLORS_DATA)
+
+    refused = await handle_text(deps, _TG_USER_ID, "зелёный — слабый\nкрасный агрессор")
+
+    assert refused == note_colors_refused_msg(2, "красный агрессор", "no_separator")
+    assert await fetch_all(db_factory, "select * from note_colors") == []
+    row = await fetch_one(db_factory, "select pending_input from players")
+    assert row["pending_input"] == {"kind": "note_color"}
+
+    saved = await handle_text(deps, _TG_USER_ID, "зелёный — слабый\nкрасный — агрессор")
+    assert saved is not None and saved.text.startswith("Записал 2 цвета")
+
+
+async def test_colours_over_the_ceiling_are_refused_and_the_input_stays_open(
+    deps, db_factory, invited
+):
+    from harness.bot.handlers import handle_text, handle_ui_callback
+    from harness.contracts import MAX_NOTE_COLORS
+    from harness.presentation import SETTINGS_COLORS_DATA, note_colors_too_many_msg
+
+    await handle_ui_callback(deps, _TG_USER_ID, SETTINGS_COLORS_DATA)
+    lines = "\n".join(f"цвет{i} — подпись" for i in range(MAX_NOTE_COLORS + 1))
+
+    assert await handle_text(deps, _TG_USER_ID, lines) == note_colors_too_many_msg(
+        MAX_NOTE_COLORS
+    )
+    assert await fetch_all(db_factory, "select * from note_colors") == []
+    row = await fetch_one(db_factory, "select pending_input from players")
+    assert row["pending_input"] == {"kind": "note_color"}
+
+
+async def test_a_menu_press_closes_the_colour_input(deps, db_factory, invited):
+    from harness.bot.handlers import handle_text, handle_ui_callback
+    from harness.presentation import MENU_LEAKS, SETTINGS_COLORS_DATA
+
+    await handle_ui_callback(deps, _TG_USER_ID, SETTINGS_COLORS_DATA)
+    await handle_text(deps, _TG_USER_ID, MENU_LEAKS)
+
+    row = await fetch_one(db_factory, "select pending_input from players")
+    assert row["pending_input"] is None
+
+
+async def test_a_colour_is_deleted_by_its_button_and_leaves_the_notes(
+    deps, db_factory, invited
+):
+    """«🗑 имя» удаляет цвет, снимает его с заметок, показывает экран и снова открывает ввод."""
+    from harness.bot.handlers import handle_ui_callback
+    from harness.presentation import NOTE_COLOR_DELETE_PREFIX
+
+    red = await _own_colour(db_factory, invited, "красный", "агрессор")
+    green = await _own_colour(db_factory, invited, "зелёный", "слабый")
+    note_id = await _own_note(db_factory, invited)
+    await handle_ui_callback(deps, _TG_USER_ID, f"notecolorset:{note_id}:{red}")
+
+    screen = await handle_ui_callback(deps, _TG_USER_ID, f"{NOTE_COLOR_DELETE_PREFIX}{red}")
+
+    assert screen is not None
+    assert "красный" not in screen.text and "зелёный — слабый" in screen.text
+    assert [b.callback_data for row in screen.buttons for b in row] == [
+        f"{NOTE_COLOR_DELETE_PREFIX}{green}"
+    ]
+    assert (await fetch_one(db_factory, "select text, color_id from notes")) == {
+        "text": "фолдит на опен",
+        "color_id": None,
+    }
+    row = await fetch_one(db_factory, "select pending_input from players")
+    assert row["pending_input"] == {"kind": "note_color"}
+
+
+async def test_a_delete_button_of_another_players_colour_deletes_nothing(
+    deps, db_factory, invited
+):
+    from harness.bot.handlers import handle_ui_callback
+    from harness.presentation import NOTE_COLOR_DELETE_PREFIX
+
+    async with db_factory() as session:
+        stranger = await PlayersRepo(session).get_or_create(tg_user_id=999008)
+        await session.commit()
+    foreign = await _own_colour(db_factory, stranger.id, "красный", "агрессор")
+
+    await handle_ui_callback(deps, _TG_USER_ID, f"{NOTE_COLOR_DELETE_PREFIX}{foreign}")
+    await handle_ui_callback(deps, _TG_USER_ID, f"{NOTE_COLOR_DELETE_PREFIX}abc")
+
+    assert len(await fetch_all(db_factory, "select * from note_colors")) == 1
+
+
+async def test_the_colour_button_of_a_note_offers_only_own_colours_and_none(
+    deps, db_factory, invited
+):
+    from harness.bot.handlers import handle_ui_callback
+
+    async with db_factory() as session:
+        stranger = await PlayersRepo(session).get_or_create(tg_user_id=999009)
+        await session.commit()
+    await _own_colour(db_factory, stranger.id, "чужой", "не мой")
+    red = await _own_colour(db_factory, invited, "красный", "агрессор")
+    note_id = await _own_note(db_factory, invited)
+
+    prompt = await handle_ui_callback(deps, _TG_USER_ID, f"notecolor:{note_id}")
+
+    assert prompt is not None
+    assert [b.callback_data for row in prompt.buttons for b in row] == [
+        f"notecolorset:{note_id}:{red}",
+        f"notecolorset:{note_id}:none",
+    ]
+
+
+async def test_without_colours_the_colour_button_points_at_settings(
+    deps, db_factory, invited
+):
+    from harness.bot.handlers import handle_ui_callback
+
+    note_id = await _own_note(db_factory, invited)
+
+    prompt = await handle_ui_callback(deps, _TG_USER_ID, f"notecolor:{note_id}")
+
+    assert prompt is not None
+    assert prompt.buttons == []
+    assert "Настройки → 🎨 Цвета заметок" in prompt.text
+
+
+async def test_a_colour_is_put_on_a_note_and_taken_off_by_buttons(
+    deps, db_factory, invited
+):
+    from harness.bot.handlers import handle_ui_callback
+
+    red = await _own_colour(db_factory, invited, "красный", "агрессор")
+    note_id = await _own_note(db_factory, invited)
+
+    put = await handle_ui_callback(deps, _TG_USER_ID, f"notecolorset:{note_id}:{red}")
+    assert put is not None and put.text == "villain — красный — агрессор."
+    assert (await fetch_one(db_factory, "select color_id from notes"))["color_id"] == red
+
+    taken = await handle_ui_callback(deps, _TG_USER_ID, f"notecolorset:{note_id}:none")
+    assert taken is not None and taken.text == "villain — без цвета."
+    assert (await fetch_one(db_factory, "select color_id from notes"))["color_id"] is None
+
+
+async def test_a_colour_of_another_player_is_not_put_on_a_note_by_a_button(
+    deps, db_factory, invited
+):
+    from harness.bot.handlers import handle_ui_callback
+    from harness.presentation import note_gone_msg
+
+    async with db_factory() as session:
+        stranger = await PlayersRepo(session).get_or_create(tg_user_id=999010)
+        await session.commit()
+    foreign = await _own_colour(db_factory, stranger.id, "красный", "агрессор")
+    note_id = await _own_note(db_factory, invited)
+
+    assert await handle_ui_callback(
+        deps, _TG_USER_ID, f"notecolorset:{note_id}:{foreign}"
+    ) == note_gone_msg()
+    assert (await fetch_one(db_factory, "select color_id from notes"))["color_id"] is None
+
+
+def test_the_colour_buttons_are_routed_and_their_prefixes_do_not_swallow_each_other():
+    """Разбор идёт по `startswith`: экран цветов (`notecolors`) не ловится
+    префиксом `notecolor:`, удаление и постановка цвета — тоже; и наоборот."""
+    from harness.bot.handlers import UI_CALLBACK_PREFIXES
+    from harness.presentation import (
+        NOTE_COLOR_DELETE_PREFIX,
+        NOTE_COLOR_PREFIX,
+        NOTE_COLOR_SET_PREFIX,
+        SETTINGS_COLORS_DATA,
+    )
+
+    assert SETTINGS_COLORS_DATA in UI_CALLBACK_PREFIXES
+    assert NOTE_COLOR_DELETE_PREFIX in UI_CALLBACK_PREFIXES
+    for data in (SETTINGS_COLORS_DATA, f"{NOTE_COLOR_DELETE_PREFIX}5", f"{NOTE_COLOR_SET_PREFIX}1:5"):
+        assert not data.startswith(NOTE_COLOR_PREFIX), data
+    assert not f"{NOTE_COLOR_PREFIX}5".startswith(SETTINGS_COLORS_DATA)
+    assert not f"{NOTE_COLOR_DELETE_PREFIX}5".startswith(NOTE_COLOR_SET_PREFIX)
+
+
+async def test_the_colours_screen_and_the_colour_buttons_reach_their_own_handlers(
+    deps, db_factory, invited
+):
+    """`notecolorset:` начинается с `notecolors`: экран цветов сверяется равенством."""
+    from harness.bot.handlers import handle_ui_callback
+    from harness.presentation import SETTINGS_COLORS_DATA
+
+    red = await _own_colour(db_factory, invited, "красный", "агрессор")
+    note_id = await _own_note(db_factory, invited)
+
+    screen = await handle_ui_callback(deps, _TG_USER_ID, SETTINGS_COLORS_DATA)
+    assert screen is not None and screen.text.startswith("Цвета заметок")
+    put = await handle_ui_callback(deps, _TG_USER_ID, f"notecolorset:{note_id}:{red}")
+    assert put is not None and put.text == "villain — красный — агрессор."
+
+
+async def test_unicode_digits_in_button_numbers_break_nothing_and_change_nothing(
+    deps, db_factory, invited
+):
+    """`"²".isdigit()` истинно, а `int("²")` падает: номер из `callback_data` —
+    только ASCII-цифры, иначе это не номер."""
+    from harness.bot.handlers import handle_ui_callback
+    from harness.presentation import note_gone_msg, session_unavailable_msg
+
+    red = await _own_colour(db_factory, invited, "красный", "агрессор")
+    note_id = await _own_note(db_factory, invited)
+
+    assert await handle_ui_callback(
+        deps, _TG_USER_ID, f"notecolorset:{note_id}:²"
+    ) == note_gone_msg()
+    assert await handle_ui_callback(deps, _TG_USER_ID, "notecolorset:²:1") == note_gone_msg()
+    assert await handle_ui_callback(deps, _TG_USER_ID, "notecolor:²") == note_gone_msg()
+    assert await handle_ui_callback(deps, _TG_USER_ID, "notedel:²") == note_gone_msg()
+    assert await handle_ui_callback(deps, _TG_USER_ID, "session:²") == session_unavailable_msg()
+    deleted = await handle_ui_callback(deps, _TG_USER_ID, "notecolordel:²")
+    assert deleted is not None and "красный — агрессор" in deleted.text
+
+    assert (await fetch_one(db_factory, "select color_id from notes"))["color_id"] is None
+    assert [r["id"] for r in await fetch_all(db_factory, "select id from note_colors")] == [red]

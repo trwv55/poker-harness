@@ -140,13 +140,16 @@ class Config:
     конфиг, см. их докстринги).
     """
 
+    # Модель зрения. НЕОБЯЗАТЕЛЬНА с 2026-09-17: скрин-вход закрыт (бот на фото
+    # отвечает отказом, задачи `screenshot_analyze` никто не ставит), и держать
+    # её условием старта значило бы ронять оба процесса из-за переменной, без
+    # которой они работают целиком. Пустая строка — «зрения нет»; спросить его
+    # всё-таки могут `eval_runner vision` и `scripts/vision_probe.py`, и тогда
+    # переменную называет `llm._resolve_model`, а не отказ провайдера.
     llm_vision_model: str
     # Вторая ступень каскада зрения (задача 22): дорогая модель, на которой
-    # перечитывается экран, не прошедший контрольную сумму. НЕОБЯЗАТЕЛЬНА —
-    # пустая строка означает «каскада нет», и тогда первая же несошедшаяся сверка
-    # уходит вопросом игроку. Обязательной её делать нельзя: она добавила бы
-    # седьмую переменную в `from_env`, без которой не поднялся бы и HH-путь,
-    # модель не зовущий вовсе.
+    # перечитывается экран, не прошедший контрольную сумму. Необязательна по той
+    # же причине и с самого начала — пустая строка означает «каскада нет».
     llm_vision_fallback_model: str
     llm_verdict_model: str
     llm_max_concurrency: int
@@ -157,7 +160,7 @@ class Config:
     @classmethod
     def from_env(cls) -> Config:
         return cls(
-            llm_vision_model=_require("LLM_VISION_MODEL"),
+            llm_vision_model=optional_env("LLM_VISION_MODEL", ""),
             llm_vision_fallback_model=optional_env("LLM_VISION_FALLBACK_MODEL", ""),
             llm_verdict_model=_require("LLM_VERDICT_MODEL"),
             llm_max_concurrency=_require_int("LLM_MAX_CONCURRENCY"),

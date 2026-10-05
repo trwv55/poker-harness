@@ -864,6 +864,25 @@ def test_config_from_env_missing_var_fails_loudly(monkeypatch):
     """Отсутствующая переменная — явный `MissingEnvVar`, а не `KeyError` без
     контекста и не тихая подстановка дефолта (спека §7: смена лимита — дело
     окружения, а не источник для угадывания)."""
+    monkeypatch.delenv("LLM_VERDICT_MODEL", raising=False)
+    monkeypatch.setenv("LLM_VISION_MODEL", "anthropic:claude-sonnet-x")
+    monkeypatch.setenv("LLM_MAX_CONCURRENCY", "4")
+    monkeypatch.setenv("LLM_MAX_PER_MINUTE", "60")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@h/db")
+    monkeypatch.setenv("TELEGRAM_TOKEN", "123:abc")
+
+    with pytest.raises(MissingEnvVar, match="LLM_VERDICT_MODEL"):
+        Config.from_env()
+
+
+def test_a_process_starts_without_the_vision_model(monkeypatch):
+    """Скрин-вход закрыт — значит `LLM_VISION_MODEL` больше не условие старта.
+
+    Обязательной она была, пока зрение звалось из конвейера. Держать её
+    обязательной теперь значит ронять бота из-за переменной, без которой он
+    работает целиком: единственный вызов модели в проде — ответ на вопрос игрока,
+    и он берёт `LLM_VERDICT_MODEL` (`llm._resolve_model`).
+    """
     monkeypatch.delenv("LLM_VISION_MODEL", raising=False)
     monkeypatch.setenv("LLM_VERDICT_MODEL", "anthropic:claude-haiku-x")
     monkeypatch.setenv("LLM_MAX_CONCURRENCY", "4")
@@ -871,8 +890,7 @@ def test_config_from_env_missing_var_fails_loudly(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@h/db")
     monkeypatch.setenv("TELEGRAM_TOKEN", "123:abc")
 
-    with pytest.raises(MissingEnvVar, match="LLM_VISION_MODEL"):
-        Config.from_env()
+    assert Config.from_env().llm_vision_model == ""
 
 
 def test_optional_env_treats_empty_value_as_unset(monkeypatch):
@@ -965,6 +983,29 @@ async def test_asking_for_an_unconfigured_expensive_model_names_the_variable(db_
     )
     with pytest.raises(LLMNotConfigured, match="LLM_VISION_FALLBACK_MODEL"):
         LLM(without, db_factory)._resolve_model("vision_extract_fallback")
+
+
+async def test_asking_to_read_a_screen_without_a_vision_model_names_the_variable(db_factory):
+    """Необязательная переменная обязана быть НАЗВАНА, когда её всё-таки спросили.
+
+    Та же причина, что у дорогой ступени: `Agent("")` отказал бы тремя уровнями
+    глубже, а править надо `.env`. Спросить зрение из прода нечему — вход закрыт,
+    — но `eval_runner vision` и `scripts/vision_probe.py` живы, и их запуск без
+    переменной должен назвать её, а не уйти в отказ провайдера.
+    """
+    from harness.platform.llm import LLMNotConfigured
+
+    without = Config(
+        llm_vision_model="",
+        llm_vision_fallback_model=cfg.llm_vision_fallback_model,
+        llm_verdict_model=cfg.llm_verdict_model,
+        llm_max_concurrency=1,
+        llm_max_per_minute=1,
+        database_url=cfg.database_url,
+        telegram_token=cfg.telegram_token,
+    )
+    with pytest.raises(LLMNotConfigured, match="LLM_VISION_MODEL"):
+        LLM(without, db_factory)._resolve_model("vision_extract")
 
 
 async def test_the_hoster_that_actually_served_the_call_is_recorded(db_factory):

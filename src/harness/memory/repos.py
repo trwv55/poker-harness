@@ -23,8 +23,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from harness.contracts import (
     LEAK_RULES,
+    MAX_NOTE_COLORS,
     MAX_NOTE_TEXT_CHARS,
-    NOTE_COLOR_NONE,
     AnalysisResult,
     CalcName,
     CanonicalHand,
@@ -35,6 +35,7 @@ from harness.contracts import (
     LeaksOverview,
     LeakStat,
     Measurement,
+    NoteColorRecord,
     NoteRecord,
     OpponentRecord,
     PointFilter,
@@ -44,6 +45,7 @@ from harness.contracts import (
     SessionLine,
     SessionSummary,
     Window,
+    append_note_entry,
     is_judged,
     leak_rule_for,
 )
@@ -56,6 +58,7 @@ from harness.memory.models import (
     Invite,
     Job,
     Note,
+    NoteColor,
     Opponent,
     OpponentLink,
     Player,
@@ -1393,10 +1396,10 @@ class LeaksRepo:
 class NotesRepo:
     """`notes`: заметки на оппонентов — сквозные, одна на оппонента.
 
-    Живут только на vision-пути: в GG-HH оппоненты анонимизированы, и
-    идентичность не переживает турнир (ARCHITECTURE §6, спека §5.2). Ник сюда
-    приходит с экрана, поэтому все методы, кроме списка, сверяют владельца —
-    номер заметки приезжает из `callback_data`, то есть из внешнего мира.
+    Ник сюда приходит со стола (кнопка под разбором скриншота) или от игрока
+    командой `/note` — в GG-HH оппоненты анонимизированы. Все методы, кроме
+    списка, сверяют владельца: номер заметки приезжает из `callback_data`, то
+    есть из внешнего мира.
 
     Личность оппонента общая с частотами: заметка ссылается на строку
     `opponents` (`OpponentsRepo`), а не держит ник своей колонкой. Поэтому
@@ -1408,7 +1411,12 @@ class NotesRepo:
         self.db = db
 
     async def upsert(
-        self, *, owner_player_id: int, nick: str, text_: str, color: str | None = None
+        self,
+        *,
+        owner_player_id: int,
+        nick: str,
+        text_: str,
+        now: datetime | None = None,
     ) -> int:
         """Записать наблюдение об оппоненте; вторая запись на того же — правка.
 
@@ -1419,8 +1427,8 @@ class NotesRepo:
         `Vasya` и заметка на `vasya` — одна заметка
         (`test_a_note_is_one_per_opponent_and_editing_keeps_its_colour`).
 
-        `color=None` означает «цвет не трогать»: цвет ставится отдельной
-        кнопкой, и правка текста не имеет права его стирать
+        Цвет здесь не пишется: его ставит только `set_color`, и правка текста
+        его не стирает
         (`test_a_note_is_one_per_opponent_and_editing_keeps_its_colour`).
         """
         stripped = text_.strip()
@@ -1434,17 +1442,14 @@ class NotesRepo:
         opponent_id = await OpponentsRepo(self.db).get_or_create(
             owner_player_id=owner_player_id, nick=nick
         )
-        now = datetime.now(UTC)
+        now = now or datetime.now(UTC)
         insert = pg_insert(Note).values(
             owner_player_id=owner_player_id,
             opponent_id=opponent_id,
-            color=color if color is not None else NOTE_COLOR_NONE,
             text=stripped,
             updated_at=now,
         )
         updates: dict[str, Any] = {"text": stripped, "updated_at": now}
-        if color is not None:
-            updates["color"] = color
         stmt = insert.on_conflict_do_update(
             index_elements=["opponent_id"], set_=updates
         ).returning(Note.id)
@@ -1454,12 +1459,68 @@ class NotesRepo:
             raise LookupError(f"заметка на {nick!r} не записалась")
         return int(note_id)
 
-    async def set_color(self, note_id: int, owner_player_id: int, color: str) -> bool:
-        """Поставить цветовой архетип; `False` — заметки нет или она чужая."""
+    async def append(
+        self,
+        *,
+        owner_player_id: int,
+        nick: str,
+        entry: str,
+        now: datetime | None = None,
+    ) -> int:
+        """Дописать наблюдение поверх прежнего текста заметки — строкой с датой сверху.
+
+        Склейку и вытеснение старых строк делает `contracts.append_note_entry`;
+        здесь — чтение прежнего текста и запись через `upsert`, так что правила
+        заметки (одна на оппонента, ник без учёта регистра, цвет не трогается)
+        у дополнения те же, что у замены
+        (`test_appending_to_a_note_puts_the_entry_on_top_and_keeps_its_colour`).
+
+        День записи — по UTC, как у названия вечера (`_session_title`)
+        (`test_the_date_of_a_note_entry_is_the_utc_day`).
+
+        Прежний текст читается `FOR UPDATE`, но одновременность дополнений тестом
+        не проверена. Известная дыра: пока строки заметки нет, блокировать нечего,
+        и два одновременных ПЕРВЫХ дополнения одного оппонента сохранят только
+        одно из двух.
+        """
+        moment = (now or datetime.now(UTC)).astimezone(UTC)
+        opponent_id = await OpponentsRepo(self.db).get_or_create(
+            owner_player_id=owner_player_id, nick=nick
+        )
+        existing = await self.db.scalar(
+            select(Note.text).where(Note.opponent_id == opponent_id).with_for_update()
+        )
+        text_ = append_note_entry(existing, entry, moment.date())
+        return await self.upsert(
+            owner_player_id=owner_player_id, nick=nick, text_=text_, now=moment
+        )
+
+    async def set_color(
+        self, note_id: int, owner_player_id: int, color_id: int | None
+    ) -> bool:
+        """Поставить цвет игрока на заметку (`None` — снять цвет).
+
+        `False` — заметки нет, она чужая, или цвет чужой либо несуществующий;
+        тогда в базу не пишется ничего
+        (`test_a_colour_of_another_player_is_neither_deleted_nor_put_on_a_note`).
+
+        Цвет сверяется с владельцем запросом до записи, и этот запрос берёт
+        строку цвета `FOR KEY SHARE`: `NoteColorsRepo.delete` берёт ту же строку
+        `FOR UPDATE` и ждёт конца этой транзакции. Одновременность тестом не
+        проверена.
+        """
+        if color_id is not None:
+            own = await self.db.scalar(
+                select(NoteColor.id)
+                .where(NoteColor.id == color_id, NoteColor.player_id == owner_player_id)
+                .with_for_update(key_share=True)
+            )
+            if own is None:
+                return False
         result = await self.db.execute(
             update(Note)
             .where(Note.id == note_id, Note.owner_player_id == owner_player_id)
-            .values(color=color, updated_at=datetime.now(UTC))
+            .values(color_id=color_id, updated_at=datetime.now(UTC))
             .returning(Note.id)
         )
         await self.db.flush()
@@ -1484,26 +1545,22 @@ class NotesRepo:
     async def get(self, note_id: int, owner_player_id: int) -> NoteRecord | None:
         row = (
             await self.db.execute(
-                select(Note, Opponent.opponent_nick)
-                .join(Opponent, Note.opponent_id == Opponent.id)
-                .where(Note.id == note_id, Note.owner_player_id == owner_player_id)
+                self._select().where(Note.id == note_id, Note.owner_player_id == owner_player_id)
             )
         ).first()
-        return None if row is None else self._to_record(row[0], row[1])
+        return None if row is None else self._to_record(*row)
 
     async def find_by_nick(self, owner_player_id: int, nick: str) -> NoteRecord | None:
         """Заметка на этого оппонента, если она уже есть, — для показа перед правкой."""
         row = (
             await self.db.execute(
-                select(Note, Opponent.opponent_nick)
-                .join(Opponent, Note.opponent_id == Opponent.id)
-                .where(
+                self._select().where(
                     Note.owner_player_id == owner_player_id,
                     func.lower(Opponent.opponent_nick) == func.lower(nick.strip()),
                 )
             )
         ).first()
-        return None if row is None else self._to_record(row[0], row[1])
+        return None if row is None else self._to_record(*row)
 
     async def count_for_player(self, owner_player_id: int) -> int:
         """Сколько заметок у игрока всего — знаменатель строки обрезки экрана.
@@ -1524,23 +1581,133 @@ class NotesRepo:
     async def list_for_player(self, owner_player_id: int, *, limit: int = 50) -> list[NoteRecord]:
         """Заметки игрока, свежие первыми."""
         stmt = (
-            select(Note, Opponent.opponent_nick)
-            .join(Opponent, Note.opponent_id == Opponent.id)
+            self._select()
             .where(Note.owner_player_id == owner_player_id)
             .order_by(Note.updated_at.desc(), Note.id.desc())
             .limit(limit)
         )
-        return [self._to_record(note, nick) for note, nick in await self.db.execute(stmt)]
+        return [self._to_record(*row) for row in await self.db.execute(stmt)]
 
     @staticmethod
-    def _to_record(record: Note, nick: str) -> NoteRecord:
+    def _select():
+        """Заметка, ник её оппонента и её цвет (`None`, если цвета нет)."""
+        return (
+            select(Note, Opponent.opponent_nick, NoteColor)
+            .join(Opponent, Note.opponent_id == Opponent.id)
+            .outerjoin(NoteColor, Note.color_id == NoteColor.id)
+        )
+
+    @staticmethod
+    def _to_record(record: Note, nick: str, color: NoteColor | None) -> NoteRecord:
         return NoteRecord(
             note_id=record.id,
             nick=nick,
-            color=record.color,
+            color=None if color is None else NoteColorsRepo.to_record(color),
             text=record.text,
             updated_at=record.updated_at,
         )
+
+
+class NoteColorsRepo:
+    """`note_colors`: цвета заметок, которые игрок назвал сам.
+
+    У каждого игрока свои цвета, у нового их нет
+    (`test_note_colours_of_one_player_are_invisible_to_another`,
+    `test_a_new_player_has_no_note_colours`). Номер цвета приезжает кнопкой из
+    внешнего мира, поэтому каждый метод сверяет игрока.
+    """
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def upsert_many(
+        self, player_id: int, pairs: Sequence[tuple[str, str]], *, now: datetime | None = None
+    ) -> None:
+        """Записать цвета «имя → подпись»; имя, которое уже есть, — правка подписи.
+
+        Имя сравнивается без учёта регистра, написание остаётся первым
+        (`test_the_same_colour_in_another_case_updates_the_meaning_and_keeps_the_first_spelling`).
+        Повтор имени в `pairs` — последняя подпись.
+
+        Если цветов у игрока стало бы больше `MAX_NOTE_COLORS` — `ValueError`,
+        и не записано ничего
+        (`test_a_player_has_at_most_twelve_colours_and_an_overflow_writes_nothing`).
+        Строка игрока берётся `FOR UPDATE` до подсчёта; одновременность двух
+        вводов тестом не проверена.
+        """
+        merged: dict[str, tuple[str, str]] = {}
+        for name, meaning in pairs:
+            first = merged.get(name.lower())
+            merged[name.lower()] = (first[0] if first else name, meaning)
+        if not merged:
+            return
+        await self.db.execute(
+            select(Player.id).where(Player.id == player_id).with_for_update()
+        )
+        existing = set(
+            (
+                await self.db.scalars(
+                    select(func.lower(NoteColor.name)).where(NoteColor.player_id == player_id)
+                )
+            ).all()
+        )
+        if len(existing | set(merged)) > MAX_NOTE_COLORS:
+            raise ValueError(f"цветов у игрока стало бы больше {MAX_NOTE_COLORS}")
+        moment = now or datetime.now(UTC)
+        insert = pg_insert(NoteColor).values(
+            [
+                {"player_id": player_id, "name": name, "meaning": meaning, "created_at": moment}
+                for name, meaning in merged.values()
+            ]
+        )
+        await self.db.execute(
+            insert.on_conflict_do_update(
+                index_elements=[NoteColor.player_id, func.lower(NoteColor.name)],
+                set_={"meaning": insert.excluded.meaning},
+            )
+        )
+        await self.db.flush()
+
+    async def list_for_player(self, player_id: int) -> list[NoteColorRecord]:
+        """Цвета игрока в порядке, в котором он их завёл."""
+        rows = await self.db.scalars(
+            select(NoteColor)
+            .where(NoteColor.player_id == player_id)
+            .order_by(NoteColor.created_at, NoteColor.id)
+        )
+        return [self.to_record(row) for row in rows]
+
+    async def delete(self, color_id: int, player_id: int) -> bool:
+        """Удалить цвет игрока и снять его с его заметок; `False` — цвета нет или он чужой.
+
+        Сначала строка цвета берётся `FOR UPDATE` (её же `NotesRepo.set_color`
+        берёт `FOR KEY SHARE`), затем обнуляется `notes.color_id` и удаляется
+        цвет — в транзакции вызывающего; заметки остаются
+        (`test_deleting_a_colour_clears_it_from_notes_and_keeps_the_notes`).
+        """
+        locked = await self.db.scalar(
+            select(NoteColor.id)
+            .where(NoteColor.id == color_id, NoteColor.player_id == player_id)
+            .with_for_update()
+        )
+        if locked is None:
+            return False
+        await self.db.execute(
+            update(Note)
+            .where(Note.color_id == color_id, Note.owner_player_id == player_id)
+            .values(color_id=None)
+        )
+        result = await self.db.execute(
+            delete(NoteColor)
+            .where(NoteColor.id == color_id, NoteColor.player_id == player_id)
+            .returning(NoteColor.id)
+        )
+        await self.db.flush()
+        return result.first() is not None
+
+    @staticmethod
+    def to_record(row: NoteColor) -> NoteColorRecord:
+        return NoteColorRecord(color_id=row.id, name=row.name, meaning=row.meaning)
 
 
 class InvitesRepo:

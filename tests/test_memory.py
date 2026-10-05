@@ -57,6 +57,7 @@ _ALL_TABLES = {
     "analyses",
     "decision_points",
     "notes",
+    "note_colors",
     "eval_cases",
     "jobs",
     "traces",
@@ -908,6 +909,15 @@ async def test_the_session_count_does_not_depend_on_the_page_size(db):
     assert await SessionsRepo(db).count_for_player(player_id) == 5
 
 
+async def _colour(db, player_id: int, name: str, meaning: str):
+    """Цвет игрока, записанный тем же путём, что ввод в «Настройках»."""
+    from harness.memory.repos import NoteColorsRepo
+
+    colours = NoteColorsRepo(db)
+    await colours.upsert_many(player_id, [(name, meaning)])
+    return next(c for c in await colours.list_for_player(player_id) if c.name == name)
+
+
 async def test_a_note_is_one_per_opponent_and_editing_keeps_its_colour(db):
     """Заметка накапливается на оппоненте: вторая запись — правка, а не дубль.
 
@@ -918,14 +928,66 @@ async def test_a_note_is_one_per_opponent_and_editing_keeps_its_colour(db):
     player_id, _session_id = await _player_with_session(db, tg_user_id=5010)
     notes = NotesRepo(db)
     first = await notes.upsert(owner_player_id=player_id, nick="villain", text_="фолдит на опен")
-    await notes.set_color(first, player_id, "red")
+    red = await _colour(db, player_id, "красный", "агрессор")
+    await notes.set_color(first, player_id, red.color_id)
     again = await notes.upsert(owner_player_id=player_id, nick="villain", text_="донкает флоп")
 
     assert again == first
     stored = await notes.get(first, player_id)
     assert stored is not None
-    assert (stored.text, stored.color) == ("донкает флоп", "red")
+    assert (stored.text, stored.color) == ("донкает флоп", red)
     assert len(await notes.list_for_player(player_id)) == 1
+
+
+async def test_appending_to_a_note_puts_the_entry_on_top_and_keeps_its_colour(db):
+    """Дополнение копит наблюдения на оппоненте: новое сверху, старое под ним.
+
+    Ник сверяется без учёта регистра, как и у правки, — `Villain` тот же
+    оппонент; цвет, поставленный кнопкой, дополнение не трогает.
+    """
+    from datetime import UTC, datetime
+
+    from harness.memory.repos import NotesRepo
+
+    player_id, _session_id = await _player_with_session(db, tg_user_id=5017)
+    notes = NotesRepo(db)
+    first = await notes.append(
+        owner_player_id=player_id,
+        nick="villain",
+        entry="фолдит на опен",
+        now=datetime(2026, 9, 18, 21, 0, tzinfo=UTC),
+    )
+    red = await _colour(db, player_id, "красный", "агрессор")
+    await notes.set_color(first, player_id, red.color_id)
+    again = await notes.append(
+        owner_player_id=player_id,
+        nick="Villain",
+        entry="донкает флоп",
+        now=datetime(2026, 9, 25, 22, 0, tzinfo=UTC),
+    )
+
+    assert again == first
+    stored = await notes.get(first, player_id)
+    assert stored is not None
+    assert (stored.text, stored.color) == ("25.09: донкает флоп\n18.09: фолдит на опен", red)
+    assert len(await notes.list_for_player(player_id)) == 1
+
+
+async def test_the_date_of_a_note_entry_is_the_utc_day(db):
+    """День записи — по UTC, как и название вечера: одна шкала на весь продукт."""
+    from datetime import datetime, timedelta, timezone
+
+    from harness.memory.repos import NotesRepo
+
+    player_id, _session_id = await _player_with_session(db, tg_user_id=5018)
+    moscow_after_midnight = datetime(2026, 9, 26, 1, 0, tzinfo=timezone(timedelta(hours=3)))
+    note_id = await NotesRepo(db).append(
+        owner_player_id=player_id, nick="villain", entry="лимпит", now=moscow_after_midnight
+    )
+
+    stored = await NotesRepo(db).get(note_id, player_id)
+    assert stored is not None
+    assert stored.text == "25.09: лимпит"
 
 
 def test_the_note_upsert_docstring_points_at_a_test_that_exists():
@@ -987,7 +1049,7 @@ async def test_a_note_of_another_player_is_neither_read_nor_deleted_by_its_numbe
 
     assert await notes.get(foreign, mine) is None
     assert await notes.delete(foreign, mine) is False
-    assert await notes.set_color(foreign, mine, "red") is False
+    assert await notes.set_color(foreign, mine, None) is False
     assert await notes.delete(foreign, theirs) is True
 
 
@@ -1041,6 +1103,148 @@ async def test_deleting_a_note_leaves_the_opponent_and_his_links(db):
     assert await NotesRepo(db).delete(note_id, owner) is True
     assert await opponents.links(opponent_id, owner) == {"T1": "p1"}
     assert [(o.nick, o.links) for o in await opponents.list_for_player(owner)] == [("Vasya", 1)]
+
+
+async def test_note_colours_of_one_player_are_invisible_to_another(db):
+    """Цвета у каждого игрока свои: тот же цвет у другого — другая строка с другой подписью."""
+    from harness.memory.repos import NoteColorsRepo
+
+    mine, _s1 = await _player_with_session(db, tg_user_id=5030)
+    theirs, _s2 = await _player_with_session(db, tg_user_id=5031)
+    colours = NoteColorsRepo(db)
+    await colours.upsert_many(mine, [("зелёный", "слабый, коллер")])
+    await colours.upsert_many(theirs, [("зелёный", "регуляр")])
+
+    assert [(c.name, c.meaning) for c in await colours.list_for_player(mine)] == [
+        ("зелёный", "слабый, коллер")
+    ]
+    assert [(c.name, c.meaning) for c in await colours.list_for_player(theirs)] == [
+        ("зелёный", "регуляр")
+    ]
+
+
+async def test_a_new_player_has_no_note_colours(db):
+    from harness.memory.repos import NoteColorsRepo
+
+    player_id, _session = await _player_with_session(db, tg_user_id=5032)
+
+    assert await NoteColorsRepo(db).list_for_player(player_id) == []
+
+
+async def test_the_same_colour_in_another_case_updates_the_meaning_and_keeps_the_first_spelling(db):
+    from harness.memory.repos import NoteColorsRepo
+
+    player_id, _session = await _player_with_session(db, tg_user_id=5033)
+    colours = NoteColorsRepo(db)
+    await colours.upsert_many(player_id, [("Зелёный", "слабый"), ("красный", "агрессор")])
+    before = await colours.list_for_player(player_id)
+
+    await colours.upsert_many(player_id, [("ЗЕЛЁНЫЙ", "слабый, коллер")])
+    after = await colours.list_for_player(player_id)
+
+    assert [(c.name, c.meaning) for c in after] == [
+        ("Зелёный", "слабый, коллер"),
+        ("красный", "агрессор"),
+    ]
+    # Та же строка, а не новая: заметки, которые на неё ссылаются, видят новую подпись.
+    assert [c.color_id for c in after] == [c.color_id for c in before]
+
+
+async def test_a_player_has_at_most_twelve_colours_and_an_overflow_writes_nothing(db):
+    from harness.contracts import MAX_NOTE_COLORS
+    from harness.memory.repos import NoteColorsRepo
+
+    player_id, _session = await _player_with_session(db, tg_user_id=5034)
+    colours = NoteColorsRepo(db)
+    await colours.upsert_many(
+        player_id, [(f"цвет{i}", "подпись") for i in range(MAX_NOTE_COLORS - 1)]
+    )
+
+    with pytest.raises(ValueError):
+        await colours.upsert_many(player_id, [("цвет0", "правка"), ("новый1", "x"), ("новый2", "y")])
+
+    stored = await colours.list_for_player(player_id)
+    assert len(stored) == MAX_NOTE_COLORS - 1
+    assert stored[0].meaning == "подпись"  # правка из отказанного набора не записана
+
+    # Правка имеющегося цвета потолка не задевает, а двенадцатый ещё помещается.
+    await colours.upsert_many(player_id, [("ЦВЕТ0", "правка"), ("новый1", "x")])
+    assert len(await colours.list_for_player(player_id)) == MAX_NOTE_COLORS
+
+
+async def test_deleting_a_colour_clears_it_from_notes_and_keeps_the_notes(db):
+    from harness.memory.repos import NoteColorsRepo, NotesRepo
+
+    player_id, _session = await _player_with_session(db, tg_user_id=5035)
+    red = await _colour(db, player_id, "красный", "агрессор")
+    green = await _colour(db, player_id, "зелёный", "слабый")
+    notes = NotesRepo(db)
+    vasya = await notes.upsert(owner_player_id=player_id, nick="Vasya", text_="фолдит")
+    petya = await notes.upsert(owner_player_id=player_id, nick="Petya", text_="лимпит")
+    await notes.set_color(vasya, player_id, red.color_id)
+    await notes.set_color(petya, player_id, green.color_id)
+
+    assert await NoteColorsRepo(db).delete(red.color_id, player_id) is True
+
+    kept_vasya = await notes.get(vasya, player_id)
+    kept_petya = await notes.get(petya, player_id)
+    assert kept_vasya is not None and (kept_vasya.text, kept_vasya.color) == ("фолдит", None)
+    assert kept_petya is not None and kept_petya.color == green
+    assert await NoteColorsRepo(db).list_for_player(player_id) == [green]
+
+
+async def test_a_colour_of_another_player_is_neither_deleted_nor_put_on_a_note(db):
+    """Номер цвета приезжает кнопкой из внешнего мира: чужой не удаляется и не ставится."""
+    from harness.memory.repos import NoteColorsRepo, NotesRepo
+
+    mine, _s1 = await _player_with_session(db, tg_user_id=5036)
+    theirs, _s2 = await _player_with_session(db, tg_user_id=5037)
+    foreign = await _colour(db, theirs, "красный", "агрессор")
+    notes = NotesRepo(db)
+    note_id = await notes.upsert(owner_player_id=mine, nick="Vasya", text_="фолдит")
+    before = await notes.get(note_id, mine)
+
+    assert await notes.set_color(note_id, mine, foreign.color_id) is False
+    assert await notes.set_color(note_id, mine, 999_999_999) is False
+    assert await NoteColorsRepo(db).delete(foreign.color_id, mine) is False
+
+    assert await notes.get(note_id, mine) == before
+    assert await NoteColorsRepo(db).list_for_player(theirs) == [foreign]
+
+
+async def test_a_colour_is_taken_off_a_note_with_none(db):
+    from harness.memory.repos import NotesRepo
+
+    player_id, _session = await _player_with_session(db, tg_user_id=5038)
+    red = await _colour(db, player_id, "красный", "агрессор")
+    notes = NotesRepo(db)
+    note_id = await notes.upsert(owner_player_id=player_id, nick="Vasya", text_="фолдит")
+    await notes.set_color(note_id, player_id, red.color_id)
+
+    assert await notes.set_color(note_id, player_id, None) is True
+
+    stored = await notes.get(note_id, player_id)
+    assert stored is not None and stored.color is None
+
+
+async def test_every_note_reading_carries_its_colour(db):
+    """`get`, `find_by_nick` и список — все три заполняют цвет из `note_colors`."""
+    from harness.memory.repos import NotesRepo
+
+    player_id, _session = await _player_with_session(db, tg_user_id=5039)
+    red = await _colour(db, player_id, "красный", "агрессор")
+    notes = NotesRepo(db)
+    coloured = await notes.upsert(owner_player_id=player_id, nick="Vasya", text_="фолдит")
+    await notes.upsert(owner_player_id=player_id, nick="Petya", text_="лимпит")
+    await notes.set_color(coloured, player_id, red.color_id)
+
+    got = await notes.get(coloured, player_id)
+    found = await notes.find_by_nick(player_id, "vasya")
+    listed = {note.nick: note.color for note in await notes.list_for_player(player_id)}
+
+    assert got is not None and got.color == red
+    assert found is not None and found.color == red
+    assert listed == {"Vasya": red, "Petya": None}
 
 
 async def test_an_invite_code_opens_the_door_exactly_once(db):
@@ -1675,6 +1879,168 @@ def test_migration_0007_collapses_notes_of_one_nick_in_two_cases():
                 (fresh_note, "Vasya"),
                 (lone_note, "Petya"),
             ]
+        finally:
+            engine.dispose()
+
+
+def test_migration_0013_turns_colour_keys_into_colours_of_their_owners():
+    """Ключи цвета → строки `note_colors` владельца с прежними подписями, и назад.
+
+    Свой контейнер и номера ревизий вместо `head` — по той же причине, что у
+    `test_migration_0007_collapses_notes_of_one_nick_in_two_cases`.
+    """
+    from alembic import command
+    from sqlalchemy import create_engine
+    from testcontainers.community.postgres import PostgresContainer
+
+    from tests.conftest import alembic_config
+
+    moment = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
+    with PostgresContainer("postgres:16-alpine") as container:
+        dsn = container.get_connection_url(driver="psycopg")
+        config = alembic_config(dsn)
+        command.upgrade(config, "0012")
+        engine = create_engine(dsn)
+        try:
+            planted: dict[tuple[int, str], int] = {}
+            with engine.begin() as conn:
+                mine = conn.execute(
+                    text("insert into players (tg_user_id) values (9101) returning id")
+                ).scalar_one()
+                theirs = conn.execute(
+                    text("insert into players (tg_user_id) values (9102) returning id")
+                ).scalar_one()
+                for owner, nick, colour in (
+                    (mine, "Vasya", "red"),
+                    (mine, "Petya", "red"),  # второй раз тот же цвет — цвет один
+                    (mine, "Kolya", "green"),
+                    (mine, "Misha", "none"),
+                    (theirs, "Vasya", "red"),
+                    (theirs, "Sasha", "purple"),  # ключ вне набора — не теряется
+                    (theirs, "Lena", ""),  # пустой ключ — без цвета, а не цвет ''
+                ):
+                    opponent = conn.execute(
+                        text(
+                            "insert into opponents (owner_player_id, opponent_nick) "
+                            "values (:owner, :nick) returning id"
+                        ),
+                        {"owner": owner, "nick": nick},
+                    ).scalar_one()
+                    planted[(owner, nick)] = conn.execute(
+                        text(
+                            "insert into notes (owner_player_id, opponent_id, color, text, "
+                            "updated_at) values (:owner, :opponent, :color, 'x', :moment) "
+                            "returning id"
+                        ),
+                        {"owner": owner, "opponent": opponent, "color": colour, "moment": moment},
+                    ).scalar_one()
+
+            command.upgrade(config, "0013")
+
+            with engine.connect() as conn:
+                colours = {
+                    owner: conn.execute(
+                        text(
+                            "select id, name, meaning from note_colors "
+                            "where player_id = :owner order by created_at, id"
+                        ),
+                        {"owner": owner},
+                    ).all()
+                    for owner in (mine, theirs)
+                }
+                pointed = {
+                    row.id: row.color_id
+                    for row in conn.execute(text("select id, color_id from notes"))
+                }
+                note_columns = set(
+                    conn.execute(
+                        text(
+                            "select column_name from information_schema.columns "
+                            "where table_name = 'notes'"
+                        )
+                    ).scalars()
+                )
+
+            assert [(c.name, c.meaning) for c in colours[mine]] == [
+                ("красный", "агрессор"),
+                ("зелёный", "слабый"),
+            ]
+            assert [(c.name, c.meaning) for c in colours[theirs]] == [
+                ("красный", "агрессор"),
+                ("purple", "purple"),
+            ]
+            my_red, my_green = (c.id for c in colours[mine])
+            their_red, their_purple = (c.id for c in colours[theirs])
+            assert pointed == {
+                planted[(mine, "Vasya")]: my_red,
+                planted[(mine, "Petya")]: my_red,
+                planted[(mine, "Kolya")]: my_green,
+                planted[(mine, "Misha")]: None,
+                planted[(theirs, "Vasya")]: their_red,
+                planted[(theirs, "Sasha")]: their_purple,
+                planted[(theirs, "Lena")]: None,
+            }
+            assert "color" not in note_columns
+
+            # После миграции игрок назвал свой цвет — по имени из таблицы спеки
+            # (в другом регистре) он вернётся ключом, своё имя — потеряется.
+            with engine.begin() as conn:
+                blue = conn.execute(
+                    text(
+                        "insert into note_colors (player_id, name, meaning, created_at) "
+                        "values (:owner, 'Синий', 'тайтовый', now()) returning id"
+                    ),
+                    {"owner": mine},
+                ).scalar_one()
+                conn.execute(
+                    text("update notes set color_id = :colour where id = :note"),
+                    {"colour": blue, "note": planted[(mine, "Misha")]},
+                )
+
+            command.downgrade(config, "0012")
+
+            with engine.connect() as conn:
+                back = {
+                    row.id: row.color
+                    for row in conn.execute(text("select id, color from notes"))
+                }
+                tables = set(
+                    conn.execute(
+                        text(
+                            "select table_name from information_schema.tables "
+                            "where table_schema = 'public'"
+                        )
+                    ).scalars()
+                )
+                columns_back = set(
+                    conn.execute(
+                        text(
+                            "select column_name from information_schema.columns "
+                            "where table_name = 'notes'"
+                        )
+                    ).scalars()
+                )
+                constraints_back = set(
+                    conn.execute(
+                        text(
+                            "select conname from pg_constraint "
+                            "where conrelid = 'notes'::regclass"
+                        )
+                    ).scalars()
+                )
+
+            assert back == {
+                planted[(mine, "Vasya")]: "red",
+                planted[(mine, "Petya")]: "red",
+                planted[(mine, "Kolya")]: "green",
+                planted[(mine, "Misha")]: "blue",
+                planted[(theirs, "Vasya")]: "red",
+                planted[(theirs, "Sasha")]: "none",  # своё имя откат теряет
+                planted[(theirs, "Lena")]: "none",
+            }
+            assert "note_colors" not in tables
+            assert "color_id" not in columns_back
+            assert "fk_notes_color_note_colors" not in constraints_back
         finally:
             engine.dispose()
 
