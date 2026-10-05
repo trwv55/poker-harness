@@ -422,13 +422,19 @@ def test_no_llm_and_no_result_bias():
 # --- Классификация --------------------------------------------------------------
 
 
-def test_classify_deep_stack_is_preflop_other():
-    """40bb — не пуш-фолд-зона: вердикт не выносится, цена нулевая."""
+def test_classify_deep_unopened_shove_goes_to_the_chart_and_names_a_missing_one():
+    """40bb в неоткрытом банке — открытие по чарту, а не пуш-фолд.
+
+    Стол синтетики — 6 мест, а чарты владельца есть только для 8-max: точка
+    остаётся без вердикта и называет, какого чарта нет. Соседний стол не
+    подставляется.
+    """
     en = _make_multiway_shove_hand(hero_cards=("Ac", "Ts"), eff_bb=40.0, players_behind=3)
     dp = en.report.decision_points[0]
-    assert classify(dp, en) == "preflop_other"
+    assert classify(dp, en) == "open_chart"
     p = analyze_hand(en).points[0]
-    assert p.best_action == "" and p.ev_diff_bb == 0.0 and p.assumption is None
+    assert p.best_action == "" and p.mismatch is None and p.ev_diff_bb == 0.0
+    assert "6 мест" in p.detail["unjudged"]
 
 
 def test_classify_limp_in_pushfold_zone_is_not_priced():
@@ -523,12 +529,12 @@ def test_the_reference_multiway_spot_reproduces_the_solved_table():
     8-макс, анте 1200 с восьми мест, блайнды 4000/8000, UTG спасовал, герой
     UTG+1 с A5s и шестью игроками позади. Числа зафиксированы здесь потому, что
     это единственная точка, где связка «решатель — восстановление стола —
-    `shove_ev_bb`» проверяется на настоящей раздаче, а не на синтетике: ошибка в
-    переносе постов или банка сдвинет их все сразу.
+    симуляция раздачи» проверяется на настоящей раздаче, а не на синтетике:
+    ошибка в переносе постов или банка сдвинет их все сразу.
 
-    Разные ширины колла у мест — следствие разных постов: SB и BB платят за колл
-    меньше на свой блайнд, и коллируют шире. Порядок `call_range_fractions` —
-    порядок хода.
+    Колл растёт по ходу: чем меньше игроков позади, тем меньше риск оверколла, а
+    SB и BB вдобавок платят за колл меньше на свой блайнд. Порядок
+    `call_range_fractions` — порядок хода.
     """
     from harness.parsers.hh_parser import parse_file
 
@@ -539,20 +545,20 @@ def test_the_reference_multiway_spot_reproduces_the_solved_table():
     assert point.spot == "pushfold_unopened"
     assert point.detail["hero_class"] == "A5s"
     assert [round(w * 100, 2) for w in point.detail["call_range_fractions"]] == [
-        11.50,
-        10.54,
-        10.54,
-        10.54,
-        12.30,
-        13.86,
+        8.35,
+        8.42,
+        9.80,
+        10.38,
+        12.17,
+        15.07,
     ]
-    assert round(point.detail["shove_range_fraction"] * 100, 2) == 18.82
-    assert round(point.detail["p_all_fold"] * 100, 2) == 51.44
-    assert point.detail["expected_callers"] == pytest.approx(0.629, abs=5e-4)
-    assert point.detail["ev_shove_bb"] == pytest.approx(0.0628, abs=5e-5)
+    assert round(point.detail["shove_range_fraction"] * 100, 2) == 18.73
+    assert round(point.detail["p_all_fold"] * 100, 2) == 53.95
+    assert point.detail["expected_callers"] == pytest.approx(0.585, abs=5e-4)
+    assert point.detail["ev_shove_bb"] == pytest.approx(0.1882, abs=5e-5)
     # Эксплуатируемость профиля названа числом и уезжает в `detail` наружу —
     # заявлять «строго» «потому что равновесие» здесь оснований нет.
-    assert point.detail["equilibrium_hand_regret_bb"] == pytest.approx(0.00421, abs=5e-6)
+    assert point.detail["equilibrium_hand_regret_bb"] == pytest.approx(0.002576, abs=5e-6)
 
 
 # --- Фолд-эквити ----------------------------------------------------------------
@@ -564,8 +570,8 @@ def test_fold_equity_gate_recorded_for_shove():
     p = analyze_hand(en).points[0]
     assert p.spot == "pushfold_unopened"
     assert isinstance(p.detail["fold_equity_ok"], bool)
-    assert p.detail["method"] == "subset_enumeration"
-    assert p.detail["branches"] == 2**3
+    assert p.detail["method"] == "full_deal_shove"
+    assert p.detail["simulated_deals"] == 100_000
 
 
 # --- Оценщик и ранжирование -----------------------------------------------------
@@ -645,8 +651,8 @@ def test_a_shove_the_field_would_rarely_let_through_is_still_judged():
     """Широкий равновесный ответ вердикта не снимает: равновесие — эталон, а не гипотеза.
 
     На 4bb с пятерыми позади равновесные колл-диапазоны широки: шов проходит без
-    ответа в 16% случаев, а отвечают на него в среднем полтора игрока из пяти
-    (`p_all_fold` 0.1596, `expected_callers` 1.4777). Это не признак сломанной
+    ответа в 21% случаев, а отвечают на него в среднем 1.3 игрока из пяти
+    (`p_all_fold` 0.2134, `expected_callers` 1.2721). Это не признак сломанной
     модели, а верный ответ на 4bb, и вердикт здесь есть.
 
     Больше того, вердикт от ширины колла вообще не зависит: интервал по всей
@@ -661,9 +667,9 @@ def test_a_shove_the_field_would_rarely_let_through_is_still_judged():
     assert "unjudged" not in p.detail
     assert p.best_action == "shove"
     assert p.zone == "strict" and p.assumption is None
-    # Ровно те числа, по которым точка прежде снималась целиком.
-    assert p.detail["p_all_fold"] == pytest.approx(0.1596, abs=5e-5)
-    assert p.detail["expected_callers"] == pytest.approx(1.4777, abs=5e-5)
+    # Широкий ответ поля — тот, по которому точка когда-то снималась целиком.
+    assert p.detail["p_all_fold"] == pytest.approx(0.2134, abs=5e-5)
+    assert p.detail["expected_callers"] == pytest.approx(1.2721, abs=5e-5)
     # Вердикт не опирается на угаданную ширину: он одинаков на всей полосе.
     assert p.interval is not None and p.interval.low_bb > 0.0
     assert min(p.detail["ev_shove_by_width_bb"].values()) > 0.0
@@ -675,9 +681,9 @@ def test_the_table_equilibrium_never_hands_the_heads_up_range_to_everyone():
     Это тот самый дефект, ради которого когда-то считалась контрольная сумма
     модели: одна и та же ширина у каждого места независимо от того, сколько их.
     Решатель подыгры так не умеет — он решает места совместно, и на 12bb с
-    пятерыми позади даёт им 6.6...7.9% комбо против 33.1% хедз-ап на той же
+    пятерыми позади даёт им 5.95...8.43% комбо против 33.1% хедз-ап на той же
     глубине. Сводные числа модели расходятся соответственно: равновесие —
-    `p_all_fold` 0.7156 при 0.3237 отвечающих, хедз-ап-раздача — 0.1554 при
+    `p_all_fold` 0.7238 при 0.3127 отвечающих, хедз-ап-раздача — 0.1554 при
     1.5544.
     """
     from harness.analysis.preflop import (
@@ -713,8 +719,8 @@ def test_the_table_equilibrium_never_hands_the_heads_up_range_to_everyone():
         ]
 
     assert _call_model_detail(callers(solved), "A5s") == {
-        "p_all_fold": pytest.approx(0.7156, abs=5e-5),
-        "expected_callers": pytest.approx(0.3237, abs=5e-5),
+        "p_all_fold": pytest.approx(0.7238, abs=5e-5),
+        "expected_callers": pytest.approx(0.3127, abs=5e-5),
     }
     assert _call_model_detail(callers(heads_up), "A5s") == {
         "p_all_fold": pytest.approx(0.1554, abs=5e-5),
@@ -1014,8 +1020,8 @@ def test_a_blind_all_in_behind_hero_is_not_priced():
 
     BB со стеком в один блайнд уходит в олл-ин самим постом: он жив, фишек за
     спиной нет, действия в круге у него не было. Коллером он быть не может —
-    коллировать нечем; но и посчитать точку не из чего: `call_shove_ev_bb` берёт
-    эквити против одного диапазона и весь банк записывает герою.
+    коллировать нечем; но и посчитать точку не из чего: ни симуляция раздачи, ни
+    ось «входят все» его участия во вскрытии не разыгрывают.
 
     Открывший рейз НЕ в олл-ин выбран намеренно: только так олл-ин в руке
     остаётся один и точка доходит до `_facing_shove_verdict`, а не отсекается
@@ -1179,7 +1185,7 @@ def test_a_forfeited_seat_behind_hero_is_not_an_all_in():
     p = analyze_hand(en).points[0]
     # Точка дошла до модели колла шова: если бы форфейтное место считалось живым
     # олл-ином, спот снялся бы с оценки раньше и `method` бы не появился.
-    assert p.spot == "pushfold_facing_shove" and p.detail["method"] == "call_ev"
+    assert p.spot == "pushfold_facing_shove" and p.detail["method"] == "full_deal_call"
     # CO, BTN и SB — все живые за героем помимо шовера; форфейтного BB среди них нет.
     assert p.detail["live_others"] == 3
 
@@ -1613,7 +1619,7 @@ def test_the_table_equilibrium_turns_a_heads_up_call_into_a_fold():
     """Направление сдвига: приписанный шоверу диапазон уже, и колл дешевеет.
 
     UTG шовит 12bb, позади него пятеро. Хедз-ап пуш-диапазон этой глубины —
-    53.3% комбо, равновесие его стола — 13.4%; KQo против первого коллируется,
+    53.3% комбо, равновесие его стола — 14.0%; KQo против первого коллируется,
     против второго сбрасывается. Направление названо замером, а не рассуждением:
     обе цены считает один и тот же `call_shove_ev_bb`, меняется только диапазон.
     """
@@ -1646,7 +1652,7 @@ def test_the_table_equilibrium_turns_a_heads_up_call_into_a_fold():
         )
 
     assert round(heads_up_push.fraction_of_hands(), 4) == 0.5332
-    assert round(solution.push.fraction_of_hands(), 4) == 0.1337
+    assert round(solution.push.fraction_of_hands(), 4) == 0.1403
     assert ev(heads_up_push) > 0.0 > ev(solution.push)
 
     point = analyze_hand(en).points[0]

@@ -47,10 +47,11 @@ class FakeLLM:
     def __init__(self, reply: TournamentTextOut) -> None:
         self.reply = reply
         self.prompts: list[str] = []
+        self.purposes: list[str] = []
 
     async def __call__(
         self,
-        purpose: Literal["verdict_text"],
+        purpose: Literal["tournament_text"],
         schema: type[_T],
         *,
         prompt: str,
@@ -58,6 +59,7 @@ class FakeLLM:
         trace_id: int,
     ) -> tuple[_T, None]:
         self.prompts.append(prompt)
+        self.purposes.append(purpose)
         return cast("_T", self.reply), None
 
 
@@ -237,6 +239,21 @@ async def test_the_prompt_carries_the_digest_and_the_rules():
     assert "Не выдумывай числа" in llm.prompts[0]
     assert "Стек по уровням" in llm.prompts[0]
     assert "{digest}" not in llm.prompts[0]
+
+
+@requires_prompts
+async def test_the_story_is_paid_for_under_its_own_purpose():
+    """Рассказ ходит в модель под `tournament_text`, а не под `verdict_text`.
+
+    Это не косметика имени: `llm_calls.purpose` — единственное, по чему
+    себестоимость входа продукта отделяется от себестоимости другого входа.
+    Пока ключ был общим с вердиктом, цена скана и цена разбора руки лежали в
+    таблице одной суммой (миграция 0010; то же решение, что `question_answer` в
+    0009).
+    """
+    llm = FakeLLM(_answer("Турнир прошёл ровно."))
+    await tournament_text(llm, _report(), trace_id=1)
+    assert llm.purposes == ["tournament_text"]
 
 
 @requires_prompts

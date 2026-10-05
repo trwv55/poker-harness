@@ -177,6 +177,25 @@ def _describe_model(model: Model | str) -> tuple[str, str]:
     return model.system, model.model_name
 
 
+def _served_by(response: object) -> str | None:
+    """Хостер, фактически обслуживший вызов, — из метаданных ответа шлюза.
+
+    Между нами и моделью может стоять шлюз (OpenRouter), который маршрутизирует
+    запрос к одному из нескольких хостеров одной и той же модели. Хостеры
+    различаются тем, что нам критично: `seed` поддерживают не все, а
+    `tool_choice: required`, без которого нет структурированного вывода, — не все
+    из оставшихся. Имя приходит в `provider_details.downstream_provider`.
+
+    `None` при прямом вызове вендора: он хостера не называет, и это факт, а не
+    пропуск — выдумывать здесь нечего (`llm_calls.served_by` nullable).
+    """
+    details = getattr(response, "provider_details", None)
+    if not isinstance(details, dict):
+        return None
+    name = details.get("downstream_provider")
+    return name[:64] if isinstance(name, str) and name else None
+
+
 def _is_retryable_http_error(exc: ModelHTTPError) -> bool:
     return exc.status_code == 429 or 500 <= exc.status_code < 600
 
@@ -220,7 +239,11 @@ class LLM:
     async def __call__(
         self,
         purpose: Literal[
-            "vision_extract", "vision_extract_fallback", "verdict_text", "question_answer"
+            "vision_extract",
+            "vision_extract_fallback",
+            "verdict_text",
+            "tournament_text",
+            "question_answer",
         ],
         schema: type[T],
         *,
@@ -435,6 +458,7 @@ class LLM:
                         tokens_out=usage.output_tokens,
                         cost=usage.cost,
                         latency_ms=latency_ms,
+                        served_by=_served_by(result.response),
                     )
                     return result.output, CallMeta(
                         model=result.response.model_name or model_name,
@@ -476,6 +500,7 @@ class LLM:
         tokens_out: int | None = None,
         cost: Decimal | None = None,
         latency_ms: int | None = None,
+        served_by: str | None = None,
     ) -> None:
         async with self._session_factory() as session:
             await session.execute(
@@ -487,6 +512,7 @@ class LLM:
                     tokens_out=tokens_out,
                     cost=cost,
                     latency_ms=latency_ms,
+                    served_by=served_by,
                 )
             )
             await session.commit()

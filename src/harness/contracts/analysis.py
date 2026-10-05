@@ -32,6 +32,7 @@ class Zone(StrEnum):
 class SpotKind(StrEnum):
     PUSHFOLD_UNOPENED = "pushfold_unopened"
     PUSHFOLD_FACING_SHOVE = "pushfold_facing_shove"
+    OPEN_CHART = "open_chart"
     PREFLOP_OTHER = "preflop_other"
     POSTFLOP = "postflop"
 
@@ -195,6 +196,27 @@ class PointVerdict(BaseModel):
     assumption: Assumption | None = None
     tools: list[str] = []
     detail: dict[str, Any] = {}
+    # Расхождение, названное ядром без цены (спот `open_chart`: сверка с чартом).
+    # `None` — точка ценовая, и расхождение выводится из `ev_diff_bb`
+    # (`contracts.is_mismatch`). У точки с `mismatch` число `ev_diff_bb` — не цена.
+    mismatch: bool | None = None
+
+    @model_validator(mode="after")
+    def _mismatch_only_where_there_is_no_price(self) -> PointVerdict:
+        """`mismatch` заполнен ровно у судимой точки по чарту.
+
+        Чарт цену не даёт, и ноль в `ev_diff_bb` читался бы как «сыграно верно»;
+        расхождение такой точки обязано быть названо явно. У ценовой точки
+        `mismatch` нет: её расхождение — цена, и второго источника правды быть
+        не должно.
+        """
+        chart_judged = self.spot is SpotKind.OPEN_CHART and self.best_action != ""
+        if chart_judged != (self.mismatch is not None):
+            raise ValueError(
+                f"mismatch заполняется ровно у судимой точки по чарту: спот {self.spot}, "
+                f"best_action {self.best_action!r}, mismatch {self.mismatch}"
+            )
+        return self
 
     @model_validator(mode="after")
     def _assumption_matches_zone(self) -> PointVerdict:
@@ -259,9 +281,12 @@ class ScanItem(BaseModel):
     spot: SpotKind
     action_taken: str
     best_action: str
-    ev_diff_bb: float  # < -0.1bb для расхождения; 0.0 для точки «около нуля»
+    ev_diff_bb: float  # < -0.1bb для расхождения; 0.0 для точки «около нуля» и по чарту
     zone: Zone
     interval: EvInterval | None = None
+    # Только у расхождения по чарту: частота сыгранного действия в чарте — по ней
+    # такие строки упорядочены (реже у солвера — выше). У ценовых — `None`.
+    taken_frequency: float | None = None
 
 
 class ScanSummary(BaseModel):
@@ -281,12 +306,11 @@ class ScanSummary(BaseModel):
 
     `points_total`/`points_judged` — покрытие в точках решения, а не в руках:
     сколько точек героя было во всех разобранных руках файла и по скольким из
-    них есть вердикт (`error_cost.is_judged`). Без этой пары пустой `items`
-    читается как «сыграно чисто», хотя означать может «оценить почти ничего не
-    удалось» — точка без вердикта в список не попадает по построению. Считает
-    их `scan_tournament`, показывает — `presentation.scan_summary_msg` (строка
-    печатается всегда). Руки, пропущенные политикой отказа, в `points_total` не
-    входят: у них не посчитана ни одна точка, и они названы `hands_failed`.
+    них есть вердикт (`error_cost.is_judged`). Считает их `scan_tournament`;
+    сводка скана их не печатает с 2026-09-12 (решение владельца), поле остаётся
+    данными в `tournaments.scan_summary`. Руки, пропущенные политикой отказа, в
+    `points_total` не входят: у них не посчитана ни одна точка, и они названы
+    `hands_failed`.
 
     `items` НЕ ограничен по длине — это данные, и `tournaments.scan_summary`
     хранит их целиком. Потолок показа живёт в изложении
@@ -318,6 +342,14 @@ class ScanSummary(BaseModel):
     # появления этих полей: они читаются тем же типом.
     points_total: int = 0
     points_judged: int = 0
+    # Номера ВСЕХ разобранных раздач файла, в порядке файла. Нужны сводке, чтобы
+    # дать дверь в разбор под каждой рукой, а не только под теми, где нашлось
+    # расхождение: движок v1 судит лишь пуш-фолд, поэтому на обычном файле
+    # `items` пуст — и вместе с ним прежде исчезал единственный способ дойти до
+    # разбора раздачи вообще. Умолчание `[]` — ради сводок, записанных в
+    # `tournaments.scan_summary` до появления поля: у них кнопок не будет, но
+    # читаться тем же типом они не перестанут.
+    hand_nos: list[str] = []
 
 
 class PlayerStats(BaseModel):

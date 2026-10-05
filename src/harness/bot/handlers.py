@@ -38,7 +38,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from harness.bot.menus import render_menu_screen, session_summary_screen
 from harness.contracts import MAX_NOTE_TEXT_CHARS, NOTE_COLORS, CanonicalHand
-from harness.explanation.hand_replay import hand_replay
 from harness.memory.models import Job, Player
 from harness.memory.repos import (
     AnalysesRepo,
@@ -58,7 +57,6 @@ from harness.parsers.vision_adapter import apply_vision_answer
 from harness.platform.llm import MAX_IMAGE_BYTES, MAX_IMAGE_MB
 from harness.platform.queue import JobsQueue
 from harness.presentation import (
-    DETAIL_PREFIX,
     DISAGREE_PREFIX,
     NEW_SESSION_DATA,
     NOTE_ADD_PREFIX,
@@ -84,7 +82,7 @@ from harness.presentation import (
     gg_nickname_saved_msg,
     gg_nickname_too_long_msg,
     hh_accepted_msg,
-    hh_duplicate_msg,
+    hh_scan_in_progress_msg,
     invite_accepted_msg,
     invite_created_msg,
     invite_required_msg,
@@ -102,8 +100,6 @@ from harness.presentation import (
     question_usage_msg,
     quota_exceeded_msg,
     ranges_msg,
-    replay_msg,
-    replay_unavailable_msg,
     screenshot_too_large_msg,
     session_unavailable_msg,
     start_msg,
@@ -174,12 +170,16 @@ UI_CALLBACK_PREFIXES: tuple[str, ...] = (
     NOTE_ADD_PREFIX,
     SET_NICKNAME_DATA,
     RANGES_PREFIX,
-    DETAIL_PREFIX,
     DISAGREE_PREFIX,
 )
 
 # PokerCraft отдаёт историю раздач текстом; всё остальное сканировать нечем.
 _HH_SUFFIX = ".txt"
+
+# Статусы задачи скана, при которых файл СЧИТАЕТСЯ прямо сейчас. `done` и
+# `failed` сюда не входят намеренно: законченный скан повтору не мешает, а
+# провалившийся повтором и лечится.
+_SCAN_IN_FLIGHT = frozenset({"queued", "running", "awaiting_user"})
 
 # Картинка, присланная документом («отправить без сжатия»), — тот же вход зрения,
 # что и фотография. Набор УЖЕ, чем понимает `platform/llm.py` (там ещё и GIF):
@@ -538,10 +538,17 @@ async def handle_document(
         session_row = await SessionsRepo(db).active_or_create(player.id)
         tournaments = TournamentsRepo(db)
 
+        # Отказ — только пока скан этого файла В РАБОТЕ. Две задачи на один файл
+        # отработали бы подряд и прислали две одинаковые сводки, поэтому вторую
+        # не заводим; но законченный скан повтору не помеха. Прежде отклонялся
+        # любой статус кроме `failed`, включая `done`, и на сессии, которая живёт
+        # неделями (а не «вечер», как предполагалось), правило означало «файл,
+        # разобранный однажды, нельзя разобрать никогда» — выходом оставался
+        # `/new`, то есть разрыв истории ради повтора одного файла.
         last_status = await JobsRepo(db).last_scan_status(session_row.id, source_file)
-        if last_status is not None and last_status != "failed":
+        if last_status in _SCAN_IN_FLIGHT:
             await db.commit()  # игрок/сессия могли быть заведены выше — это не откатываем
-            return hh_duplicate_msg()
+            return hh_scan_in_progress_msg()
 
         # Явная сверка с None, а не `... or ...`: `or` считает ложным и целый ноль,
         # а id турнира — число из последовательности, и молчаливая зависимость от
@@ -979,7 +986,7 @@ async def _apply_answer(db: AsyncSession, job: Job, field: str, value: str) -> N
 
 
 async def handle_ui_callback(deps: BotDeps, tg_user_id: int, data: str) -> Msg | None:
-    """Нажатия кнопок задачи 23: сессии, заметки, ник, диапазоны, реплей, возражение.
+    """Нажатия кнопок задачи 23: сессии, заметки, ник, диапазоны, возражение.
 
     Один обработчик на все префиксы `UI_CALLBACK_PREFIXES`, а не десять входов в
     роутер: роутер по контракту не решает ничего (`bot/router.py`), и разбор
@@ -1047,8 +1054,6 @@ async def _dispatch_ui(deps: BotDeps, db: AsyncSession, player: Player, data: st
         return await _note_prompt_from_button(db, player, data.removeprefix(NOTE_ADD_PREFIX))
     if data.startswith(RANGES_PREFIX):
         return await _ranges_reply(db, player, data.removeprefix(RANGES_PREFIX))
-    if data.startswith(DETAIL_PREFIX):
-        return await _replay_reply(db, player, data.removeprefix(DETAIL_PREFIX))
     if data.startswith(DISAGREE_PREFIX):
         return await _disagree_reply(db, player, data.removeprefix(DISAGREE_PREFIX))
     return None
@@ -1127,20 +1132,6 @@ async def _ranges_reply(db: AsyncSession, player: Player, hand_no: str) -> Msg:
     if analysis is None:
         return analysis_unavailable_msg()
     return ranges_msg(analysis.range_images or [], analysis.result)
-
-
-async def _replay_reply(db: AsyncSession, player: Player, hand_no: str) -> Msg:
-    """Кнопка «Подробнее»: ход раздачи с выделенной точкой решения героя.
-
-    Реплей считается из `hands.enriched` в момент нажатия, а не хранится: это
-    чистая функция от сохранённой руки (`explanation.hand_replay` — ноль токенов
-    и ноль расчётов), и держать её результат второй копией было бы вторым
-    источником одного и того же.
-    """
-    hand, _analysis = await _hand_with_analysis(db, player, hand_no)
-    if hand is None or hand.enriched is None:
-        return replay_unavailable_msg()
-    return replay_msg(hand_replay(hand.enriched), hand_no)
 
 
 async def _disagree_reply(db: AsyncSession, player: Player, hand_no: str) -> Msg:

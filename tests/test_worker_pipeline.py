@@ -58,14 +58,13 @@ from harness.contracts import (
     PointVerdict,
     Range,
     RawHand,
+    ScanSummary,
     SpotKind,
     Street,
-    VerdictTextOut,
     VisionMeta,
     Zone,
 )
 from harness.engine import enrich
-from harness.explanation import UnfaithfulText
 from harness.memory.models import Job
 from harness.memory.repos import (
     AnalysesRepo,
@@ -79,20 +78,22 @@ from harness.parsers import hh_parser as hh_parser_module
 from harness.parsers.hh_parser import parse_file
 from harness.parsers.vision_adapter import reading_to_raw
 from harness.platform.config import Config
-from harness.platform.llm import LLM, LLMProviderError
+from harness.platform.llm import LLM
 from harness.platform.queue import JobsQueue
-from harness.presentation import Msg, Photo, deep_dive_msg
+from harness.presentation import Msg, Photo, hand_analysis_msgs, scan_summary_msg
 from harness.worker import pipeline as pipeline_module
-from harness.worker.main import configure_logging
+from harness.worker.main import _payload, configure_logging
 from harness.worker.pipeline import (
     Deps,
     HandDataMissing,
     SourceFileUnavailable,
+    _hand_analysis_msg,
     _hand_zone,
     _public_failure_reason,
     run_job,
 )
 from tests.conftest import FIXTURE_DAILY, requires_fixtures, requires_prompts
+from tests.test_hand_replay import _postflop_hand
 
 # Тестовый `Config` — те же плейсхолдеры, что в `test_llm_facade.py`: `LLM` внутри
 # `Deps` собирается по-настоящему (тип `Deps.llm` — конкретный класс, не протокол),
@@ -171,8 +172,8 @@ def queue(db_factory) -> JobsQueue:
 
 @pytest.fixture
 def deps(db_factory, queue, fake_sender, process_pool) -> Deps:
-    # `model_override=TestModel()` — станция `explain` (задача 21) зовёт модель на
-    # обоих путях, а тесты в сеть не ходят (ограничение задачи 16). `TestModel`
+    # `model_override=TestModel()` — тесты в сеть не ходят (ограничение задачи 16),
+    # а модель в конвейере ещё зовут скриншот и вопрос игрока. `TestModel`
     # PydanticAI сам собирает валидный ответ по схеме, то есть проверяет ровно то,
     # что нужно здесь: что оркестрация умеет вызвать модель и разложить её ответ.
     llm = LLM(_TEST_CFG, db_factory, model_override=TestModel())
@@ -1020,8 +1021,8 @@ async def test_llm_call_from_inside_a_job_has_a_trace_row_to_reference(db_factor
     `traces` писалась только в `flush()`, то есть В КОНЦЕ попытки. Любая станция,
     позвавшая `deps.llm(...)`, ложилась нарушением внешнего ключа на ПЕРВОМ же
     вызове. Держалось это лишь тем, что станции v1-HH модель не зовут вовсе
-    (`grep 'deps\\.llm' src/harness/worker/` — пусто); задача 21 (`explain`)
-    упёрлась бы в это сразу.
+    (`grep 'deps\\.llm' src/harness/worker/` — пусто); первый же вызов модели из
+    станции упёрся бы в это сразу.
 
     Тест зовёт фасад из джоб-подобного контекста — изнутри `_dispatch`, с тем
     самым `trace`, который завёл `run_job`, — то есть ровно так, как это будет
@@ -1139,10 +1140,9 @@ def test_hand_zone_says_nothing_when_nothing_was_judged():
     """
     result = AnalysisResult(hand_no="TM1", points=[], ranked=[])
     assert _hand_zone(result) is None
-    msg = deep_dive_msg(result, elapsed_s=3, zone=None, quota_left=1, quota_total=5)
-    assert "зона" not in msg.text
+    msg = hand_analysis_msgs(result, _postflop_hand(), 3, None, 1, 5)[0]
+    assert "зона:" not in msg.text
     assert "строго" not in msg.text
-    assert "точек с вердиктом нет" in msg.text
 
 
 def test_hand_zone_is_the_weakest_of_all_judged_points_not_the_first():
@@ -1155,11 +1155,12 @@ def test_hand_zone_is_the_weakest_of_all_judged_points_not_the_first():
 
     mixed = AnalysisResult(hand_no="TM1", points=[strict_point, assuming_point], ranked=[0, 1])
     assert _hand_zone(mixed) is Zone.ASSUMING
-    assert "зона: предполагая" in deep_dive_msg(mixed, 1, _hand_zone(mixed), 1, 5).text
+    hand = _postflop_hand()
+    assert "зона: предполагая" in hand_analysis_msgs(mixed, hand, 1, _hand_zone(mixed), 1, 5)[0].text
 
     all_strict = AnalysisResult(hand_no="TM1", points=[strict_point], ranked=[0])
     assert _hand_zone(all_strict) is Zone.STRICT
-    assert "зона: строго" in deep_dive_msg(all_strict, 1, _hand_zone(all_strict), 1, 5).text
+    assert "зона: строго" in hand_analysis_msgs(all_strict, hand, 1, _hand_zone(all_strict), 1, 5)[0].text
 
     # Незасуженные точки на зону руки не влияют — судится только `ranked`.
     unranked_assuming = AnalysisResult(
@@ -1197,90 +1198,17 @@ def test_a_proven_river_fold_puts_its_zone_in_the_status_line():
     )
     result = AnalysisResult(hand_no="TM1", points=[river], ranked=[])
     assert _hand_zone(result) is Zone.STRICT
-    assert "зона: строго" in deep_dive_msg(result, 1, _hand_zone(result), 1, 5).text
+    assert (
+        "зона: строго"
+        in hand_analysis_msgs(result, _postflop_hand(), 1, _hand_zone(result), 1, 5)[0].text
+    )
 
     # Та же точка без доказательства линии не называет — и зоне взяться неоткуда.
     unproven = river.model_copy(update={"best_action": ""})
     assert _hand_zone(AnalysisResult(hand_no="TM1", points=[unproven], ranked=[])) is None
 
 
-# --- станция отчёта по турниру (задача 23) -----------------------------------------
-
-
-@requires_fixtures
-async def test_hh_scan_sends_the_tournament_report_before_the_scan_summary(
-    db_factory, fake_sender, queue, deps
-):
-    """Отчёт уходит игроку первым, сводка с кнопками — следом.
-
-    Порядок несущий: отчёт отвечает на «что случилось за турнир», сводка — на
-    «что из этого разбирать», и кнопка «разобрать» обязана оказаться под
-    последним сообщением, а не быть отлистанной вверх. Кнопок под отчётом нет
-    вовсе — одно действие живёт в одном месте.
-
-    Руки предзаполнены чекпоинтами (`hands_saved`), поэтому скан идёт по трём
-    раздачам, а не по 146: проверяется станция, а не скорость скана.
-    """
-    player_id, session_id = await _make_scope(db_factory)
-    tournament_id, raw_hands = await _seed_checkpointed_hands(
-        db_factory, session_id=session_id, source_file=FIXTURE_DAILY, n=3
-    )
-    await queue.enqueue(
-        type="hh_scan",
-        player_id=player_id,
-        session_id=session_id,
-        payload={
-            "source_file": str(FIXTURE_DAILY),
-            "tournament_id": tournament_id,
-            "hands_saved": True,
-        },
-    )
-
-    job = await queue.claim("w1")
-    assert job is not None
-    await run_job(job, deps)
-
-    report, summary = fake_sender.sent[-2:]
-    assert f"Турнир. Раздач: {len(raw_hands)}." in report.text
-    assert report.buttons == []
-    assert f"Скан завершён: {len(raw_hands)} рук" in summary.text
-
-
-@requires_fixtures
-async def test_the_report_message_id_is_remembered_for_a_repeat_attempt(
-    db_factory, fake_sender, queue, deps
-):
-    """Повторная попытка обязана редактировать отчёт, а не слать второй.
-
-    Тот же механизм, что у сводки (`_send_idempotent`), и та же цена ошибки:
-    `id` сообщения живёт в `jobs.payload`, а не в памяти воркера.
-    """
-    player_id, session_id = await _make_scope(db_factory)
-    tournament_id, _raw_hands = await _seed_checkpointed_hands(
-        db_factory, session_id=session_id, source_file=FIXTURE_DAILY, n=3
-    )
-    jid = await queue.enqueue(
-        type="hh_scan",
-        player_id=player_id,
-        session_id=session_id,
-        payload={
-            "source_file": str(FIXTURE_DAILY),
-            "tournament_id": tournament_id,
-            "hands_saved": True,
-        },
-    )
-
-    job = await queue.claim("w1")
-    assert job is not None
-    await run_job(job, deps)
-
-    async with db_factory() as session:
-        row = await session.get(Job, jid)
-        assert row is not None
-        assert row.payload["report_message_id"] != row.payload["result_message_id"]
-
-
-# --- станция explain: слова поверх посчитанного (задача 21) -------------------------
+# --- станция analyze: числа и картинки диапазонов -----------------------------------
 
 
 async def _seed_hands_and_pick_a_judged_one(
@@ -1288,9 +1216,8 @@ async def _seed_hands_and_pick_a_judged_one(
 ) -> tuple[str, AnalysisResult]:
     """Разложить `n` раздач чекпоинтами и вернуть первую, у которой ЕСТЬ вердикт.
 
-    Судимая точка есть не у каждой раздачи (постфлоп и префлоп вне пуш-фолда
-    цены не получают), а станция explain на раздаче без вердикта модель не
-    зовёт вовсе — тест про текст модели на такой раздаче молча проверял бы
+    Судимая точка есть не у каждой раздачи: постфлоп и префлоп вне пуш-фолда
+    цены не получают, и тест про вердикт на такой раздаче молча проверял бы
     пустоту.
     """
     _tournament_id, raw_hands = await _seed_checkpointed_hands(
@@ -1347,215 +1274,18 @@ def _stub_verdict_llm(db_factory, reply: dict[str, object]) -> LLM:
     return LLM(_TEST_CFG, db_factory, model_override=FunctionModel(_reply))
 
 
-@requires_fixtures
-@requires_prompts
-async def test_deep_dive_saves_the_model_text_and_shows_it_to_the_player(
-    db_factory, fake_sender, queue, deps
-):
-    """Станция explain: текст модели уходит игроку и ложится в `analyses.verdict_text`.
-
-    Ответ модели фиксирован тестом и намеренно не содержит чисел — так проверка
-    верности гарантированно проходит, и тест меряет оркестрацию, а не удачу
-    генератора.
-    """
-    player_id, session_id = await _make_scope(db_factory)
-    # Раздача выбирается ПО НАЛИЧИЮ судимой точки, а не первая попавшаяся:
-    # у раздачи без вердикта модель не зовётся вовсе (`verdict_text`), и тест,
-    # которому досталась такая, не проверял бы ровно то, ради чего написан.
-    # 20 раздач — с запасом: в измеренной фикстуре первая раздача с вердиктом
-    # шестнадцатая, и запас нужен, чтобы тест не сломался от сдвига на одну.
-    hand_no, result = await _seed_hands_and_pick_a_judged_one(
-        db_factory, session_id=session_id, n=20
-    )
-    jid = await enqueue_deep_dive(queue, hand_no, player_id=player_id, session_id=session_id)
-
-    async with db_factory() as session:
-        hand = await HandsRepo(session).find_by_hand_no(session_id, hand_no)
-        assert hand is not None and hand.enriched is not None
-
-    # Точки разбора этой руки заранее неизвестны, поэтому ответ собирается по
-    # факту: dp_index обязан совпасть с судимыми точками, иначе текст отбракован.
-    reply = {
-        "points": [
-            {"dp_index": result.points[i].dp_index, "text": "Если оппонент отвечает шире, шов дешевле."}
-            for i in result.ranked
-        ],
-        "summary": "Разбор без выдуманных чисел.",
-    }
-    llm_deps = replace(deps, llm=_stub_verdict_llm(db_factory, reply))
-
-    job = await queue.claim("w1")
-    assert job is not None
-    await run_job(job, llm_deps)
-
-    assert (await job_status(db_factory, jid)) == "done"
-    async with db_factory() as session:
-        record = await AnalysesRepo(session).get_by_hand(hand.id)
-    assert record is not None
-    texts = _all_texts(fake_sender)
-    assert record.verdict_text is not None
-    assert any("Разбор без выдуманных чисел." in text for text in texts)
-    # Ход раздачи с задачи 23 уходит не с вердиктом, а по кнопке «Подробнее»
-    # (`presentation.replay_msg`): в самом разборе его больше нет, а кнопка есть.
-    assert not any("ПРЕФЛОП" in text for text in texts)
-    assert any(
-        btn.callback_data.startswith("detail:")
-        for msg in [*fake_sender.sent, *(m for _mid, m in fake_sender.edits)]
-        for row in msg.buttons
-        for btn in row
-    ), "кнопка «Подробнее» обязана стоять под разбором"
+def test_the_payload_carries_parse_mode_when_the_message_has_markup():
+    """Разбор с блоком «Что было» едет в HTML; без этого поля Bot API показал
+    бы `<b>` и `&amp;` буквально. Без разметки поля нет — как и раньше."""
+    assert _payload(Msg(text="x", parse_mode="HTML"), chat_id=1)["parse_mode"] == "HTML"
+    assert "parse_mode" not in _payload(Msg(text="x"), chat_id=1)
 
 
 @requires_fixtures
-@pytest.mark.parametrize(
-    "failure",
-    [LLMProviderError("провайдер недоступен"), UnfaithfulText("числа не из расчёта")],
-    ids=["провайдер недоступен", "текст не прошёл проверку верности"],
-)
-async def test_a_broken_model_does_not_take_the_analysis_away_from_the_player(
-    db_factory, fake_sender, queue, deps, monkeypatch, failure
+async def test_the_range_images_are_saved_without_any_model(
+    db_factory, fake_sender, queue, deps, tmp_path
 ):
-    """Слова необязательны, числа обязательны: провал изложения оставляет разбор
-    целым, а задачу — успешной.
-
-    Оба отказа проверяются, а не один: `UnfaithfulText` — наш собственный и самый
-    вероятный (модель ответила, но не тем), и раньше он этим тестом не покрывался
-    вовсе (ревью, раздел A).
-    """
-    player_id, session_id = await _make_scope(db_factory)
-    jid, _raw = await _seed_one_hand_deep_dive_job(
-        db_factory, queue, player_id=player_id, session_id=session_id
-    )
-
-    async def _boom(*args, **kwargs):
-        raise failure
-
-    monkeypatch.setattr(pipeline_module, "verdict_text", _boom)
-
-    job = await queue.claim("w1")
-    assert job is not None
-    await run_job(job, deps)
-
-    assert (await job_status(db_factory, jid)) == "done"
-    assert any(f"Рука {_raw.hand_no}" in shown for shown in _all_texts(fake_sender))
-    async with db_factory() as session:
-        hand = await HandsRepo(session).find_by_hand_no(session_id, _raw.hand_no)
-        assert hand is not None
-        record = await AnalysesRepo(session).get_by_hand(hand.id)
-    assert record is not None and record.verdict_text is None
-
-
-@requires_fixtures
-async def test_a_repeat_attempt_does_not_pay_for_the_words_twice(
-    db_factory, fake_sender, queue, deps, monkeypatch
-):
-    """Чекпоинт станции: если текст уже сохранён, модель не зовётся снова."""
-    player_id, session_id = await _make_scope(db_factory)
-    jid, _raw = await _seed_one_hand_deep_dive_job(
-        db_factory, queue, player_id=player_id, session_id=session_id
-    )
-
-    job = await queue.claim("w1")
-    assert job is not None
-    await run_job(job, deps)
-    assert (await job_status(db_factory, jid)) == "done"
-
-    async with db_factory() as session:
-        hand = await HandsRepo(session).find_by_hand_no(session_id, _raw.hand_no)
-        assert hand is not None
-        await AnalysesRepo(session).set_explanation(
-            hand_id=hand.id,
-            verdict_text=VerdictTextOut(points=[], summary="Уже сказано.").model_dump_json(),
-            range_images=[],
-        )
-        await session.commit()
-
-    called = False
-
-    async def _should_not_be_called(*args, **kwargs):
-        nonlocal called
-        called = True
-        raise AssertionError("модель позвана повторно за уже сохранённым текстом")
-
-    monkeypatch.setattr(pipeline_module, "verdict_text", _should_not_be_called)
-
-    async with db_factory() as session:
-        await session.execute(
-            text("UPDATE jobs SET status = 'queued', locked_by = NULL WHERE id = :id"),
-            {"id": jid},
-        )
-        await session.commit()
-    repeat = await queue.claim("w2")
-    assert repeat is not None
-    await run_job(repeat, deps)
-
-    assert called is False
-    assert any("Уже сказано." in shown for shown in _all_texts(fake_sender))
-
-
-@requires_fixtures
-@requires_prompts
-async def test_a_repeat_scan_does_not_pay_for_the_story_twice(
-    db_factory, fake_sender, queue, deps, monkeypatch
-):
-    """Близнец чекпоинта разбора, но для рассказа по турниру (ревью, раздел G).
-
-    Разница с остальными станциями существенна: их повтор даёт ТОТ ЖЕ результат,
-    а повторный вызов модели даёт ДРУГОЙ текст — то есть игроку переписали бы
-    уже прочитанное сообщение, заплатив за это второй раз.
-    """
-    player_id, session_id = await _make_scope(db_factory)
-    tournament_id, _raw_hands = await _seed_checkpointed_hands(
-        db_factory, session_id=session_id, source_file=FIXTURE_DAILY, n=3
-    )
-    jid = await queue.enqueue(
-        type="hh_scan",
-        player_id=player_id,
-        session_id=session_id,
-        payload={
-            "source_file": str(FIXTURE_DAILY),
-            "tournament_id": tournament_id,
-            "hands_saved": True,
-        },
-    )
-
-    job = await queue.claim("w1")
-    assert job is not None
-    await run_job(job, deps)
-    assert (await job_status(db_factory, jid)) == "done"
-    async with db_factory() as session:
-        row = await session.get(Job, jid)
-        assert row is not None
-        assert row.payload.get("story_message_id") is not None
-
-    called = False
-
-    async def _should_not_be_called(*args, **kwargs):
-        nonlocal called
-        called = True
-        raise AssertionError("модель позвана повторно за уже отправленным рассказом")
-
-    monkeypatch.setattr(pipeline_module, "tournament_text", _should_not_be_called)
-
-    async with db_factory() as session:
-        await session.execute(
-            text("UPDATE jobs SET status = 'queued', locked_by = NULL WHERE id = :id"),
-            {"id": jid},
-        )
-        await session.commit()
-    repeat = await queue.claim("w2")
-    assert repeat is not None
-    await run_job(repeat, deps)
-
-    assert called is False
-    assert (await job_status(db_factory, jid)) == "done"
-
-
-@requires_fixtures
-async def test_range_images_survive_a_model_that_did_not_answer(
-    db_factory, fake_sender, queue, deps, monkeypatch, tmp_path
-):
-    """Картинки диапазонов — выход кода, и отказ модели их не отменяет.
+    """Картинки диапазонов — выход кода, и модели в разборе раздачи больше нет.
 
     Раздача берётся та, у которой есть точка с допущением: только у таких точек
     есть что рисовать (`_render_ranges`). Если в первых раздачах файла её нет,
@@ -1566,11 +1296,6 @@ async def test_range_images_survive_a_model_that_did_not_answer(
     jid, _raw = await _seed_one_hand_deep_dive_job(
         db_factory, queue, player_id=player_id, session_id=session_id
     )
-
-    async def _boom(*args, **kwargs):
-        raise UnfaithfulText("числа не из расчёта")
-
-    monkeypatch.setattr(pipeline_module, "verdict_text", _boom)
 
     job = await queue.claim("w1")
     assert job is not None
@@ -2098,9 +1823,11 @@ async def test_the_rendered_range_pictures_reach_the_player(
     player_id, session_id = await _make_scope(db_factory)
     # Раздача с ДОПУЩЕНИЕМ: рисуются только такие точки (`_render_ranges`), и на
     # раздаче без них тест проверял бы пустоту (та же ловушка, что у теста про
-    # текст модели, — см. `_seed_hands_and_pick_a_judged_one`).
+    # текст модели, — см. `_seed_hands_and_pick_a_judged_one`). С 2026-10-03
+    # открытие первым от 13bb судит чарт в зоне «строго», и первая точка с
+    # допущением в фикстуре — 51-я раздача.
     hand_no, _result = await _seed_hands_and_pick_an_assuming_one(
-        db_factory, session_id=session_id, n=20
+        db_factory, session_id=session_id, n=60
     )
     jid = await enqueue_deep_dive(queue, hand_no, player_id=player_id, session_id=session_id)
 
@@ -2154,6 +1881,60 @@ async def test_a_repeated_attempt_does_not_send_the_same_picture_twice(
         await _send_range_photos(deps, session, job_id, "w1", 777, photos)
         await session.commit()
     assert len(fake_sender.photos) == 2, "повтор попытки прислал картинки заново"
+
+
+async def test_a_repeat_attempt_does_not_send_the_overflow_twice(
+    db_factory, fake_sender, queue, deps
+):
+    """Хвост сырых чисел едет вторым сообщением под СВОИМ ключом.
+
+    Второй `result_message_id` был бы невозможен: ключ один, и повторная попытка
+    либо переписала бы разбор хвостом, либо прислала хвост заново.
+    """
+    from harness.worker.pipeline import _send_analysis
+
+    player_id, session_id = await _make_scope(db_factory)
+    job_id = await queue.enqueue(
+        type="deep_dive", player_id=player_id, session_id=session_id, payload={"hand_no": "X"}
+    )
+    job = await queue.claim("w1")
+    assert job is not None
+    msgs = [Msg(text="разбор раздачи"), Msg(text="1. ривер — хвост чисел")]
+
+    async with db_factory() as session:
+        await _send_analysis(deps, session, job_id, "w1", 777, msgs)
+    assert [msg.text for msg in fake_sender.sent] == [m.text for m in msgs]
+    async with db_factory() as session:
+        row = await session.get(Job, job_id)
+        assert row is not None
+        assert row.payload["result_message_id"] != row.payload["raw_overflow_message_id"]
+
+    async with db_factory() as session:
+        await _send_analysis(deps, session, job_id, "w1", 777, msgs)
+    assert len(fake_sender.sent) == 2, "повтор прислал сообщения заново"
+    assert len(fake_sender.edits) == 2, "повтор обязан отредактировать оба"
+
+
+async def test_a_hand_that_fits_sends_only_one_message(
+    db_factory, fake_sender, queue, deps
+):
+    """Обратная сторона: одного сообщения хватает — второй ключ не заводится."""
+    from harness.worker.pipeline import _send_analysis
+
+    player_id, session_id = await _make_scope(db_factory)
+    job_id = await queue.enqueue(
+        type="deep_dive", player_id=player_id, session_id=session_id, payload={"hand_no": "X"}
+    )
+    job = await queue.claim("w1")
+    assert job is not None
+
+    async with db_factory() as session:
+        await _send_analysis(deps, session, job_id, "w1", 777, [Msg(text="разбор раздачи")])
+    assert len(fake_sender.sent) == 1
+    async with db_factory() as session:
+        row = await session.get(Job, job_id)
+        assert row is not None
+        assert "raw_overflow_message_id" not in row.payload
 
 
 async def test_a_missing_picture_file_does_not_take_the_verdict_away(
@@ -2260,3 +2041,112 @@ async def test_a_question_without_a_calculation_shows_the_refusal_not_the_model(
     texts = _all_texts(fake_sender)
     assert any("нет расчёта" in text for text in texts)
     assert not [text for text in texts if "25% рук" in text]
+
+
+# --- развилка «Что было»: блок принадлежит разбору раздачи, не скану HH ---------------
+
+
+def test_a_hand_analysis_always_carries_the_what_happened_block():
+    """Разбор ОДНОЙ раздачи собирается единственной функцией, и она сама строит
+    реплей — забыть его нельзя, не удалив строку сознательно.
+
+    До этого теста оба пути разбора (скрин и кнопка «разобрать») звали
+    сборщик сообщения напрямую, а `replay` был необязательным аргументом со
+    значением `None`: новый путь, забывший его передать, молча терял блок и не
+    ронял ни одного теста.
+    """
+    enriched = _postflop_hand()
+    msgs = _hand_analysis_msg(
+        analyze_hand(enriched),
+        enriched,
+        elapsed_s=3,
+        quota_left=1,
+        quota_total=5,
+        stats=None,
+    )
+    assert "Что было" in msgs[0].text
+
+
+def test_the_hh_scan_summary_never_carries_the_what_happened_block():
+    """Вторая сторона развилки, и держать надо именно пару: тест только на первую
+    пропустил бы «а давайте покажем ход раздачи и в сводке скана».
+
+    Ход раздачи — свойство ОДНОЙ раздачи. В файле турнира их сотни, и ни одна не
+    выделена; сводка называет руки номерами, а рассказывает про турнир.
+    """
+    summary = ScanSummary(
+        hands_total=1,
+        hands_with_decision=0,
+        items=[],
+        close_calls=[],
+        total_loss_bb=0.0,
+        hands_failed=0,
+        points_total=4,
+        points_judged=0,
+    )
+    assert "Что было" not in scan_summary_msg(summary, quota_left=1, quota_total=5).text
+
+
+_SYNTHETIC_HH = """Poker Hand #SYNTH1: Tournament #1, Synthetic Hold'em No Limit - \
+Level5(100/200(20)) - 2026/01/01 00:00:00
+Table 'S1' 3-max Seat #1 is the button
+Seat 1: Alice (2,000 in chips)
+Seat 2: Bob (2,000 in chips)
+Seat 3: Hero (2,000 in chips)
+Alice: posts the ante 20
+Bob: posts the ante 20
+Hero: posts the ante 20
+Bob: posts small blind 100
+Hero: posts big blind 200
+*** HOLE CARDS ***
+Dealt to Alice\x20
+Dealt to Bob\x20
+Dealt to Hero [Ah Kd]
+Alice: folds
+Bob: raises 500 to 600
+Hero: folds
+Uncalled bet (400) returned to Bob
+Bob collected 460 from pot
+*** SUMMARY ***
+Total pot 460 | Rake 0 | Jackpot 0 | Bingo 0 | Fortune 0 | Tax 0
+Seat 1: Alice (button) folded before Flop
+Seat 2: Bob (small blind) collected (460)
+Seat 3: Hero (big blind) folded before Flop
+"""
+"""Одна выдуманная раздача в формате GG: три места, герой пасует на рейз.
+
+Синтетика здесь законна ровно потому, что тест проверяет ОРКЕСТРАЦИЮ (кому
+воркер шлёт второе сообщение), а не качество разбора: про качество говорит
+регрессионная сетка на настоящих руках, и она гейтится `@requires_fixtures`.
+Настоящие hand history в репозиторий не кладутся (CLAUDE.md, публикация).
+"""
+
+
+async def test_an_hh_scan_sends_the_summary_and_nothing_else(
+    deps, queue, db_factory, fake_sender, tmp_path
+):
+    """Скан файла — одна сводка, и в ней дверь в разбор под каждой раздачей.
+
+    Рассказ по турниру и отчёт с числами из скана убраны (решение владельца
+    2026-09-12): первым отвечал рассказ модели, а второй был третьим подряд
+    сообщением с числами, мимо которых игрок пролистывал к кнопкам.
+    """
+    player_id, session_id = await _make_scope(db_factory)
+    source = tmp_path / "hand.txt"
+    source.write_text(_SYNTHETIC_HH, encoding="utf-8")
+    await enqueue_hh_scan(queue, source, player_id=player_id, session_id=session_id)
+
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    summary = fake_sender.sent[-1]
+    assert summary.text.startswith("Скан завершён: 1 рука.")
+    assert "Турнир. Раздач" not in "".join(_all_texts(fake_sender)), "отчёт больше не шлётся"
+    assert [b.callback_data for row in summary.buttons for b in row] == ["deep:SYNTH1"]
+
+    async with db_factory() as session:
+        row = await session.get(Job, job.id)
+        assert row is not None
+        assert "report_message_id" not in row.payload
+        assert "story_message_id" not in row.payload

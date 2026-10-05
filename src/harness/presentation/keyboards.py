@@ -58,7 +58,6 @@ NOTE_COLOR_SET_PREFIX = "notecolorset:"
 NOTE_DELETE_PREFIX = "notedel:"
 SET_NICKNAME_DATA = "setnick"
 RANGES_PREFIX = "ranges:"
-DETAIL_PREFIX = "detail:"
 DISAGREE_PREFIX = "disagree:"
 
 
@@ -68,7 +67,14 @@ def deep_dive_button(hand_no: str) -> Btn:
 
 
 def verdict_buttons(hand_no: str) -> list[Btn]:
-    """Три кнопки под вердиктом (SESSIONS_UX): диапазоны, полный разбор, возражение.
+    """Две кнопки под вердиктом (SESSIONS_UX): диапазоны и возражение.
+
+    Третьей была «Подробнее»; ход раздачи стоит блоком «Что было» в самом
+    разборе (спека §5.6), и кнопка, показывающая его второй раз, осталась бы
+    без содержания. Слот зарезервирован, чем он станет — решение владельца.
+    Побочный эффект, принятый сознательно: «Подробнее» в УЖЕ отправленных
+    сообщениях никуда не делась и теперь попадает в `on_unhandled_callback` →
+    «Эта кнопка не работает.» Это дешевле переписывания старых сообщений.
 
     «Не согласен» — не декорация: нажатие уходит в eval-датасет (`verdict_dispute`,
     задача 21), поэтому `callback_data` несёт `hand_no` уже здесь, а не
@@ -76,7 +82,6 @@ def verdict_buttons(hand_no: str) -> list[Btn]:
     """
     return [
         Btn(text="🎯 Диапазоны", callback_data=f"{RANGES_PREFIX}{hand_no}"),
-        Btn(text="🔍 Подробнее", callback_data=f"{DETAIL_PREFIX}{hand_no}"),
         Btn(text="✋ Не согласен", callback_data=f"{DISAGREE_PREFIX}{hand_no}"),
     ]
 
@@ -198,7 +203,6 @@ def escalation_buttons(job_id: int, field: str, options: list[str]) -> list[Btn]
 
 
 __all__ = [
-    "DETAIL_PREFIX",
     "DISAGREE_PREFIX",
     "MAIN_MENU",
     "MENU_HELP",

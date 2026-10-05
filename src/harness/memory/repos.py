@@ -564,6 +564,29 @@ class HandsRepo:
             )
         return list(grouped.values())
 
+    async def canonical_by_tournament(self, tournament_id: int) -> list[CanonicalHand]:
+        """Канонические руки одного турнира — одной колонкой.
+
+        Вход частот оппонентов для блока «Что было» (план 2026-09-12). Читается
+        только `canonical`, как в `player_hands_by_tournament`: `raw` и
+        `enriched` весят кратно больше, а `player_stats_by_label` нужен лишь
+        канон. Руки без чекпоинта пропускаются
+        (`test_canonical_by_tournament_reads_only_hands_with_a_canonical_checkpoint`).
+
+        Область — один турнир: метка места сквозная только внутри него, и рука
+        соседнего турнира приписала бы той же метке чужие действия
+        (`test_canonical_by_tournament_does_not_reach_into_a_neighbouring_tournament`).
+        """
+        stmt = (
+            select(Hand.canonical)
+            .where(Hand.tournament_id == tournament_id, Hand.canonical.is_not(None))
+            .order_by(Hand.id)
+        )
+        return [
+            CanonicalHand.model_validate(canonical)
+            for canonical in await self.db.scalars(stmt)
+        ]
+
     async def player_canonical(
         self, player_id: int, window: Window | None = None
     ) -> list[CanonicalHand]:
@@ -678,6 +701,7 @@ _POINT_COLUMNS: Mapping[str, str] = {
     "assumption": "assumption",
     "tools": "tools",
     "detail": "detail",
+    "mismatch": "mismatch",
 }
 
 # Обстановка точки из `DecisionPoint` (`hands.enriched`): имя поля и имя колонки
@@ -776,17 +800,19 @@ class AnalysesRepo:
     async def set_explanation(
         self, *, hand_id: int, verdict_text: str | None = None, range_images: list[str]
     ) -> None:
-        """Дописать изложение к УЖЕ сохранённому разбору — чекпоинт станции explain.
+        """Дописать изложение к УЖЕ сохранённому разбору.
 
-        Отдельным методом, а не вторым `save()`: разбор (`result`) и текст к нему
-        считаются разными станциями конвейера и переживают разные падения (задача
-        18, чекпоинты). Повторная попытка, у которой числа уже посчитаны, обязана
-        дописать к ним слова, а не завести вторую строку на ту же руку.
+        Отдельным методом, а не вторым `save()`: числа разбора (`result`) и то,
+        что к ним дописывается, переживают разные падения (задача 18,
+        чекпоинты). Повторная попытка, у которой числа уже посчитаны, обязана
+        дописать к ним остальное, а не завести вторую строку на ту же руку.
 
-        `verdict_text=None` — законный случай: картинки диапазонов рисует код, и
-        сохранить их надо даже тогда, когда модель не ответила. Пустой текст при
-        этом НЕ записывается поверх существующего — колонка просто не попадает в
-        `UPDATE` (`test_set_explanation_without_text_keeps_the_saved_one`).
+        `verdict_text=None` — законный случай, и единственный, который встречает
+        конвейер сегодня: текст вердикта из него отключён (решение владельца
+        2026-09-12), а картинки диапазонов рисует код и сохранить их надо.
+        Пустой текст при этом НЕ записывается поверх существующего — колонка
+        просто не попадает в `UPDATE`
+        (`test_set_explanation_without_text_keeps_the_saved_one`).
         """
         values: dict[str, Any] = {"range_images": range_images}
         if verdict_text is not None:
@@ -1263,7 +1289,8 @@ class LeaksRepo:
 
         Пара, которую экран печатает строкой «оценено N из M решений»: без неё
         список ликов читается как полная картина игры, хотя судится сегодня
-        только префлоп-пуш-фолд. Судимость читается колонкой `judged`, а не
+        только префлоп: пуш-фолд и открытие первым по чарту. Судимость читается
+        колонкой `judged`, а не
         условием: правило записано один раз, в `contracts.is_judged`.
 
         Фильтр по умолчанию пуст — вся история игрока.
@@ -1328,7 +1355,12 @@ class LeaksRepo:
                 func.count().label("n"),
                 _negative_loss().label("loss"),
             )
-            .where(*_points_of(player_id, filters or PointFilter()))
+            .where(
+                *_points_of(player_id, filters or PointFilter()),
+                # Точка по чарту в пределах чарта лика не даёт, даже если её
+                # тройка есть в таблице (`contracts.leak_rule_of_point`).
+                DecisionPointRow.mismatch.is_not(False),
+            )
             .group_by(
                 DecisionPointRow.spot,
                 DecisionPointRow.action_taken,

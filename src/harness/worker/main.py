@@ -126,10 +126,14 @@ def _keyboard(buttons: list[list[Btn]]) -> dict[str, object] | None:
 
 
 def _payload(msg: Msg, **fields: object) -> dict[str, object]:
-    """Тело запроса к Bot API: обязательные поля плюс `reply_markup` — но только
-    когда кнопки действительно есть (см. `_keyboard`).
+    """Тело запроса к Bot API: обязательные поля, `reply_markup` — когда кнопки
+    есть, `parse_mode` — когда сообщение несёт разметку (`Msg.parse_mode`).
+    Без последнего разбор с блоком «Что было» ушёл бы игроку с `<b>` буквально
+    (`test_the_payload_carries_parse_mode_when_the_message_has_markup`).
     """
     body: dict[str, object] = {**fields, "text": msg.text}
+    if msg.parse_mode is not None:
+        body["parse_mode"] = msg.parse_mode
     markup = _keyboard(msg.buttons)
     if markup is not None:
         body["reply_markup"] = markup
@@ -466,7 +470,7 @@ async def main() -> None:
             llm=llm,
             process_pool=process_pool,
             # Тот же том, что у бота (`bot.main.data_dir`): туда ложатся картинки
-            # диапазонов станции `explain`, в БД едут пути (спека §6).
+            # диапазонов (`pipeline._render_ranges`), в БД едут пути (спека §6).
             data_dir=data_dir(),
             # Флаг, а не имя модели: станции нужно одно решение — звать вторую
             # ступень каскада зрения или сразу спрашивать игрока. Переменная

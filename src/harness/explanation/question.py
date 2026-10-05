@@ -31,6 +31,7 @@ from harness.contracts import (
     FrequencyStat,
     LeaksResult,
     Measurement,
+    ModelOutput,
     Subject,
     ThresholdOutcome,
     ThresholdResult,
@@ -88,7 +89,7 @@ _OUTCOME_BRIEF: dict[ThresholdOutcome, str] = {
 }
 
 
-class QuestionDraft(BaseModel):
+class QuestionDraft(ModelOutput, BaseModel):
     """Что модели разрешено вернуть: слова, и ничего кроме слов.
 
     Ни имени расчёта, ни чисел отдельным полем: подпись собирает код по выходу

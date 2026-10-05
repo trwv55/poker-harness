@@ -25,24 +25,20 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 from harness.contracts import VisionCheck
 
 __all__ = [
     "CHECK_BUTTON",
-    "CHECK_CARDS",
     "CHECK_EQUITY",
     "CHECK_HERO",
-    "CHECK_POSITIONS",
     "CHECK_POT",
     "CHECK_SEATS",
     "EQUITY_TOLERANCE_PP",
     "POT_TOLERANCE_BB",
-    "button_check",
-    "cards_check",
     "equity_check",
     "match_hero",
-    "positions_check",
     "pot_check",
     "seats_check",
     "within_tolerance",
@@ -50,10 +46,8 @@ __all__ = [
 
 CHECK_POT = "pot"
 CHECK_BUTTON = "button"
-CHECK_CARDS = "cards"
 CHECK_EQUITY = "equity"
 CHECK_HERO = "hero"
-CHECK_POSITIONS = "positions"
 CHECK_SEATS = "seats"
 
 # Допуск сверки банка — в больших блайндах. Экспорт печатает стеки и суммы с
@@ -116,68 +110,22 @@ def pot_check(pot_shown_bb: float | None, contributions_bb: float) -> VisionChec
     )
 
 
-def button_check(marked: str | None, derived: str | None) -> VisionCheck:
-    """Фишка дилера против рассадки, восстановленной из порядка хода (реестр D3).
-
-    Два прочтения одной рассадки: кружок с буквой `D` за столом и последний
-    ходивший до блайндов в логе префлопа. Ошибка в кнопке сдвигает раскладку
-    позиций целиком и меняет вердикт, не меняя ни одного числа на экране (A3),
-    поэтому она вынесена в отдельную проверку, а не выводится из каскада
-    денежных расхождений.
-
-    Молчит, когда сверять нечего: на живом столе лога нет, и второго прочтения
-    не существует — там кнопку проверяет валидатор против блайндов.
-    """
-    if marked is None or derived is None:
-        return VisionCheck(
-            name=CHECK_BUTTON, passed=True, detail="второго прочтения рассадки на экране нет"
-        )
-    return VisionCheck(
-        name=CHECK_BUTTON,
-        passed=marked == derived,
-        detail=f"фишка дилера у {marked!r}, по порядку хода кнопка у {derived!r}",
-        options=[marked, derived],
-    )
-
-
-def cards_check(at_seat: dict[str, list[str]], in_log: dict[str, list[str]]) -> VisionCheck:
-    """Карты у места против карт в колонке улицы — сильнейшая из проверок карт.
-
-    Два независимых прочтения одних и тех же карт: у места их перекрывает баннер
-    выигрыша, в колонке лога они нарисованы чисто. Почему одного прочтения мало —
-    реестр, «Карты отрисованы дважды», и отчёт прогона датасета.
-
-    Работает без вскрытия и без напечатанных процентов, то есть на любой руке с
-    олл-ином, а не только там, где GG показал эквити, — поэтому идёт первой.
-    Сравниваются только те игроки, у кого прочитаны ОБА места.
-    """
-    disagreements = [
-        f"{label}: у места {at_seat[label]}, в логе {in_log[label]}"
-        for label in sorted(set(at_seat) & set(in_log))
-        if sorted(at_seat[label]) != sorted(in_log[label])
-    ]
-    if not disagreements:
-        return VisionCheck(name=CHECK_CARDS, passed=True, detail="карты обоих мест совпали")
-    first = disagreements[0].split(": ", 1)[0]
-    return VisionCheck(
-        name=CHECK_CARDS,
-        passed=False,
-        detail="; ".join(disagreements),
-        options=[" ".join(at_seat[first]), " ".join(in_log[first])],
-        subject=first,
-    )
-
-
 def equity_check(
-    shown_pct: float | None, hero: list[str], villain: list[str], board: list[str]
+    hands: Sequence[tuple[list[str], float | None]], board: list[str]
 ) -> VisionCheck:
     """Напечатанный GG процент против посчитанного нами (реестр, «Эквити — оракул»).
 
     Единственная проверка, которая проверяет именно КАРТЫ, а не суммы, и
     единственная, где второе прочтение не с экрана, а из нашего расчёта. Считает
-    тот же `equity_hand_vs_hand`, что и ядро: две реализации эквити разошлись бы
-    молча, и тогда проверка стала бы измерять разницу между ними, а не ошибку
-    чтения.
+    тем же модулем, что и ядро (`equity_multiway`): две реализации эквити
+    разошлись бы молча, и тогда проверка стала бы измерять разницу между ними, а
+    не ошибку чтения.
+
+    На вход идут ВСЕ участники олл-ина, чью долю подписал экран, а не пара:
+    посчитанная вдвоём доля трёхстороннего олл-ина расходится с напечатанной на
+    десяток процентных единиц, и проверка объявляла бы ошибкой чтения свою
+    собственную неполноту. Доля без процента (`None`) участвует в расчёте, но не
+    сверяется — её карты влияют на чужие доли.
 
     Молчит, когда сверять нечего: процент напечатан только на экспортах с
     олл-ином, и не на каждом.
@@ -190,21 +138,34 @@ def equity_check(
     (`test_bot_image_does_not_import_calculation_stack`). Считает эквити воркер,
     и грузит его тоже он.
     """
-    from harness.analysis.tools.equity import equity_hand_vs_hand
+    from harness.analysis.tools.equity import equity_multiway
 
-    if shown_pct is None or len(hero) != 2 or len(villain) != 2:
+    known = [(cards, shown) for cards, shown in hands if len(cards) == 2]
+    printed = [shown for _, shown in known if shown is not None]
+    if len(known) < 2 or not printed:
         return VisionCheck(
             name=CHECK_EQUITY, passed=True, detail="эквити на экране не напечатано"
         )
-    if len(set(hero) | set(villain) | set(board)) != len(hero) + len(villain) + len(board):
+
+    cards_flat = [card for pair, _ in known for card in pair]
+    if len(set(cards_flat) | set(board)) != len(cards_flat) + len(board):
         return VisionCheck(
             name=CHECK_EQUITY,
             passed=False,
-            detail=f"карта названа дважды: {hero} против {villain} на борде {board}",
-            options=[f"{shown_pct:.2f}", "—"],
+            detail=f"карта названа дважды: {[pair for pair, _ in known]} на борде {board}",
+            options=[f"{printed[0]:.2f}", "—"],
         )
-    computed_pct = 100.0 * equity_hand_vs_hand((hero[0], hero[1]), (villain[0], villain[1]), board)
-    delta = abs(shown_pct - computed_pct)
+
+    computed = equity_multiway([(pair[0], pair[1]) for pair, _ in known], board)
+    worst = max(
+        (
+            (abs(shown - 100.0 * value), shown, 100.0 * value)
+            for (_, shown), value in zip(known, computed, strict=True)
+            if shown is not None
+        ),
+        key=lambda item: item[0],
+    )
+    delta, shown_pct, computed_pct = worst
     return VisionCheck(
         name=CHECK_EQUITY,
         passed=within_tolerance(delta, EQUITY_TOLERANCE_PP),
@@ -214,46 +175,6 @@ def equity_check(
         ),
         options=[f"{shown_pct:.2f}", f"{computed_pct:.2f}"],
     )
-
-
-def positions_check(printed: dict[str, str], derived: dict[str, str]) -> VisionCheck:
-    """Напечатанные метки позиций против рассадки, восстановленной по порядку хода.
-
-    Третий независимый сигнал о рассадке (реестр A3): экспорт подписывает
-    позиции у всех, кроме героя, и подпись эта не участвует в восстановлении
-    круга — тот строится из порядка строк лога. Расхождение означает, что круг
-    собран не из тех строк.
-
-    Ловит лишнего участника, которого денежные сверки не видят: банк, кнопка и
-    эквити считаются по одному и тому же чтению и расходятся только вместе с ним
-    (реестр D4). Случай, ради которого проверка написана, — в отчёте прогона.
-
-    **Сравниваются только сопоставимые метки.** Словарь позиций у рума и у
-    нормалайзера совпадает не весь: рум подписывает середину стола иначе, и
-    набор меток к тому же зависит от числа мест. Метка, которой в круге этого
-    стола не бывает вовсе, ничего не доказывает — она называется в `detail` как
-    «не сопоставимо» и проверку НЕ роняет. Иначе сверка краснела бы на каждом
-    экране непривычного размера, то есть измеряла бы полноту нашей таблицы
-    соответствий, а не чтение (ревью раунда 2, F3).
-
-    Молчит, когда сверять нечего: на живом столе позиций не печатают вовсе.
-    """
-    ring = set(derived.values())
-    common = sorted(set(printed) & set(derived))
-    comparable = [nick for nick in common if printed[nick] in ring]
-    unknown = sorted({printed[nick] for nick in common if printed[nick] not in ring})
-    if not comparable:
-        note = f"не сопоставимо: {', '.join(unknown)}" if unknown else "меток позиций на экране нет"
-        return VisionCheck(name=CHECK_POSITIONS, passed=True, detail=note)
-    wrong = [
-        f"{nick}: напечатано {printed[nick]}, по порядку хода {derived[nick]}"
-        for nick in comparable
-        if printed[nick] != derived[nick]
-    ]
-    detail = "; ".join(wrong) or f"метки позиций сошлись у {len(comparable)} мест"
-    if unknown:
-        detail += f"; не сопоставимо: {', '.join(unknown)}"
-    return VisionCheck(name=CHECK_POSITIONS, passed=not wrong, detail=detail)
 
 
 def seats_check(players: int, max_seats: int | None) -> VisionCheck:

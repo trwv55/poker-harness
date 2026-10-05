@@ -31,6 +31,7 @@ __all__ = [
     "JUDGED_SPOTS",
     "LEAK_RULES",
     "MAX_NOTE_TEXT_CHARS",
+    "MISMATCH_LOSS_BB",
     "NOTE_COLORS",
     "NOTE_COLOR_NONE",
     "LeakRule",
@@ -42,6 +43,7 @@ __all__ = [
     "SessionLine",
     "SessionSummary",
     "is_judged",
+    "is_mismatch",
     "leak_rule_for",
     "leak_rule_of_point",
 ]
@@ -66,15 +68,11 @@ class LeakRule(BaseModel, frozen=True):
     best_action: str
 
 
-# Таксономия v1 — решение владельца 2026-09-07, выведенное из того, что разбор
-# умеет судить сегодня (`is_judged` ниже: только пуш-фолд в неоткрытом банке и
-# колл чужого шова).
-#
-# Последняя строка — ЗАРЕЗЕРВИРОВАНА под чарты открытия: спот `preflop_other`
-# сегодня не судится вовсе, поэтому правило не может совпасть ни с одной точкой,
-# которую производит ядро (`test_the_reserved_open_raise_leak_matches_nothing_
-# the_core_judges_today`). Она стоит здесь не как мёртвый код, а как образец
-# формы: новый тип лика — строка, а не ветка.
+# Таксономия v1 — решение владельца 2026-09-07; правила спота `open_chart` —
+# 2026-10-03 (спека 2026-10-03-open-chart-verdict, §6). У точки по чарту правило
+# опознаётся тройкой только при `is_mismatch`: смешанная рука, сыгранная не самым
+# частым действием, расхождением не является и в лики не идёт
+# (`leak_rule_of_point`, `memory.repos.LeaksRepo.by_type`).
 LEAK_RULES: tuple[LeakRule, ...] = (
     LeakRule(
         key="no_shove",
@@ -105,11 +103,74 @@ LEAK_RULES: tuple[LeakRule, ...] = (
         best_action="fold",
     ),
     LeakRule(
+        key="open_not_opened_raise",
+        title="Сбрасывает руки, которые чарт открывает рейзом",
+        spot=SpotKind.OPEN_CHART,
+        action_taken="fold",
+        best_action="raise",
+    ),
+    LeakRule(
+        key="open_not_opened_shove",
+        title="Сбрасывает руки, которые чарт шовит первым",
+        spot=SpotKind.OPEN_CHART,
+        action_taken="fold",
+        best_action="shove",
+    ),
+    LeakRule(
         key="open_too_wide",
-        title="Открывает слишком широко",
-        spot=SpotKind.PREFLOP_OTHER,
+        title="Открывает рейзом шире чарта",
+        spot=SpotKind.OPEN_CHART,
         action_taken="raise",
         best_action="fold",
+    ),
+    LeakRule(
+        key="open_shove_too_wide",
+        title="Шовит первым шире чарта",
+        spot=SpotKind.OPEN_CHART,
+        action_taken="shove",
+        best_action="fold",
+    ),
+    LeakRule(
+        key="open_limp_too_wide",
+        title="Лимпует руки, которые чарт сбрасывает",
+        spot=SpotKind.OPEN_CHART,
+        action_taken="limp",
+        best_action="fold",
+    ),
+    LeakRule(
+        key="open_shove_instead_of_raise",
+        title="Шовит там, где чарт рейзит",
+        spot=SpotKind.OPEN_CHART,
+        action_taken="shove",
+        best_action="raise",
+    ),
+    LeakRule(
+        key="open_raise_instead_of_shove",
+        title="Рейзит там, где чарт шовит",
+        spot=SpotKind.OPEN_CHART,
+        action_taken="raise",
+        best_action="shove",
+    ),
+    LeakRule(
+        key="open_not_limped",
+        title="Сбрасывает руки, которые чарт лимпует",
+        spot=SpotKind.OPEN_CHART,
+        action_taken="fold",
+        best_action="limp",
+    ),
+    LeakRule(
+        key="open_raise_instead_of_limp",
+        title="Рейзит там, где чарт лимпует",
+        spot=SpotKind.OPEN_CHART,
+        action_taken="raise",
+        best_action="limp",
+    ),
+    LeakRule(
+        key="open_limp_instead_of_raise",
+        title="Лимпует там, где чарт рейзит",
+        spot=SpotKind.OPEN_CHART,
+        action_taken="limp",
+        best_action="raise",
     ),
 )
 
@@ -121,8 +182,13 @@ LEAK_RULES: tuple[LeakRule, ...] = (
 # расчётный стек (`test_bot_image_does_not_import_calculation_stack`), а
 # `contracts` не тянут ничего.
 JUDGED_SPOTS: frozenset[SpotKind] = frozenset(
-    {SpotKind.PUSHFOLD_UNOPENED, SpotKind.PUSHFOLD_FACING_SHOVE}
+    {SpotKind.PUSHFOLD_UNOPENED, SpotKind.PUSHFOLD_FACING_SHOVE, SpotKind.OPEN_CHART}
 )
+
+# Порог, с которого потеря ценовой точки — расхождение: дешевле него упрёк не
+# стоит внимания игрока (задача 13). Живёт в контрактах, потому что читает его
+# единый предикат `is_mismatch`, а за ним — скан и изложение.
+MISMATCH_LOSS_BB = 0.1
 
 
 def is_judged(point: PointVerdict) -> bool:
@@ -135,6 +201,17 @@ def is_judged(point: PointVerdict) -> bool:
     (`test_the_judged_column_is_written_by_the_one_predicate`).
     """
     return point.spot in JUDGED_SPOTS and point.best_action != ""
+
+
+def is_mismatch(point: PointVerdict) -> bool:
+    """Расхождение ли эта точка — ЕДИНСТВЕННАЯ формулировка правила.
+
+    Точка по чарту несёт ответ сама (`PointVerdict.mismatch`): цены у неё нет.
+    Ценовая точка — расхождение, если судима и потеряла больше `MISMATCH_LOSS_BB`.
+    """
+    if point.mismatch is not None:
+        return point.mismatch
+    return is_judged(point) and point.ev_diff_bb < -MISMATCH_LOSS_BB
 
 
 def leak_rule_for(spot: SpotKind | str, action_taken: str, best_action: str) -> LeakRule | None:
@@ -159,7 +236,13 @@ def leak_rule_for(spot: SpotKind | str, action_taken: str, best_action: str) -> 
 
 
 def leak_rule_of_point(point: PointVerdict) -> LeakRule | None:
-    """Тип лика этой точки решения — та же таблица, взятая по полям вердикта."""
+    """Тип лика этой точки решения — та же таблица, взятая по полям вердикта.
+
+    Точка по чарту, сыгранная в пределах чарта (`mismatch is False`), лика не
+    даёт, даже если её тройка есть в таблице.
+    """
+    if point.mismatch is False:
+        return None
     return leak_rule_for(point.spot, point.action_taken, point.best_action)
 
 

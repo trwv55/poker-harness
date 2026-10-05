@@ -1,4 +1,6 @@
-"""Текст вердикта по одной раздаче — единственный второй вызов модели в системе.
+"""Текст вердикта по одной раздаче.
+
+Из конвейера не вызывается с 2026-09-12 (решение владельца).
 
 Граница CLAUDE.md здесь проходит буквально: **модель излагает готовые числа и
 не считает ничего**. Из этого три следствия, каждое реализовано, а не обещано:
@@ -39,6 +41,7 @@ from pydantic import BaseModel
 
 from harness.contracts import (
     AnalysisResult,
+    ModelOutput,
     PointText,
     PointVerdict,
     SpotKind,
@@ -181,7 +184,7 @@ class PointDraft(BaseModel):
     text: str
 
 
-class VerdictDraft(BaseModel):
+class VerdictDraft(ModelOutput, BaseModel):
     """Сырой ответ модели до проверок — то, что видит eval-прогон.
 
     Публичный тип (в отличие от прежнего приватного) ровно потому, что у него

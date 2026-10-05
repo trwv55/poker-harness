@@ -222,7 +222,7 @@ class DecisionPointRow(Base):
 
     * `point_no`, `dp_index`, `street`, `spot`, `zone`, `action_taken`,
       `best_action`, `ev_diff_bb`, `ev_interval`, `assumption`, `tools`,
-      `detail` — `PointVerdict` целиком, поле в поле
+      `detail`, `mismatch` — `PointVerdict` целиком, поле в поле
       (`test_every_field_of_a_point_verdict_has_its_column`). Единственное
       переименование — `interval` → `ev_interval`: `interval` в Postgres
       зарезервировано, и колонка с таким именем требовала бы кавычек в каждом
@@ -286,6 +286,8 @@ class DecisionPointRow(Base):
     best_action: Mapped[str] = mapped_column(String, nullable=False)
     ev_diff_bb: Mapped[float] = mapped_column(Double, nullable=False)
     judged: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    # Расхождение, названное ядром без цены (точка по чарту); у ценовых — NULL.
+    mismatch: Mapped[bool | None] = mapped_column(Boolean)
     position: Mapped[str | None] = mapped_column(String(16))
     to_call: Mapped[int | None] = mapped_column(BigInteger)
     pot_before: Mapped[int | None] = mapped_column(BigInteger)
@@ -564,8 +566,11 @@ class LlmCall(Base):
             # `vision_extract_fallback` — вторая ступень каскада зрения (задача
             # 22). Отдельное назначение, а не то же самое: по нему считается,
             # сколько раз дешёвого чтения не хватило, и сколько это стоило.
+            # `tournament_text` — рассказ по турниру (миграция 0010): модель у
+            # него та же, что у вердикта, а вход продукта другой, и по одному
+            # ключу на два входа себестоимость каждого не посчитать.
             "purpose IN ('vision_extract', 'vision_extract_fallback', 'verdict_text', "
-            "'question_answer')",
+            "'tournament_text', 'question_answer')",
             name="purpose_allowed",
         ),
         CheckConstraint(
@@ -577,6 +582,13 @@ class LlmCall(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     trace_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("traces.id"), nullable=False)
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Кто НА САМОМ ДЕЛЕ обслужил вызов, когда между нами и моделью стоит шлюз
+    # (миграция 0011). `provider` — куда слали (`openrouter`), это — кто ответил
+    # (`Parasail`). У одной модели на OpenRouter несколько хостеров, и они
+    # различаются поддержкой `seed` и `tool_choice: required`; без этой колонки
+    # разбор расхождений между прогонами упирается в «неизвестно, кто отвечал».
+    # `None` — прямой вызов вендора, он хостера не называет, и это факт, а не пропуск.
+    served_by: Mapped[str | None] = mapped_column(String(64))
     model: Mapped[str] = mapped_column(String(128), nullable=False)
     purpose: Mapped[str] = mapped_column(String(32), nullable=False)
     tokens_in: Mapped[int | None] = mapped_column(Integer)

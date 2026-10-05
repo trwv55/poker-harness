@@ -965,3 +965,41 @@ async def test_asking_for_an_unconfigured_expensive_model_names_the_variable(db_
     )
     with pytest.raises(LLMNotConfigured, match="LLM_VISION_FALLBACK_MODEL"):
         LLM(without, db_factory)._resolve_model("vision_extract_fallback")
+
+
+async def test_the_hoster_that_actually_served_the_call_is_recorded(db_factory):
+    """Кто обслужил вызов — отдельная колонка, а не то же поле, что «куда слали».
+
+    У одной модели на OpenRouter пять хостеров, и они различаются по тому, что нам
+    критично: `seed` поддерживают не все, а `tool_choice: required`, без которого
+    нет структурированного вывода, — не все из оставшихся (замер 2026-09-12). Без
+    записи обслужившего разбор расхождений между прогонами упирается в «неизвестно,
+    кто отвечал»; складывать его в `provider` к «openrouter» значило бы держать в
+    одном поле две сущности — та же болезнь, что была у анте.
+
+    Имя приходит в `provider_details.downstream_provider` (проверено живым вызовом).
+    """
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=11)
+
+    def served_by_parasail(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(
+            parts=[ToolCallPart(tool_name="final_result", args={"text": "ok"})],
+            provider_details={"downstream_provider": "Parasail", "finish_reason": "tool_calls"},
+        )
+
+    llm = LLM(cfg, db_factory, model_override=FunctionModel(served_by_parasail))
+    await llm("verdict_text", Out, prompt="скажи привет", trace_id=trace_id)
+
+    rows = await fetch_all(db_factory, "select status, served_by from llm_calls")
+    assert rows == [("ok", "Parasail")]
+
+
+async def test_a_provider_that_reports_no_hoster_leaves_the_column_empty(db_factory):
+    """Прямой вызов вендора хостера не называет — выдумывать его нельзя."""
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=12)
+    llm = LLM(cfg, db_factory, model_override=TestModel())
+
+    await llm("verdict_text", Out, prompt="скажи привет", trace_id=trace_id)
+
+    rows = await fetch_all(db_factory, "select served_by from llm_calls")
+    assert rows == [(None,)]

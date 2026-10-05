@@ -86,3 +86,31 @@ class CanonicalHand(BaseModel):
     bounties: dict[str, int] | None = None
     bounty_source: str | None = None
     vision: VisionMeta | None = None
+
+
+def went_to_showdown(hand: CanonicalHand, label: str) -> bool:
+    """Дошло ли место до вскрытия: доска доехала до ривера, оно не пасовало, и оно не одно.
+
+    Единственная формулировка правила для ДВУХ её читателей — статистики
+    (`analysis.player_stats`, доля дошедших до вскрытия) и реплея
+    (`explanation.hand_replay`, строка вскрытия): им разойтись негде. Второй
+    предикат того же вопроса в системе всё же есть —
+    `analysis.tournament._showdown` («герой есть в `hand.showdowns`»). Он
+    заполняет поля отчёта по турниру (`AllInEvent.showdown`, `ChipMove.showdown`);
+    отчёт из конвейера не вызывается с 2026-09-12 (решение владельца), и свести
+    два предиката — отдельная работа.
+
+    Считается по пасам и доске, а НЕ по строкам показа карт: источник пишет
+    показ и за тем, кто спасовал, и такая строка вскрытием не является
+    (`test_cards_shown_after_a_fold_are_not_a_showdown`). Двое непасовавших —
+    условие того, что вскрытие вообще состоялось: когда последнюю ставку никто
+    не уравнял, до вскрытия не дошёл никто
+    (`test_a_river_fold_leaves_no_showdown_for_anyone`).
+
+    Цена формулировки-функции: `hand.actions` обходится на каждый вызов, то есть
+    на каждое место раздачи, а не один раз на раздачу, как считал предрасчёт
+    `player_stats._HandView` до переноса. Владелец эту цену принял осознанно.
+    """
+    folded = {action.label for action in hand.actions if action.kind is ActionKind.FOLD}
+    live = sum(1 for player in hand.players if player.label not in folded)
+    return Street.RIVER in hand.boards and live >= 2 and label not in folded

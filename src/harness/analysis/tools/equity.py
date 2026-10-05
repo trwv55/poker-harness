@@ -189,6 +189,39 @@ def equity_vs_ranges(
     return _mc_equity(hero, opponent_sources, board_cards, iterations=iterations, seed=seed)
 
 
+def equity_multiway(
+    hands: Sequence[tuple[str, str]],
+    board: list[str] | None = None,
+) -> list[float]:
+    """Доля банка КАЖДОЙ из вскрытых рук — по одной доле на руку, в том же порядке.
+
+    Обобщение `equity_hand_vs_hand` на любое число участников. Нужно оракулу
+    зрения: олл-ин на троих GG подписывает долей каждого, и сверять напечатанное
+    можно только против расчёта, где участвуют все. Посчитанное вдвоём на
+    трёхстороннем олл-ине расходится с экраном на десяток процентных единиц —
+    не ошибкой чтения, а неполнотой расчёта.
+
+    Движок тот же (`_mc_equity`), и это не экономия строк: две реализации
+    эквити разошлись бы молча, и тогда сверка мерила бы разницу между ними, а не
+    ошибку чтения (тот же довод, что в докстринге `vision_checks.equity_check`).
+    """
+    if len(hands) < 2:
+        raise ValueError("нужно хотя бы две руки")
+    board_cards = list(board or [])
+    _validate_no_overlap(*hands, board_cards)
+
+    return [
+        _mc_equity(
+            hero,
+            [([other], [1.0]) for index, other in enumerate(hands) if index != position],
+            board_cards,
+            iterations=_DEFAULT_ITERATIONS_HEADS_UP,
+            seed=_DEFAULT_SEED,
+        )
+        for position, hero in enumerate(hands)
+    ]
+
+
 def equity_hand_vs_hand(
     hero: tuple[str, str],
     villain: tuple[str, str],

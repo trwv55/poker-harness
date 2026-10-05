@@ -23,6 +23,7 @@ from harness.explanation.faithfulness import (
 from harness.explanation.hand_replay import HandReplay, ReplaySpan, hand_replay
 from harness.explanation.range_render import range_svg, render_range_png
 from harness.explanation.tournament_text import (
+    TournamentLLM,
     tournament_digest,
     tournament_draft,
     tournament_text,
@@ -43,6 +44,7 @@ __all__ = [
     "HandReplay",
     "PromptUnavailable",
     "ReplaySpan",
+    "TournamentLLM",
     "UnfaithfulText",
     "VerdictDraft",
     "VerdictLLM",

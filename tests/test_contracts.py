@@ -144,24 +144,46 @@ def test_a_verdict_names_the_checks_it_could_not_run():
     assert named.not_checked == ["payouts"]
 
 
-def test_the_reading_keeps_the_two_card_renderings_apart():
-    """Карты у места и карты в логе — два независимых наблюдения, а не одно.
+def test_the_reading_asks_for_the_cards_once():
+    """Карты — ОДНО поле. Второе «независимое» наблюдение им не было.
 
-    Измерено (реестр, «Карты отрисованы дважды»): спрошенная один раз модель
-    схлопывает избыточность экрана и подставляет одно чтение в оба места.
+    Отмена решения о двойном чтении (владелец, 2026-09-12). Замер, который его
+    обосновал, сделан на ВЫРЕЗКЕ колонки лога; на полном экране модель либо
+    подставляла туда же, что у места, либо мусор — на тринадцати прогонах одного
+    экрана расхождение полей ни разу не указало на верное чтение, зато давало
+    вопрос игроку в двенадцати. Карты проверяет оракул эквити там, где рум
+    напечатал проценты; где не напечатал — ничто, и это честнее ложной сверки.
     """
     from harness.contracts import SeenPlayer
 
-    player = SeenPlayer(seat=1, cards_at_seat=["As", "5c"], cards_in_log=["As", "5s"])
-    assert player.cards_at_seat != player.cards_in_log
+    assert "cards_in_log" not in SeenPlayer.model_fields
+    assert SeenPlayer(seat=1, cards_at_seat=["As", "5s"]).cards_at_seat == ["As", "5s"]
 
 
-def test_the_reading_keeps_the_ante_pool_apart_from_the_per_player_ante():
-    """Пул анте и подушевое анте — разные поля: делит код, не модель (реестр B2)."""
+def test_the_reading_asks_for_the_printed_ante_only():
+    """Анте — ОДНО поле: на экране напечатан пул, подушевого там нет нигде.
+
+    Прежняя схема просила различить два числа, которых на экране одно («Все анте:
+    N»), и модель честно записывала напечатанное дважды. Это была ошибка схемы, а
+    не чтения (владелец, 2026-09-12, отмена реестра B2). Делит код —
+    `test_the_ante_pool_is_divided_by_the_code_not_by_the_model`.
+    """
     from harness.contracts import Unit, VisionReading
 
-    reading = VisionReading(ante_pool_shown=6800.0, ante_unit=Unit.CHIPS)
-    assert reading.ante_per_player_shown is None
+    assert "ante_per_player_shown" not in VisionReading.model_fields
+    assert VisionReading(ante_pool_shown=6800.0, ante_unit=Unit.CHIPS).ante_pool_shown == 6800.0
+
+
+def test_the_reading_does_not_ask_for_printed_positions():
+    """Напечатанной позиции в схеме нет: круг строит код по блайндам и порядку хода.
+
+    Метка под аватаром не добавляла независимого наблюдения — круг и так
+    восстанавливается из тех же строк лога, — зато добавляла поле, которое роняли
+    обе проверенные модели в каждом прогоне (владелец, 2026-09-12).
+    """
+    from harness.contracts import SeenAction
+
+    assert "position" not in SeenAction.model_fields
 
 
 def test_the_reading_can_refuse_a_screen_that_is_not_a_hand():
@@ -197,11 +219,13 @@ def test_every_leak_rule_recognises_its_own_point():
     Правило заводится строкой, и строка обязана быть достаточной: точка,
     собранная ИЗ правила, обязана этим же правилом и опознаться.
     """
-    from harness.contracts import LEAK_RULES, leak_rule_of_point
+    from harness.contracts import LEAK_RULES, SpotKind, leak_rule_of_point
 
     for rule in LEAK_RULES:
+        # Точка по чарту обязана назвать расхождение сама: цены у неё нет.
+        chart = {"mismatch": True, "ev_diff_bb": 0.0} if rule.spot is SpotKind.OPEN_CHART else {}
         point = _leak_point(
-            spot=rule.spot, action_taken=rule.action_taken, best_action=rule.best_action
+            spot=rule.spot, action_taken=rule.action_taken, best_action=rule.best_action, **chart
         )
         assert leak_rule_of_point(point) is rule
 
@@ -242,17 +266,47 @@ def test_an_unjudged_point_matches_no_leak_rule():
     assert leak_rule_of_point(point) is None
 
 
-def test_the_reserved_open_raise_leak_matches_nothing_the_core_judges_today():
-    """«Открывает слишком широко» зарезервирован под чарты и сегодня пуст.
+def test_a_chart_point_within_the_chart_is_not_a_leak():
+    """Смешанная рука, сыгранная не самым частым действием, — не лик.
 
-    Держится не намерением, а тем, что судимых спотов ровно два
-    (`JUDGED_SPOTS`), и спот этого правила в них не входит: вердикта с таким
-    спотом ядро не выносит, значит и совпасть правилу не с чем.
+    Тройка `fold → raise` есть в таблице, но точка по чарту с `mismatch=False`
+    (частота сыгранного у чарта не ниже порога) правилу не совпадает.
     """
-    from harness.contracts import JUDGED_SPOTS, LEAK_RULES
+    from harness.contracts import SpotKind, leak_rule_of_point
 
-    reserved = next(rule for rule in LEAK_RULES if rule.key == "open_too_wide")
-    assert reserved.spot not in JUDGED_SPOTS
+    common = {"spot": SpotKind.OPEN_CHART, "action_taken": "fold", "best_action": "raise"}
+    assert leak_rule_of_point(_leak_point(**common, ev_diff_bb=0.0, mismatch=False)) is None
+    assert leak_rule_of_point(_leak_point(**common, ev_diff_bb=0.0, mismatch=True)) is not None
+
+
+@pytest.mark.parametrize(
+    ("spot", "best_action", "mismatch"),
+    [
+        ("open_chart", "raise", None),  # судимая точка по чарту без mismatch
+        ("pushfold_unopened", "shove", True),  # mismatch у ценовой точки
+        ("open_chart", "", True),  # mismatch у точки без вердикта
+    ],
+)
+def test_mismatch_is_named_exactly_by_a_judged_chart_point(spot, best_action, mismatch):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="mismatch"):
+        _leak_point(
+            spot=spot, action_taken="fold", best_action=best_action, ev_diff_bb=0.0,
+            mismatch=mismatch,
+        )
+
+
+def test_a_mismatch_is_the_price_or_the_word_of_the_chart():
+    """Ценовая точка — расхождение дороже 0.1bb; точка по чарту — по своему слову."""
+    from harness.contracts import SpotKind, is_mismatch
+
+    priced = {"spot": SpotKind.PUSHFOLD_UNOPENED, "action_taken": "fold", "best_action": "shove"}
+    assert is_mismatch(_leak_point(**priced, ev_diff_bb=-0.11))
+    assert not is_mismatch(_leak_point(**priced, ev_diff_bb=-0.1))
+    chart = {"spot": SpotKind.OPEN_CHART, "action_taken": "fold", "best_action": "raise"}
+    assert is_mismatch(_leak_point(**chart, ev_diff_bb=0.0, mismatch=True))
+    assert not is_mismatch(_leak_point(**chart, ev_diff_bb=0.0, mismatch=False))
 
 
 def test_the_core_judges_a_point_by_the_predicate_of_the_contracts():
@@ -368,3 +422,69 @@ def test_the_share_of_bluffs_and_their_count_are_filled_together():
     for half in ({"bluffs_needed_min_value": None}, {"bluff_share": None}):
         with pytest.raises(ValidationError):
             TurnFlopCallDetail.model_validate({**whole, **half})
+
+
+# --- вывод модели: конверт вокруг полезной нагрузки --------------------------
+#
+# Измеренный класс сбоя, а не гипотеза: Sonnet кладёт заполненную схему внутрь
+# одного контейнерного ключа вместо раскладки по корню. Имя ключа плавает
+# (`params`, `$PARAMETER_NAME`), поэтому сравнивать с конкретной строкой нельзя.
+# Схемы вывода состоят из необязательных полей — без разворота такой ответ
+# валиден, пуст и от честного «ничего не вижу» неотличим ничем.
+
+
+def _full_reading_payload() -> dict:
+    return {
+        "hand_no": "TM1",
+        "board": ["6s", "4h", "Jc"],
+        "players": [{"nickname": "N1", "seat": 1}],
+    }
+
+
+@pytest.mark.parametrize("envelope", ["params", "$PARAMETER_NAME", "properties"])
+def test_an_output_wrapped_in_one_container_key_is_unwrapped(envelope: str):
+    from harness.contracts import VisionReading
+
+    reading = VisionReading.model_validate({envelope: _full_reading_payload()})
+
+    assert reading.hand_no == "TM1"
+    assert len(reading.players) == 1
+    assert reading.board == ["6s", "4h", "Jc"]
+
+
+def test_an_unknown_key_is_an_error_and_not_a_silently_empty_output():
+    """Тихая потеря становится громкой: неизвестное поле — отказ валидации.
+
+    Без этого структурно неверный ответ неотличим от пустого чтения, а повтор
+    на той же модели даёт тот же результат и ту же цену (`llm_calls`: два
+    вызова по 1400 выходных токенов, оба выброшены).
+    """
+    from harness.contracts import VisionReading
+
+    with pytest.raises(ValidationError):
+        VisionReading.model_validate({**_full_reading_payload(), "лишнее": 1})
+
+
+@pytest.mark.parametrize(
+    ("schema_path", "payload"),
+    [
+        ("harness.contracts:VisionReading", {"hand_no": "TM1"}),
+        ("harness.contracts:TournamentTextOut", {"paragraphs": ["а", "б"]}),
+        ("harness.explanation.verdict_text:VerdictDraft", {"points": [], "summary": "с"}),
+        ("harness.explanation.question:QuestionDraft", {"answer": "о"}),
+    ],
+)
+def test_every_schema_the_model_fills_survives_the_container_key(schema_path: str, payload: dict):
+    """Разворот конверта — на всех четырёх местах LLM, а не только на зрении.
+
+    Конверт — свойство транспорта, а не одной схемы: он приходит от того, КАК
+    модель заполняет вызов инструмента. У трёх схем поля обязательные, и конверт
+    там не теряется молча, а падает валидацией — но падает он оплаченным
+    вызовом, и схема-ретрай фасада платит второй раз за то же самое.
+    """
+    import importlib
+
+    module_name, class_name = schema_path.split(":")
+    schema = getattr(importlib.import_module(module_name), class_name)
+
+    assert schema.model_validate({"params": payload}) == schema.model_validate(payload)

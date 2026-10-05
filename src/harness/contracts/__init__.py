@@ -62,6 +62,7 @@ from harness.contracts.canonical import (
     CanonicalHand,
     Identity,
     PlayerState,
+    went_to_showdown,
 )
 from harness.contracts.enriched import (
     DecisionPoint,
@@ -70,6 +71,7 @@ from harness.contracts.enriched import (
     SidePot,
     ValidationStatus,
     Verdict,
+    hero_stack_delta_bb,
 )
 from harness.contracts.explanation import (
     PointText,
@@ -81,6 +83,7 @@ from harness.contracts.history import (
     JUDGED_SPOTS,
     LEAK_RULES,
     MAX_NOTE_TEXT_CHARS,
+    MISMATCH_LOSS_BB,
     NOTE_COLOR_NONE,
     NOTE_COLORS,
     LeakRule,
@@ -92,9 +95,11 @@ from harness.contracts.history import (
     SessionLine,
     SessionSummary,
     is_judged,
+    is_mismatch,
     leak_rule_for,
     leak_rule_of_point,
 )
+from harness.contracts.model_output import ModelOutput
 from harness.contracts.ranges import RANKS, Range, all_classes, class_of
 from harness.contracts.raw import (
     ActionKind,
@@ -127,6 +132,7 @@ __all__ = [
     "JUDGED_SPOTS",
     "LEAK_RULES",
     "MAX_NOTE_TEXT_CHARS",
+    "MISMATCH_LOSS_BB",
     "NOTE_COLORS",
     "NOTE_COLOR_NONE",
     "POSITIONS",
@@ -168,6 +174,7 @@ __all__ = [
     "LeaksResult",
     "LevelLine",
     "Measurement",
+    "ModelOutput",
     "NoteColor",
     "NoteRecord",
     "OpponentFrequencyParams",
@@ -221,9 +228,12 @@ __all__ = [
     "Zone",
     "all_classes",
     "class_of",
+    "hero_stack_delta_bb",
     "is_judged",
+    "is_mismatch",
     "leak_rule_for",
     "leak_rule_of_point",
     "river_call_detail",
     "turn_flop_call_detail",
+    "went_to_showdown",
 ]
