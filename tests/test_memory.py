@@ -252,6 +252,7 @@ async def test_a_river_point_survives_the_round_trip_through_the_database(db):
     )
     assert row is not None
     assert row.judged is False
+    assert row.detail[RIVER_CALL_DETAIL] == numbers
 
 
 async def test_a_postflop_line_survives_the_round_trip_through_the_database(db):
@@ -336,6 +337,7 @@ async def test_a_postflop_line_survives_the_round_trip_through_the_database(db):
     )
     assert row is not None
     assert row.judged is False
+    assert row.detail[POSTFLOP_LINE_DETAIL] == line
 
 
 async def test_set_explanation_without_text_keeps_the_saved_one(db):

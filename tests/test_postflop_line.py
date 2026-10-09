@@ -477,6 +477,24 @@ def test_a_folded_aggressor_does_not_make_a_donk():
     assert _tag(en, F) == (ActionTag.BET, None)
 
 
+def test_a_multiway_lead_after_another_players_check_into_the_aggressor_behind_is_a_donk():
+    """A чекнул, герой ставит, открывший позади ещё не ходил: донк, а не
+    «ставка после чека» — строка 6 таблицы §4.3 раньше строки 7."""
+    seats = (("A", _STACK), ("Hero", _STACK), ("V", _STACK))
+    en = _hand(
+        [
+            _raise(P, "V", 300),
+            _call(P, "A", 250),
+            _call(P, "Hero", 200),
+            _check(F, "A"),
+            _bet(F, "Hero", 300),
+        ],
+        seats=seats,
+        button="V",
+    )
+    assert _tag(en, F) == (ActionTag.DONK, None)
+
+
 def test_a_turn_bet_in_position_after_flop_checks_is_not_a_probe():
     """Проба — только вне позиции: в позиции та же ставка — «ставка после чека»."""
     en = _ip(
@@ -976,6 +994,93 @@ def test_a_call_that_ends_the_betting_on_the_flop_takes_the_chance_to_the_river(
     assert detail.draw_call.beyond_stack is True
 
 
+def _gutshot_check_call(bet: int, stack: int) -> EnrichedHand:
+    """Гатшот 6♣5♣ на K♥9♦8♠: чек-колл ставки `bet` в банк 600."""
+    return _oop(
+        [*_V_OPENS, _check(F, "Hero"), _bet(F, "V", bet), _call(F, "Hero", bet)],
+        seats=(("Hero", stack), ("V", stack)),
+        hero_cards=("6c", "5c"),
+        boards={F: ["Kh", "9d", "8s"], T: ["2c"], R: ["2d"]},
+    )
+
+
+def test_a_fractional_implied_amount_is_rounded_up_to_a_chip():
+    """X = 303 · 47/4 − (903 + 303) = 2 354.25 — печатается 2 355, не 2 354."""
+    detail = _detail(_gutshot_check_call(303, _DEEP), F)
+    assert detail.draw_call is not None
+    assert Fraction(303 * 47, 4) - (903 + 303) == Fraction(9_417, 4)
+    assert detail.draw_call.implied_needed_chips == 2_355
+
+
+def test_the_implied_amount_is_an_exact_fraction_and_not_a_float():
+    """Флеш-дро с гатшотом, 12 аутов: X = 372 · 47/12 − 1 344 = 113 ровно.
+
+    Деление на шанс в двоичной дроби даёт 113.000…01, и округление вверх
+    подняло бы сумму на фишку.
+    """
+    en = _oop(
+        [*_V_OPENS, _check(F, "Hero"), _bet(F, "V", 372), _call(F, "Hero", 372)],
+        seats=(("Hero", _DEEP), ("V", _DEEP)),
+        hero_cards=("Jc", "Tc"),
+        boards={F: ["8c", "7d", "2c"], T: ["3h"], R: ["4h"]},
+    )
+    detail = _detail(en, F)
+    assert detail.draw is not None and len(detail.draw.outs) == 12
+    assert detail.draw_call is not None
+    assert Fraction(372) / Fraction(12, 47) - 1_344 == 113
+    assert ceil(372 / (12 / 47) - 1_344) == 114, "двоичная дробь ушла бы на фишку вверх"
+    assert detail.draw_call.implied_needed_chips == 113
+
+
+def test_an_implied_amount_equal_to_the_stack_left_can_still_be_won():
+    """X = 400 · 47/4 − 1 400 = 3 300 — ровно столько у обоих после колла."""
+    en = _gutshot_check_call(400, 4_000)
+    dp = _points(en, F)[-1]
+    assert dp.eff_stack - dp.action.committed_after == 3_300
+    detail = postflop_line(dp, en)
+    assert detail.draw_call is not None
+    assert detail.draw_call.implied_needed_chips == 3_300
+    assert detail.draw_call.beyond_stack is False
+
+
+def test_the_stack_left_after_a_call_takes_the_heros_earlier_chips_on_the_street():
+    """Донк 300, рейз до 800, колл 500 при 4 300 у обоих на флопе: после колла
+    остаётся 4 300 − 800 = 3 500, а не 4 300 − 500 = 3 800. X = 3 675 — уже
+    больше остатка."""
+    en = _oop(
+        [*_V_OPENS, _bet(F, "Hero", 300), _raise(F, "V", 800), _call(F, "Hero", 500)],
+        seats=(("Hero", 4_600), ("V", 4_600)),
+        hero_cards=("6c", "5c"),
+        boards={F: ["Kh", "9d", "8s"], T: ["2c"], R: ["2d"]},
+    )
+    dp = _points(en, F)[-1]
+    assert (dp.eff_stack, dp.pot_before, dp.to_call) == (4_300, 1_700, 500)
+    detail = postflop_line(dp, en)
+    assert detail.draw_call is not None
+    assert detail.draw_call.implied_needed_chips == 3_675
+    assert detail.draw_call.beyond_stack is True
+
+
+def test_a_call_against_an_overbet_is_priced_by_what_the_hero_can_call():
+    """Ставка 40 000 против остатка героя 15 000: банк до хода урезан движком до
+    25 000, доплата — 15 000; колл в олл-ин берёт шанс к риверу."""
+    en = _oop(
+        [*_BIG_POT_PREFLOP, _check(F, "Hero"), _bet(F, "V", 40_000), _call(F, "Hero", 15_000)],
+        seats=(("Hero", 20_000), ("V", _DEEP)),
+        hero_cards=("6c", "5c"),
+        boards={F: ["Kh", "9d", "8s"], T: ["2c"], R: ["2d"]},
+    )
+    dp = _points(en, F)[-1]
+    assert (dp.pot_before, dp.to_call, dp.eff_stack) == (25_000, 15_000, 15_000)
+    detail = postflop_line(dp, en)
+    assert detail.draw is not None and detail.draw_call is not None
+    assert detail.draw_call.required_equity == 15_000 / 40_000
+    assert detail.draw_call.hit == detail.draw.hit_by_river
+    q = 1 - Fraction(comb(43, 2), comb(47, 2))
+    assert detail.draw_call.implied_needed_chips == ceil(15_000 / q - 40_000)
+    assert detail.draw_call.beyond_stack is True
+
+
 def test_a_proven_river_fold_turns_a_strong_call_into_a_bluff_catch():
     en = _oop(
         [
@@ -1098,6 +1203,104 @@ def test_a_deep_answer_to_an_open_names_the_missing_defence_chart():
     point = analyze_hand(_oop([*_V_OPENS, _check(F, "Hero"), _check(F, "V")])).points[0]
     assert point.street is P
     assert point.detail["unjudged"] == "нет чарта защиты BB против опена BTN на 100 ББ"
+
+
+@pytest.mark.parametrize(("stack", "depth"), [(3_650, 37), (3_649, 36), (3_750, 38)])
+def test_the_open_depth_in_the_reason_rounds_a_half_up(stack, depth):
+    """36.5 ББ — 37, а не банковское 36."""
+    en = _oop([*_V_OPENS, _check(F, "Hero"), _check(F, "V")], seats=(("Hero", stack), ("V", _STACK)))
+    point = analyze_hand(en).points[0]
+    assert point.detail["unjudged"] == f"нет чарта защиты BB против опена BTN на {depth} ББ"
+
+
+def test_a_deep_answer_off_the_blinds_names_a_missing_response_chart():
+    """«Защита» — у блайндов; кнопка на опен UTG отвечает."""
+    seats = (("A", _STACK), ("B", _STACK), ("V", _STACK), ("Hero", _STACK))
+    en = _hand(
+        [
+            _raise(P, "V", 300),
+            _call(P, "Hero", 300),
+            _fold(P, "A"),
+            _fold(P, "B"),
+            _check(F, "V"),
+            _check(F, "Hero"),
+        ],
+        seats=seats,
+        button="Hero",
+    )
+    point = analyze_hand(en).points[0]
+    assert point.street is P
+    assert point.detail["unjudged"] == "нет чарта ответа BTN на опен UTG на 100 ББ"
+
+
+def _raises_on_every_street() -> EnrichedHand:
+    """Герой чек-рейзит флоп, тёрн и ривер; соперник коллирует."""
+    return _oop(
+        [
+            *_V_OPENS,
+            _check(F, "Hero"),
+            _bet(F, "V", 300),
+            _raise(F, "Hero", 1_000),
+            _call(F, "V", 700),
+            _check(T, "Hero"),
+            _bet(T, "V", 500),
+            _raise(T, "Hero", 1_500),
+            _call(T, "V", 1_000),
+            _check(R, "Hero"),
+            _bet(R, "V", 500),
+            _raise(R, "Hero", 1_500),
+            _call(R, "V", 1_000),
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("dealt", "refusal"),
+    [({}, "карты героя неизвестны"), ({"Hero": ["Kh", "3c"]}, None)],
+    ids=["unknown", "tool-failure"],
+)
+def test_a_raise_keeps_the_fold_frequency_reason_where_the_call_tool_refuses(dealt, refusal):
+    """Инструмент колла к рейзу героя неприменим: его отказ по данным — карт нет
+    или перебор не принял карты (K♥ героя уже на борде) — остаётся у колла, а у
+    рейза причина §4.9."""
+    en = _raises_on_every_street()
+    broken = en.model_copy(update={"hand": en.hand.model_copy(update={"dealt": dealt})})
+    points = [p for p in analyze_hand(broken).points if p.street is not P]
+    raises = [p for p in points if p.action_taken == "raise"]
+    assert [p.street for p in raises] == [F, T, R]
+    for point in raises:
+        assert point.detail["unjudged"] == POSTFLOP_FOLD_FREQUENCY_REASON
+    for dp in (_points(broken, F)[-1], _points(broken, R)[-1]):
+        verdict = turn_flop_verdict(dp, broken) or river_verdict(dp, broken)
+        assert verdict is not None
+        assert verdict.detail["unjudged"] == POSTFLOP_FOLD_FREQUENCY_REASON
+    # Та же граница у колла остаётся причиной о данных.
+    called = _oop(
+        [*_V_OPENS, _check(F, "Hero"), _bet(F, "V", 300), _call(F, "Hero", 300)]
+    )
+    called = called.model_copy(
+        update={"hand": called.hand.model_copy(update={"dealt": dealt})}
+    )
+    call_point = turn_flop_verdict(_points(called, F)[-1], called)
+    assert call_point is not None
+    reason = call_point.detail["unjudged"]
+    assert reason != POSTFLOP_FOLD_FREQUENCY_REASON
+    if refusal is not None:
+        assert reason == refusal
+
+
+def test_a_raise_on_a_short_board_keeps_the_fold_frequency_reason():
+    """Борд без карт тёрна и ривера — граница инструмента колла, но не рейза."""
+    en = _raises_on_every_street()
+    short = en.model_copy(
+        update={"hand": en.hand.model_copy(update={"boards": {F: en.hand.boards[F]}})}
+    )
+    for street in (T, R):
+        dp = _points(short, street)[-1]
+        assert dp.action.kind is ActionKind.RAISE
+        verdict = turn_flop_verdict(dp, short) or river_verdict(dp, short)
+        assert verdict is not None
+        assert verdict.detail["unjudged"] == POSTFLOP_FOLD_FREQUENCY_REASON
 
 
 def test_a_deep_limped_pot_keeps_its_old_reason():
