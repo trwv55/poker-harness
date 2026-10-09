@@ -47,6 +47,7 @@ from harness.contracts import (
     SpotKind,
     Street,
     Zone,
+    postflop_line_detail,
 )
 from harness.contracts.enriched import hero_stack_delta_bb
 from harness.explanation import HandReplay, ReplaySpan, hand_replay
@@ -822,7 +823,7 @@ def test_a_hand_too_long_for_one_message_goes_out_in_two():
         "второе сообщение обязано сказать, чьё оно: игрок видит его отдельно"
     )
     assert blank == ""
-    assert re.match(r"^\d+\. (префлоп|флоп|тёрн|ривер)", rest), (
+    assert re.match(r"^\d+\. (Префлоп|Флоп|Тёрн|Ривер)", rest), (
         "дальше — целая точка, без обрубка предыдущей"
     )
     assert "\n\n\n" not in first.text
@@ -1130,8 +1131,8 @@ def test_the_turn_line_is_worded_exactly_like_the_river_line():
 def test_the_street_of_a_point_is_taken_from_its_own_data():
     """Улица берётся у точки, а не прибита к риверу."""
     text = _one_point_msg(_turn_point(street=Street.FLOP))
-    assert "5. флоп" in text
-    assert "ривер" not in text and "тёрн" not in text
+    titles = [line for line in text.splitlines() if re.match(r"\d+\. ", line)]
+    assert [title.split(" ")[:2] for title in titles] == [["5.", "Флоп"]]
 
 
 def test_a_requirement_beyond_the_board_prints_no_number_of_bluffs():
@@ -1164,7 +1165,7 @@ def test_the_streets_are_printed_in_the_order_they_were_dealt():
         AnalysisResult(hand_no="H8", points=[flop, _turn_point(), _river_point()], ranked=[]),
         zone=None,
     ).text
-    assert text.index("4. флоп") < text.index("5. тёрн") < text.index("7. ривер")
+    assert text.index("4. Флоп") < text.index("5. Тёрн") < text.index("7. Ривер")
 
 
 # --- экраны нижнего меню (задача 23) -------------------------------------------------
@@ -1939,13 +1940,12 @@ def test_the_raw_data_block_names_what_each_number_means():
         "анте",
         "Игроков в раздаче",
         "Вы на",
-        "позиция",
         "(банк ",
         "Конечный банк",
         "Итог",
         "банк до хода",
         "доставить",
-        "эфф. стек",
+        "эфф. ",
         "SPR",
         "живых",
         "вердикт",
@@ -1984,6 +1984,15 @@ def test_the_raw_data_block_prints_no_money_the_hand_does_not_contain():
                 abs(round(point.interval.cost_ceiling_bb, 1)),
             }
     allowed |= {abs(round(res.total_ev_loss_bb, 1))}
+    # Одна производная сумма ядра: `X` — сколько добрать позже при колле с дро
+    # (спека постфлоп-линии, §9 гейт 11). Рука этого теста колла с дро не содержит;
+    # руки с `X` разобраны в `tests/test_postflop_line_text.py`.
+    for point in res.points:
+        line = postflop_line_detail(point)
+        if line is not None and line.draw_call is not None:
+            chips = line.draw_call.implied_needed_chips
+            if chips is not None:
+                allowed.add(round(chips / hand.bb, 1))
 
     text = _deep_dive(res, en).text
     money = [float(n) for n in re.findall(r"(\d+(?:\.\d+)?)\s*ББ", text)]

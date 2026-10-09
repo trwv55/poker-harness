@@ -88,6 +88,7 @@ __all__ = [
     "HandReplay",
     "ReplaySpan",
     "bb",
+    "cards_text",
     "chips",
     "hand_replay",
     "signed_bb",
@@ -213,6 +214,16 @@ def _card(card: str) -> str:
 def _cards(cards: list[str]) -> str:
     """Карманные карты подряд, без пробелов: `J♥9♥` — так одномастность видна разом."""
     return "".join(_card(card) for card in cards)
+
+
+def cards_text(cards: list[str]) -> str:
+    """Карты подряд, без пробелов, мастями-символами: `5♣3♣`, флоп `Q♥4♦2♦`.
+
+    Публична ради второго читателя — заголовка точки решения в
+    `presentation.messages`: карты там и в блоке «Что было:» обязаны быть записаны
+    одним форматом (`test_the_point_title_writes_cards_like_the_replay_block`).
+    """
+    return _cards(cards)
 
 
 def _board(cards: list[str]) -> str:
