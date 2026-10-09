@@ -48,7 +48,7 @@ from harness.contracts import (
     Zone,
 )
 from harness.contracts.enriched import hero_stack_delta_bb
-from harness.explanation import HandReplay, ReplaySpan
+from harness.explanation import HandReplay, ReplaySpan, hand_replay
 from harness.presentation import (
     Btn,
     Msg,
@@ -329,7 +329,8 @@ def _deep_dive(res: AnalysisResult, en=None, **kw) -> Msg:
     `hand_analysis_msgs` печатает сырые числа раздачи, и взять их неоткуда, кроме
     `EnrichedHand`; тестам, которые проверяют не числа, а статус-строку или
     кнопки, подставляется любая настоящая раздача. Возвращается ПЕРВОЕ сообщение:
-    про второе (хвост чисел) говорит отдельный тест.
+    про второе (хвост чисел) говорит отдельный тест. Блок «Что было:» по
+    умолчанию — настоящий реплей той же раздачи: без него разбор не собирается.
     """
     return _deep_dive_all(res, en, **kw)[0]
 
@@ -340,7 +341,9 @@ def _deep_dive_all(res: AnalysisResult, en=None, **kw) -> list[Msg]:
     kw.setdefault("zone", Zone.STRICT)
     kw.setdefault("quota_left", 17)
     kw.setdefault("quota_total", 50)
-    return hand_analysis_msgs(res, en if en is not None else _postflop_hand(), **kw)
+    hand = en if en is not None else _postflop_hand()
+    kw.setdefault("replay", hand_replay(hand))
+    return hand_analysis_msgs(res, hand, **kw)
 
 
 def _mixed_result(hand_no: str = "H42") -> AnalysisResult:
@@ -403,9 +406,9 @@ def test_the_hand_analysis_dev_line_appears_only_when_passed():
 
 
 def test_the_hand_analysis_with_no_points_at_all_still_shows_the_hand():
-    res = AnalysisResult(hand_no="H0", points=[], ranked=[], total_ev_loss_bb=0.0)
+    res = AnalysisResult(hand_no="SYN1", points=[], ranked=[], total_ev_loss_bb=0.0)
     msg = _deep_dive(res, elapsed_s=3, quota_left=1, quota_total=1)
-    assert "Рука H0" in msg.text
+    assert "Рука SYN1" in msg.text
     assert "⏱ 3с" in msg.text
 
 
@@ -710,7 +713,7 @@ def _two_point_result() -> AnalysisResult:
 def _replay() -> HandReplay:
     return HandReplay(
         spans=[
-            ReplaySpan(text="Вы на SB, J♥️9♥️, 10.0 ББ.\nUTG фолд → "),
+            ReplaySpan(text="Вы на SB, J♥9♥, 10.0 ББ.\nUTG фолд → "),
             ReplaySpan(text="вы олл-ин 9.9", emphasis=True),
             ReplaySpan(text=" → BB & CO фолд."),
         ]
@@ -725,16 +728,40 @@ def test_the_deep_dive_opens_with_what_happened_in_html():
     """
     msg = _deep_dive(_two_point_result(), replay=_replay())
     assert msg.parse_mode == "HTML"
-    assert msg.text.startswith("Что было\n")
+    assert msg.text.startswith("Что было:\n")
     assert "<b>вы олл-ин 9.9</b>" in msg.text
     assert "<b>Вы на SB" not in msg.text, "жирным — только помеченный кусок"
     assert "BB &amp; CO" in msg.text, "остальной текст экранируется"
 
 
-def test_without_a_replay_the_deep_dive_stays_plain():
-    """Без блока разметки в сообщении нет — и экранировать текст незачем."""
-    msg = _deep_dive(_two_point_result())
-    assert msg.parse_mode is None and "Что было" not in msg.text
+def test_the_block_title_ends_with_a_colon():
+    """«Что было:» с двоечием (решение владельца 2026-10-07), и сразу под ним —
+    шапка раздачи: номер руки стоит в блоке, а не в сырых числах."""
+    en = _postflop_hand()
+    lines = _deep_dive(analyze_hand(en), en).text.splitlines()
+    assert lines[0] == "Что было:"
+    assert lines[1].startswith(f"Рука {en.hand.hand_no} · уровень ")
+
+
+def test_the_lines_that_moved_into_the_block_are_not_printed_twice():
+    """Шапка сырых чисел переехала в блок «Что было:» (владелец 2026-10-07).
+    Старых строк нет, а то, что сохранено, стоит ровно один раз."""
+    en = _postflop_hand()
+    text = _deep_dive(analyze_hand(en), en).text
+    for gone in (
+        "Вы: ",
+        "стек до раздачи",
+        "после раздачи",
+        "Борд по улицам",
+        "Банк по улицам",
+        "Исход раздачи для вас",
+        "фишек ·",
+        "с каждого",
+    ):
+        assert gone not in text, f"старая строка осталась: «{gone}»"
+    for once in ("Рука SYN1 · ", "Игроков в раздаче:", "Вы на ", "Конечный банк:", "Отдаёте "):
+        assert text.count(once) == 1, f"«{once}» напечатано не один раз"
+    assert "\ufe0f" not in text
 
 
 def test_a_hand_that_fits_goes_out_in_one_message():
@@ -756,13 +783,15 @@ def test_a_hand_too_long_for_one_message_goes_out_in_two():
     en = _river_hand()
     res = analyze_hand(en)
     assert len(res.points) == 7, "фикстура перестала быть семиточечной"
-    long_replay = HandReplay(spans=[ReplaySpan(text="а" * 1500), ReplaySpan(text="шов", emphasis=True)])
+    # Шапка сырых чисел переехала в блок (2026-10-07), и сообщение стало короче:
+    # реплей растянут с запасом под это.
+    long_replay = HandReplay(spans=[ReplaySpan(text="а" * 2500), ReplaySpan(text="шов", emphasis=True)])
 
     msgs = _deep_dive_all(res, en, replay=long_replay)
     assert len(msgs) == 2
     first, second = msgs
     assert len(first.text) <= 4096 and len(second.text) <= 4096
-    assert first.text.startswith("Что было\n")
+    assert first.text.startswith("Что было:\n")
     assert "Сверка денег с источником" in first.text, "сверка несжимаема и живёт в первом"
     assert "разборов 17/50" in first.text, "статус-строка не уезжает"
     assert first.buttons and not second.buttons
@@ -782,7 +811,7 @@ def test_the_two_messages_together_carry_every_point_of_the_hand():
 
     en = _river_hand()
     res = analyze_hand(en)
-    long_replay = HandReplay(spans=[ReplaySpan(text="а" * 1500)])
+    long_replay = HandReplay(spans=[ReplaySpan(text="а" * 2500)])
     whole = "\n".join(msg.text for msg in _deep_dive_all(res, en, replay=long_replay))
     for point in res.points:
         assert f"{point.dp_index + 1}. " in whole, f"точка {point.dp_index} потерялась"
@@ -1887,13 +1916,11 @@ def test_the_raw_data_block_names_what_each_number_means():
         "блайнды",
         "анте",
         "Игроков в раздаче",
-        "Вы:",
+        "Вы на",
         "позиция",
-        "стек до раздачи",
-        "Борд",
-        "Банк по улицам",
+        "(банк ",
         "Конечный банк",
-        "Исход раздачи для вас",
+        "Отдаёте",
         "банк до хода",
         "доставить",
         "эфф. стек",
@@ -2032,8 +2059,12 @@ def test_a_hand_with_two_pots_names_each_part_and_who_claims_it():
         for line in _deep_dive(analyze_hand(en), en).text.splitlines()
         if line.startswith("Банк делится на части")
     )
+    position = {p.label: p.position for p in en.hand.players}
     for pot in en.report.side_pots:
-        assert f"{pot.amount / en.hand.bb:.1f} ББ (претендуют: {', '.join(pot.eligible)})" in line
+        who = ", ".join(
+            "вы" if label == en.hand.hero_label else position[label] for label in pot.eligible
+        )
+        assert f"{pot.amount / en.hand.bb:.1f} ББ (претендуют: {who})" in line
 
 
 def test_a_point_without_a_verdict_gets_no_zone_no_price_and_no_better_line():

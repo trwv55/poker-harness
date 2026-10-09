@@ -577,7 +577,7 @@ def _hand_analysis_msg(
 
 
 async def _tournament_stats(
-    session: AsyncSession, tournament_id: int | None
+    session: AsyncSession, tournament_id: int | None, hand_no: str
 ) -> dict[str, PlayerStats] | None:
     """Частоты соседей по столу — или `None`, если считать их не по чему.
 
@@ -585,10 +585,21 @@ async def _tournament_stats(
     поэтому на HH-входе частоты набираются по рукам турнира, а у скриншота
     `tournament_id` нет — и частот нет. `None`, не пустой словарь: «не считали»
     и «посчитали, вышло пусто» — разные вещи.
+
+    **Разбираемая рука в выборку не входит** (`hand_no`). Прежде входила, и на
+    файле из одной раздачи открывший банк соперник получал «VPIP 100%, PFR 100%»
+    — частоту, измеренную на той самой руке, которую она якобы описывает
+    (`test_a_single_hand_file_prints_no_opponent_frequencies`). Порога выборки
+    нет: частоты печатаются, как только у места есть хотя бы одна ДРУГАЯ рука
+    этого турнира, и число раздач стоит рядом с ними.
     """
     if tournament_id is None:
         return None
-    hands = await HandsRepo(session).canonical_by_tournament(tournament_id)
+    hands = [
+        hand
+        for hand in await HandsRepo(session).canonical_by_tournament(tournament_id)
+        if hand.hand_no != hand_no
+    ]
     return player_stats_by_label(hands) if hands else None
 
 
@@ -1198,7 +1209,7 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
             elapsed_s=round(deps.clock() - started_at),
             quota_left=quota_left,
             quota_total=quota_total,
-            stats=await _tournament_stats(session, hand.tournament_id),
+            stats=await _tournament_stats(session, hand.tournament_id, hand_no),
         )
         await _send_analysis(deps, session, job.id, worker_id, chat_id, msgs)
         await _send_range_photos(

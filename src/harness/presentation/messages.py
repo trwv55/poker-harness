@@ -121,7 +121,6 @@ from harness.contracts.enriched import (
     DecisionPoint,
     EnrichedHand,
     ValidationStatus,
-    hero_stack_delta_bb,
 )
 from harness.contracts.history import (
     MAX_NOTE_COLOR_MEANING_CHARS,
@@ -765,10 +764,6 @@ def _raw_signed_bb(value_bb: float) -> str:
     return f"{_signed_bb_number(value_bb)} ББ"
 
 
-# Слово игрока для типа анте. Значение, которого в словаре нет, печатается как
-# есть: выдумать вместо него нечего, а спрятать нельзя.
-_ANTE_TYPE_WORD: dict[str, str] = {"per_player": "с каждого"}
-
 # Слова игрока для машинных значений `detail`. Значение без перевода печатается
 # как есть — по той же причине, что и ключ без подписи.
 _METHOD_WORD: dict[str, str] = {
@@ -998,57 +993,6 @@ def _detail_lines(point: PointVerdict) -> list[str]:
     return lines
 
 
-def _hand_head_lines(en: EnrichedHand, hand_no: str) -> list[str]:
-    """Шапка раздачи: уровень, блайнды, стол, ваши карты и стек, борд, банк, исход."""
-    hand = en.hand
-    rep = en.report
-    ante = (
-        f"{hand.ante} фишек ({_ANTE_TYPE_WORD.get(hand.ante_type, hand.ante_type)})"
-        if hand.ante
-        else "нет"
-    )
-    lines = [
-        (
-            f"Рука {hand_no} · уровень {hand.level} · "
-            f"блайнды {hand.sb}/{hand.bb} фишек · анте {ante}"
-        ),
-        f"Игроков в раздаче: {len(hand.players)}.",
-    ]
-    hero = next((p for p in hand.players if p.label == hand.hero_label), None)
-    if hero is not None:
-        cards = " ".join(hand.dealt.get(hand.hero_label, [])) or "не известны"
-        ended = rep.stacks_end.get(hand.hero_label)
-        tail = "" if ended is None else f" → после раздачи {_raw_bb(ended, hand.bb)}"
-        lines.append(
-            f"Вы: {cards} · позиция {hero.position} · "
-            f"стек до раздачи {_raw_bb(hero.stack, hand.bb)}{tail}"
-        )
-    if hand.boards:
-        board = " · ".join(
-            f"{_STREET_WORD.get(street, street.value).lower()} {' '.join(cards)}"
-            for street, cards in hand.boards.items()
-        )
-        lines.append(f"Борд по улицам: {board}")
-    pots = " · ".join(
-        f"{_STREET_WORD.get(street, street.value).lower()} {_raw_bb(value, hand.bb)}"
-        for street, value in rep.pot_by_street.items()
-    )
-    lines.append(f"Банк по улицам (сколько лежало в банке к концу улицы): {pots}.")
-    lines.append(f"Конечный банк: {_raw_bb(rep.final_pot, hand.bb)}.")
-    if len(rep.side_pots) > 1:
-        # Движок кладёт в `side_pots` ВСЕ поты PokerKit, включая главный, поэтому
-        # один элемент означает неделёный банк и печатать его нечем
-        # (`test_the_hand_with_one_pot_says_nothing_about_side_pots`).
-        parts = " · ".join(
-            f"{_raw_bb(pot.amount, hand.bb)} (претендуют: {', '.join(pot.eligible)})"
-            for pot in rep.side_pots
-        )
-        lines.append(f"Банк делится на части: {parts}.")
-    if hero is not None:
-        lines.append(f"Исход раздачи для вас: {_raw_signed_bb(hero_stack_delta_bb(en))}.")
-    return lines
-
-
 def _played_words(dp: DecisionPoint, big_blind: int) -> str:
     """Что сыграно и на какую сумму — каждому действию своё число.
 
@@ -1173,7 +1117,12 @@ def _verdict_lines(point: PointVerdict) -> list[str]:
 
 
 def _raw_blocks(res: AnalysisResult, en: EnrichedHand) -> list[list[str]]:
-    """Сырые числа раздачи, разбитые на блоки: шапка, потом по блоку на точку.
+    """Сырые числа раздачи, разбитые на блоки: по блоку на точку решения.
+
+    Шапки раздачи здесь больше нет: номер, уровень, блайнды, стеки, борд, банк и
+    исход стоят ровно один раз — в блоке «Что было» (`explanation.hand_replay`,
+    решение владельца 2026-10-07,
+    `test_the_lines_that_moved_into_the_block_are_not_printed_twice`).
 
     Блоками, а не одним списком, потому что при переполнении сообщение режется
     ПО ГРАНИЦЕ ТОЧКИ (`hand_analysis_msgs`): половина точки в одном сообщении и
@@ -1189,7 +1138,6 @@ def _raw_blocks(res: AnalysisResult, en: EnrichedHand) -> list[list[str]]:
     из него.
     """
     hand = en.hand
-    head = _hand_head_lines(en, res.hand_no)
     decisions = {dp.index: dp for dp in en.report.decision_points}
     blocks: list[list[str]] = []
     for point in res.points:
@@ -1201,7 +1149,7 @@ def _raw_blocks(res: AnalysisResult, en: EnrichedHand) -> list[list[str]]:
             else [f"{point.dp_index + 1}. {street}"]
         )
         blocks.append([*block, *_verdict_lines(point), *_detail_lines(point)])
-    return [head, *blocks]
+    return blocks
 
 
 def _raw_tail_lines(res: AnalysisResult, en: EnrichedHand) -> list[str]:
@@ -1241,8 +1189,9 @@ def hand_analysis_msgs(
     zone: Zone | None,
     quota_left: int,
     quota_total: int,
+    *,
+    replay: HandReplay,
     dev_line: str | None = None,
-    replay: HandReplay | None = None,
     not_checked: Sequence[str] = (),
     note_nicks: Sequence[str] = (),
 ) -> list[Msg]:
@@ -1278,10 +1227,12 @@ def hand_analysis_msgs(
     (`_hand_zone`), а называет непроверенное эта строка: одно без другого
     оставляет либо неназванную оговорку, либо неоправданную уверенность.
 
-    **Блок «Что было» — первым** (спека §5.6). Несжимаемы реплей, сверка денег,
-    оговорка и статус-строка; уезжают во второе сообщение только точки.
-    `parse_mode="HTML"` только при наличии блока — иначе экранировать пришлось
-    бы весь текст всюду.
+    **Блок «Что было:» — первым** (спека §5.6) и обязателен: шапка раздачи живёт
+    только в нём, и разбор без блока остался бы без номера руки, стеков и
+    исхода. Несжимаемы блок, сверка денег, оговорка и статус-строка; уезжают во
+    второе сообщение только точки — при нужде все
+    (`test_a_hand_too_long_for_one_message_goes_out_in_two`). Сообщение всегда
+    в `parse_mode="HTML"`: выделение точки решения — разметка.
 
     `note_nicks` — оппоненты, на которых можно записать заметку одним тапом
     (решение владельца 2026-09-04: путь заметки начинается ИЗ РАЗБОРА). Ники
@@ -1296,23 +1247,16 @@ def hand_analysis_msgs(
     if dev_line is not None:
         tail.append(dev_line)
 
-    head = None if replay is None else f"Что было\n{_replay_html(replay)}"
+    head = f"Что было:\n{_replay_html(replay)}"
     buttons = [verdict_buttons(res.hand_no), *note_buttons_for_hand(res.hand_no, note_nicks)]
 
     def rendered(kept: int) -> str:
-        lines = ([""] if head is not None else []) + _joined(blocks[:kept]) + tail
-        if head is None:
-            return "\n".join(lines)
-        return _render_html(head, lines)
+        return _render_html(head, ["", *_joined(blocks[:kept]), *tail])
 
     kept = len(blocks)
-    while kept > 1 and len(rendered(kept)) > _TELEGRAM_TEXT_LIMIT:
+    while kept > 0 and len(rendered(kept)) > _TELEGRAM_TEXT_LIMIT:
         kept -= 1
-    first = Msg(
-        text=rendered(kept),
-        buttons=buttons,
-        parse_mode=None if head is None else "HTML",
-    )
+    first = Msg(text=rendered(kept), buttons=buttons, parse_mode="HTML")
     if kept == len(blocks):
         return [first]
     head_line = f"Рука {res.hand_no}, продолжение разбора:\n\n"

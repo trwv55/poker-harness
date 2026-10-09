@@ -65,6 +65,7 @@ from harness.contracts import (
     Zone,
 )
 from harness.engine import enrich
+from harness.explanation import hand_replay
 from harness.memory.models import Job
 from harness.memory.repos import (
     AnalysesRepo,
@@ -1140,7 +1141,9 @@ def test_hand_zone_says_nothing_when_nothing_was_judged():
     """
     result = AnalysisResult(hand_no="TM1", points=[], ranked=[])
     assert _hand_zone(result) is None
-    msg = hand_analysis_msgs(result, _postflop_hand(), 3, None, 1, 5)[0]
+    msg = hand_analysis_msgs(
+        result, _postflop_hand(), 3, None, 1, 5, replay=hand_replay(_postflop_hand())
+    )[0]
     assert "зона:" not in msg.text
     assert "строго" not in msg.text
 
@@ -1156,11 +1159,15 @@ def test_hand_zone_is_the_weakest_of_all_judged_points_not_the_first():
     mixed = AnalysisResult(hand_no="TM1", points=[strict_point, assuming_point], ranked=[0, 1])
     assert _hand_zone(mixed) is Zone.ASSUMING
     hand = _postflop_hand()
-    assert "зона: предполагая" in hand_analysis_msgs(mixed, hand, 1, _hand_zone(mixed), 1, 5)[0].text
+    assert "зона: предполагая" in hand_analysis_msgs(
+        mixed, hand, 1, _hand_zone(mixed), 1, 5, replay=hand_replay(hand)
+    )[0].text
 
     all_strict = AnalysisResult(hand_no="TM1", points=[strict_point], ranked=[0])
     assert _hand_zone(all_strict) is Zone.STRICT
-    assert "зона: строго" in hand_analysis_msgs(all_strict, hand, 1, _hand_zone(all_strict), 1, 5)[0].text
+    assert "зона: строго" in hand_analysis_msgs(
+        all_strict, hand, 1, _hand_zone(all_strict), 1, 5, replay=hand_replay(hand)
+    )[0].text
 
     # Незасуженные точки на зону руки не влияют — судится только `ranked`.
     unranked_assuming = AnalysisResult(
@@ -1200,7 +1207,10 @@ def test_a_proven_river_fold_puts_its_zone_in_the_status_line():
     assert _hand_zone(result) is Zone.STRICT
     assert (
         "зона: строго"
-        in hand_analysis_msgs(result, _postflop_hand(), 1, _hand_zone(result), 1, 5)[0].text
+        in hand_analysis_msgs(
+            result, _postflop_hand(), 1, _hand_zone(result), 1, 5,
+            replay=hand_replay(_postflop_hand()),
+        )[0].text
     )
 
     # Та же точка без доказательства линии не называет — и зоне взяться неоткуда.
@@ -2120,6 +2130,88 @@ Seat 3: Hero (big blind) folded before Flop
 регрессионная сетка на настоящих руках, и она гейтится `@requires_fixtures`.
 Настоящие hand history в репозиторий не кладутся (CLAUDE.md, публикация).
 """
+
+
+_SYNTHETIC_HH_SECOND = """Poker Hand #SYNTH2: Tournament #1, Synthetic Hold'em No Limit - \
+Level5(100/200(20)) - 2026/01/01 00:01:00
+Table 'S1' 3-max Seat #2 is the button
+Seat 1: Alice (2,000 in chips)
+Seat 2: Bob (2,000 in chips)
+Seat 3: Hero (2,000 in chips)
+Alice: posts the ante 20
+Bob: posts the ante 20
+Hero: posts the ante 20
+Hero: posts small blind 100
+Alice: posts big blind 200
+*** HOLE CARDS ***
+Dealt to Alice\x20
+Dealt to Bob\x20
+Dealt to Hero [7h 2c]
+Bob: folds
+Hero: folds
+Uncalled bet (100) returned to Alice
+Alice collected 260 from pot
+*** SUMMARY ***
+Total pot 260 | Rake 0 | Jackpot 0 | Bingo 0 | Fortune 0 | Tax 0
+Seat 1: Alice (big blind) collected (260)
+Seat 2: Bob (button) folded before Flop
+Seat 3: Hero (small blind) folded before Flop
+"""
+"""Вторая раздача того же турнира: Bob пасует. Своя выборка у него — одна рука,
+и VPIP по ней 0%; посчитай разбор SYNTH1 вместе с собой, вышло бы 50%."""
+
+
+async def _deep_dive_text(
+    deps, queue, db_factory, fake_sender, tmp_path, hh: str, hand_no: str
+) -> str:
+    """Скан файла, затем разбор одной его раздачи; текст первого сообщения разбора."""
+    player_id, session_id = await _make_scope(db_factory)
+    source = tmp_path / "hand.txt"
+    source.write_text(hh, encoding="utf-8")
+    await enqueue_hh_scan(queue, source, player_id=player_id, session_id=session_id)
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+    sent_before = len(fake_sender.sent)
+    jid = await enqueue_deep_dive(queue, hand_no, player_id=player_id, session_id=session_id)
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, replace(deps, data_dir=tmp_path))
+    assert (await job_status(db_factory, jid)) == "done"
+    return next(m.text for m in fake_sender.sent[sent_before:] if "Что было:" in m.text)
+
+
+async def test_a_single_hand_file_prints_no_opponent_frequencies(
+    deps, queue, db_factory, fake_sender, tmp_path
+):
+    """Файл из одной раздачи: других рук у соперника нет, и частот нет.
+
+    Прежде в выборку входила сама разбираемая рука, и открывший банк получал
+    «VPIP 100%, PFR 100%» — измерение на той руке, которую оно якобы описывает.
+    Вместо частот у оставшегося в раздаче — его стек до раздачи.
+    """
+    text = await _deep_dive_text(
+        deps, queue, db_factory, fake_sender, tmp_path, _SYNTHETIC_HH, "SYNTH1"
+    )
+    assert "VPIP" not in text and "PFR" not in text
+    assert "SB (10ББ) опен 3.0" in text
+
+
+async def test_opponent_frequencies_come_only_from_other_hands(
+    deps, queue, db_factory, fake_sender, tmp_path
+):
+    """Две раздачи турнира: частоты Bob при разборе SYNTH1 — по SYNTH2 одной."""
+    text = await _deep_dive_text(
+        deps,
+        queue,
+        db_factory,
+        fake_sender,
+        tmp_path,
+        _SYNTHETIC_HH + "\n\n" + _SYNTHETIC_HH_SECOND,
+        "SYNTH1",
+    )
+    assert "VPIP 0%, PFR 0%, раздач 1)" in text
+    assert "SB (10ББ · " in text
 
 
 async def test_an_hh_scan_sends_the_summary_and_nothing_else(

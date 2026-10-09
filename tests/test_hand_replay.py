@@ -335,7 +335,7 @@ def _river_fold_hand(
     )
 
 
-def _river_fold_beside_a_showdown_hand() -> EnrichedHand:
+def _river_fold_beside_a_showdown_hand(*, hero_shows: bool = True) -> EnrichedHand:
     """Герой пасует на ривере, а двое соперников доходят до вскрытия.
 
     Заведена ради случая, где запись о показе стоит РЯДОМ с настоящим вскрытием:
@@ -415,7 +415,7 @@ def _river_fold_beside_a_showdown_hand() -> EnrichedHand:
             showdowns=[
                 ShowdownEntry(label="P5", cards=["Ks", "Kd"]),
                 ShowdownEntry(label="P6", cards=["8c", "8d"]),
-                ShowdownEntry(label="Hero", cards=["Jh"]),
+                *([ShowdownEntry(label="Hero", cards=["Jh"])] if hero_shows else []),
             ],
         )
     )
@@ -605,7 +605,7 @@ def _fabricated_showdown_hand() -> EnrichedHand:
             dealt={"Hero": ["Jh", "9h"]},  # карт соперника на экране не видно
             # Борд подобран так, чтобы выдуманное вскрытие герой ПРОИГРАЛ:
             # остаток колоды движок берёт по порядку (`replay._DECK`), и
-            # непрочитанному сопернику достаётся 4♣️4♦️ — сет на этом борде.
+            # непрочитанному сопернику достаётся 4♣4♦ — сет на этом борде.
             # Выиграй герой, блок промолчал бы и без страховки (банка рум не
             # записал), и тест ничего бы не проверял.
             boards={
@@ -655,6 +655,82 @@ def _untouched_stack_hand() -> EnrichedHand:
     return _enriched(raw)
 
 
+def _owner_example_hand(*, hero_cards: tuple[str, str] = ("5c", "3c")) -> EnrichedHand:
+    """Раздача из примера владельца (2026-10-07) в синтетике: те же позиции, карты,
+    ставки и итоговые величины в ББ; номер руки, метки игроков (P1…P7) и фишки — синтетические.
+
+    Семь мест, кнопка на 7-м: SB, BB (герой, 37.1 ББ), UTG, UTG+1 (100 ББ), HJ, CO,
+    BTN. Суммы подобраны так, чтобы округлились в числа примера: банк 7 089 при
+    bb 250 — 28.4 ББ, банк до ривера 2 837 — 11.3 ББ, убыль героя 3 407 — 13.6 ББ.
+
+    `hero_cards` — для выигранного вскрытия: с картами, бьющими T♣Q♣, банк
+    записан на героя.
+    """
+    opener = "P4"
+    seats = [
+        SeatInfo(seat=1, label="P1", stack=20_000),
+        SeatInfo(seat=2, label="Hero", stack=9_275),
+        SeatInfo(seat=3, label="P3", stack=20_000),
+        SeatInfo(seat=4, label=opener, stack=25_000),
+        *[SeatInfo(seat=n, label=f"P{n}", stack=20_000) for n in (5, 6, 7)],
+    ]
+
+    def act(street: Street, label: str, kind: ActionKind, amount: int | None = None,
+            to_amount: int | None = None) -> RawAction:
+        return RawAction(
+            street=street, label=label, kind=kind, amount=amount, to_amount=to_amount,
+            raw_line=f"{label}: {kind.value}",
+        )
+
+    raw = RawHand(
+        provenance=Provenance.HAND_HISTORY,
+        source_ref="synthetic",
+        hand_no="SYN-OWNER",
+        tournament_id="TSYN",
+        tournament_name="synthetic",
+        level=5,
+        sb=125,
+        bb=250,
+        ante=30,
+        timestamp=_START,
+        table_name="syn",
+        max_seats=7,
+        button_seat=7,
+        seats=seats,
+        posts=[Post(label=s.label, kind=PostKind.ANTE, amount=30) for s in seats]
+        + [
+            Post(label="P1", kind=PostKind.SMALL_BLIND, amount=125),
+            Post(label="Hero", kind=PostKind.BIG_BLIND, amount=250),
+        ],
+        dealt={"Hero": list(hero_cards)},
+        actions=[
+            _fold("P3"),
+            act(Street.PREFLOP, opener, ActionKind.RAISE, to_amount=500),
+            *[_fold(label) for label in ("P5", "P6", "P7", "P1")],
+            act(Street.PREFLOP, "Hero", ActionKind.CALL, amount=250),
+            act(Street.FLOP, "Hero", ActionKind.CHECK),
+            act(Street.FLOP, opener, ActionKind.CHECK),
+            act(Street.TURN, "Hero", ActionKind.BET, amount=751),
+            act(Street.TURN, opener, ActionKind.CALL, amount=751),
+            act(Street.RIVER, "Hero", ActionKind.BET, amount=2_126),
+            act(Street.RIVER, opener, ActionKind.CALL, amount=2_126),
+        ],
+        boards={
+            Street.FLOP: ["Qh", "4d", "2d"],
+            Street.TURN: ["7s"],
+            Street.RIVER: ["Qd"],
+        },
+        showdowns=[
+            ShowdownEntry(label="Hero", cards=list(hero_cards)),
+            ShowdownEntry(label=opener, cards=["Tc", "Qc"]),
+        ],
+        collected=[
+            Collected(label="Hero" if hero_cards != ("5c", "3c") else opener, amount=7_089)
+        ],
+    )
+    return _enriched(raw)
+
+
 def _lines(text: str) -> list[str]:
     return [line for line in text.splitlines() if line.strip()]
 
@@ -662,9 +738,35 @@ def _lines(text: str) -> list[str]:
 # --- форма: проза, ББ, «вы» ----------------------------------------------------------
 
 
-def test_header_is_one_line_with_position_cards_and_stack():
-    """Шапка — одна строка (спека §5.6): позиция героя, карманные карты, стек в ББ."""
-    assert hand_replay(_preflop_shove_hand()).plain.startswith("Вы на SB, J♥️9♥️, 10.0 ББ.\n")
+def test_the_hero_line_has_position_cards_and_stack():
+    """Строка героя одна (спека §5.6): позиция, карманные карты, стек до раздачи в ББ."""
+    assert "\nВы на SB, J♥9♥, 10.0 ББ.\n" in hand_replay(_preflop_shove_hand()).plain
+
+
+def test_the_block_has_the_owners_layout_line_by_line():
+    """Форма владельца 2026-10-07 целиком, на синтетике его раздачи: шапка, строка
+    героя, по строке на улицу с банком в скобках, конечный банк, вскрытие с
+    исходом через ` · `. Без «фишек» у блайндов и без «(с каждого)» у анте."""
+    assert hand_replay(_owner_example_hand()).plain == (
+        "Рука SYN-OWNER · уровень 5 · блайнды 125/250 · анте 30 фишек\n"
+        "Игроков в раздаче: 7.\n"
+        "\n"
+        "Вы на BB, 5♣3♣, 37.1 ББ.\n"
+        "Префлоп: UTG фолд → UTG+1 (100ББ) опен 2.0 → HJ/CO/BTN/SB фолд → вы колл\n"
+        "Флоп Q♥ 4♦ 2♦ (банк 5.3): вы чек → UTG+1 чек\n"
+        "Тёрн 7♠ (банк 5.3): вы бет 3.0 → UTG+1 колл\n"
+        "Ривер Q♦ (банк 11.3): вы бет 8.5 → UTG+1 колл\n"
+        "Конечный банк: 28.4 ББ.\n"
+        "Вскрытие: вы 5♣3♣ vs UTG+1 T♣Q♣ · отдаёте 13.6 ББ"
+    )
+
+
+def test_an_ante_of_another_kind_keeps_its_kind_in_the_header():
+    """«С каждого» не называется, любой другой тип анте — называется: та же сумма
+    анте большого блайнда — другая раздача, и спрятать это нельзя."""
+    en = _owner_example_hand()
+    en.hand.ante_type = "bb_ante"
+    assert "· анте 30 фишек (bb_ante)\n" in hand_replay(en).plain
 
 
 def test_the_replay_speaks_in_big_blinds_not_chips():
@@ -673,9 +775,13 @@ def test_the_replay_speaks_in_big_blinds_not_chips():
     assert "ББ" in text
 
 
-def test_the_replay_is_a_short_paragraph():
-    """Построчный формат и был причиной, по которой блок прятали под кнопку."""
-    assert len(_lines(hand_replay(_postflop_hand()).plain)) <= 3
+def test_every_street_is_its_own_line():
+    """Абзац одной строкой не читался (владелец 2026-10-07): каждая улица — своя
+    строка, и начинается она названием улицы."""
+    lines = hand_replay(_postflop_hand()).plain.splitlines()
+    assert any(line.startswith("Префлоп: UTG/HJ фолд → CO (50ББ) опен 2.5") for line in lines)
+    flop = [line for line in lines if line.startswith("Флоп")]
+    assert flop == ["Флоп 6♠ J♦ Q♦ (банк 6.6): вы чек → CO бет 3.0 → вы фолд"]
 
 
 def test_the_replay_addresses_the_player_as_you_everywhere():
@@ -687,26 +793,22 @@ def test_the_replay_addresses_the_player_as_you_everywhere():
         assert "вы" in text.lower()
 
 
-def test_a_street_sentence_starts_with_a_capital_even_when_it_is_you():
+def test_the_pot_of_a_street_stands_in_brackets_after_its_board():
     text = hand_replay(_postflop_hand()).plain
-    assert "банк 6.6. Вы чек" in text and "→ вы фолд" in text
+    assert "Флоп 6♠ J♦ Q♦ (банк 6.6): вы чек" in text and "→ вы фолд" in text
 
 
 # --- масти -------------------------------------------------------------------------
 
 
-def test_suits_are_symbols_with_colour_and_never_letters():
-    """Масти — символ плюс цвет, никогда буквы (спека §5.6, требование дословно).
-
-    Цвет в тексте Телеграма даёт только эмодзи-презентация, поэтому за каждым
-    символом масти стоит селектор U+FE0F: ♠️♣️ тёмные, ♥️♦️ красные. Буквенная
-    нотация не должна встречаться ни в одном виде — ни `Jh`, ни `J h`.
+def test_suits_are_symbols_without_the_emoji_selector():
+    """Масти — символом, никогда буквами (спека §5.6), и без селектора
+    эмодзи-презентации U+FE0F: «♥», а не «♥️» (решение владельца 2026-10-07).
+    Буквенная нотация не должна встречаться ни в одном виде — ни `Jh`, ни `J h`.
     """
     text = hand_replay(_preflop_shove_hand()).plain
-    for suit in "♠♥♦♣":
-        for position in (m.start() for m in re.finditer(suit, text)):
-            assert text[position + 1] == "️", f"масть {suit} без цвета"
-    assert "♥️" in text and "♠️" in text
+    assert "\ufe0f" not in text
+    assert "♥" in text and "♠" in text
     assert not re.search(r"\b[AKQJT2-9][shdc]\b", text)
 
 
@@ -731,9 +833,11 @@ def test_consecutive_folds_are_merged_into_one_token():
 def test_a_run_out_street_prints_only_its_board():
     """После олл-ина никто не ходит. Печатается борд — и НИКАКИХ «чек-чек»:
     приписать игрокам действия, которых не было, значит выдумать ход руки."""
-    text = hand_replay(_preflop_shove_hand()).plain
-    assert "чек" not in text.lower()
-    assert "Флоп 6♠️ J♦️ Q♦️ · Тёрн 7♥️ · Ривер A♥️." in text
+    lines = hand_replay(_preflop_shove_hand()).plain.splitlines()
+    assert "чек" not in "\n".join(lines).lower()
+    assert ["Флоп 6♠ J♦ Q♦", "Тёрн 7♥", "Ривер A♥"] == [
+        line for line in lines if line.startswith(("Флоп", "Тёрн", "Ривер"))
+    ]
 
 
 def test_raise_over_a_raise_is_called_a_3bet_preflop():
@@ -790,7 +894,9 @@ def test_the_replay_prints_no_number_the_hand_does_not_contain():
     """
     en = _preflop_shove_hand()
     hand = en.hand
-    allowed = {float(hand.level), float(hand.sb), float(hand.bb)}
+    allowed = {float(hand.level), float(hand.sb), float(hand.bb), float(hand.ante)}
+    allowed |= {float(len(hand.players))}
+    allowed |= {round(en.report.final_pot / hand.bb, 1)}
     allowed |= {float(p.stack) for p in hand.players}
     allowed |= {round(p.stack_bb, 1) for p in hand.players}
     allowed |= {round(p.stack / hand.bb, 1) for p in hand.players}
@@ -814,7 +920,8 @@ def test_the_replay_prints_no_number_the_hand_does_not_contain():
         for card in [*hand.dealt["Hero"], *(c for cs in hand.boards.values() for c in cs)]
         if card[0].isdigit()
     }
-    text = re.sub(r"\s", "", hand_replay(en).plain)
+    # Номер руки — идентификатор, а не величина.
+    text = re.sub(r"\s", "", hand_replay(en).plain.replace(hand.hand_no, ""))
     numbers = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", text)]
     assert numbers, "в реплее не осталось ни одного числа — тест перестал что-либо значить"
     assert set(numbers) <= allowed, f"выдуманные числа: {set(numbers) - allowed}"
@@ -829,7 +936,7 @@ def test_showdown_line_shows_the_cards_that_were_actually_shown():
     line = next(
         line for line in _lines(hand_replay(_preflop_shove_hand()).plain) if "Вскрытие" in line
     )
-    assert "вы J♥️9♥️" in line and "K♠️K♦️" in line
+    assert "вы J♥9♥" in line and "K♠K♦" in line
 
 
 def test_players_who_reached_the_showdown_carry_no_show_mark():
@@ -838,7 +945,7 @@ def test_players_who_reached_the_showdown_carry_no_show_mark():
     line = next(
         line for line in _lines(hand_replay(_preflop_shove_hand()).plain) if "Вскрытие" in line
     )
-    assert "вы J♥️9♥️ vs CO K♠️K♦️" in line
+    assert "вы J♥9♥ vs CO K♠K♦" in line
     assert "показал" not in line
 
 
@@ -853,8 +960,8 @@ def test_a_card_shown_after_a_fold_is_marked_as_a_show():
         ]
     )
     line = next(line for line in _lines(hand_replay(en).plain) if "Вскрытие" in line)
-    assert "вы J♥️9♥️ vs CO K♠️K♦️" in line
-    assert "BTN A♠️ (игрок показал)" in line
+    assert "вы J♥9♥ vs CO K♠K♦" in line
+    assert "BTN A♠ (игрок показал)" in line
     assert "vs BTN" not in line
 
 
@@ -869,21 +976,21 @@ def test_cards_of_a_folded_player_read_off_a_screenshot_are_not_printed():
         )
     ).plain
     assert "Вскрытие" not in text and "показал" not in text
-    assert text.count("J♥️T♠️") == 1, "карты героя удвоились строкой вскрытия"
+    assert text.count("J♥T♠") == 1, "карты героя удвоились строкой вскрытия"
 
 
 def test_a_show_without_a_showdown_is_not_called_a_showdown():
     """Рум назвал карту спасовавшего в раздаче, где до вскрытия не дошёл никто:
     карта печатается, а слово «Вскрытие» — нет, вскрытия не было. Показ героя —
-    фраза во втором лице и отдельное предложение, значит с заглавной буквы.
-    Последним предложением абзаца она больше не стоит: за ней идёт исход раздачи."""
+    фраза во втором лице и своя строка, значит с заглавной буквы; исход раздачи
+    к показу не клеится — вскрытия не было — и стоит следующей строкой."""
     text = hand_replay(
         _river_fold_hand(
             provenance=Provenance.HAND_HISTORY,
             showdowns=[ShowdownEntry(label="Hero", cards=["Jh"])],
         )
     ).plain
-    assert "вы фолд. Вы показали J♥️." in text
+    assert text.splitlines()[-2:] == ["Вы показали J♥", "Отдаёте 2.6 ББ."]
     assert "Вскрытие" not in text
 
 
@@ -893,7 +1000,17 @@ def test_a_hero_show_beside_a_real_showdown_stays_inside_the_line():
     потому со строчной."""
     text = hand_replay(_river_fold_beside_a_showdown_hand()).plain
     line = next(line for line in _lines(text) if "Вскрытие" in line)
-    assert "Вскрытие: CO K♠️K♦️ vs BTN 8♣️8♦️; вы показали J♥️." in line
+    assert line == "Вскрытие: CO K♠K♦ vs BTN 8♣8♦; вы показали J♥"
+    assert text.splitlines()[-1].startswith("Отдаёте "), "исход героя — своей строкой"
+
+
+def test_a_showdown_without_the_hero_does_not_carry_his_outcome():
+    """Герой спасовал и карт не показал, вскрылись двое других. Исход героя (здесь
+    его вложения до паса) к их вскрытию не клеится — иначе «Вскрытие: … · отдаёте»
+    читалось бы как проигрыш на вскрытии. Исход стоит своей строкой."""
+    lines = hand_replay(_river_fold_beside_a_showdown_hand(hero_shows=False)).plain.splitlines()
+    assert lines[-2] == "Вскрытие: CO K♠K♦ vs BTN 8♣8♦"
+    assert re.fullmatch(r"Отдаёте \d+\.\d ББ\.", lines[-1])
 
 
 def test_a_hand_without_a_showdown_says_nothing_about_one():
@@ -914,6 +1031,16 @@ def test_a_won_hand_ends_with_the_whole_pot():
     assert hero_stack_delta_bb(en) == 1.8
 
 
+def test_a_won_showdown_ends_with_the_pot_after_the_cards():
+    """Выигранное вскрытие: исход — та же строка, через ` · `, словом «забираете»
+    и банком героя целиком (`_outcome_line`)."""
+    en = _owner_example_hand(hero_cards=("Ks", "Qs"))
+    assert hero_stack_delta_bb(en) > 0, "фикстура перестала быть выигранной"
+    assert hand_replay(en).plain.splitlines()[-1] == (
+        "Вскрытие: вы K♠Q♠ vs UTG+1 T♣Q♣ · забираете 28.4 ББ"
+    )
+
+
 def test_a_lost_hand_ends_with_the_chips_that_left_the_stack():
     """Проигрыш — чистая убыль стека: колл до 250 плюс анте 10 при bb 100."""
     text = hand_replay(_postflop_hand()).plain
@@ -923,7 +1050,7 @@ def test_a_lost_hand_ends_with_the_chips_that_left_the_stack():
 def test_an_untouched_stack_ends_the_paragraph_without_an_outcome():
     """Ноль движения — фразы нет вовсе: «Отдаёте 0.0 ББ» не событие раздачи."""
     text = hand_replay(_untouched_stack_hand()).plain
-    assert text.rstrip().endswith("вы фолд → SB фолд."), "абзац кончился не ходом раздачи"
+    assert text.splitlines()[-1].startswith("Конечный банк:"), "за банком появилась строка"
     assert "Забираете" not in text and "Отдаёте" not in text
 
 
@@ -935,8 +1062,8 @@ def test_the_sign_comes_from_the_stack_not_from_the_payout_record():
     раздаче, которую герой проиграл.
     """
     text = hand_replay(_side_pot_loss_hand()).plain
-    assert text.rstrip().endswith("Отдаёте 1.1 ББ.")
-    assert "Забираете" not in text
+    assert text.rstrip().endswith(" · отдаёте 1.1 ББ")
+    assert "забираете" not in text.lower()
 
 
 def test_a_win_the_source_did_not_record_stays_silent():
@@ -950,7 +1077,7 @@ def test_a_win_the_source_did_not_record_stays_silent():
     en = _folded_through_shove_hand()
     en.hand.collected.clear()
     text = hand_replay(en).plain
-    assert text.rstrip().endswith("BB фолд."), "абзац кончился не ходом раздачи"
+    assert text.splitlines()[-1].startswith("Конечный банк:"), "за банком появилась строка"
     assert "Забираете" not in text and "Отдаёте" not in text
 
 
@@ -967,8 +1094,8 @@ def test_an_unverified_showdown_leaves_the_outcome_unsaid():
     assert en.verdict.not_checked, "фикстура перестала быть непроверенным входом"
     assert hero_stack_delta_bb(en) < 0, "без проигрыша по стекам блок промолчал бы и без страховки"
     text = hand_replay(en).plain
-    assert text.rstrip().endswith("Вскрытие: вы J♥️9♥️.")
-    assert "Забираете" not in text and "Отдаёте" not in text
+    assert text.splitlines()[-1] == "Вскрытие: вы J♥9♥"
+    assert "забираете" not in text.lower() and "отдаёте" not in text.lower()
 
 
 def test_the_replay_no_longer_prints_the_cost_of_the_decision():
@@ -983,15 +1110,25 @@ def test_the_replay_no_longer_prints_the_cost_of_the_decision():
 def test_an_opponent_carries_its_label_and_both_frequencies_once():
     stats = {"P5": PlayerStats(hands=40, vpip=10, pfr=7)}
     text = hand_replay(_postflop_hand(), stats=stats).plain
-    assert "CO (P5, VPIP 25%, PFR 18%) опен 2.5" in text
+    assert "CO (50ББ · P5: VPIP 25%, PFR 18%, раздач 40) опен 2.5" in text
     assert text.count("P5") == 1, "метка ставится один раз, не у каждого хода"
 
 
-def test_an_opponent_without_a_sample_carries_no_brackets():
-    """Скрин даёт одну руку, знаменателя нет. «VPIP 0%» никто не измерял;
-    пустая скобка не печатается вовсе."""
-    text = hand_replay(_postflop_hand(), stats={"P5": PlayerStats()}).plain
-    assert "VPIP" not in text and "(" not in text
+def test_an_opponent_without_a_sample_carries_only_his_stack():
+    """Выборки нет — «VPIP 0%» никто не измерял: в скобке остаётся один стек."""
+    for stats in ({"P5": PlayerStats()}, None):
+        text = hand_replay(_postflop_hand(), stats=stats).plain
+        assert "VPIP" not in text and "P5" not in text
+        assert "CO (50ББ) опен 2.5" in text
+
+
+def test_an_opponent_who_stays_in_carries_his_starting_stack():
+    """Стек — стартовый, до раздачи, в ББ, ровное число без «.0», при первом
+    упоминании; спасовавшие на префлопе стека не несут."""
+    text = hand_replay(_owner_example_hand()).plain
+    assert "UTG+1 (100ББ) опен 2.0" in text
+    assert text.count("(100ББ)") == 1, "стек ставится один раз, не у каждого хода"
+    assert "UTG (" not in text and "HJ/CO/BTN/SB фолд" in text
 
 
 def test_a_measured_zero_is_printed_because_it_was_measured():
@@ -1021,7 +1158,7 @@ def test_the_hero_gets_no_label_though_he_is_in_the_stats():
     """
     row = PlayerStats(hands=40, vpip=10, pfr=7)
     text = hand_replay(_postflop_hand(), stats={"Hero": row, "P5": row}).plain
-    assert "CO (P5, VPIP 25%, PFR 18%) опен 2.5" in text
+    assert "CO (50ББ · P5: VPIP 25%, PFR 18%, раздач 40) опен 2.5" in text
     assert "Hero" not in text
     assert "вы (" not in text.lower()
 
