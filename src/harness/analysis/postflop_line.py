@@ -36,14 +36,20 @@
 назначение и пороги не входят.
 
 **Пороги** (§4.6) — только у блефа и полублефа. Чистый блеф — `B / (P + B)`, где
-`B` — сколько герой добавляет. Полублеф — только один на один:
+`B` — сколько герой добавляет, урезанное стеком соперника: в `B` идёт ставка не
+выше `DecisionPoint.eff_stack` за вычетом поставленного героем на улице до неё
+(`test_the_thresholds_cut_the_bet_by_the_opponents_stack`); размер в «сыграно»
+считается от полной ставки. Полублеф — только один на один:
 `E = q·(P + B + C) − B`, где `C` — колл соперника (`B` у ставки, `B − колл` у
-рейза), `q` — шанс собрать к концу раздачи; порог `−E / (P − E)`, при `E ≥ 0` —
-ноль и признак «окупается без фолдов». Колл с дро — `C / (P + C)` против шанса на
+рейза, оба после урезания), `q` — шанс собрать к концу раздачи, точной дробью;
+порог `−E / (P − E)`, при `E ≥ 0` (включая ровно ноль,
+`test_a_semibluff_with_zero_expectation_pays_without_folds`) — ноль и признак
+«окупается без фолдов». Колл с дро — `C / (P + C)` против шанса на
 следующей карте, а если после колла у героя или у соперника не остаётся фишек —
-против шанса к риверу; иначе `X = C / q − (P + C)` и сравнение `X` с меньшим из
-стеков после колла, `DecisionPoint.eff_stack − (поставлено героем на улице после
-колла)`.
+против шанса к риверу; иначе `X = C / q − (P + C)` точной дробью, вверх до
+фишки, и сравнение `X` с меньшим из стеков после колла,
+`DecisionPoint.eff_stack − (поставлено героем на улице после колла)`: «добрать
+столько нельзя» — только при `X` строго больше.
 """
 
 from __future__ import annotations
@@ -313,15 +319,20 @@ def _fold_threshold(
 ) -> FoldThreshold:
     taken = en.hand.actions[index]
     pot = dp.pot_before
-    bet = taken.committed_after - _committed_on_street(en.hand, index, taken.label)
+    # Ставка сверх стека соперника вернётся герою: в пороги идёт только та её
+    # часть, которую соперник может уравнять. Размер в «сыграно» описывает
+    # сыгранное и считается от полной ставки (`_line`).
+    bet = min(taken.committed_after, dp.eff_stack) - _committed_on_street(
+        en.hand, index, taken.label
+    )
     semibluff: float | None = None
     free = False
     if draw is not None and len(_live(en, index)) == _HEADS_UP:
-        hit = _hit_to_the_end(draw)
+        hit = _exact_hit(draw, to_the_end=True)
         their_call = bet - dp.to_call
         ev = hit * (pot + bet + their_call) - bet
         free = ev >= 0
-        semibluff = 0.0 if free else -ev / (pot - ev)
+        semibluff = 0.0 if free else float(-ev / (pot - ev))
     return FoldThreshold(bluff=bet / (pot + bet), semibluff=semibluff, semibluff_free=free)
 
 

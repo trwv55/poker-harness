@@ -781,6 +781,92 @@ def test_a_semibluff_that_pays_without_folds_is_flagged_and_needs_none():
     assert detail.fold_threshold.bluff == 1_000 / 11_000
 
 
+# Флеш-дро с двусторонним, 15 аутов: T♣7♣ на K♥9♣8♣, тёрн 2♦.
+_COMBO_BOARD = {F: ["Kh", "9c", "8c"], T: ["2d"], R: ["2s"]}
+
+
+def test_the_thresholds_cut_the_bet_by_the_opponents_stack():
+    """Шов 49 700 в банк 600 против стека 4 700: соперник уравняет только 4 700.
+
+    Пороги считаются от B = 4 700: блеф 4 700 / 5 300 = 88.7%, полублеф с 15
+    аутами на тёрне 70.6%. От полной ставки вышло бы 98.8% и 96.6%. Размер в
+    «сыграно» описывает сыгранное и остаётся от полной ставки.
+    """
+    en = _oop(
+        [
+            *_V_OPENS,
+            _check(F, "Hero"),
+            _check(F, "V"),
+            _bet(T, "Hero", 49_700),
+        ],
+        seats=(("Hero", 50_000), ("V", 5_000)),
+        hero_cards=("Tc", "7c"),
+        boards=_COMBO_BOARD,
+    )
+    dp = _points(en, T)[-1]
+    assert (dp.pot_before, dp.to_call, dp.eff_stack) == (600, 0, 4_700)
+    detail = _detail(en, T)
+    assert detail.draw is not None and len(detail.draw.outs) == 15
+    assert detail.line is not None and detail.line.purpose is Purpose.SEMIBLUFF
+    assert detail.line.size_pct == 49_700 / 600
+    threshold = detail.fold_threshold
+    assert threshold is not None
+    assert threshold.bluff == 4_700 / 5_300
+    assert round(threshold.bluff, 3) == 0.887
+    ev = Fraction(15, 46) * (600 + 4_700 + 4_700) - 4_700
+    assert threshold.semibluff == pytest.approx(float(-ev / (600 - ev)), abs=1e-12)
+    assert threshold.semibluff is not None and round(threshold.semibluff, 3) == 0.706
+
+
+def test_a_raise_threshold_cuts_the_raise_and_the_call_by_the_opponents_stack():
+    """Рейз в олл-ин 49 700 на тёрне против ставки 1 000 при стеке соперника
+    4 700: B = 4 700, C = 4 700 − 1 000, P = 1 600 (банк со ставкой)."""
+    en = _oop(
+        [
+            *_V_OPENS,
+            _check(F, "Hero"),
+            _check(F, "V"),
+            _check(T, "Hero"),
+            _bet(T, "V", 1_000),
+            _raise(T, "Hero", 49_700),
+        ],
+        seats=(("Hero", 50_000), ("V", 5_000)),
+        hero_cards=("Tc", "7c"),
+        boards=_COMBO_BOARD,
+    )
+    dp = _points(en, T)[-1]
+    assert (dp.pot_before, dp.to_call, dp.eff_stack) == (1_600, 1_000, 4_700)
+    detail = _detail(en, T)
+    assert detail.line is not None and detail.line.purpose is Purpose.SEMIBLUFF
+    assert detail.line.size_pct == (49_700 - 1_000) / (1_600 + 1_000)
+    threshold = detail.fold_threshold
+    assert threshold is not None
+    assert threshold.bluff == 4_700 / 6_300
+    ev = Fraction(15, 46) * (1_600 + 4_700 + 3_700) - 4_700
+    assert threshold.semibluff == pytest.approx(float(-ev / (1_600 - ev)), abs=1e-12)
+
+
+def test_a_semibluff_with_zero_expectation_pays_without_folds():
+    """Ровно E = 0: 15/46 · (1 600 + 2 · 1 500) − 1 500 = 0 — «окупается без фолдов»."""
+    en = _oop(
+        [
+            _raise(P, "V", 800),
+            _call(P, "Hero", 700),
+            _check(F, "Hero"),
+            _check(F, "V"),
+            _bet(T, "Hero", 1_500),
+        ],
+        hero_cards=("Tc", "7c"),
+        boards=_COMBO_BOARD,
+    )
+    assert _points(en, T)[-1].pot_before == 1_600
+    detail = _detail(en, T)
+    assert detail.line is not None and detail.line.purpose is Purpose.SEMIBLUFF
+    assert Fraction(15, 46) * (1_600 + 2 * 1_500) - 1_500 == 0
+    assert detail.fold_threshold is not None
+    assert (detail.fold_threshold.semibluff, detail.fold_threshold.semibluff_free) == (0.0, True)
+
+
 def test_the_semibluff_threshold_is_heads_up_only():
     board = {F: ["Kh", "9d", "8s"], T: ["2c"], R: ["2d"]}
     seats = (("Hero", _STACK), ("V2", _STACK), ("V1", _STACK))
