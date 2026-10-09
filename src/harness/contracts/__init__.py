@@ -1,8 +1,8 @@
 """Контракты данных: модели, которыми обмениваются сервисы конвейера.
 
 Публичный API пакета — реэкспорт из всех подмодулей (`raw`, `canonical`,
-`enriched`, `ranges`, `analysis`, `explanation`, `vision`), чтобы последующие задачи
-импортировали из `harness.contracts`, а не из отдельных модулей.
+`enriched`, `ranges`, `analysis`, `postflop`, `explanation`, `vision`), чтобы
+последующие задачи импортировали из `harness.contracts`, а не из отдельных модулей.
 """
 
 from __future__ import annotations
@@ -105,6 +105,17 @@ from harness.contracts.history import (
     parse_note_colors,
 )
 from harness.contracts.model_output import ModelOutput
+from harness.contracts.postflop import (
+    Backdoor,
+    Combination,
+    Draw,
+    DrawKind,
+    HandCategory,
+    HandStrength,
+    Overcards,
+    ShowdownValue,
+    StrengthClass,
+)
 from harness.contracts.ranges import RANKS, Range, all_classes, class_of
 from harness.contracts.raw import (
     ActionKind,
@@ -150,6 +161,7 @@ __all__ = [
     "AllInEvent",
     "AnalysisResult",
     "Assumption",
+    "Backdoor",
     "BetSizeThreshold",
     "CalcName",
     "CalcParams",
@@ -158,12 +170,15 @@ __all__ = [
     "CanonicalHand",
     "ChipMove",
     "Collected",
+    "Combination",
     "Completeness",
     "CoverageParams",
     "CoverageResult",
     "DecisionPoint",
     "DefenseParams",
     "DefenseResult",
+    "Draw",
+    "DrawKind",
     "EngineReport",
     "EnrichedHand",
     "EvInterval",
@@ -172,6 +187,8 @@ __all__ = [
     "Finding",
     "FrequencyResult",
     "FrequencyStat",
+    "HandCategory",
+    "HandStrength",
     "HeroFrequencyParams",
     "Identity",
     "LeakRule",
@@ -187,6 +204,7 @@ __all__ = [
     "NoteRecord",
     "OpponentFrequencyParams",
     "OpponentRecord",
+    "Overcards",
     "PlayerState",
     "PlayerStats",
     "PointFilter",
@@ -209,10 +227,12 @@ __all__ = [
     "SessionLine",
     "SessionSummary",
     "ShowdownEntry",
+    "ShowdownValue",
     "SidePot",
     "SpotKind",
     "StackTrajectory",
     "Street",
+    "StrengthClass",
     "Subject",
     "SummaryInfo",
     "ThresholdOutcome",
