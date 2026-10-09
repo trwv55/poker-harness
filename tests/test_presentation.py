@@ -734,6 +734,28 @@ def test_the_deep_dive_opens_with_what_happened_in_html():
     assert "BB &amp; CO" in msg.text, "остальной текст экранируется"
 
 
+def test_street_titles_are_bold_in_the_html_and_nothing_else_of_the_flow_is():
+    """Названия улиц («Префлоп:», «Флоп:» …) — жирным вместе с двоеточием
+    (решение владельца 2026-10-09); ход героя остаётся жирным как был, прочий
+    поток — нет. Экранирование не двоится: `&` в потоке — один раз `&amp;`."""
+    en = _postflop_hand()
+    msg = _deep_dive(analyze_hand(en), en)
+    assert "\n<b>Префлоп:</b> " in msg.text
+    assert "\n<b>Флоп:</b> 6♠ J♦ Q♦ (банк 6.6): " in msg.text
+    assert "Вскрытие" not in msg.text or "<b>Вскрытие" not in msg.text
+    replay = HandReplay(
+        spans=[
+            ReplaySpan(text="\n"),
+            ReplaySpan(text="Тёрн:", title=True),
+            ReplaySpan(text=" 7♠ & "),
+            ReplaySpan(text="вы шов", emphasis=True),
+        ]
+    )
+    html = _deep_dive(_two_point_result(), replay=replay).text
+    assert "<b>Тёрн:</b> 7♠ &amp; <b>вы шов</b>" in html
+    assert "&amp;amp;" not in html
+
+
 def test_the_block_title_ends_with_a_colon():
     """«Что было:» с двоечием (решение владельца 2026-10-07), и сразу под ним —
     шапка раздачи: номер руки стоит в блоке, а не в сырых числах."""
@@ -751,7 +773,6 @@ def test_the_lines_that_moved_into_the_block_are_not_printed_twice():
     for gone in (
         "Вы: ",
         "стек до раздачи",
-        "после раздачи",
         "Борд по улицам",
         "Банк по улицам",
         "Исход раздачи для вас",
@@ -759,7 +780,7 @@ def test_the_lines_that_moved_into_the_block_are_not_printed_twice():
         "с каждого",
     ):
         assert gone not in text, f"старая строка осталась: «{gone}»"
-    for once in ("Рука SYN1 · ", "Игроков в раздаче:", "Вы на ", "Конечный банк:", "Отдаёте "):
+    for once in ("Рука SYN1 · ", "Игроков в раздаче:", "Вы на ", "Конечный банк:", "Итог: ", "Стек после раздачи: "):
         assert text.count(once) == 1, f"«{once}» напечатано не один раз"
     assert "\ufe0f" not in text
 
@@ -1920,7 +1941,7 @@ def test_the_raw_data_block_names_what_each_number_means():
         "позиция",
         "(банк ",
         "Конечный банк",
-        "Отдаёте",
+        "Итог",
         "банк до хода",
         "доставить",
         "эфф. стек",

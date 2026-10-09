@@ -137,7 +137,7 @@ from harness.contracts.history import (
     is_judged,
 )
 from harness.contracts.raw import ActionKind, Street
-from harness.explanation.hand_replay import HandReplay, bb, chips
+from harness.explanation.hand_replay import HandReplay, bb, chips, signed_bb
 from harness.presentation.keyboards import (
     MAIN_MENU,
     MENU_LEAKS,
@@ -397,10 +397,7 @@ def _signed_bb_number(value_bb: float) -> str:
     интервал пересекает ноль. Без явного плюса читатель видит два числа и должен
     сам заметить, что у одного знак есть, а у другого нет.
     """
-    magnitude = round(abs(value_bb), 1)
-    if magnitude == 0.0:
-        return "0.0"
-    return f"{'−' if value_bb < 0 else '+'}{magnitude:.1f}"
+    return signed_bb(value_bb)
 
 
 def _fmt_signed_bb(value_bb: float) -> str:
@@ -2083,7 +2080,7 @@ def _html_escape(text: str) -> str:
 
 
 def _replay_html(replay: HandReplay) -> str:
-    """Ход раздачи разметкой Телеграма: точка решения героя — жирным.
+    """Ход раздачи разметкой Телеграма: точка решения героя и названия улиц — жирным.
 
     Спека §5.6 требует выделить точку решения прямо в потоке действий;
     `explanation.hand_replay` отдаёт куски с флагом `emphasis`, а во что
@@ -2094,7 +2091,9 @@ def _replay_html(replay: HandReplay) -> str:
     читаются они порознь.
     """
     return "".join(
-        f"<b>{_html_escape(span.text)}</b>" if span.emphasis else _html_escape(span.text)
+        f"<b>{_html_escape(span.text)}</b>"
+        if span.emphasis or span.title
+        else _html_escape(span.text)
         for span in replay.spans
     )
 

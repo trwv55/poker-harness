@@ -2197,21 +2197,47 @@ async def test_a_single_hand_file_prints_no_opponent_frequencies(
     assert "SB (10ББ) опен 3.0" in text
 
 
+def _copies_of_the_second_hand(n: int) -> str:
+    """`n` синтетических раздач того же турнира с разными номерами: Bob в каждой пасует."""
+    return "\n\n".join(
+        _SYNTHETIC_HH_SECOND.replace("#SYNTH2:", f"#SYNTHX{i}:") for i in range(n)
+    )
+
+
 async def test_opponent_frequencies_come_only_from_other_hands(
     deps, queue, db_factory, fake_sender, tmp_path
 ):
-    """Две раздачи турнира: частоты Bob при разборе SYNTH1 — по SYNTH2 одной."""
+    """Двадцать других раздач турнира: частоты Bob при разборе SYNTH1 — по ним,
+    разбираемая в выборку не входит (раздач ровно 20, не 21)."""
     text = await _deep_dive_text(
         deps,
         queue,
         db_factory,
         fake_sender,
         tmp_path,
-        _SYNTHETIC_HH + "\n\n" + _SYNTHETIC_HH_SECOND,
+        _SYNTHETIC_HH + "\n\n" + _copies_of_the_second_hand(20),
         "SYNTH1",
     )
-    assert "VPIP 0%, PFR 0%, раздач 1)" in text
+    assert "VPIP 0%, PFR 0%, раздач 20)" in text
     assert "SB (10ББ · " in text
+
+
+async def test_nineteen_other_hands_are_not_enough_for_frequencies(
+    deps, queue, db_factory, fake_sender, tmp_path
+):
+    """Порог 20 на целом пути (`test_frequencies_appear_only_from_twenty_other_hands`
+    — на нём же в реплее): 19 других раздач — в скобке один стек."""
+    text = await _deep_dive_text(
+        deps,
+        queue,
+        db_factory,
+        fake_sender,
+        tmp_path,
+        _SYNTHETIC_HH + "\n\n" + _copies_of_the_second_hand(19),
+        "SYNTH1",
+    )
+    assert "VPIP" not in text
+    assert "SB (10ББ) опен 3.0" in text
 
 
 async def test_an_hh_scan_sends_the_summary_and_nothing_else(
