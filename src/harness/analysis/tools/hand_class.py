@@ -17,8 +17,11 @@
 **Таблица §4.1 сверху вниз.** Ранги борда берутся различные, по убыванию: на
 Q Q 7 2 старшая — Q, вторая — 7, младшая — 2. Пара героя меряется своим рангом
 среди них, а не силой всей комбинации: на борде Q Q 4 у героя 4 — две пары, но
-меряется пара четвёрок, второй различный ранг борда, — средняя пара
-(`test_two_pair_with_the_board_pair_is_judged_by_the_heros_pair`). Пара героя,
+меряется пара четвёрок, младший различный ранг борда, — слабая пара
+(`test_two_pair_with_the_board_pair_is_judged_by_the_heros_pair`). Младший
+различный ранг при двух различных и больше всегда даёт слабую пару; второй ранг —
+средняя пара, только когда ниже него есть ещё различный ранг
+(`test_a_paired_board_counts_distinct_ranks`). Пара героя,
 которая не вошла в лучшие пять карт (на борде Q Q 7 7 4 у героя 4), — уже рука на
 борде (`test_a_counterfeited_pair_is_on_the_board`).
 
@@ -209,7 +212,9 @@ def _heros(
                 HandCategory.TOP_PAIR_STRONG_KICKER, StrengthClass.STRONG, combination, [rank]
             )
         return _pair(HandCategory.TOP_PAIR_WEAK_KICKER, StrengthClass.MEDIUM, combination, [rank])
-    if place == 1:
+    # Младший различный ранг борда — всегда слабая пара: второй ранг даёт среднюю,
+    # только когда ниже него есть ещё различный ранг.
+    if place == 1 and place < len(board_distinct) - 1:
         return _pair(HandCategory.MIDDLE_PAIR, StrengthClass.MEDIUM, combination, [rank])
     return _pair(HandCategory.WEAK_PAIR, StrengthClass.WEAK, combination, [rank])
 

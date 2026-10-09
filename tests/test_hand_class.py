@@ -153,12 +153,13 @@ def test_a_paired_board_counts_distinct_ranks():
 
 def test_two_pair_with_the_board_pair_is_judged_by_the_heros_pair():
     # Q Q 4 и четвёрка у героя: в комбинации две пары, но сила — у пары героя.
-    # Различные ранги борда — Q и 4, и 4 здесь второй ранг: средняя пара по строке
-    # таблицы §4.1 (заметка под таблицей называет этот случай «слабой парой» — см.
-    # отчёт подзадачи).
+    # Различные ранги борда — Q и 4; 4 — младший различный ранг, ниже него рангов
+    # нет: слабая пара (§4.1, строка «средняя пара» — только когда ниже второго
+    # ранга есть ещё различный ранг).
     result = _hand("4h 3d", "Qh Qs 4d")
     assert result.combination is Combination.TWO_PAIR
-    assert (result.category, result.strength) == (HandCategory.MIDDLE_PAIR, _MEDIUM)
+    assert (result.category, result.strength) == (HandCategory.WEAK_PAIR, _WEAK)
+    assert result.ranks == ["4"]
     assert result.plays == "hand"
 
 
