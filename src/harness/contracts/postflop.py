@@ -164,3 +164,100 @@ class ShowdownValue(BaseModel):
     ties: int
     losses: int
     ties_with: list[str]
+
+
+class ActionTag(StrEnum):
+    """Тип действия героя на постфлопе (спека, §4.3).
+
+    Ставка — первая подошедшая строка таблицы §4.3: `CBET` … `BET`. Ответы и
+    повышения — `CHECK_CALL` … `FOLD`. `RERAISE` — третье и дальнейшие повышения
+    улицы: спека называет только первое («рейз») и второе («3-бет»).
+    """
+
+    CBET = "cbet"
+    BARREL = "barrel"
+    REPEAT_BET = "repeat_bet"
+    DELAYED_CBET = "delayed_cbet"
+    PROBE = "probe"
+    DONK = "donk"
+    BET_AFTER_CHECK = "bet_after_check"
+    BET = "bet"
+    CHECK_CALL = "check_call"
+    CHECK_FOLD = "check_fold"
+    CHECK_RAISE = "check_raise"
+    RAISE = "raise"
+    THREE_BET = "three_bet"
+    RERAISE = "reraise"
+    CALL = "call"
+    FLOAT = "float"
+    FOLD = "fold"
+
+
+class SizeTag(StrEnum):
+    """Тег размера ставки или рейза по полуоткрытым интервалам доли банка (§4.3).
+
+    Блок [0, 33%), стандарт [33%, 75%), крупная [75%, 100%), овербет [100%, ∞).
+    """
+
+    BLOCK = "block"
+    STANDARD = "standard"
+    BIG = "big"
+    OVERBET = "overbet"
+
+
+class Purpose(StrEnum):
+    """Назначение ставки, рейза или колла по силе руки и дро (спека, §4.5)."""
+
+    VALUE = "value"
+    MEDIUM_HAND = "medium_hand"
+    SEMIBLUFF = "semibluff"
+    BLUFF = "bluff"
+    CALL_STRONG = "call_strong"
+    BLUFF_CATCH = "bluff_catch"
+    CALL_WITH_DRAW = "call_with_draw"
+
+
+class Line(BaseModel):
+    """Что сыграно героем в точке (спека, §4.3–§4.5).
+
+    `barrel` — 2 или 3 у `ActionTag.BARREL`, иначе `None`. `size_pct` — точная
+    доля банка у ставки и рейза (у рейза — повышение сверх колла к банку вместе с
+    коллом), `None` у колла и фолда; `size_tag` — тег по ней. `purpose` — `None`,
+    когда карты героя неизвестны, и у фолда.
+    """
+
+    action: ActionTag
+    barrel: int | None
+    size_pct: float | None
+    size_tag: SizeTag | None
+    purpose: Purpose | None
+
+
+class FoldThreshold(BaseModel):
+    """Сколько фолдов нужно ставке или рейзу (спека, §4.6), в долях единицы.
+
+    `bluff` — `B / (P + B)`. `semibluff` — порог с учётом аутов, только у
+    полублефа один на один; `None` — мультивей или назначение «блеф».
+    `semibluff_free` — `E ≥ 0`: ставка окупается и без фолдов, тогда
+    `semibluff` — ноль.
+    """
+
+    bluff: float
+    semibluff: float | None
+    semibluff_free: bool
+
+
+class DrawCall(BaseModel):
+    """Колл с дро (спека, §4.6): шансы банка против шанса собрать.
+
+    `required_equity` — `C / (P + C)`; `hit` — шанс собрать, которым колл
+    меряется; `by_pot_odds` — `hit ≥ required_equity`. Иначе
+    `implied_needed_chips` — `X = C / hit − (P + C)` в фишках, округлённый вверх,
+    а `beyond_stack` — `X` больше меньшего из стеков героя и соперника после колла.
+    """
+
+    required_equity: float
+    hit: float
+    by_pot_odds: bool
+    implied_needed_chips: int | None
+    beyond_stack: bool
