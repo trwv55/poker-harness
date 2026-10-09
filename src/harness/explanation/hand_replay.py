@@ -456,7 +456,7 @@ def _outcome_bb(en: EnrichedHand) -> str | None:
     """Исход раздачи для героя: «−13.6 ББ» или «+1.8 ББ» — или `None`, строка молчит.
 
     Решение владельца 2026-10-09: знак вместо слов «отдаёте/забираете». Число —
-    ЧИСТОЕ изменение стека героя (`contracts.hero_stack_delta_bb` — счёт движка),
+    ЧИСТОЕ изменение стека героя (по стекам движка, см. `_shown_delta_bb`),
     а не банк целиком: выигрыш пишется тем же «+X», что и проигрыш «−X», без
     фишек, которые герой положил сам. Раньше при выигрыше печатался весь банк
     героя из записи рума (`CanonicalHand.collected`); теперь второго источника
@@ -480,8 +480,26 @@ def _outcome_bb(en: EnrichedHand) -> str | None:
     """
     if en.verdict.not_checked:
         return None
-    text = signed_bb(hero_stack_delta_bb(en))
+    text = signed_bb(_shown_delta_bb(en))
     return None if text == "0.0" else f"{text} ББ"
+
+
+def _shown_delta_bb(en: EnrichedHand) -> float:
+    """Итог как разность стеков В ТОМ ВИДЕ, в каком они напечатаны блоком.
+
+    Решение владельца 2026-10-09: «Вы на …, 13.9 ББ», «итог −0.1» и «Стек после
+    раздачи: 13.7 ББ» не сходились на глаз — каждое число верно, но округлено
+    отдельно. Разность округлённых стеков сходится всегда
+    (`test_the_shown_stacks_and_the_outcome_add_up`). От счёта движка
+    (`hero_stack_delta_bb`) она отличается не больше чем на 0.1 ББ округления.
+    Нет стека на конец руки — берётся счёт движка как есть.
+    """
+    hand = en.hand
+    end = en.report.stacks_end.get(hand.hero_label)
+    if end is None:
+        return hero_stack_delta_bb(en)
+    start = _hero(hand).stack
+    return float(bb(end, hand.bb)) - float(bb(start, hand.bb))
 
 
 def _stack_after_line(en: EnrichedHand) -> str | None:

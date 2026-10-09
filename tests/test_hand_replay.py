@@ -1049,6 +1049,32 @@ def test_a_lost_hand_ends_with_the_chips_that_left_the_stack():
     assert lines[-2] == "Итог: −2.6 ББ."
 
 
+def test_the_shown_stacks_and_the_outcome_add_up():
+    """«Вы на …» + итог = «Стек после раздачи» в напечатанных числах.
+
+    Стек 13.86 ББ → 13.71 ББ: по отдельности это «13.9» и «13.7», а счёт движка
+    −0.15 округлился бы в «−0.1» — на экране 13.9 − 0.1 ≠ 13.7. Итог берётся
+    разностью напечатанных стеков (решение владельца 2026-10-09).
+    """
+    en = _postflop_hand()
+    hand = en.hand
+    hero = hand.hero_label
+    players = [
+        p.model_copy(update={"stack": 1386}) if p.label == hero else p for p in hand.players
+    ]
+    stacks_end = {**en.report.stacks_end, hero: 1371}
+    en = en.model_copy(
+        update={
+            "hand": hand.model_copy(update={"players": players}),
+            "report": en.report.model_copy(update={"stacks_end": stacks_end}),
+        }
+    )
+    lines = hand_replay(en).plain.splitlines()
+    assert any(line.startswith("Вы на ") and line.endswith(", 13.9 ББ.") for line in lines)
+    assert lines[-1] == "Стек после раздачи: 13.7 ББ."
+    assert lines[-2] == "Итог: \u22120.2 ББ."
+
+
 def test_the_outcome_sign_is_a_typographic_minus():
     """Минус — U+2212, как у цены решения ниже, а не дефис."""
     text = hand_replay(_postflop_hand()).plain
