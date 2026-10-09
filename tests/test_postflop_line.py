@@ -14,13 +14,23 @@ from math import ceil, comb
 
 import pytest
 
+from harness.analysis import analyze_hand, rank_points, total_ev_loss_bb, verdict_for
+from harness.analysis.classifier import (
+    POSTFLOP_CHECK_REASON,
+    POSTFLOP_FOLD_FREQUENCY_REASON,
+)
 from harness.analysis.postflop_line import postflop_line
+from harness.analysis.river import river_verdict
+from harness.analysis.turn_flop import turn_flop_verdict
 from harness.contracts import (
+    POSTFLOP_LINE_DETAIL,
     ActionKind,
     ActionTag,
+    Collected,
     DecisionPoint,
     DrawKind,
     EnrichedHand,
+    HandCategory,
     Post,
     PostflopLineDetail,
     PostKind,
@@ -29,9 +39,13 @@ from harness.contracts import (
     RawAction,
     RawHand,
     SeatInfo,
+    ShowdownEntry,
     SizeTag,
     Street,
+    StrengthClass,
     ValidationStatus,
+    is_judged,
+    postflop_line_detail,
 )
 from harness.engine import enrich
 from harness.normalizer import normalize
@@ -194,6 +208,144 @@ def _oop(actions: list[RawAction], **kwargs) -> EnrichedHand:
 
 
 # --- гейт 1: эталонная рука §2 -----------------------------------------------------------
+
+
+def _reference_hand(*, opponent_cards: tuple[str, str] = ("Tc", "Qc")) -> EnrichedHand:
+    """Рука §2 спеки в синтетике: BB защищает 5♣3♣ против опена UTG+1.
+
+    Флоп Q♥4♦2♦ чек-чек, тёрн 7♠ ставка 750 — колл, ривер Q♦ ставка 2127 — колл.
+    Банк до тёрна 1335, до ривера 2835, итог 7089. `opponent_cards` — карты
+    открывшего в раздаче и на вскрытии: линия их не читает (гейт 8).
+    """
+    opener = "P4"
+    seats = [
+        SeatInfo(seat=1, label="P1", stack=20_000),
+        SeatInfo(seat=2, label="Hero", stack=9_275),
+        SeatInfo(seat=3, label="P3", stack=20_000),
+        SeatInfo(seat=4, label=opener, stack=25_000),
+        *[SeatInfo(seat=n, label=f"P{n}", stack=20_000) for n in (5, 6, 7)],
+    ]
+    raw = RawHand(
+        provenance=Provenance.HAND_HISTORY,
+        source_ref="synthetic",
+        hand_no="SYN-LINE-2",
+        tournament_id="TSYN",
+        tournament_name="synthetic",
+        level=5,
+        sb=125,
+        bb=250,
+        ante=30,
+        timestamp=datetime(2026, 8, 20, 21, 30, tzinfo=UTC),
+        table_name="syn",
+        max_seats=7,
+        button_seat=7,
+        seats=seats,
+        posts=[Post(label=s.label, kind=PostKind.ANTE, amount=30) for s in seats]
+        + [
+            Post(label="P1", kind=PostKind.SMALL_BLIND, amount=125),
+            Post(label="Hero", kind=PostKind.BIG_BLIND, amount=250),
+        ],
+        dealt={"Hero": ["5c", "3c"], opener: list(opponent_cards)},
+        actions=[
+            _fold(P, "P3"),
+            _raise(P, opener, 500),
+            *[_fold(P, label) for label in ("P5", "P6", "P7", "P1")],
+            _call(P, "Hero", 250),
+            _check(F, "Hero"),
+            _check(F, opener),
+            _bet(T, "Hero", 750),
+            _call(T, opener, 750),
+            _bet(R, "Hero", 2_127),
+            _call(R, opener, 2_127),
+        ],
+        boards={F: ["Qh", "4d", "2d"], T: ["7s"], R: ["Qd"]},
+        showdowns=[
+            ShowdownEntry(label="Hero", cards=["5c", "3c"]),
+            ShowdownEntry(label=opener, cards=list(opponent_cards)),
+        ],
+        collected=[Collected(label=opener, amount=7_089)],
+    )
+    en = enrich(normalize(raw))
+    assert en.verdict.status is ValidationStatus.PASS, en.verdict.reasons
+    return en
+
+
+def test_the_reference_hand_carries_the_data_the_owners_layout_prints():
+    """Гейт 1 (ядро): каждая постфлоп-точка §2 несёт ровно данные макета.
+
+    Дроби — из §9: 750/1335, 2127/2835, 8/47, 1 − 39·38/(47·46), 8/46, 750/2085,
+    2127/4962, полублеф 0.1614, вскрытие 0/8/982 из 990.
+    """
+    points = analyze_hand(_reference_hand()).points
+    preflop, flop, turn, river = points
+    assert [p.street for p in points] == [P, F, T, R]
+
+    assert POSTFLOP_LINE_DETAIL not in preflop.detail
+    assert preflop.detail["unjudged"] == "нет чарта защиты BB против опена UTG+1 на 37 ББ"
+
+    # Флоп: чек, рука и дро, строки «линия» нет.
+    line = postflop_line_detail(flop)
+    assert line is not None
+    assert line.hand is not None
+    assert (line.hand.category, line.hand.strength, line.hand.ranks) == (
+        HandCategory.NO_PAIR,
+        StrengthClass.WEAK,
+        ["5"],
+    )
+    assert line.draw is not None
+    assert line.draw.kinds == [DrawKind.OPEN_ENDED]
+    assert line.draw.out_ranks == ["A", "6"]
+    assert (len(line.draw.outs), line.draw.unseen) == (8, 47)
+    assert line.draw.hit_next == 8 / 47
+    assert line.draw.hit_by_river == pytest.approx(1 - 39 * 38 / (47 * 46), abs=1e-12)
+    assert (line.backdoors, line.overcards, line.showdown) == ([], None, None)
+    assert line.draw_missed is False
+    assert (line.line, line.fold_threshold, line.draw_call) == (None, None, None)
+    assert flop.detail["unjudged"] == POSTFLOP_CHECK_REASON == ""
+
+    # Тёрн: проба · полублеф, 56% банка, пороги 750/2085 и 0.1614.
+    line = postflop_line_detail(turn)
+    assert line is not None and line.draw is not None and line.line is not None
+    assert line.hand is not None and line.hand.category is HandCategory.NO_PAIR
+    assert (len(line.draw.outs), line.draw.unseen, line.draw.hit_by_river) == (8, 46, None)
+    assert line.draw.hit_next == 8 / 46
+    assert line.line.action is ActionTag.PROBE
+    assert line.line.barrel is None
+    assert line.line.size_pct == 750 / 1335
+    assert line.line.size_tag is SizeTag.STANDARD
+    assert line.line.purpose is Purpose.SEMIBLUFF
+    assert line.fold_threshold is not None
+    assert line.fold_threshold.bluff == 750 / 2085
+    q = Fraction(8, 46)
+    ev = q * (1335 + 2 * 750) - 750
+    assert line.fold_threshold.semibluff == pytest.approx(float(-ev / (1335 - ev)), abs=1e-12)
+    assert line.fold_threshold.semibluff == pytest.approx(0.1614, abs=5e-5)
+    assert line.fold_threshold.semibluff_free is False
+    assert line.draw_call is None
+    assert turn.detail["unjudged"] == POSTFLOP_FOLD_FREQUENCY_REASON
+
+    # Ривер: пара дам на борде с кикером 5, дро не закрылось, вскрытие 0/8/982.
+    line = postflop_line_detail(river)
+    assert line is not None and line.hand is not None and line.line is not None
+    assert (line.hand.category, line.hand.strength, line.hand.ranks) == (
+        HandCategory.ON_BOARD,
+        StrengthClass.WEAK,
+        ["Q"],
+    )
+    assert (line.hand.plays, line.hand.kicker) == ("kicker", "5")
+    assert line.draw is None
+    assert line.draw_missed is True
+    assert line.showdown is not None
+    assert (line.showdown.wins, line.showdown.ties, line.showdown.losses) == (0, 8, 982)
+    assert line.showdown.ties_with == ["53o", "53s"]
+    assert line.line.action is ActionTag.REPEAT_BET
+    assert line.line.size_pct == 2127 / 2835
+    assert line.line.size_tag is SizeTag.BIG
+    assert line.line.purpose is Purpose.BLUFF
+    assert line.fold_threshold is not None
+    assert line.fold_threshold.bluff == 2127 / 4962
+    assert line.fold_threshold.semibluff is None
+    assert river.detail["unjudged"] == POSTFLOP_FOLD_FREQUENCY_REASON
 
 
 # --- гейт 4: тип действия, строки таблицы §4.3 -------------------------------------------
@@ -704,6 +856,19 @@ def test_a_draw_call_short_of_pot_odds_names_the_chips_to_win_later():
     assert detail.draw_call.beyond_stack is False
 
 
+def test_an_implied_amount_beyond_the_stacks_is_a_line_and_the_point_stays_unjudged():
+    """X ≈ 87 500 больше 85 000, что останется у обоих после колла."""
+    en = _gutshot_call(_DEEP)
+    dp = _points(en, F)[-1]
+    detail = postflop_line(dp, en)
+    assert detail.draw_call is not None
+    assert detail.draw_call.implied_needed_chips is not None
+    assert detail.draw_call.implied_needed_chips > _DEEP - 5_000 - 10_000
+    assert detail.draw_call.beyond_stack is True
+    point = verdict_for(dp, en)
+    assert point.best_action == "" and not is_judged(point)
+
+
 @pytest.mark.parametrize(
     ("hero_stack", "villain_stack"), [(20_000, _DEEP), (_DEEP, 20_000)], ids=["hero", "villain"]
 )
@@ -765,4 +930,99 @@ def test_a_preflop_point_has_no_postflop_line():
 # --- гейт 8: граница — карты соперника и вскрытие ----------------------------------------
 
 
+def test_opponent_cards_and_the_showdown_do_not_move_the_line():
+    def lines(en: EnrichedHand) -> list[object]:
+        return [p.detail.get(POSTFLOP_LINE_DETAIL) for p in analyze_hand(en).points]
+
+    assert lines(_reference_hand()) == lines(_reference_hand(opponent_cards=("Ac", "Kc")))
+
+
 # --- гейт 13 и §4.9: судимость не тронута, причины ---------------------------------------
+
+
+def _hands_for_the_sum() -> list[EnrichedHand]:
+    return [
+        _reference_hand(),
+        _gutshot_call(_DEEP),
+        _oop(
+            [
+                *_V_OPENS,
+                _check(F, "Hero"),
+                _check(F, "V"),
+                _check(T, "Hero"),
+                _check(T, "V"),
+                _check(R, "Hero"),
+                _bet(R, "V", 300),
+                _call(R, "Hero", 300),
+            ],
+            hero_cards=("Kc", "Ks"),
+        ),
+    ]
+
+
+def test_the_line_changes_neither_the_sum_nor_the_ranking():
+    """Ключ линии — единственное, чем постфлоп-точка `verdict_for` отличается
+    от разбора улицы; сумма потерь и ранжирование без него те же."""
+    for en in _hands_for_the_sum():
+        result = analyze_hand(en)
+        stripped = [
+            p.model_copy(
+                update={"detail": {k: v for k, v in p.detail.items() if k != POSTFLOP_LINE_DETAIL}}
+            )
+            for p in result.points
+        ]
+        assert rank_points(stripped) == result.ranked
+        assert total_ev_loss_bb(stripped) == result.total_ev_loss_bb
+        postflop = [dp for dp in en.report.decision_points if dp.street is not P]
+        for dp in postflop:
+            street_point = river_verdict(dp, en) or turn_flop_verdict(dp, en)
+            assert street_point is not None
+            point = verdict_for(dp, en)
+            assert POSTFLOP_LINE_DETAIL in point.detail
+            without = {k: v for k, v in point.detail.items() if k != POSTFLOP_LINE_DETAIL}
+            assert point.model_copy(update={"detail": without}) == street_point
+            assert is_judged(point) == is_judged(street_point)
+
+
+def test_postflop_reasons_name_what_a_verdict_lacks():
+    """§4.9: ставка и рейз — частота фолдов, чек — без причины, колл — как был."""
+    en = _oop(
+        [
+            *_V_OPENS,
+            _check(F, "Hero"),
+            _bet(F, "V", 300),
+            _raise(F, "Hero", 1_000),
+            _call(F, "V", 700),
+            _bet(T, "Hero", 1_000),
+            _raise(T, "V", 3_000),
+            _call(T, "Hero", 2_000),
+        ]
+    )
+    reasons = [p.detail["unjudged"] for p in analyze_hand(en).points if p.street in (F, T)]
+    assert reasons == [
+        POSTFLOP_CHECK_REASON,
+        POSTFLOP_FOLD_FREQUENCY_REASON,
+        POSTFLOP_FOLD_FREQUENCY_REASON,
+        "требование к ставящему диапазону посчитано, лучшего действия нет",
+    ]
+
+
+def test_a_deep_answer_to_an_open_names_the_missing_defence_chart():
+    """Ответ на опен глубже пуш-фолда: чарта защиты нет; глубина — целым числом."""
+    point = analyze_hand(_oop([*_V_OPENS, _check(F, "Hero"), _check(F, "V")])).points[0]
+    assert point.street is P
+    assert point.detail["unjudged"] == "нет чарта защиты BB против опена BTN на 100 ББ"
+
+
+def test_a_deep_limped_pot_keeps_its_old_reason():
+    """Причину без опена §4.9 не трогает."""
+    point = analyze_hand(_oop([*_V_LIMPS, _check(F, "Hero"), _check(F, "V")])).points[0]
+    assert point.street is P
+    assert point.detail["unjudged"].startswith("глубже пуш-фолд-зоны")
+
+
+def test_a_foreign_shape_under_the_postflop_line_key_is_not_swallowed():
+    point = analyze_hand(_reference_hand()).points[2]
+    broken = point.model_copy(update={"detail": {**point.detail, POSTFLOP_LINE_DETAIL: {"x": 1}}})
+    with pytest.raises(ValueError):
+        postflop_line_detail(broken)

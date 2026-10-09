@@ -329,8 +329,21 @@ def unpriced_reason(dp: DecisionPoint, state: TableState) -> str:
     Причина попадает в `detail` и дальше в сводку: игрок должен видеть не только
     то, что спот не разобран, но и чем именно он не подошёл. Без этого пробел в
     охвате выглядит как подтверждение правильной игры.
+
+    Ответ на опен глубже пуш-фолда называет, чего не хватает: чарта защиты
+    позиции героя против позиции открывшего на глубине `open_depth_bb`, целым
+    числом (спека постфлоп-линии, §4.9;
+    `test_a_deep_answer_to_an_open_names_the_missing_defence_chart`). Опен —
+    единственное повышение до героя, сделанное первым вошедшим; герой на этой
+    улице ещё не ходил.
     """
     if dp.eff_stack_bb > PUSHFOLD_MAX_EFF_BB:
+        opener = state.aggressor
+        if opener is not None and state.opened_by_aggressor and not state.hero.acted:
+            return (
+                f"нет чарта защиты {state.hero.position} против опена {opener.position} "
+                f"на {round(open_depth_bb(state))} ББ"
+            )
         return (
             f"глубже пуш-фолд-зоны: эффективный стек {dp.eff_stack_bb:.1f}bb "
             f"> {PUSHFOLD_MAX_EFF_BB:.0f}bb"
@@ -356,6 +369,30 @@ def unpriced_reason(dp: DecisionPoint, state: TableState) -> str:
             "а модель считает эквити против одного диапазона"
         )
     return "перед героем олл-ин, но сыгран не колл и не пас"
+
+
+# Причины «вердикта нет» постфлоп-точки (спека постфлоп-линии, §4.9): у ставки и
+# рейза не хватает частоты фолдов соперника, у чека причины нет вовсе — пустая
+# строка.
+POSTFLOP_FOLD_FREQUENCY_REASON = "частота фолдов оппонента зависит от его диапазона"
+POSTFLOP_CHECK_REASON = ""
+
+
+def postflop_reason(dp: DecisionPoint, boundary: str) -> str:
+    """Причина «вердикта нет» постфлоп-точки на границе инструмента колла.
+
+    `boundary` — причина, которую инструмент колла назвал бы сам (нет ставки
+    перед героем, живых больше двух, лучшее действие не названо); она остаётся
+    у колла и фолда. Ставка и рейз получают `POSTFLOP_FOLD_FREQUENCY_REASON`,
+    чек — `POSTFLOP_CHECK_REASON`
+    (`test_postflop_reasons_name_what_a_verdict_lacks`).
+    """
+    kind = dp.action.kind
+    if kind in (ActionKind.BET, ActionKind.RAISE):
+        return POSTFLOP_FOLD_FREQUENCY_REASON
+    if kind is ActionKind.CHECK:
+        return POSTFLOP_CHECK_REASON
+    return boundary
 
 
 def unjudged_point(

@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 
 from harness.analysis import analyze_hand
 from harness.contracts import (
+    POSTFLOP_LINE_DETAIL,
     RIVER_CALL_DETAIL,
     TURN_FLOP_CALL_DETAIL,
     AnalysisResult,
@@ -2026,8 +2027,14 @@ def test_every_detail_key_the_analysis_produces_has_a_label():
     # лукап по чарту (`cheap_fold_verdict`). Прогоном их не собрать, поэтому они
     # перечислены здесь — второй половиной того же обещания.
     seen |= {"solver_error", "push_weight", "lookup_depth_bb"}
-    # `unjudged` печатается своей строкой «вердикта нет: …», а не по таблице.
-    printed_elsewhere = {RIVER_CALL_DETAIL, TURN_FLOP_CALL_DETAIL, "unjudged"}
+    # `unjudged` печатается своей строкой «вердикта нет: …», а не по таблице;
+    # постфлоп-линия — своими строками (спека постфлоп-линии, §7).
+    printed_elsewhere = {
+        RIVER_CALL_DETAIL,
+        TURN_FLOP_CALL_DETAIL,
+        POSTFLOP_LINE_DETAIL,
+        "unjudged",
+    }
     assert not (seen - printed_elsewhere) - set(_DETAIL_LABELS), (
         f"ключи без подписи: {sorted((seen - printed_elsewhere) - set(_DETAIL_LABELS))}"
     )

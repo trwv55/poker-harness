@@ -106,6 +106,7 @@ from harness.analysis.classifier import (
     unpriced_reason,
 )
 from harness.analysis.open_chart import chart_exists, open_chart_verdict, taken_token
+from harness.analysis.postflop_line import postflop_line
 from harness.analysis.river import river_verdict
 from harness.analysis.tools.equity import equity_vs_ranges
 from harness.analysis.tools.full_deal import (
@@ -134,6 +135,7 @@ from harness.analysis.tools.pushfold import (
 )
 from harness.analysis.turn_flop import turn_flop_verdict
 from harness.contracts import (
+    POSTFLOP_LINE_DETAIL,
     ActionKind,
     Assumption,
     CanonicalHand,
@@ -146,6 +148,7 @@ from harness.contracts import (
     Street,
     Zone,
     class_of,
+    river_call_detail,
 )
 from harness.engine.validation import forced_blind
 
@@ -1730,12 +1733,21 @@ def verdict_for(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict:
     Такая точка не судима (`SpotKind.POSTFLOP` вне `JUDGED_SPOTS`) и в сумму
     потерь не входит.
 
+    Каждая постфлоп-точка получает в `detail` постфлоп-линию героя
+    (`POSTFLOP_LINE_DETAIL`, `analysis.postflop_line`); зона, лучшее действие,
+    цена и судимость от неё не меняются
+    (`test_the_line_changes_neither_the_sum_nor_the_ranking`).
     """
     if dp.street is not Street.PREFLOP:
-        for postflop in (river_verdict(dp, en), turn_flop_verdict(dp, en)):
-            if postflop is not None:
-                return postflop
-        return unjudged_point(dp, SpotKind.POSTFLOP, f"улица {dp.street} не разбирается")
+        point = next(
+            (
+                postflop
+                for postflop in (river_verdict(dp, en), turn_flop_verdict(dp, en))
+                if postflop is not None
+            ),
+            None,
+        ) or unjudged_point(dp, SpotKind.POSTFLOP, f"улица {dp.street} не разбирается")
+        return _with_postflop_line(point, dp, en)
 
     state = table_state(dp, en)
     spot = spot_for(dp, state)
@@ -1755,3 +1767,11 @@ def verdict_for(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict:
             return _unopened_verdict(dp, en, state)
         return open_chart_verdict(dp, en, state)
     return unjudged_point(dp, spot, unpriced_reason(dp, state))
+
+
+def _with_postflop_line(point: PointVerdict, dp: DecisionPoint, en: EnrichedHand) -> PointVerdict:
+    """Точка с постфлоп-линией в `detail`; остальные поля — как вернул разбор улицы."""
+    river = river_call_detail(point)
+    line = postflop_line(dp, en, fold_proven=river is not None and river.fold_proven)
+    detail = {**point.detail, POSTFLOP_LINE_DETAIL: line.model_dump(mode="json")}
+    return point.model_copy(update={"detail": detail})

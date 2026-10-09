@@ -37,7 +37,7 @@
 
 from __future__ import annotations
 
-from harness.analysis.classifier import action_name, unjudged_point
+from harness.analysis.classifier import action_name, postflop_reason, unjudged_point
 from harness.analysis.tools.river_call import RiverCallRequirement, river_call_requirement
 from harness.contracts import (
     RIVER_CALL_DETAIL,
@@ -65,6 +65,10 @@ _BOARD_STREETS = (Street.FLOP, Street.TURN, Street.RIVER)
 # (SESSIONS_UX — не рассказывать о том, чего не умеем).
 _NOT_PROVEN = "фолд не доказан: требование к ставящему диапазону посчитано, лучшего действия нет"
 
+# Граница инструмента колла: перед героем нет ставки. У чека и ставки её
+# заменяет `postflop_reason`.
+_NO_BET = "перед героем нет ставки: колл не оценивается"
+
 _TOOL = "river_call"
 
 
@@ -76,12 +80,14 @@ def river_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | None:
     hero = en.hand.dealt.get(en.hand.hero_label, [])
     board = [card for street in _BOARD_STREETS for card in en.hand.boards.get(street, [])]
     if dp.to_call <= 0:
-        return unjudged_point(dp, SpotKind.POSTFLOP, "перед героем нет ставки: колл не оценивается")
+        return unjudged_point(dp, SpotKind.POSTFLOP, postflop_reason(dp, _NO_BET))
     if dp.live_total != _HEADS_UP:
         return unjudged_point(
             dp,
             SpotKind.POSTFLOP,
-            f"живых в руке {dp.live_total}: перебор считает требование к одному диапазону",
+            postflop_reason(
+                dp, f"живых в руке {dp.live_total}: перебор считает требование к одному диапазону"
+            ),
         )
     if len(hero) != _HERO_CARDS:
         return unjudged_point(dp, SpotKind.POSTFLOP, "карты героя неизвестны")
@@ -99,7 +105,9 @@ def river_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | None:
 
     detail = {RIVER_CALL_DETAIL: _detail(requirement, dp).model_dump(mode="json")}
     if not requirement.fold_proven:
-        return unjudged_point(dp, SpotKind.POSTFLOP, _NOT_PROVEN, detail, tools=[_TOOL])
+        return unjudged_point(
+            dp, SpotKind.POSTFLOP, postflop_reason(dp, _NOT_PROVEN), detail, tools=[_TOOL]
+        )
     return PointVerdict(
         dp_index=dp.index,
         street=dp.street,
