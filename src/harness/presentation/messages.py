@@ -1334,7 +1334,8 @@ def _payoff_line(detail: PostflopLineDetail, big_blind: int) -> str | None:
     """«окупается: …» — порог фолдов у блефа и полублефа, доплата у колла с дро (§4.6).
 
     У вэлью и средней руки порога нет — ядро его не кладёт, и печатать нечего. Сумма
-    «добрать позже» — фишки ядра в ББ блока.
+    «добрать позже» — фишки ядра в ББ, вверх до десятой: требование не занижается
+    (`test_the_amount_to_win_later_rounds_up_to_a_tenth`).
     """
     line = detail.line
     fold = detail.fold_threshold
@@ -1359,8 +1360,14 @@ def _payoff_line(detail: PostflopLineDetail, big_blind: int) -> str | None:
     if call.beyond_stack:
         return "    окупается: добрать столько нельзя — колл не окупается добором"
     if call.implied_needed_chips is not None:
-        return f"    окупается: нужно добрать позже {_raw_bb(call.implied_needed_chips, big_blind)}"
+        return f"    окупается: нужно добрать позже {_bb_up(call.implied_needed_chips, big_blind)} ББ"
     return None
+
+
+def _bb_up(value_chips: int, big_blind: int) -> str:
+    """Фишки в ББ одним знаком, вверх до десятой: 1 234 при ББ 100 — «12.4»."""
+    tenths = -(-10 * value_chips // big_blind)
+    return f"{tenths / 10:.1f}"
 
 
 def _postflop_line_lines(detail: PostflopLineDetail | None, big_blind: int) -> list[str]:

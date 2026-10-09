@@ -37,9 +37,14 @@
 
 **Пороги** (§4.6) — только у блефа и полублефа. Чистый блеф — `B / (P + B)`, где
 `B` — сколько герой добавляет, урезанное стеком соперника: в `B` идёт ставка не
-выше `DecisionPoint.eff_stack` за вычетом поставленного героем на улице до неё
-(`test_the_thresholds_cut_the_bet_by_the_opponents_stack`); размер в «сыграно»
-считается от полной ставки. Полублеф — только один на один:
+выше стека на улице самого глубокого живого соперника с фишками за спиной (не
+`DecisionPoint.eff_stack`: в мультивее за агрессором может сидеть глубже) за
+вычетом поставленного героем на улице до неё
+(`test_the_thresholds_cut_the_bet_by_the_opponents_stack`,
+`test_a_multiway_raise_is_cut_by_the_deepest_opponent_who_can_call`,
+`test_a_multiway_raise_is_not_cut_by_a_deeper_opponent_than_the_hero`,
+`test_the_cut_takes_the_hero_stack_and_not_the_bet_left_after_his_bet`); размер в
+«сыграно» считается от полной ставки. Полублеф — только один на один:
 `E = q·(P + B + C) − B`, где `C` — колл соперника (`B` у ставки, `B − колл` у
 рейза, оба после урезания), `q` — шанс собрать к концу раздачи, точной дробью;
 порог `−E / (P − E)`, при `E ≥ 0` (включая ровно ноль,
@@ -317,14 +322,15 @@ def _purpose(kind: ActionKind, cards: _Cards, *, fold_proven: bool) -> Purpose |
 def _fold_threshold(
     dp: DecisionPoint, en: EnrichedHand, index: int, draw: Draw | None
 ) -> FoldThreshold:
-    taken = en.hand.actions[index]
+    hand = en.hand
+    taken = hand.actions[index]
     pot = dp.pot_before
+    before = _committed_on_street(hand, index, taken.label)
     # Ставка сверх стека соперника вернётся герою: в пороги идёт только та её
     # часть, которую соперник может уравнять. Размер в «сыграно» описывает
     # сыгранное и считается от полной ставки (`_line`).
-    bet = min(taken.committed_after, dp.eff_stack) - _committed_on_street(
-        en.hand, index, taken.label
-    )
+    bet = min(taken.committed_after, _call_cap(hand, index, _live(en, index), before + dp.to_call))
+    bet -= before
     semibluff: float | None = None
     free = False
     if draw is not None and len(_live(en, index)) == _HEADS_UP:
@@ -443,15 +449,50 @@ def _live(en: EnrichedHand, index: int) -> set[str]:
     }
 
 
-def _all_in_before(hand: CanonicalHand, index: int, label: str) -> bool:
-    """Игрок вложил в руку весь стек до действия `index`: анте, блайнд, ставки улиц."""
+def _invested(hand: CanonicalHand, index: int, label: str) -> tuple[int, int, dict[Street, int]]:
+    """Стек игрока, его анте и поставленное по улицам до действия `index`."""
     player = next(p for p in hand.players if p.label == label)
     ante = min(hand.ante, player.stack)
     by_street = {Street.PREFLOP: forced_blind(hand, player, ante)}
     for action in hand.actions[:index]:
         if action.label == label:
             by_street[action.street] = action.committed_after
-    return ante + sum(by_street.values()) >= player.stack
+    return player.stack, ante, by_street
+
+
+def _all_in_before(hand: CanonicalHand, index: int, label: str) -> bool:
+    """Игрок вложил в руку весь стек до действия `index`: анте, блайнд, ставки улиц."""
+    stack, ante, by_street = _invested(hand, index, label)
+    return ante + sum(by_street.values()) >= stack
+
+
+def _street_depth(hand: CanonicalHand, index: int, label: str) -> int:
+    """Сколько игрок может вложить на улице действия `index` всего: остаток плюс
+    уже поставленное на ней — стек на входе в улицу."""
+    street = hand.actions[index].street
+    stack, ante, by_street = _invested(hand, index, label)
+    earlier = sum(chips for s, chips in by_street.items() if s is not street)
+    return stack - ante - earlier
+
+
+def _call_cap(hand: CanonicalHand, index: int, live: set[str], level: int) -> int:
+    """Потолок ставки героя, которую соперники могут уравнять (§4.6).
+
+    Самый глубокий живой соперник, у которого перед ходом есть фишки за спиной:
+    его остаток плюс поставленное на улице. Блеф окупается, только когда
+    сбрасывают все, а проигрыш при колле считается против того, кто может
+    заплатить больше всех.
+    """
+    hero = hand.actions[index].label
+    depths = [
+        _street_depth(hand, index, label)
+        for label in live
+        if label != hero and not _all_in_before(hand, index, label)
+    ]
+    # `level` — поставленное героем до хода плюс колл, уже уравненная часть.
+    # Движок не принимает ставку и рейз, когда уравнять их некому, так что на
+    # принятой руке потолок выше; `level` лишь не даёт пустому списку упасть.
+    return max([level, *depths])
 
 
 def _in_position(en: EnrichedHand, index: int) -> bool:

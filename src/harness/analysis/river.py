@@ -90,14 +90,10 @@ def river_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | None:
             ),
         )
     if len(hero) != _HERO_CARDS:
-        return unjudged_point(
-            dp, SpotKind.POSTFLOP, postflop_reason(dp, "карты героя неизвестны")
-        )
+        return unjudged_point(dp, SpotKind.POSTFLOP, "карты героя неизвестны")
     if len(board) != _BOARD_SIZE:
         return unjudged_point(
-            dp,
-            SpotKind.POSTFLOP,
-            postflop_reason(dp, f"борд из {len(board)} карт, а перебор ждёт {_BOARD_SIZE}"),
+            dp, SpotKind.POSTFLOP, f"борд из {len(board)} карт, а перебор ждёт {_BOARD_SIZE}"
         )
 
     try:
@@ -105,7 +101,8 @@ def river_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | None:
     except ValueError as failure:
         # Карты, которых нет в колоде, или разъехавшийся банк: считать по ним
         # нельзя, а подправить их значило бы соврать про деньги (CLAUDE.md).
-        return unjudged_point(dp, SpotKind.POSTFLOP, postflop_reason(dp, str(failure)))
+        # Причина о данных остаётся у любого действия, рейз не исключение.
+        return unjudged_point(dp, SpotKind.POSTFLOP, str(failure))
 
     detail = {RIVER_CALL_DETAIL: _detail(requirement, dp).model_dump(mode="json")}
     if not requirement.fold_proven:

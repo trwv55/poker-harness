@@ -390,14 +390,15 @@ POSTFLOP_CHECK_REASON = ""
 def postflop_reason(dp: DecisionPoint, boundary: str) -> str:
     """Причина «вердикта нет» постфлоп-точки на границе инструмента колла.
 
-    `boundary` — причина, которую инструмент колла назвал бы сам (нет ставки
-    перед героем, живых больше двух, лучшее действие не названо, карты героя
-    неизвестны, борд не той длины, отказ перебора); она остаётся у колла и
-    фолда. Ставка и рейз получают `POSTFLOP_FOLD_FREQUENCY_REASON` — инструмент
-    колла к ним неприменим, какой бы ни была его граница; чек —
-    `POSTFLOP_CHECK_REASON` (`test_postflop_reasons_name_what_a_verdict_lacks`,
-    `test_a_raise_keeps_the_fold_frequency_reason_where_the_call_tool_refuses`,
-    `test_a_raise_on_a_short_board_keeps_the_fold_frequency_reason`).
+    `boundary` — граница применимости, которую инструмент колла назвал бы сам
+    (нет ставки перед героем, живых больше двух, лучшее действие не названо,
+    фолд не доказан); она остаётся у колла и фолда. Ставка и рейз получают
+    `POSTFLOP_FOLD_FREQUENCY_REASON`, чек — `POSTFLOP_CHECK_REASON`
+    (`test_postflop_reasons_name_what_a_verdict_lacks`). Отказ по данным сюда не
+    идёт: карты героя неизвестны, борд не той длины, перебор не принял карты —
+    причина о данных у любого действия, и у рейза тоже
+    (`test_a_raise_keeps_the_data_reason_where_the_call_tool_refuses_on_data`,
+    `test_a_raise_on_a_short_board_keeps_the_data_reason`).
     """
     kind = dp.action.kind
     if kind in (ActionKind.BET, ActionKind.RAISE):

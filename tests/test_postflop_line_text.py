@@ -593,7 +593,24 @@ def test_a_draw_call_short_of_the_pot_odds_names_the_amount_to_win_later():
     assert detail.draw_call is not None and detail.draw_call.implied_needed_chips is not None
     chips = detail.draw_call.implied_needed_chips
     block = next(b for b in _blocks(_text(en)) if "окупается:" in b)
-    assert f"    окупается: нужно добрать позже {chips / en.hand.bb:.1f} ББ" in block.splitlines()
+    printed = -(-10 * chips // en.hand.bb) / 10
+    assert f"    окупается: нужно добрать позже {printed:.1f} ББ" in block.splitlines()
+
+
+@pytest.mark.parametrize(
+    ("chips", "printed"), [(1_234, "12.4"), (1_230, "12.3"), (1_201, "12.1"), (5, "0.1")]
+)
+def test_the_amount_to_win_later_rounds_up_to_a_tenth(chips, printed):
+    """X — требование: 1 234 фишки при ББ 100 печатаются «12.4», а не «12.3» —
+    округление к ближайшему занизило бы его на 0.04 ББ."""
+    call = DrawCallDetail(
+        required_equity=0.25,
+        hit=0.1,
+        by_pot_odds=False,
+        implied_needed_chips=chips,
+        beyond_stack=False,
+    )
+    assert _printed(draw_call=call) == [f"    окупается: нужно добрать позже {printed} ББ"]
 
 
 def test_an_amount_beyond_the_stacks_is_a_line_and_not_a_verdict():
@@ -675,8 +692,8 @@ def _money_the_hand_contains(en: EnrichedHand) -> set[float]:
     """Суммы в ББ, которые вправе стоять в разборе: руки, движка и `detail` ядра.
 
     К суммам руки и ядра добавлена одна производная сумма ядра — `X` из `detail`
-    (сколько добрать позже, `DrawCall.implied_needed_chips`), решение спеки
-    постфлоп-линии, §9 гейт 11.
+    (сколько добрать позже, `DrawCall.implied_needed_chips`, в ББ вверх до
+    десятой, как печатается), решение спеки постфлоп-линии, §9 гейт 11.
     """
     from harness.contracts.enriched import hero_stack_delta_bb
 
@@ -700,7 +717,7 @@ def _money_the_hand_contains(en: EnrichedHand) -> set[float]:
         if detail is not None and detail.draw_call is not None:
             chips = detail.draw_call.implied_needed_chips
             if chips is not None:
-                allowed.add(round(chips / hand.bb, 1))
+                allowed.add(-(-10 * chips // hand.bb) / 10)
     return allowed
 
 

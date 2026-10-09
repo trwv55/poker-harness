@@ -864,6 +864,92 @@ def test_a_raise_threshold_cuts_the_raise_and_the_call_by_the_opponents_stack():
     assert threshold.semibluff == pytest.approx(float(-ev / (1_600 - ev)), abs=1e-12)
 
 
+def test_the_cut_takes_the_hero_stack_and_not_the_bet_left_after_his_bet():
+    """Герой ставит 1 000, соперник со стеком 4 700 рейзит до 3 000, герой идёт в
+    олл-ин 49 700: урезается вся ставка героя на улице, а не добавка.
+
+    B = min(49 700, 4 700) − 1 000 = 3 700, C = 3 700 − 2 000 = 1 700, P = 4 600:
+    блеф 3 700 / 8 300, полублеф с 15 аутами на тёрне ≈ 8.7%. Урезание добавки
+    (min(48 700, 4 700) = 4 700) дало бы другие числа.
+    """
+    en = _oop(
+        [
+            *_V_OPENS,
+            _check(F, "Hero"),
+            _check(F, "V"),
+            _bet(T, "Hero", 1_000),
+            _raise(T, "V", 3_000),
+            _raise(T, "Hero", 49_700),
+        ],
+        seats=(("Hero", 50_000), ("V", 5_000)),
+        hero_cards=("Tc", "7c"),
+        boards=_COMBO_BOARD,
+    )
+    dp = _points(en, T)[-1]
+    assert (dp.pot_before, dp.to_call, dp.eff_stack) == (4_600, 2_000, 4_700)
+    detail = _detail(en, T)
+    assert detail.line is not None and detail.line.purpose is Purpose.SEMIBLUFF
+    threshold = detail.fold_threshold
+    assert threshold is not None
+    assert threshold.bluff == 3_700 / 8_300
+    assert round(threshold.bluff, 4) == 0.4458
+    ev = Fraction(15, 46) * (4_600 + 3_700 + 1_700) - 3_700
+    assert threshold.semibluff == pytest.approx(float(-ev / (4_600 - ev)), abs=1e-12)
+    assert threshold.semibluff is not None and round(threshold.semibluff, 4) == 0.0871
+
+
+def _multiway_shove_over_a_called_bet(
+    v2_stack: int, v2_answer: RawAction | None = None
+) -> EnrichedHand:
+    """Герой на кнопке (50 000), V1 на SB (5 000), V2 на BB; опен 300 и два колла,
+    флоп чек ×3; на тёрне V1 ставит 1 000, V2 отвечает, герой рейзит в олл-ин 49 700."""
+    return _ip(
+        [
+            _raise(P, "Hero", 300),
+            _call(P, "V1", 250),
+            _call(P, "V2", 200),
+            _check(F, "V1"),
+            _check(F, "V2"),
+            _check(F, "Hero"),
+            _bet(T, "V1", 1_000),
+            v2_answer or _call(T, "V2", 1_000),
+            _raise(T, "Hero", 49_700),
+        ],
+        seats=(("Hero", 50_000), ("V1", 5_000), ("V2", v2_stack)),
+    )
+
+
+def test_a_multiway_raise_is_not_cut_by_a_deeper_opponent_than_the_hero():
+    """V2 позади агрессора глубже героя и уравнивает все 49 700: урезать нечего.
+
+    `eff_stack` (4 700 — против агрессора V1) здесь не потолок: от него вышло бы
+    4 700 / 7 600 ≈ 61.8%. Без урезания — 49 700 / (2 900 + 49 700) ≈ 94.5%.
+    """
+    en = _multiway_shove_over_a_called_bet(50_000)
+    dp = _points(en, T)[-1]
+    assert (dp.pot_before, dp.to_call, dp.eff_stack) == (2_900, 1_000, 4_700)
+    detail = _detail(en, T)
+    assert detail.line is not None and detail.line.purpose is Purpose.BLUFF
+    assert detail.fold_threshold is not None
+    assert detail.fold_threshold.bluff == 49_700 / 52_600
+    assert round(detail.fold_threshold.bluff, 3) == 0.945
+
+
+@pytest.mark.parametrize(
+    ("v2_stack", "v2_answer", "cap"),
+    [(20_000, None, 19_700), (50_000, _fold(T, "V2"), 4_700)],
+    ids=["deepest-is-shorter-than-hero", "deep-one-folded"],
+)
+def test_a_multiway_raise_is_cut_by_the_deepest_opponent_who_can_call(v2_stack, v2_answer, cap):
+    """Потолок — стек на улице самого глубокого живого соперника: V2 с 19 700, а
+    сбросивший V2 в счёт не идёт — тогда потолок V1 с 4 700."""
+    en = _multiway_shove_over_a_called_bet(v2_stack, v2_answer)
+    dp = _points(en, T)[-1]
+    detail = _detail(en, T)
+    assert detail.fold_threshold is not None
+    assert detail.fold_threshold.bluff == cap / (dp.pot_before + cap)
+
+
 def test_a_semibluff_with_zero_expectation_pays_without_folds():
     """Ровно E = 0: 15/46 · (1 600 + 2 · 1 500) − 1 500 = 0 — «окупается без фолдов»."""
     en = _oop(
@@ -1254,27 +1340,30 @@ def _raises_on_every_street() -> EnrichedHand:
     )
 
 
+_DUPLICATE_CARD = "карта встречается дважды среди карт героя и борда: "
+
+
 @pytest.mark.parametrize(
     ("dealt", "refusal"),
-    [({}, "карты героя неизвестны"), ({"Hero": ["Kh", "3c"]}, None)],
+    [({}, "карты героя неизвестны"), ({"Hero": ["Kh", "3c"]}, _DUPLICATE_CARD)],
     ids=["unknown", "tool-failure"],
 )
-def test_a_raise_keeps_the_fold_frequency_reason_where_the_call_tool_refuses(dealt, refusal):
-    """Инструмент колла к рейзу героя неприменим: его отказ по данным — карт нет
-    или перебор не принял карты (K♥ героя уже на борде) — остаётся у колла, а у
-    рейза причина §4.9."""
+def test_a_raise_keeps_the_data_reason_where_the_call_tool_refuses_on_data(dealt, refusal):
+    """Отказ инструмента колла по данным — карт героя нет или перебор не принял
+    карты (K♥ героя уже на борде) — у рейза остаётся причиной о данных, как у
+    колла: расхождение с источником видно, а не спрятано за частотой фолдов."""
     en = _raises_on_every_street()
     broken = en.model_copy(update={"hand": en.hand.model_copy(update={"dealt": dealt})})
     points = [p for p in analyze_hand(broken).points if p.street is not P]
     raises = [p for p in points if p.action_taken == "raise"]
     assert [p.street for p in raises] == [F, T, R]
     for point in raises:
-        assert point.detail["unjudged"] == POSTFLOP_FOLD_FREQUENCY_REASON
+        assert point.detail["unjudged"].startswith(refusal)
     for dp in (_points(broken, F)[-1], _points(broken, R)[-1]):
         verdict = turn_flop_verdict(dp, broken) or river_verdict(dp, broken)
         assert verdict is not None
-        assert verdict.detail["unjudged"] == POSTFLOP_FOLD_FREQUENCY_REASON
-    # Та же граница у колла остаётся причиной о данных.
+        assert verdict.detail["unjudged"].startswith(refusal)
+    # Та же причина у колла.
     called = _oop(
         [*_V_OPENS, _check(F, "Hero"), _bet(F, "V", 300), _call(F, "Hero", 300)]
     )
@@ -1283,24 +1372,29 @@ def test_a_raise_keeps_the_fold_frequency_reason_where_the_call_tool_refuses(dea
     )
     call_point = turn_flop_verdict(_points(called, F)[-1], called)
     assert call_point is not None
-    reason = call_point.detail["unjudged"]
-    assert reason != POSTFLOP_FOLD_FREQUENCY_REASON
-    if refusal is not None:
-        assert reason == refusal
+    assert call_point.detail["unjudged"].startswith(refusal)
 
 
-def test_a_raise_on_a_short_board_keeps_the_fold_frequency_reason():
-    """Борд без карт тёрна и ривера — граница инструмента колла, но не рейза."""
+def test_a_raise_on_a_short_board_keeps_the_data_reason():
+    """Борд без карт тёрна и ривера — отказ по данным: у рейза причина о борде.
+    Рейз на флопе, где борд полон и инструмент посчитал без лучшего действия,
+    держит частоту фолдов."""
     en = _raises_on_every_street()
     short = en.model_copy(
         update={"hand": en.hand.model_copy(update={"boards": {F: en.hand.boards[F]}})}
     )
-    for street in (T, R):
+    reasons = {}
+    for street in (F, T, R):
         dp = _points(short, street)[-1]
         assert dp.action.kind is ActionKind.RAISE
         verdict = turn_flop_verdict(dp, short) or river_verdict(dp, short)
         assert verdict is not None
-        assert verdict.detail["unjudged"] == POSTFLOP_FOLD_FREQUENCY_REASON
+        reasons[street] = verdict.detail["unjudged"]
+    assert reasons == {
+        F: POSTFLOP_FOLD_FREQUENCY_REASON,
+        T: "борд из 3 карт, а на этой улице их 4",
+        R: "борд из 3 карт, а перебор ждёт 5",
+    }
 
 
 def test_a_deep_limped_pot_keeps_its_old_reason():

@@ -1992,7 +1992,7 @@ def test_the_raw_data_block_prints_no_money_the_hand_does_not_contain():
         if line is not None and line.draw_call is not None:
             chips = line.draw_call.implied_needed_chips
             if chips is not None:
-                allowed.add(round(chips / hand.bb, 1))
+                allowed.add(-(-10 * chips // hand.bb) / 10)
 
     text = _deep_dive(res, en).text
     money = [float(n) for n in re.findall(r"(\d+(?:\.\d+)?)\s*ББ", text)]

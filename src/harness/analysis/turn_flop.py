@@ -96,14 +96,10 @@ def turn_flop_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | Non
             ),
         )
     if len(hero) != _HERO_CARDS:
-        return unjudged_point(
-            dp, SpotKind.POSTFLOP, postflop_reason(dp, "карты героя неизвестны")
-        )
+        return unjudged_point(dp, SpotKind.POSTFLOP, "карты героя неизвестны")
     if len(board) != board_size:
         return unjudged_point(
-            dp,
-            SpotKind.POSTFLOP,
-            postflop_reason(dp, f"борд из {len(board)} карт, а на этой улице их {board_size}"),
+            dp, SpotKind.POSTFLOP, f"борд из {len(board)} карт, а на этой улице их {board_size}"
         )
 
     try:
@@ -113,8 +109,8 @@ def turn_flop_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | Non
     except ValueError as failure:
         # Карты, которых нет в колоде, борд не той длины или разъехавшийся банк:
         # считать по ним нельзя, а подправить их значило бы соврать про деньги
-        # (CLAUDE.md).
-        return unjudged_point(dp, SpotKind.POSTFLOP, postflop_reason(dp, str(failure)))
+        # (CLAUDE.md). Причина о данных остаётся у любого действия, рейз не исключение.
+        return unjudged_point(dp, SpotKind.POSTFLOP, str(failure))
 
     detail = {TURN_FLOP_CALL_DETAIL: _detail(requirement, dp).model_dump(mode="json")}
     return unjudged_point(
