@@ -301,7 +301,7 @@ async def test_hh_scan_end_to_end(db_factory, fake_sender, queue, deps):
     # вердикта больше не получают. Проверяется то, что от состава списка не
     # зависит, — что игроку ушла именно сводка скана с числом в bb; раскладку
     # кнопок под пунктами закрывает `test_presentation`.
-    assert "Скан завершён: 146 рук" in final.text and "bb" in final.text
+    assert "Скан завершён: 146 рук" in final.text and "BB" in final.text
     assert await count(db_factory, "hands") == 146  # артефакты записаны
     assert await count(db_factory, "traces") == 1
     # Контроллерский рулинг задачи 18, п.1: эквити-кэш скана обязан осесть в
@@ -2194,7 +2194,7 @@ async def test_a_single_hand_file_prints_no_opponent_frequencies(
         deps, queue, db_factory, fake_sender, tmp_path, _SYNTHETIC_HH, "SYNTH1"
     )
     assert "VPIP" not in text and "PFR" not in text
-    assert "SB (10ББ) опен 3.0" in text
+    assert "SB (10BB) опен 3.0" in text
 
 
 def _copies_of_the_second_hand(n: int) -> str:
@@ -2219,7 +2219,7 @@ async def test_opponent_frequencies_come_only_from_other_hands(
         "SYNTH1",
     )
     assert "VPIP 0%, PFR 0%, раздач 20)" in text
-    assert "SB (10ББ · " in text
+    assert "SB (10BB · " in text
 
 
 async def test_nineteen_other_hands_are_not_enough_for_frequencies(
@@ -2237,7 +2237,7 @@ async def test_nineteen_other_hands_are_not_enough_for_frequencies(
         "SYNTH1",
     )
     assert "VPIP" not in text
-    assert "SB (10ББ) опен 3.0" in text
+    assert "SB (10BB) опен 3.0" in text
 
 
 async def test_an_hh_scan_sends_the_summary_and_nothing_else(

@@ -309,6 +309,7 @@ async def test_a_postflop_line_survives_the_round_trip_through_the_database(db):
         },
         "draw_call": None,
         "showdown": None,
+        "alternatives": None,
     }
     point = PointVerdict(
         dp_index=2,

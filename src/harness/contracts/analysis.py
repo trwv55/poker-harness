@@ -22,6 +22,7 @@ from pydantic import BaseModel, model_validator
 
 from harness.contracts.postflop import (
     Backdoor,
+    BetAlternatives,
     Draw,
     DrawCall,
     FoldThreshold,
@@ -220,6 +221,28 @@ class PostflopLineDetail(BaseModel):
     fold_threshold: FoldThreshold | None
     draw_call: DrawCall | None
     showdown: ShowdownValue | None
+    # Только у последнего решения героя в раздаче — чека или бета не в олл-ин без
+    # ставки перед ним (решение владельца 2026-10-10). Значение по умолчанию —
+    # чтобы точки, записанные до поля, читались.
+    alternatives: BetAlternatives | None = None
+
+
+# Порог опена первым (решение владельца 2026-10-10, спека постфлоп-линии, §12):
+# рейз в неоткрытый банк печатает его вместо шансов банка колла.
+OPEN_THRESHOLD_DETAIL = "open_threshold"
+
+
+class OpenThreshold(BaseModel):
+    """Сколько фолдов нужно, чтобы опен первым окупился сразу, в долях единицы.
+
+    `risk` — сколько рейз добавляет к уже поставленному героем блайнду, не выше
+    стека самого глубокого соперника, который может уравнять (анте не входит: оно
+    уже в банке); `pot` — банк до хода; `fold_share` — `risk / (pot + risk)`.
+    """
+
+    risk: int
+    pot: int
+    fold_share: float
 
 
 class PointVerdict(BaseModel):
@@ -312,6 +335,18 @@ def postflop_line_detail(point: PointVerdict) -> PostflopLineDetail | None:
     if raw is None:
         return None
     return PostflopLineDetail.model_validate(raw)
+
+
+def open_threshold_detail(point: PointVerdict) -> OpenThreshold | None:
+    """Порог опена точки из `detail` — или `None`, если его там нет.
+
+    Чужое содержимое под ключом роняет разбор — то же правило, что у
+    `river_call_detail`.
+    """
+    raw = point.detail.get(OPEN_THRESHOLD_DETAIL)
+    if raw is None:
+        return None
+    return OpenThreshold.model_validate(raw)
 
 
 class AnalysisResult(BaseModel):

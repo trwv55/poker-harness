@@ -55,6 +55,17 @@
 фишки, и сравнение `X` с меньшим из стеков после колла,
 `DecisionPoint.eff_stack − (поставлено героем на улице после колла)`: «добрать
 столько нельзя» — только при `X` строго больше.
+
+**Альтернативы** (решение владельца 2026-10-10, спека §12) — только у последнего
+решения героя в раздаче, если это чек или бет не в олл-ин без ставки перед ним:
+порог ставки 50% банка `B / (P + B)` при `B = P / 2` (ровно 1/3; нет, если
+эффективный стек не больше половины банка) и олл-ина `S / (P + S)`, где `S` —
+`DecisionPoint.eff_stack`.
+
+**Порог опена первым** (`open_threshold`, там же) — префлоп: рейз в неоткрытый
+банк окупается сразу при доле фолдов от `R / (P + R)`, где `P` —
+`DecisionPoint.pot_before`, `R` — сколько рейз добавляет к блайнду героя (анте
+уже в банке), урезанное тем же потолком, что у блефа.
 """
 
 from __future__ import annotations
@@ -77,6 +88,7 @@ from harness.contracts import (
     ActionKind,
     ActionTag,
     Backdoor,
+    BetAlternatives,
     CanonicalAction,
     CanonicalHand,
     DecisionPoint,
@@ -86,6 +98,7 @@ from harness.contracts import (
     FoldThreshold,
     HandStrength,
     Line,
+    OpenThreshold,
     Overcards,
     PostflopLineDetail,
     Purpose,
@@ -97,7 +110,7 @@ from harness.contracts import (
 from harness.engine.validation import forced_blind
 from harness.normalizer import POSITIONS_BY_COUNT
 
-__all__ = ["postflop_line"]
+__all__ = ["open_threshold", "postflop_line"]
 
 _POSTFLOP = (Street.FLOP, Street.TURN, Street.RIVER)
 _BOARD_SIZE = {Street.FLOP: 3, Street.TURN: 4, Street.RIVER: 5}
@@ -151,6 +164,50 @@ def postflop_line(
             else None
         ),
         showdown=cards.showdown,
+        alternatives=_alternatives(dp, hand, index),
+    )
+
+
+def open_threshold(dp: DecisionPoint, en: EnrichedHand) -> OpenThreshold:
+    """Порог опена первым: доля фолдов, при которой рейз окупается сразу.
+
+    `risk` — рейз до `committed_after` за вычетом блайнда героя, урезанный стеком
+    самого глубокого соперника, который может уравнять (`_call_cap`); анте в риск
+    не входит. Звать для рейза героя в неоткрытый банк — проверку делает
+    вызывающий (`preflop.verdict_for`).
+    """
+    hand = en.hand
+    index = action_index(hand, dp)
+    taken = hand.actions[index]
+    hero = next(player for player in hand.players if player.label == taken.label)
+    posted = forced_blind(hand, hero, min(hand.ante, hero.stack))
+    cap = _call_cap(hand, index, _live(en, index), posted + dp.to_call)
+    risk = min(taken.committed_after, cap) - posted
+    pot = dp.pot_before
+    return OpenThreshold(risk=risk, pot=pot, fold_share=risk / (pot + risk))
+
+
+def _alternatives(dp: DecisionPoint, hand: CanonicalHand, index: int) -> BetAlternatives | None:
+    """Ставка 50% банка и олл-ин вместо последнего чека или бета героя (§12).
+
+    Только последнее решение героя в раздаче, только чек или бет не в олл-ин и
+    без ставки перед ним; ставки 50% нет, если эффективный стек не больше
+    половины банка — такая ставка и есть олл-ин.
+    """
+    taken = hand.actions[index]
+    if taken.kind not in (ActionKind.CHECK, ActionKind.BET) or taken.is_all_in or dp.to_call:
+        return None
+    if any(action.label == taken.label for action in hand.actions[index + 1 :]):
+        return None
+    pot, stack = dp.pot_before, dp.eff_stack
+    if pot <= 0 or stack <= 0:
+        return None
+    half = Fraction(pot, 2)
+    return BetAlternatives(
+        pot=pot,
+        half_pot=float(half / (pot + half)) if 2 * stack > pot else None,
+        all_in_chips=stack,
+        all_in=stack / (pot + stack),
     )
 
 

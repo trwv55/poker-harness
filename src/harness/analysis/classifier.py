@@ -350,12 +350,12 @@ def unpriced_reason(dp: DecisionPoint, state: TableState) -> str:
             hero, depth = state.hero.position, _open_depth_half_up(state)
             if hero in _BLINDS:
                 return (
-                    f"нет чарта защиты {hero} против опена {opener.position} на {depth} ББ"
+                    f"нет чарта защиты {hero} против опена {opener.position} на {depth}BB"
                 )
-            return f"нет чарта ответа {hero} на опен {opener.position} на {depth} ББ"
+            return f"нет чарта ответа {hero} на опен {opener.position} на {depth}BB"
         return (
-            f"глубже пуш-фолд-зоны: эффективный стек {dp.eff_stack_bb:.1f}bb "
-            f"> {PUSHFOLD_MAX_EFF_BB:.0f}bb"
+            f"глубже пуш-фолд-зоны: эффективный стек {dp.eff_stack_bb:.1f}BB "
+            f"> {PUSHFOLD_MAX_EFF_BB:.0f}BB"
         )
     if state.hero.acted:
         return "герой уже вложился на этой улице: это война повышений, а не пуш-фолд"

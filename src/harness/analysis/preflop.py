@@ -106,7 +106,7 @@ from harness.analysis.classifier import (
     unpriced_reason,
 )
 from harness.analysis.open_chart import chart_exists, open_chart_verdict, taken_token
-from harness.analysis.postflop_line import postflop_line
+from harness.analysis.postflop_line import open_threshold, postflop_line
 from harness.analysis.river import river_verdict
 from harness.analysis.tools.equity import equity_vs_ranges
 from harness.analysis.tools.full_deal import (
@@ -135,6 +135,7 @@ from harness.analysis.tools.pushfold import (
 )
 from harness.analysis.turn_flop import turn_flop_verdict
 from harness.contracts import (
+    OPEN_THRESHOLD_DETAIL,
     POSTFLOP_LINE_DETAIL,
     ActionKind,
     Assumption,
@@ -749,7 +750,7 @@ def _too_wide_for_near_zero(interval: EvInterval) -> str:
     if width <= _NEAR_ZERO_MAX_WIDTH_BB:
         return ""
     return (
-        f"модели диапазона расходятся здесь на {width:.1f} bb и по разные стороны "
+        f"модели диапазона расходятся здесь на {width:.1f}BB и по разные стороны "
         f"нуля: при одних лучше входить, при других пасовать. Это не «решение "
         f"неважное» — про эту точку расчёт не говорит ничего"
     )
@@ -1750,15 +1751,32 @@ def verdict_for(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict:
         return _with_postflop_line(point, dp, en)
 
     state = table_state(dp, en)
+    point = _preflop_verdict(dp, en, state)
+    if (
+        dp.action.kind in (ActionKind.BET, ActionKind.RAISE)
+        and not state.opened_voluntarily
+        and not state.hero.acted
+    ):
+        # Опен первым: порог фолдов вместо шансов банка колла (решение владельца
+        # 2026-10-10). Вердикт, зона и цена точки от него не меняются.
+        threshold = open_threshold(dp, en)
+        detail = {**point.detail, OPEN_THRESHOLD_DETAIL: threshold.model_dump(mode="json")}
+        point = point.model_copy(update={"detail": detail})
+    return point
+
+
+def _preflop_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) -> PointVerdict:
+    """Вердикт префлоп-точки по её споту — диспетчер `verdict_for`."""
     spot = spot_for(dp, state)
     if spot is SpotKind.PUSHFOLD_UNOPENED:
         return _unopened_verdict(dp, en, state)
     if spot is SpotKind.PUSHFOLD_FACING_SHOVE:
         return _facing_shove_verdict(dp, en, state)
     if spot is SpotKind.OPEN_CHART:
-        # Стол без чарта (хедз-ап финалки, 6-, 7-, 9-max) на 13–15bb: шов и фолд
-        # судит равновесие пуш-фолда, как до справочника. Это другой эталон, а не
-        # подстановка соседнего чарта; рейз здесь вердикта не получает, как и раньше.
+        # Стол без СВОЕГО чарта (хедз-ап финалки, 6-, 7-, 9-max) на 13–15bb: шов и
+        # фолд судит равновесие пуш-фолда, как до справочника — посчитанное для
+        # этого стола, с ценой. Рейз там судит 8-max чарт по позиции от конца
+        # (решение владельца 2026-10-10), а на 9-max вердикта не получает.
         if (
             not chart_exists(state, en.hand.ante_type)
             and dp.eff_stack_bb <= PUSHFOLD_MAX_EFF_BB

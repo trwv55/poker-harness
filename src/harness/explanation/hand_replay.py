@@ -178,7 +178,7 @@ def chips(amount: int) -> str:
 
 
 def signed_bb(value_bb: float) -> str:
-    """Величина в ББ со знаком: типографский минус U+2212 и явный плюс, ноль — «0.0».
+    """Величина в BB со знаком: типографский минус U+2212 и явный плюс, ноль — «0.0».
 
     Публична ради второго читателя: `presentation.messages` печатает цену и
     интервал тем же знаком, и две копии дали бы два вида минуса в соседних
@@ -191,7 +191,7 @@ def signed_bb(value_bb: float) -> str:
 
 
 def bb(value_chips: int, big_blind: int) -> str:
-    """Сумма в ББ, одним знаком — единственный формат величин блока (спека §5.6).
+    """Сумма в BB, одним знаком — единственный формат величин блока (спека §5.6).
     Приблизительности нет: движок считает точно, «~5.5» обещало бы неуверенность."""
     return f"{value_chips / big_blind:.1f}"
 
@@ -252,8 +252,8 @@ def _half_up(pct: float) -> int:
 
 
 def _stack_bb(value_chips: int, big_blind: int) -> str:
-    """Стек оппонента в ББ: тот же `bb`, но ровное число без «.0» — «100», не
-    «100.0» (форма владельца 2026-10-07: «UTG+1 (100ББ)»;
+    """Стек оппонента в BB: тот же `bb`, но ровное число без «.0» — «100», не
+    «100.0» (форма владельца 2026-10-07: «UTG+1 (100BB)»;
     `test_an_opponent_who_stays_in_carries_his_starting_stack`)."""
     text = bb(value_chips, big_blind)
     return text.removesuffix(".0")
@@ -262,7 +262,7 @@ def _stack_bb(value_chips: int, big_blind: int) -> str:
 def _opponent_mark(
     hand: CanonicalHand, label: str, stats: Mapping[str, PlayerStats] | None
 ) -> str:
-    """` (100ББ)` или ` (100ББ · P5: VPIP 25%, PFR 18%, раздач 40)`.
+    """` (100BB)` или ` (100BB · P5: VPIP 25%, PFR 18%, раздач 40)`.
 
     Стек — стартовый, до раздачи (`PlayerState.stack`), и стоит всегда: в
     скобку попадает только тот, кто остался в раздаче отдельным шагом.
@@ -277,7 +277,7 @@ def _opponent_mark(
     (`worker.pipeline._tournament_stats`).
     """
     player = next((p for p in hand.players if p.label == label), None)
-    stack = "" if player is None else f"{_stack_bb(player.stack, hand.bb)}ББ"
+    stack = "" if player is None else f"{_stack_bb(player.stack, hand.bb)}BB"
     row = None if stats is None else stats.get(label)
     freq = ""
     if (
@@ -309,7 +309,7 @@ def _action_text(
     raise_ordinal: int,
     mark: str,
 ) -> str:
-    """Один ход: кто (позицией; герой — «вы»), что сделал и — у ставок — на сколько в ББ.
+    """Один ход: кто (позицией; герой — «вы»), что сделал и — у ставок — на сколько в BB.
 
     `mark` — готовая скобка со стеком и, если есть выборка, частотами оппонента
     (`_opponent_mark`) либо пустая строка; КОМУ и когда она достаётся, решает `_street_flow`:
@@ -464,7 +464,7 @@ def _showdown_line(hand: CanonicalHand) -> str | None:
 
 
 def _outcome_bb(en: EnrichedHand) -> str | None:
-    """Исход раздачи для героя: «−13.6 ББ» или «+1.8 ББ» — или `None`, строка молчит.
+    """Исход раздачи для героя: «−13.6BB» или «+1.8BB» — или `None`, строка молчит.
 
     Решение владельца 2026-10-09: знак вместо слов «отдаёте/забираете». Число —
     ЧИСТОЕ изменение стека героя (по стекам движка, см. `_shown_delta_bb`),
@@ -479,7 +479,7 @@ def _outcome_bb(en: EnrichedHand) -> str | None:
     (`test_the_sign_comes_from_the_stack_not_from_the_payout_record`).
 
     **Строка молчит в двух случаях.** Стек не изменился (округляется до 0.0):
-    «0.0 ББ» не событие раздачи (`test_an_untouched_stack_ends_the_paragraph_without_an_outcome`).
+    «0.0BB» не событие раздачи (`test_an_untouched_stack_ends_the_paragraph_without_an_outcome`).
     И непроверенный вход (`Verdict.not_checked` непуст): сейчас в списке бывает
     ровно одно — шоудаун, решённый на доукомплектованных картах
     (`engine.validation._fabricated_showdown`), и стек героя на конец руки там
@@ -492,17 +492,17 @@ def _outcome_bb(en: EnrichedHand) -> str | None:
     if en.verdict.not_checked:
         return None
     text = signed_bb(_shown_delta_bb(en))
-    return None if text == "0.0" else f"{text} ББ"
+    return None if text == "0.0" else f"{text}BB"
 
 
 def _shown_delta_bb(en: EnrichedHand) -> float:
     """Итог как разность стеков В ТОМ ВИДЕ, в каком они напечатаны блоком.
 
-    Решение владельца 2026-10-09: «Вы на …, 13.9 ББ», «итог −0.1» и «Стек после
-    раздачи: 13.7 ББ» не сходились на глаз — каждое число верно, но округлено
+    Решение владельца 2026-10-09: «Вы на …, 13.9BB», «итог −0.1» и «Стек после
+    раздачи: 13.7BB» не сходились на глаз — каждое число верно, но округлено
     отдельно. Разность округлённых стеков сходится всегда
     (`test_the_shown_stacks_and_the_outcome_add_up`). От счёта движка
-    (`hero_stack_delta_bb`) она отличается не больше чем на 0.1 ББ округления.
+    (`hero_stack_delta_bb`) она отличается не больше чем на 0.1BB округления.
     Нет стека на конец руки — берётся счёт движка как есть.
     """
     hand = en.hand
@@ -514,7 +514,7 @@ def _shown_delta_bb(en: EnrichedHand) -> float:
 
 
 def _stack_after_line(en: EnrichedHand) -> str | None:
-    """«Стек после раздачи: 23.5 ББ.» — стек героя на конец руки по счёту движка.
+    """«Стек после раздачи: 23.5BB.» — стек героя на конец руки по счёту движка.
 
     Молчит, когда нечем: у героя нет записи в `stacks_end`
     (`test_the_stack_after_the_hand_is_the_last_line_when_it_is_known`), и по
@@ -527,7 +527,7 @@ def _stack_after_line(en: EnrichedHand) -> str | None:
     end = en.report.stacks_end.get(hand.hero_label)
     if end is None:
         return None
-    return f"Стек после раздачи: {bb(end, hand.bb)} ББ."
+    return f"Стек после раздачи: {bb(end, hand.bb)}BB."
 
 
 def _header(hand: CanonicalHand) -> str:
@@ -566,7 +566,7 @@ def _side_pots_line(en: EnrichedHand) -> str | None:
         return "вы" if label == hand.hero_label else _position(hand, label)
 
     parts = " · ".join(
-        f"{bb(pot.amount, hand.bb)} ББ (претендуют: {', '.join(who(lb) for lb in pot.eligible)})"
+        f"{bb(pot.amount, hand.bb)}BB (претендуют: {', '.join(who(lb) for lb in pot.eligible)})"
         for pot in pots
     )
     return f"Банк делится на части: {parts}."
@@ -581,8 +581,8 @@ def hand_replay(
 
     Итог — конечный банк (`EngineReport.final_pot`), деление банка, если оно
     было, вскрытие с исходом раздачи через ` · `
-    («Вскрытие: … · итог −13.6 ББ») — если герой на вскрытии был; иначе, как и
-    без вскрытия, исход стоит своей строкой «Итог: −2.6 ББ.»
+    («Вскрытие: … · итог −13.6BB») — если герой на вскрытии был; иначе, как и
+    без вскрытия, исход стоит своей строкой «Итог: −2.6BB.»
     (`test_a_lost_hand_ends_with_the_chips_that_left_the_stack`,
     `test_a_showdown_without_the_hero_does_not_carry_his_outcome`). Последней
     идёт «Стек после раздачи: …». Цены решения в блоке нет: она живёт ниже, в
@@ -607,7 +607,7 @@ def hand_replay(
     hero_cards = hand.dealt.get(hand.hero_label, [])
     cards_part = f", {_cards(hero_cards)}" if hero_cards else ""
     spans.append(
-        ReplaySpan(text=f"Вы на {hero.position}{cards_part}, {bb(hero.stack, hand.bb)} ББ.")
+        ReplaySpan(text=f"Вы на {hero.position}{cards_part}, {bb(hero.stack, hand.bb)}BB.")
     )
 
     decisions = _hero_decision_indices(en)
@@ -636,7 +636,7 @@ def hand_replay(
         spans.extend(_street_flow(hand, actions, decisions, stats, marked))
         pot_before = en.report.pot_by_street.get(street, pot_before)
 
-    spans.append(ReplaySpan(text=f"\nКонечный банк: {bb(en.report.final_pot, hand.bb)} ББ."))
+    spans.append(ReplaySpan(text=f"\nКонечный банк: {bb(en.report.final_pot, hand.bb)}BB."))
     side_pots = _side_pots_line(en)
     if side_pots is not None:
         spans.append(ReplaySpan(text=f"\n{side_pots}"))
@@ -644,7 +644,7 @@ def hand_replay(
     showdown = _showdown_line(hand)
     outcome = _outcome_bb(en)
     # Исход клеится к вскрытию, только если на нём был сам герой: иначе «Вскрытие:
-    # SB … vs BB … · итог −0.1 ББ» читалось бы как проигрыш на вскрытии, а это
+    # SB … vs BB … · итог −0.1BB» читалось бы как проигрыш на вскрытии, а это
     # анте спасовавшего (`test_a_showdown_without_the_hero_does_not_carry_his_outcome`).
     hero_at_showdown = went_to_showdown(hand, hand.hero_label)
     glued = showdown is not None and outcome is not None and hero_at_showdown

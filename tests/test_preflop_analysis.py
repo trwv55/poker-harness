@@ -422,19 +422,19 @@ def test_no_llm_and_no_result_bias():
 # --- Классификация --------------------------------------------------------------
 
 
-def test_classify_deep_unopened_shove_goes_to_the_chart_and_names_a_missing_one():
+def test_classify_deep_unopened_shove_goes_to_the_chart_of_eight_max_from_the_end():
     """40bb в неоткрытом банке — открытие по чарту, а не пуш-фолд.
 
-    Стол синтетики — 6 мест, а чарты владельца есть только для 8-max: точка
-    остаётся без вердикта и называет, какого чарта нет. Соседний стол не
-    подставляется.
+    Стол синтетики — 6 мест, а чарты владельца есть только для 8-max: точка судится
+    8-max чартом той позиции, у которой столько же игроков позади (CO — CO;
+    решение владельца 2026-10-10).
     """
     en = _make_multiway_shove_hand(hero_cards=("Ac", "Ts"), eff_bb=40.0, players_behind=3)
     dp = en.report.decision_points[0]
     assert classify(dp, en) == "open_chart"
     p = analyze_hand(en).points[0]
-    assert p.best_action == "" and p.mismatch is None and p.ev_diff_bb == 0.0
-    assert "6 мест" in p.detail["unjudged"]
+    assert p.best_action != "" and p.mismatch is not None
+    assert (p.detail["chart_seats"], p.detail["chart_position"]) == (8, "CO")
 
 
 def test_classify_limp_in_pushfold_zone_is_not_priced():
@@ -802,7 +802,7 @@ def test_the_near_zero_form_is_refused_to_an_interval_that_is_too_wide():
     values = [*p.detail["ev_call_by_width_bb"].values(), p.detail["ev_call_bb"]]
     width = max(values) - min(values)
     assert width > _NEAR_ZERO_MAX_WIDTH_BB
-    assert f"{width:.1f} bb" in reason
+    assert f"{width:.1f}BB" in reason
 
 
 def test_a_wide_interval_on_one_side_of_zero_keeps_its_point_verdict():

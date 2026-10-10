@@ -281,7 +281,7 @@ def test_the_reference_hand_carries_the_data_the_owners_layout_prints():
     assert [p.street for p in points] == [P, F, T, R]
 
     assert POSTFLOP_LINE_DETAIL not in preflop.detail
-    assert preflop.detail["unjudged"] == "нет чарта защиты BB против опена UTG+1 на 37 ББ"
+    assert preflop.detail["unjudged"] == "нет чарта защиты BB против опена UTG+1 на 37BB"
 
     # Флоп: чек, рука и дро, строки «линия» нет.
     line = postflop_line_detail(flop)
@@ -1288,15 +1288,15 @@ def test_a_deep_answer_to_an_open_names_the_missing_defence_chart():
     """Ответ на опен глубже пуш-фолда: чарта защиты нет; глубина — целым числом."""
     point = analyze_hand(_oop([*_V_OPENS, _check(F, "Hero"), _check(F, "V")])).points[0]
     assert point.street is P
-    assert point.detail["unjudged"] == "нет чарта защиты BB против опена BTN на 100 ББ"
+    assert point.detail["unjudged"] == "нет чарта защиты BB против опена BTN на 100BB"
 
 
 @pytest.mark.parametrize(("stack", "depth"), [(3_650, 37), (3_649, 36), (3_750, 38)])
 def test_the_open_depth_in_the_reason_rounds_a_half_up(stack, depth):
-    """36.5 ББ — 37, а не банковское 36."""
+    """36.5BB — 37, а не банковское 36."""
     en = _oop([*_V_OPENS, _check(F, "Hero"), _check(F, "V")], seats=(("Hero", stack), ("V", _STACK)))
     point = analyze_hand(en).points[0]
-    assert point.detail["unjudged"] == f"нет чарта защиты BB против опена BTN на {depth} ББ"
+    assert point.detail["unjudged"] == f"нет чарта защиты BB против опена BTN на {depth}BB"
 
 
 def test_a_deep_answer_off_the_blinds_names_a_missing_response_chart():
@@ -1316,7 +1316,7 @@ def test_a_deep_answer_off_the_blinds_names_a_missing_response_chart():
     )
     point = analyze_hand(en).points[0]
     assert point.street is P
-    assert point.detail["unjudged"] == "нет чарта ответа BTN на опен UTG на 100 ББ"
+    assert point.detail["unjudged"] == "нет чарта ответа BTN на опен UTG на 100BB"
 
 
 def _raises_on_every_street() -> EnrichedHand:

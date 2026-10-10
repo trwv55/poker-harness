@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 
 from harness.analysis import analyze_hand
 from harness.contracts import (
+    OPEN_THRESHOLD_DETAIL,
     POSTFLOP_LINE_DETAIL,
     RIVER_CALL_DETAIL,
     TURN_FLOP_CALL_DETAIL,
@@ -47,6 +48,7 @@ from harness.contracts import (
     SpotKind,
     Street,
     Zone,
+    open_threshold_detail,
     postflop_line_detail,
 )
 from harness.contracts.enriched import hero_stack_delta_bb
@@ -121,8 +123,8 @@ def test_scan_summary_msg_lists_items_with_price_and_deep_dive_button():
 
     msg = scan_summary_msg(s, quota_left=17, quota_total=50)
 
-    assert "−2.3 bb" in msg.text
-    assert "−1.1 bb" in msg.text
+    assert "−2.3BB" in msg.text
+    assert "−1.1BB" in msg.text
     assert f"{17}/{50}" in msg.text
     assert "за 24 ч" in msg.text
     assert len(msg.buttons) == 2
@@ -179,7 +181,7 @@ def test_scan_summary_msg_never_asserts_the_taken_action_was_wrong():
 def test_scan_summary_msg_marks_assuming_rows_and_not_strict_rows():
     """Гарантия честности зоны: пометка — у строки `assuming`, и ровно у неё.
 
-    Обе строки в одной сводке различаются ценой (`−2.3 bb` / `−1.1 bb`), поэтому
+    Обе строки в одной сводке различаются ценой (`−2.3BB` / `−1.1BB`), поэтому
     можно найти КОНКРЕТНУЮ строку каждого пункта и проверить пометку на ней, а
     не «где-то в тексте» — иначе шаблон, ставящий пометку на все строки без
     разбора (или ни на одну), прошёл бы проверку по ошибке.
@@ -192,8 +194,8 @@ def test_scan_summary_msg_marks_assuming_rows_and_not_strict_rows():
     msg = scan_summary_msg(s, quota_left=17, quota_total=50)
 
     lines = msg.text.splitlines()
-    strict_line = next(line for line in lines if "−2.3 bb" in line)
-    assuming_line = next(line for line in lines if "−1.1 bb" in line)
+    strict_line = next(line for line in lines if "−2.3BB" in line)
+    assuming_line = next(line for line in lines if "−1.1BB" in line)
 
     assert "по модели диапазонов" not in strict_line
     assert "по модели диапазонов" in assuming_line
@@ -220,7 +222,7 @@ def test_scan_summary_msg_item_line_is_grammatically_correct():
     s = ScanSummary(hands_total=1, hands_with_decision=1, items=items, total_loss_bb=-2.3)
     msg = scan_summary_msg(s, quota_left=1, quota_total=1)
 
-    assert "№H1 · AA · пуш-фолд: фолд (лучше: шов) — −2.3 bb" in msg.text
+    assert "№H1 · AA · пуш-фолд: фолд (лучше: шов) — −2.3BB" in msg.text
     assert "вместо шов" not in msg.text  # старая (сломанная) формулировка round 1
     assert "верно" not in msg.text  # старая (нечестная в assuming) формулировка round 2
 
@@ -287,7 +289,7 @@ def test_scan_summary_msg_does_not_mention_a_cap_it_did_not_apply():
 def test_the_scan_summary_counts_nothing_it_cannot_judge():
     """Решение владельца 2026-09-12: счётчики покрытия из сводки убраны целиком.
 
-    «Оценено решений: 0 из 4» и «Суммарная потеря 0.0 bb» на файле, где движок
+    «Оценено решений: 0 из 4» и «Суммарная потеря 0.0BB» на файле, где движок
     не судит ни одной точки, говорили только о самом движке. Пустой список
     расхождений теперь не комментируется вовсе — ни числом, ни фразой.
     """
@@ -614,8 +616,8 @@ def test_scan_summary_msg_shows_close_calls_with_interval_and_ceiling():
 
     line = next(line for line in msg.text.splitlines() if "H7" in line)
     assert "около нуля" in line
-    assert "−0.3" in line and "0.8 bb" in line  # интервал целиком
-    assert "не больше 0.8 bb" in line  # потолок цены
+    assert "−0.3" in line and "0.8BB" in line  # интервал целиком
+    assert "не больше 0.8BB" in line  # потолок цены
     assert "по модели диапазонов" in line  # зона `assuming` подписана, как и у расхождений
 
 
@@ -688,8 +690,8 @@ def test_the_close_call_line_agrees_with_itself_after_rounding():
         total_loss_bb=0.0,
     )
     line = next(line for line in scan_summary_msg(s, 1, 1).text.splitlines() if "H7" in line)
-    assert "от −3.4 bb до +2.7 bb" in line
-    assert "не больше 3.4 bb" in line
+    assert "от −3.4BB до +2.7BB" in line
+    assert "не больше 3.4BB" in line
 
 
 # --- блок «Что было» и бюджет сообщения ----------------------------------------------
@@ -715,7 +717,7 @@ def _two_point_result() -> AnalysisResult:
 def _replay() -> HandReplay:
     return HandReplay(
         spans=[
-            ReplaySpan(text="Вы на SB, J♥9♥, 10.0 ББ.\nUTG фолд → "),
+            ReplaySpan(text="Вы на SB, J♥9♥, 10.0BB.\nUTG фолд → "),
             ReplaySpan(text="вы олл-ин 9.9", emphasis=True),
             ReplaySpan(text=" → BB & CO фолд."),
         ]
@@ -1192,8 +1194,8 @@ def test_leaks_msg_names_frequency_and_cost_next_to_every_type():
 
     msg = leaks_msg(_leak_overview(("no_shove", 7, 5.4), ("call_too_wide", 1, 3.1)))
 
-    assert "Не шовит, где надо — 7 раз, −5.4 bb" in msg.text
-    assert "Коллирует шов слишком широко — 1 раз, −3.1 bb" in msg.text
+    assert "Не шовит, где надо — 7 раз, −5.4BB" in msg.text
+    assert "Коллирует шов слишком широко — 1 раз, −3.1BB" in msg.text
 
 
 def test_leaks_msg_puts_the_coverage_above_the_list():
@@ -1315,8 +1317,8 @@ def test_session_summary_msg_counts_the_evening_and_names_its_leak():
 
     assert "Турниров: 1 · разобрано раздач: 12." in msg.text
     assert "Оценено решений: 18 из 24 за этот вечер." in msg.text
-    assert "Суммарная потеря в оценённых решениях: −6.3 bb." in msg.text
-    assert "Сбрасывает против шова, где колл плюсовой — 3 раза, −4.1 bb" in msg.text
+    assert "Суммарная потеря в оценённых решениях: −6.3BB." in msg.text
+    assert "Сбрасывает против шова, где колл плюсовой — 3 раза, −4.1BB" in msg.text
 
 
 def test_session_summary_msg_scopes_the_loss_to_the_judged_points():
@@ -1332,7 +1334,7 @@ def test_session_summary_msg_scopes_the_loss_to_the_judged_points():
     msg = session_summary_msg(_summary(loss_bb=0.0, points_judged=18, points_total=24))
 
     assert "Оценено решений: 18 из 24 за этот вечер." in msg.text
-    assert "Суммарная потеря в оценённых решениях: 0.0 bb." in msg.text
+    assert "Суммарная потеря в оценённых решениях: 0.0BB." in msg.text
     assert "по всем точкам разбора" not in msg.text
 
 
@@ -1929,7 +1931,7 @@ def test_a_question_answer_never_calls_a_decision_a_mistake():
 
 def test_the_raw_data_block_names_what_each_number_means():
     """Число без подписи — не диагностика, а шум: «9.1» не говорит ничего, «конечный
-    банк 9.1 ББ» говорит всё. Тест держит ПОДПИСИ, а не числа: числа меняются от
+    банк 9.1BB» говорит всё. Тест держит ПОДПИСИ, а не числа: числа меняются от
     раздачи к раздачи, а обещание «здесь сказано, что это значит» — нет.
     """
     en = _postflop_hand()
@@ -1957,7 +1959,7 @@ def test_the_raw_data_block_names_what_each_number_means():
 
 def test_the_raw_data_block_prints_no_money_the_hand_does_not_contain():
     """Ни одной выдуманной суммы (CLAUDE.md). Проверяются именно ДЕНЬГИ — числа
-    при «ББ»: номера точек, позиции и счётчики игроков деньгами не являются, и
+    при «BB»: номера точек, позиции и счётчики игроков деньгами не являются, и
     сверять их с суммами раздачи значило бы проверять не то правило.
     """
     en = _postflop_hand()
@@ -1993,9 +1995,15 @@ def test_the_raw_data_block_prints_no_money_the_hand_does_not_contain():
             chips = line.draw_call.implied_needed_chips
             if chips is not None:
                 allowed.add(-(-10 * chips // hand.bb) / 10)
+    # Риск опена первым — тоже производная сумма ядра (решение владельца 2026-10-10):
+    # рейз за вычетом блайнда героя.
+    for point in res.points:
+        opening = open_threshold_detail(point)
+        if opening is not None:
+            allowed.add(round(opening.risk / hand.bb, 1))
 
     text = _deep_dive(res, en).text
-    money = [float(n) for n in re.findall(r"(\d+(?:\.\d+)?)\s*ББ", text)]
+    money = [float(n) for n in re.findall(r"(\d+(?:\.\d+)?)BB", text)]
     assert money, "в блоке не осталось ни одной суммы — тест перестал что-либо значить"
     assert set(money) <= allowed, f"выдуманные суммы: {set(money) - allowed}"
 
@@ -2042,6 +2050,7 @@ def test_every_detail_key_the_analysis_produces_has_a_label():
         RIVER_CALL_DETAIL,
         TURN_FLOP_CALL_DETAIL,
         POSTFLOP_LINE_DETAIL,
+        OPEN_THRESHOLD_DETAIL,
         "unjudged",
     }
     assert not (seen - printed_elsewhere) - set(_DETAIL_LABELS), (
@@ -2101,7 +2110,7 @@ def test_a_hand_with_two_pots_names_each_part_and_who_claims_it():
         who = ", ".join(
             "вы" if label == en.hand.hero_label else position[label] for label in pot.eligible
         )
-        assert f"{pot.amount / en.hand.bb:.1f} ББ (претендуют: {who})" in line
+        assert f"{pot.amount / en.hand.bb:.1f}BB (претендуют: {who})" in line
 
 
 def test_a_point_without_a_verdict_gets_no_zone_no_price_and_no_better_line():
@@ -2130,7 +2139,7 @@ def test_a_point_without_a_verdict_and_without_a_reason_still_says_so():
 def test_a_judged_point_keeps_its_zone_price_and_better_line():
     """Вторая сторона: у судимой точки всё это печатается."""
     text = _deep_dive(_mixed_result()).text
-    assert "вердикт: спот пуш-фолд · зона строго · сыграно фолд · лучше шов · цена −2.3 ББ" in text
+    assert "вердикт: спот пуш-фолд · зона строго · сыграно фолд · лучше шов · цена −2.3BB" in text
 
 
 def test_the_price_of_a_point_never_renders_a_negative_zero():
@@ -2141,8 +2150,8 @@ def test_the_price_of_a_point_never_renders_a_negative_zero():
     )
     res = AnalysisResult(hand_no="TM1", points=[cheap], ranked=[0], total_ev_loss_bb=-0.03)
     text = _deep_dive(res).text
-    assert "цена 0.0 ББ" in text
-    assert "Сумма цены расхождений: 0.0 ББ" in text
+    assert "цена 0.0BB" in text
+    assert "Сумма цены расхождений: 0.0BB" in text
     assert "−0.0" not in text
 
 
@@ -2151,20 +2160,20 @@ def test_the_action_of_a_point_prints_the_number_that_belongs_to_it():
     лежит в `to_call`. Чек и фолд суммы не несут вовсе."""
     en = _postflop_hand()
     text = _deep_dive(analyze_hand(en), en).text
-    assert "сыграно: колл 2.0 ББ" in text, "колл печатает доплату"
+    assert "сыграно: колл 2.0BB" in text, "колл печатает доплату"
     assert "сыграно: чек" in text and "сыграно: чек 0.0" not in text
     assert "сыграно: фолд" in text and "сыграно: фолд 0.0" not in text
 
     shove = _two_side_pots_hand()
     raise_text = _deep_dive(analyze_hand(shove), shove).text
-    assert "сыграно: колл 4.4 ББ, олл-ин" in raise_text
+    assert "сыграно: колл 4.4BB, олл-ин" in raise_text
 
 
 def test_a_raise_prints_the_total_it_was_raised_to():
     from tests.test_preflop_analysis import _make_multiway_shove_hand
 
     en = _make_multiway_shove_hand(("7c", "2s"), 9.0, 3)
-    assert "сыграно: рейз до 9.0 ББ, олл-ин" in _deep_dive(analyze_hand(en), en).text
+    assert "сыграно: рейз до 9.0BB, олл-ин" in _deep_dive(analyze_hand(en), en).text
 
 
 def test_no_engine_token_of_the_analysis_reaches_the_player():
@@ -2260,7 +2269,7 @@ def test_the_ceiling_of_the_choice_is_named_only_where_the_interval_crosses_zero
     )
     text_across = _deep_dive(AnalysisResult(hand_no="A", points=[across], ranked=[0])).text
     text_one = _deep_dive(AnalysisResult(hand_no="B", points=[one_sided], ranked=[0])).text
-    assert "потолок цены выбора 0.6 ББ" in text_across and "интервал через ноль" in text_across
+    assert "потолок цены выбора 0.6BB" in text_across and "интервал через ноль" in text_across
     assert "потолок цены выбора" not in text_one
 
 
@@ -2269,15 +2278,15 @@ def test_a_stack_depth_is_printed_with_one_digit_like_every_other_stack():
     разную точность измерения."""
     en = _two_side_pots_hand()
     text = _deep_dive(analyze_hand(en), en).text
-    assert "глубина стека шовера, ББ: 25.0" in text
-    assert "глубина стека шовера, ББ: 25.00" not in text
+    assert "глубина стека шовера, BB: 25.0" in text
+    assert "глубина стека шовера, BB: 25.00" not in text
 
 
 def test_the_total_price_stands_next_to_the_money_check_not_above_the_points():
     """Итог раздачи — итогом, а не шапкой: сумма и сверка денег стоят рядом, ниже
     всех точек, и обе несжимаемы."""
     lines = _deep_dive(_mixed_result()).text.splitlines()
-    assert lines.index("Сумма цены расхождений: −3.4 ББ — только по оценённым точкам.") + 1 == (
+    assert lines.index("Сумма цены расхождений: −3.4BB — только по оценённым точкам.") + 1 == (
         lines.index("Сверка денег с источником: сошлась.")
     )
     assert lines.index("Сверка денег с источником: сошлась.") > lines.index(

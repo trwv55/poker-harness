@@ -16,6 +16,12 @@
 
 Правило «судить против диапазона, а не против вскрытой карты» выполняется по
 построению: эталон — стратегия, результат раздачи в вердикт не входит.
+
+**Стол меньше 8 мест судится 8-max чартом по позиции от конца** (решение владельца
+2026-10-10, `chart_position`): позиция берётся та, у которой в 8-max столько же
+игроков позади до BB (на 7 местах BTN — BTN, UTG — UTG+1). Зона та же, `strict`;
+в `detail` точка несёт `chart_seats` и `chart_position` — каким чартом судили.
+Стол на 8 мест судится своим чартом, как прежде; на 9 местах чарта нет.
 """
 
 from __future__ import annotations
@@ -39,8 +45,13 @@ from harness.contracts import (
     Zone,
     class_of,
 )
+from harness.normalizer import POSITIONS_BY_COUNT
 
 MISMATCH_BELOW = 0.30
+
+# Раскладка, для которой в справочнике есть чарты; стол меньше судится ими по
+# позиции от конца (`chart_position`).
+CHART_SEATS = 8
 
 # Порядок при равных частотах «лучшего» действия: активное раньше пассивного —
 # то же предпочтение, что у пуш-фолда при EV ровно ноль (`preflop._best_of`).
@@ -80,12 +91,14 @@ def most_frequent(freqs: dict[str, float]) -> str:
 
 
 def chart_exists(state: TableState, ante_type: str) -> bool:
-    """Есть ли в справочнике чарт для такого стола, позиции героя и типа анте.
+    """Есть ли в справочнике СВОЙ чарт стола — той же раскладки, позиции героя и анте.
 
-    Нужен диспетчеру (`preflop.verdict_for`): на 13–15bb точку без чарта судит
-    равновесие пуш-фолда, как до появления справочника, а не оставляет без
-    вердикта. Нечитаемый справочник — тоже «чарта нет»: причину назовёт сам
-    вердикт, если точка до него дойдёт.
+    Нужен диспетчеру (`preflop.verdict_for`): на 13–15bb шов и фолд за столом без
+    своего чарта судит равновесие пуш-фолда, посчитанное для этого стола, как до
+    появления справочника; 8-max чарт по позиции от конца (`chart_table`) его не
+    заменяет (`test_a_table_without_its_own_chart_keeps_the_push_fold_verdict_up_to_15bb`).
+    Нечитаемый справочник — тоже «чарта нет»: причину назовёт сам вердикт, если
+    точка до него дойдёт.
     """
     try:
         book = load_chart_book()
@@ -93,6 +106,32 @@ def chart_exists(state: TableState, ante_type: str) -> bool:
     except (ChartMissing, DepthNotCharted, ChartFileError):
         return False
     return True
+
+
+def chart_table(seats: int, position: str) -> tuple[int, str]:
+    """Раскладка и позиция чарта, которым судится открытие за столом на `seats` мест.
+
+    Стол меньше `CHART_SEATS` — 8-max и позиция с тем же числом игроков позади до
+    BB (`test_a_seven_handed_button_is_judged_by_the_eight_max_button`,
+    `test_a_seven_handed_utg_is_judged_by_the_eight_max_utg1`,
+    `test_a_six_handed_table_is_judged_by_position_from_the_end`); остальные — как
+    есть.
+    """
+    if seats >= CHART_SEATS or seats not in POSITIONS_BY_COUNT:
+        return seats, position
+    order = _preflop_order(seats)
+    if position not in order:
+        return seats, position
+    behind = len(order) - 1 - order.index(position)
+    chart_order = _preflop_order(CHART_SEATS)
+    return CHART_SEATS, chart_order[len(chart_order) - 1 - behind]
+
+
+def _preflop_order(seats: int) -> list[str]:
+    """Порядок хода на префлопе: от первого после BB до BB; в хедз-апе первой
+    ходит кнопка (она же SB)."""
+    order = POSITIONS_BY_COUNT[seats]
+    return list(order) if seats == 2 else [*order[2:], *order[:2]]
 
 
 def open_chart_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) -> PointVerdict:
@@ -110,24 +149,22 @@ def open_chart_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) -
         return refused("карты героя неизвестны")
     seats = len(state.seats)
     position = state.hero.position
+    chart_seats, chart_pos = chart_table(seats, position)
     depth = open_depth_bb(state)
     try:
         book = load_chart_book()
-        key = book.nearest(seats, position, depth, en.hand.ante_type)
+        key = book.nearest(chart_seats, chart_pos, depth, en.hand.ante_type)
         strategy = book.get(key)
         entry = book.entry(key)
     except ChartMissing:
-        return refused(
-            f"чарта открытия для стола на {seats} мест, позиции {position} и анте "
-            f"«{en.hand.ante_type}» в справочнике нет"
-        )
+        return refused(_missing_reason(seats, chart_seats, chart_pos, en.hand.ante_type))
     except ChartPlaceholder:
         return refused(
             f"чарт для позиции {position} на этой глубине помечен образцом формата — "
             f"эталоном он не служит"
         )
     except DepthNotCharted:
-        return refused(f"стек {depth:.1f}bb мельче, чем судит справочник чартов")
+        return refused(f"стек {depth:.1f}BB мельче, чем судит справочник чартов")
     except ChartFileError:
         return refused("справочник чартов не прочитался — сверить открытие не с чем")
 
@@ -156,8 +193,28 @@ def open_chart_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) -
             "taken_frequency": round(taken_frequency, 4),
             "chart_source": entry.source,
             "chart_revised_at": entry.revised_at.isoformat(),
+            **(
+                {"chart_seats": chart_seats, "chart_position": chart_pos}
+                if chart_seats != seats
+                else {}
+            ),
         },
     )
+
+
+def _missing_reason(seats: int, chart_seats: int, chart_pos: str, ante_type: str) -> str:
+    """Чего именно нет в справочнике: раскладки, позиции или типа анте.
+
+    Называется первое недостающее, а не все три сразу: «нет чарта для 7 мест,
+    позиции BTN и анте per_player» обвиняла бы анте, которое в справочнике есть
+    (`test_a_missing_chart_names_the_real_reason`).
+    """
+    keys = load_chart_book().all_keys()
+    if not any(key.seats == chart_seats for key in keys):
+        return f"чарта открытия для стола на {seats} мест в справочнике нет"
+    if not any(key.seats == chart_seats and key.position == chart_pos for key in keys):
+        return f"чарта открытия для позиции {chart_pos} стола на {chart_seats} мест в справочнике нет"
+    return f"чарта открытия для анте «{ante_type}» в справочнике нет"
 
 
 def _hero_class(hand: CanonicalHand) -> str | None:

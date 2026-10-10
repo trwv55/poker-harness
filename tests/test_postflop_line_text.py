@@ -68,30 +68,31 @@ from tests.test_postflop_line import (
 # строк под заголовком — четыре пробела, как у остального разбора (вердикт, требование
 # к диапазону): макет спеки набран с тремя.
 _REFERENCE_POINTS = """\
-1. Префлоп · BB · 5♣3♣ · сыграно: колл 1.0 ББ
-    банк до хода 4.3 ББ · доставить 1.0 ББ · эфф. стек 37.0 ББ · живых 2 (после вас 0)
+1. Префлоп · BB · 5♣3♣ · сыграно: колл 1.0BB
+    банк до хода 4.3BB · доставить 1.0BB · эфф. стек 37.0BB · живых 2 (после вас 0)
     шансы банка: колл окупается от 18.7% эквити
-    вердикта нет: нет чарта защиты BB против опена UTG+1 на 37 ББ
+    вердикта нет: нет чарта защиты BB против опена UTG+1 на 37BB
 
 2. Флоп Q♥4♦2♦ · BB · сыграно: чек
-    банк 5.3 ББ · эфф. стек 35.0 ББ · SPR 6.6 · живых 2 (после вас 1)
+    банк 5.3BB · эфф. стек 35.0BB · SPR 6.6 · живых 2 (после вас 1)
     рука: старшая 5, без пары
     дро: двусторонний стрит (A, 6) · 8 аутов · шанс собрать: на тёрне 17.0%, тёрн + ривер 31.5%
 
-3. Тёрн 7♠ · BB · сыграно: бет 3.0 ББ (56% банка)
-    банк 5.3 ББ · эфф. стек 35.0 ББ · SPR 6.6 · живых 2 (после вас 1)
+3. Тёрн 7♠ · BB · сыграно: бет 3.0BB (56% банка)
+    банк 5.3BB · эфф. стек 35.0BB · SPR 6.6 · живых 2 (после вас 1)
     рука: старшая 5, без пары
     дро: двусторонний стрит (A, 6) · 8 аутов · шанс собрать на ривере 17.4%
     линия: проба · полублеф
     окупается: как чистый блеф от 36% фолдов; с учётом аутов от 16% фолдов
     вердикта нет: частота фолдов оппонента зависит от его диапазона
 
-4. Ривер Q♦ · BB · сыграно: бет 8.5 ББ (75% банка)
-    банк 11.3 ББ · эфф. стек 32.0 ББ · SPR 2.8 · живых 2 (после вас 1)
+4. Ривер Q♦ · BB · сыграно: бет 8.5BB (75% банка)
+    банк 11.3BB · эфф. стек 32.0BB · SPR 2.8 · живых 2 (после вас 1)
     рука: пара дам на борде, играет кикер 5 · дро не закрылось
     ценность на вскрытии: нулевая (не выигрывает ни у одной руки, делит банк только с 5-3)
     линия: повторная ставка · блеф
     окупается: от 43% фолдов
+    альтернатива: ставка 50% — нужно 33% фолдов; олл-ин 32.0BB в 11.3BB — нужно 74% фолдов
     вердикта нет: частота фолдов оппонента зависит от его диапазона"""
 
 
@@ -124,10 +125,10 @@ def test_the_reference_hand_prints_the_owners_layout_line_by_line():
 
 
 def test_the_effective_stack_is_signed_in_full():
-    """Гейт 9: «эфф. стек 37.0 / 35.0 / 35.0 / 32.0 ББ» (решение владельца 2026-10-10:
+    """Гейт 9: «эфф. стек 37.0 / 35.0 / 35.0 / 32.0BB» (решение владельца 2026-10-10:
     подпись полная, короткая «эфф.» без слова «стек» не печатается)."""
     text = _text(_reference_hand())
-    assert re.findall(r"эфф\. стек (\d+\.\d) ББ", text) == ["37.0", "35.0", "35.0", "32.0"]
+    assert re.findall(r"эфф\. стек (\d+\.\d)BB", text) == ["37.0", "35.0", "35.0", "32.0"]
     assert not re.search(r"эфф\. \d", text)
 
 
@@ -154,7 +155,7 @@ def test_the_point_title_writes_cards_like_the_replay_block():
 def test_the_preflop_title_has_no_cards_when_the_hero_cards_are_unknown():
     en = _reference_hand()
     blind = en.model_copy(update={"hand": en.hand.model_copy(update={"dealt": {}})})
-    assert _blocks(_text(blind))[0].splitlines()[0] == "1. Префлоп · BB · сыграно: колл 1.0 ББ"
+    assert _blocks(_text(blind))[0].splitlines()[0] == "1. Префлоп · BB · сыграно: колл 1.0BB"
 
 
 # --- заголовок: «сыграно» --------------------------------------------------------------
@@ -175,18 +176,18 @@ def test_a_bet_and_a_raise_print_the_percent_of_the_pot_and_not_the_size_tag():
     assert detail is not None and detail.line is not None
     assert detail.line.size_tag is SizeTag.STANDARD
     text = _text(en)
-    assert "сыграно: рейз до 9.0 ББ (50% банка)" in text
+    assert "сыграно: рейз до 9.0BB (50% банка)" in text
     for tag in ("блок", "стандарт", "крупная", "овербет"):
         assert tag not in _points_part(text)
 
     bet = _text(_oop([*_V_OPENS, _bet(F, "Hero", 300)]))
-    assert "сыграно: бет 3.0 ББ (50% банка)" in bet
+    assert "сыграно: бет 3.0BB (50% банка)" in bet
     assert "бет до" not in bet
 
 
 def test_a_preflop_raise_prints_no_percent_of_the_pot():
     first = _blocks(_text(_hand(_HERO_OPENS, button="Hero")))[0].splitlines()[0]
-    assert first.endswith("сыграно: рейз до 3.0 ББ")
+    assert first.endswith("сыграно: рейз до 3.0BB")
     assert "%" not in first
 
 
@@ -196,7 +197,7 @@ def test_an_all_in_bet_keeps_the_percent_and_then_names_the_all_in():
     first = next(
         line for line in _text(en).splitlines() if line.startswith("2. ") and "сыграно: бет" in line
     )
-    assert first.endswith("сыграно: бет 6.0 ББ (100% банка), олл-ин")
+    assert first.endswith("сыграно: бет 6.0BB (100% банка), олл-ин")
 
 
 # --- строка чисел ----------------------------------------------------------------------
@@ -210,8 +211,8 @@ def test_the_numbers_line_prints_only_what_there_is_to_say():
     assert "SPR" not in blocks[0]
     assert "доставить" in preflop[1]
     assert preflop[1].lstrip().startswith("банк до хода ")
-    assert "доставить" not in blocks[1] and "0.0 ББ" not in flop[1]
-    assert flop[1].lstrip().startswith("банк 5.3 ББ")
+    assert "доставить" not in blocks[1] and "0.0BB" not in flop[1]
+    assert flop[1].lstrip().startswith("банк 5.3BB")
     assert "банк до хода" not in "\n".join(blocks[1:])
     for block in blocks:
         assert "доставить 0.0" not in block
@@ -219,9 +220,9 @@ def test_the_numbers_line_prints_only_what_there_is_to_say():
 
 def test_a_postflop_call_prints_the_pot_odds_without_repeating_the_pot_and_the_price():
     en = _gutshot_call(500_000)
-    call = next(b for b in _blocks(_text(en)) if "сыграно: колл 100.0 ББ" in b and "Флоп" in b)
+    call = next(b for b in _blocks(_text(en)) if "сыграно: колл 100.0BB" in b and "Флоп" in b)
     lines = call.splitlines()
-    assert lines[1].startswith("    банк 200.0 ББ · доставить 100.0 ББ · эфф. стек ")
+    assert lines[1].startswith("    банк 200.0BB · доставить 100.0BB · эфф. стек ")
     assert lines[2] == "    шансы банка: колл окупается от 33.3% эквити"
 
 
@@ -594,15 +595,15 @@ def test_a_draw_call_short_of_the_pot_odds_names_the_amount_to_win_later():
     chips = detail.draw_call.implied_needed_chips
     block = next(b for b in _blocks(_text(en)) if "окупается:" in b)
     printed = -(-10 * chips // en.hand.bb) / 10
-    assert f"    окупается: нужно добрать позже {printed:.1f} ББ" in block.splitlines()
+    assert f"    окупается: нужно добрать позже {printed:.1f}BB" in block.splitlines()
 
 
 @pytest.mark.parametrize(
     ("chips", "printed"), [(1_234, "12.4"), (1_230, "12.3"), (1_201, "12.1"), (5, "0.1")]
 )
 def test_the_amount_to_win_later_rounds_up_to_a_tenth(chips, printed):
-    """X — требование: 1 234 фишки при ББ 100 печатаются «12.4», а не «12.3» —
-    округление к ближайшему занизило бы его на 0.04 ББ."""
+    """X — требование: 1 234 фишки при BB 100 печатаются «12.4», а не «12.3» —
+    округление к ближайшему занизило бы его на 0.04BB."""
     call = DrawCallDetail(
         required_equity=0.25,
         hit=0.1,
@@ -610,7 +611,7 @@ def test_the_amount_to_win_later_rounds_up_to_a_tenth(chips, printed):
         implied_needed_chips=chips,
         beyond_stack=False,
     )
-    assert _printed(draw_call=call) == [f"    окупается: нужно добрать позже {printed} ББ"]
+    assert _printed(draw_call=call) == [f"    окупается: нужно добрать позже {printed}BB"]
 
 
 def test_an_amount_beyond_the_stacks_is_a_line_and_not_a_verdict():
@@ -635,7 +636,7 @@ def test_the_draw_call_of_the_analysis_by_the_pot_odds():
         hero_cards=("Tc", "7c"),
         boards=board,
     )
-    block = next(b for b in _blocks(_text(en)) if "сыграно: колл 3.0 ББ" in b)
+    block = next(b for b in _blocks(_text(en)) if "сыграно: колл 3.0BB" in b)
     assert "    линия: чек-колл · колл с дро" in block.splitlines()
     assert "    окупается: по шансам банка" in block.splitlines()
 
@@ -647,7 +648,7 @@ def test_an_empty_reason_prints_no_verdict_line_and_a_named_one_does():
     """Пустая причина (чек на постфлопе) — строки нет; названная — печатается."""
     blocks = _blocks(_text(_reference_hand()))
     assert "вердикта нет" not in blocks[1]
-    assert "    вердикта нет: нет чарта защиты BB против опена UTG+1 на 37 ББ" in blocks[0]
+    assert "    вердикта нет: нет чарта защиты BB против опена UTG+1 на 37BB" in blocks[0]
     assert "    вердикта нет: частота фолдов оппонента зависит от его диапазона" in blocks[2]
     assert "    вердикта нет: частота фолдов оппонента зависит от его диапазона" in blocks[3]
     assert not [line for block in blocks for line in block.splitlines() if line == "    вердикта нет."]
@@ -689,10 +690,10 @@ def test_a_hand_of_four_streets_goes_out_in_two_messages_by_the_existing_rule():
 
 
 def _money_the_hand_contains(en: EnrichedHand) -> set[float]:
-    """Суммы в ББ, которые вправе стоять в разборе: руки, движка и `detail` ядра.
+    """Суммы в BB, которые вправе стоять в разборе: руки, движка и `detail` ядра.
 
     К суммам руки и ядра добавлена одна производная сумма ядра — `X` из `detail`
-    (сколько добрать позже, `DrawCall.implied_needed_chips`, в ББ вверх до
+    (сколько добрать позже, `DrawCall.implied_needed_chips`, в BB вверх до
     десятой, как печатается), решение спеки постфлоп-линии, §9 гейт 11.
     """
     from harness.contracts.enriched import hero_stack_delta_bb
@@ -735,7 +736,7 @@ def test_the_postflop_line_prints_no_money_the_hand_and_the_detail_do_not_contai
     """Гейт 11: новые строки не печатают сумм вне руки, расчёта и `X` из `detail`."""
     en = make()
     text = _text(en)
-    money = {float(n) for n in re.findall(r"(\d+(?:\.\d+)?)\s*ББ", text)}
+    money = {float(n) for n in re.findall(r"(\d+(?:\.\d+)?)BB", text)}
     assert money, "в тексте нет ни одной суммы — тест ничего не значит"
     assert money <= _money_the_hand_contains(en) | _ev_money(en), (
         f"выдуманные суммы: {money - _money_the_hand_contains(en)}"
@@ -754,7 +755,7 @@ def test_the_amount_to_win_later_is_among_the_allowed_sums_and_not_by_accident()
     """`X` стоит в тексте и входит в разрешённые только как `X` из `detail`."""
     en = _gutshot_call(500_000)
     text = _text(en)
-    (x_text,) = re.findall(r"нужно добрать позже (\d+\.\d) ББ", text)
+    (x_text,) = re.findall(r"нужно добрать позже (\d+\.\d)BB", text)
     plain = {round(v / en.hand.bb, 1) for v in en.report.pot_by_street.values()}
     assert float(x_text) not in plain
     assert float(x_text) in _money_the_hand_contains(en)

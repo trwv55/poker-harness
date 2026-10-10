@@ -99,17 +99,20 @@ from typing import Any, Literal, NamedTuple
 from pydantic import BaseModel, model_validator
 
 from harness.contracts.analysis import (
+    OPEN_THRESHOLD_DETAIL,
     POSTFLOP_LINE_DETAIL,
     RIVER_CALL_DETAIL,
     TURN_FLOP_CALL_DETAIL,
     AnalysisResult,
     EvInterval,
+    OpenThreshold,
     PointVerdict,
     PostflopLineDetail,
     ScanItem,
     ScanSummary,
     SpotKind,
     Zone,
+    open_threshold_detail,
     postflop_line_detail,
     river_call_detail,
     turn_flop_call_detail,
@@ -391,7 +394,7 @@ def _spot_word(spot: SpotKind) -> str:
 
 
 def _bb_number(value_bb: float) -> str:
-    """Число в bb без единицы — для пар вида «34.0 → 12.5 bb».
+    """Число в BB без единицы — для пар вида «34.0 → 12.5BB».
 
     Знак минуса типографский (U+2212 «−»), не дефис — так задан бриф. Знак
     берётся ПОСЛЕ округления до 0.1, а не до: `-0.03` меньше нуля, но после
@@ -407,7 +410,7 @@ def _bb_number(value_bb: float) -> str:
 def _fmt_bb(value_bb: float) -> str:
     """То же число с единицей. Округление и знак — общие с `_bb_number`, а не
     вторая их копия: две формы одной величины обязаны округляться одинаково."""
-    return f"{_bb_number(value_bb)} bb"
+    return f"{_bb_number(value_bb)}BB"
 
 
 def _signed_bb_number(value_bb: float) -> str:
@@ -422,7 +425,7 @@ def _signed_bb_number(value_bb: float) -> str:
 
 def _fmt_signed_bb(value_bb: float) -> str:
     """То же, что `_fmt_bb`, но плюс у положительного числа проговаривается."""
-    return f"{_signed_bb_number(value_bb)} bb"
+    return f"{_signed_bb_number(value_bb)}BB"
 
 
 def _tenth_down(value_bb: float) -> float:
@@ -442,7 +445,7 @@ def _fmt_ceiling_bb(value_bb: float) -> str:
     Вверх, а не к ближайшему: строка обещает игроку «не больше столько-то», и
     округление вниз сделало бы обещание неверным на величину округления.
     """
-    return f"{_tenth_up(value_bb):.1f} bb"
+    return f"{_tenth_up(value_bb):.1f}BB"
 
 
 def _interval_words(spot: SpotKind, interval: EvInterval) -> str:
@@ -759,26 +762,26 @@ def _render_html(head: str, rows: list[str]) -> str:
 # --- сырые данные раздачи: всё, что посчитал код, с подписью у каждого числа ----------
 
 def _raw_bb(value_chips: int, big_blind: int) -> str:
-    """Сумма в ББ с единицей. Формат общий с блоком «Что было» (`hand_replay.bb`),
+    """Сумма в BB с единицей. Формат общий с блоком «Что было» (`hand_replay.bb`),
     а не вторая его копия: одна величина в двух местах одного сообщения обязана
     округляться одинаково, иначе разбор спорит сам с собой."""
-    return f"{bb(value_chips, big_blind)} ББ"
+    return f"{bb(value_chips, big_blind)}BB"
 
 
 def _raw_bb_value(value_bb: float) -> str:
-    """Готовая величина в ББ — знак и округление общие с продуктовым `_fmt_bb`.
+    """Готовая величина в BB — та же запись, что продуктовый `_fmt_bb`.
 
-    Отличается от него ТОЛЬКО единицей: «ББ», как весь блок «Что было» (спека
-    §5.6). Смешивать две записи в одном сообщении нельзя: читатель принимает их
-    за разные величины.
+    С 2026-10-10 единица во всём ответе бота одна: «BB» латиницей сразу после
+    числа (решение владельца). Смешивать две записи в одном сообщении нельзя:
+    читатель принимает их за разные величины.
     """
-    return f"{_bb_number(value_bb)} ББ"
+    return _fmt_bb(value_bb)
 
 
 def _raw_signed_bb(value_bb: float) -> str:
-    """То же в ББ, но плюс у положительного числа проговаривается: у цены и у
+    """То же в BB, но плюс у положительного числа проговаривается: у цены и у
     концов интервала знак несёт смысл."""
-    return f"{_signed_bb_number(value_bb)} ББ"
+    return _fmt_signed_bb(value_bb)
 
 
 # Слова игрока для машинных значений `detail`. Значение без перевода печатается
@@ -825,38 +828,38 @@ _DETAIL_LABELS: dict[str, str] = {
     "simulated_deals_by_width": "раздач в симуляции на каждую ширину",
     "simulation_seed": "сид симуляции",
     "fold_equity_ok": "фолд-эквити возможна",
-    "ev_shove_bb": "EV шова, ББ",
-    "ev_shove_tight_bb": "EV шова против узкого диапазона, ББ",
-    "ev_shove_wide_bb": "EV шова против широкого диапазона, ББ",
-    "ev_shove_by_width_bb": "EV шова по ширине диапазона, ББ",
-    "ev_call_bb": "EV колла, ББ",
-    "ev_call_tight_bb": "EV колла против узкого диапазона, ББ",
-    "ev_call_wide_bb": "EV колла против широкого диапазона, ББ",
-    "ev_call_by_width_bb": "EV колла по ширине диапазона, ББ",
-    "ev_call_all_behind_bb": "EV колла, если входят все живые за вами, ББ",
+    "ev_shove_bb": "EV шова, BB",
+    "ev_shove_tight_bb": "EV шова против узкого диапазона, BB",
+    "ev_shove_wide_bb": "EV шова против широкого диапазона, BB",
+    "ev_shove_by_width_bb": "EV шова по ширине диапазона, BB",
+    "ev_call_bb": "EV колла, BB",
+    "ev_call_tight_bb": "EV колла против узкого диапазона, BB",
+    "ev_call_wide_bb": "EV колла против широкого диапазона, BB",
+    "ev_call_by_width_bb": "EV колла по ширине диапазона, BB",
+    "ev_call_all_behind_bb": "EV колла, если входят все живые за вами, BB",
     "hero_class": "класс вашей руки",
-    "depths_bb": "глубины стеков, ББ",
-    "dead_extra_bb": "мёртвых денег в банке, ББ",
+    "depths_bb": "глубины стеков, BB",
+    "dead_extra_bb": "мёртвых денег в банке, BB",
     "zone_reason": "почему такая зона доверия",
     "model_within_bracket": "модель попала в вилку",
     "shove_range_fraction": "рук в диапазоне шова",
     "call_range_fractions": "рук в диапазонах колла",
     "overcall_range_fractions": "рук в диапазонах оверколла",
-    "equilibrium_hand_regret_bb": "отклонение этой руки от равновесия, ББ",
+    "equilibrium_hand_regret_bb": "отклонение этой руки от равновесия, BB",
     "p_all_fold": "вероятность, что все спасуют",
     "expected_callers": "ожидаемое число ответивших",
     "required_equity": "требуемая эквити",
-    "shover_depth_bb": "глубина стека шовера, ББ",
+    "shover_depth_bb": "глубина стека шовера, BB",
     "live_others": "живых за вами в переборе",
     "behind_axis": "устойчивость к входу живых за вами",
     "rivals_when_shoved": "соперников на момент шова",
     "best_vs_one": "лучше по модели",
     "best_all_behind": "лучше, если входят все живые за вами",
     "push_weight": "вес руки в чарте шова",
-    "lookup_depth_bb": "глубина лукапа по чарту, ББ",
+    "lookup_depth_bb": "глубина лукапа по чарту, BB",
     "solver_error": "сбой расчёта",
-    "chart_depth_bb": "глубина чарта, ББ",
-    "open_depth_bb": "ваша глубина в мерах чарта (стек до анте), ББ",
+    "chart_depth_bb": "глубина чарта, BB",
+    "open_depth_bb": "ваша глубина в мерах чарта (стек до анте), BB",
     "taken_frequency": "частота сыгранного по чарту",
     "chart_source": "источник чарта",
     "chart_revised_at": "чарт сверен с источником",
@@ -886,7 +889,7 @@ _ACTION_KEYS = frozenset({"best_vs_one", "best_all_behind"})
 # (`test_the_reason_for_the_zone_speaks_the_words_of_the_player`).
 _PROSE_KEYS = frozenset({"zone_reason", "unmodelled"})
 
-# Ключи, чьё значение — глубина стека в ББ: печатается одним знаком, как все
+# Ключи, чьё значение — глубина стека в BB: печатается одним знаком, как все
 # стеки продукта. Два знака у глубины и один у стека в соседней строке читатель
 # принимает за разную точность измерения.
 _STACK_KEYS = frozenset(
@@ -896,6 +899,9 @@ _STACK_KEYS = frozenset(
 # Частоты чарта точки открытия печатаются в строке вердикта словами
 # (`_chart_verdict_line`) и в общем переборе `detail` не повторяются.
 _CHART_FREQUENCIES_KEY = "chart_frequencies"
+# Каким чартом судили стол меньше 8 мест — тоже в строке вердикта (`_chart_table_mark`).
+_CHART_SEATS_KEY = "chart_seats"
+_CHART_POSITION_KEY = "chart_position"
 _CHART_ACTION_ORDER = ("raise", "shove", "limp", "fold")
 
 # Ключ, под которым ядро пишет причину отказа. Печатается отдельной строкой
@@ -1008,8 +1014,11 @@ def _detail_lines(point: PointVerdict) -> list[str]:
         RIVER_CALL_DETAIL,
         TURN_FLOP_CALL_DETAIL,
         POSTFLOP_LINE_DETAIL,
+        OPEN_THRESHOLD_DETAIL,
         _UNJUDGED_KEY,
         _CHART_FREQUENCIES_KEY,
+        _CHART_SEATS_KEY,
+        _CHART_POSITION_KEY,
     )
     lines = _postflop_call_lines(point)
     for key, value in point.detail.items():
@@ -1085,7 +1094,10 @@ def _point_title(
 
 
 def _decision_lines(
-    dp: DecisionPoint, hand: CanonicalHand, detail: PostflopLineDetail | None = None
+    dp: DecisionPoint,
+    hand: CanonicalHand,
+    detail: PostflopLineDetail | None = None,
+    opening: OpenThreshold | None = None,
 ) -> list[str]:
     """Числа точки решения: заголовок, банк, доставить, эфф. стек, SPR, шансы банка.
 
@@ -1093,20 +1105,31 @@ def _decision_lines(
     на постфлопе и когда он посчитан; на префлопе стоит «банк до хода», на
     постфлопе «банк»; эффективный стек подписан «эфф. стек» (спека §4.7). Шансы банка —
     одной фразой, без повтора банка и доплаты, которые стоят строкой выше.
+
+    У опена первым (`opening`, решение владельца 2026-10-10) колла нет: вместо
+    «доставить» и шансов банка — порог фолдов ядра, «опен 2.2BB в банк 2.3BB
+    окупается сразу при фолдах от 48%»
+    (`test_an_open_prints_the_fold_threshold_instead_of_the_pot_odds`).
     """
     postflop = dp.street is not Street.PREFLOP
     big_blind = hand.bb
     numbers = [
         f"{'банк' if postflop else 'банк до хода'} {_raw_bb(dp.pot_before, big_blind)}"
     ]
-    if dp.to_call > 0:
+    if dp.to_call > 0 and opening is None:
         numbers.append(f"доставить {_raw_bb(dp.to_call, big_blind)}")
     numbers.append(f"эфф. стек {_raw_bb(dp.eff_stack, big_blind)}")
     if postflop and dp.spr is not None:
         numbers.append(f"SPR {dp.spr:.1f}")
     numbers.append(f"живых {dp.live_total} (после вас {dp.live_behind})")
     lines = [_point_title(dp, hand, detail), "    " + " · ".join(numbers)]
-    if dp.to_call > 0:
+    if opening is not None:
+        lines.append(
+            f"    опен {_raw_bb(opening.risk, big_blind)} в банк "
+            f"{_raw_bb(opening.pot, big_blind)} окупается сразу при фолдах от "
+            f"{_percent(opening.fold_share)}"
+        )
+    elif dp.to_call > 0:
         equity = _fmt_pct(100.0 * _required_equity(dp.to_call, dp.pot_before))
         lines.append(f"    шансы банка: колл окупается от {equity} эквити")
     return lines
@@ -1334,7 +1357,7 @@ def _payoff_line(detail: PostflopLineDetail, big_blind: int) -> str | None:
     """«окупается: …» — порог фолдов у блефа и полублефа, доплата у колла с дро (§4.6).
 
     У вэлью и средней руки порога нет — ядро его не кладёт, и печатать нечего. Сумма
-    «добрать позже» — фишки ядра в ББ, вверх до десятой: требование не занижается
+    «добрать позже» — фишки ядра в BB, вверх до десятой: требование не занижается
     (`test_the_amount_to_win_later_rounds_up_to_a_tenth`).
     """
     line = detail.line
@@ -1360,20 +1383,37 @@ def _payoff_line(detail: PostflopLineDetail, big_blind: int) -> str | None:
     if call.beyond_stack:
         return "    окупается: добрать столько нельзя — колл не окупается добором"
     if call.implied_needed_chips is not None:
-        return f"    окупается: нужно добрать позже {_bb_up(call.implied_needed_chips, big_blind)} ББ"
+        return f"    окупается: нужно добрать позже {_bb_up(call.implied_needed_chips, big_blind)}BB"
     return None
 
 
+def _alternatives_line(detail: PostflopLineDetail, big_blind: int) -> str | None:
+    """«альтернатива: ставка 50% — нужно 33% фолдов; олл-ин 16.6BB в 18.7BB — нужно
+    47% фолдов» — пороги ядра у последнего чека или бета героя (§12). Ставки 50%
+    нет, когда ядро её не положило: эффективный стек не больше половины банка."""
+    alt = detail.alternatives
+    if alt is None:
+        return None
+    parts: list[str] = []
+    if alt.half_pot is not None:
+        parts.append(f"ставка 50% — нужно {_percent(alt.half_pot)} фолдов")
+    parts.append(
+        f"олл-ин {_raw_bb(alt.all_in_chips, big_blind)} в {_raw_bb(alt.pot, big_blind)} — "
+        f"нужно {_percent(alt.all_in)} фолдов"
+    )
+    return f"    альтернатива: {'; '.join(parts)}"
+
+
 def _bb_up(value_chips: int, big_blind: int) -> str:
-    """Фишки в ББ одним знаком, вверх до десятой: 1 234 при ББ 100 — «12.4»."""
+    """Фишки в BB одним знаком, вверх до десятой: 1 234 при BB 100 — «12.4»."""
     tenths = -(-10 * value_chips // big_blind)
     return f"{tenths / 10:.1f}"
 
 
 def _postflop_line_lines(detail: PostflopLineDetail | None, big_blind: int) -> list[str]:
     """Строки постфлоп-линии в порядке макета: рука → ценность на вскрытии → дро →
-    бэкдор → оверкарты → линия → окупается. Каждая — только когда ей есть что
-    сказать (`test_an_empty_field_prints_no_line`)."""
+    бэкдор → оверкарты → линия → окупается → альтернатива. Каждая — только когда
+    ей есть что сказать (`test_an_empty_field_prints_no_line`)."""
     if detail is None:
         return []
     candidates = (
@@ -1384,6 +1424,7 @@ def _postflop_line_lines(detail: PostflopLineDetail | None, big_blind: int) -> l
         _overcards_line(detail),
         _line_line(detail),
         _payoff_line(detail, big_blind),
+        _alternatives_line(detail, big_blind),
     )
     return [text for text in candidates if text is not None]
 
@@ -1397,6 +1438,15 @@ def _chart_frequencies_text(frequencies: Mapping[str, float]) -> str:
     )
 
 
+def _chart_table_mark(point: PointVerdict) -> str:
+    """« · чарт 8-max UTG+1» — точка за столом меньше 8 мест судима 8-max чартом по
+    позиции от конца (решение владельца 2026-10-10); за своим столом пометки нет."""
+    seats = point.detail.get(_CHART_SEATS_KEY)
+    if seats is None:
+        return ""
+    return f" · чарт {seats}-max {point.detail.get(_CHART_POSITION_KEY, '')}".rstrip()
+
+
 def _chart_verdict_line(point: PointVerdict) -> str:
     """Вердикт точки открытия по чарту: частоты вместо цены и «лучше».
 
@@ -1407,7 +1457,7 @@ def _chart_verdict_line(point: PointVerdict) -> str:
     depth = float(point.detail["chart_depth_bb"])
     verdict = "расхождение" if point.mismatch else "в пределах чарта"
     return (
-        f"    вердикт: {_spot_word(point.spot)} {depth:.0f}bb · "
+        f"    вердикт: {_spot_word(point.spot)} {depth:.0f}BB{_chart_table_mark(point)} · "
         f"зона {_ZONE_WORD.get(point.zone, str(point.zone))} · "
         f"сыграно {_action_word(point.action_taken)} · "
         f"по чарту: {_chart_frequencies_text(point.detail[_CHART_FREQUENCIES_KEY])} · "
@@ -1503,7 +1553,7 @@ def _raw_blocks(res: AnalysisResult, en: EnrichedHand) -> list[list[str]]:
         street = _STREET_WORD.get(point.street, point.street.value)
         line = postflop_line_detail(point)
         block = (
-            _decision_lines(dp, hand, line)
+            _decision_lines(dp, hand, line, open_threshold_detail(point))
             if dp is not None
             else [f"{point.dp_index + 1}. {street}"]
         )
@@ -1952,7 +2002,7 @@ def _times_word(count: int) -> str:
 def _leak_line(stat: LeakStat) -> str:
     """Строка типа лика: подпись, частота, цена. Ровно то, что просил владелец.
 
-    У лика по чарту цены нет, и «0.0 bb» читалось бы как «не потеряно»: вместо
+    У лика по чарту цены нет, и «0.0BB» читалось бы как «не потеряно»: вместо
     цены строка говорит, что это сверка с чартом.
     """
     head = f"{stat.rule.title} — {stat.count} {_times_word(stat.count)}"

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from harness.contracts.analysis import (
+    OPEN_THRESHOLD_DETAIL,
     POSTFLOP_LINE_DETAIL,
     RIVER_CALL_DETAIL,
     TURN_FLOP_CALL_DETAIL,
@@ -19,6 +20,7 @@ from harness.contracts.analysis import (
     EvSplit,
     Finding,
     LevelLine,
+    OpenThreshold,
     PlayerStats,
     PointVerdict,
     PostflopLineDetail,
@@ -30,6 +32,7 @@ from harness.contracts.analysis import (
     TournamentReport,
     TurnFlopCallDetail,
     Zone,
+    open_threshold_detail,
     postflop_line_detail,
     river_call_detail,
     turn_flop_call_detail,
@@ -111,6 +114,7 @@ from harness.contracts.model_output import ModelOutput
 from harness.contracts.postflop import (
     ActionTag,
     Backdoor,
+    BetAlternatives,
     Combination,
     Draw,
     DrawCall,
@@ -162,6 +166,7 @@ __all__ = [
     "MAX_NOTE_ENTRY_CHARS",
     "MAX_NOTE_TEXT_CHARS",
     "MISMATCH_LOSS_BB",
+    "OPEN_THRESHOLD_DETAIL",
     "POSITIONS",
     "POSTFLOP_LINE_DETAIL",
     "RANKS",
@@ -173,6 +178,7 @@ __all__ = [
     "AnalysisResult",
     "Assumption",
     "Backdoor",
+    "BetAlternatives",
     "BetSizeThreshold",
     "CalcName",
     "CalcParams",
@@ -216,6 +222,7 @@ __all__ = [
     "NoteColorLineError",
     "NoteColorRecord",
     "NoteRecord",
+    "OpenThreshold",
     "OpponentFrequencyParams",
     "OpponentRecord",
     "Overcards",
@@ -279,6 +286,7 @@ __all__ = [
     "is_mismatch",
     "leak_rule_for",
     "leak_rule_of_point",
+    "open_threshold_detail",
     "parse_note_colors",
     "postflop_line_detail",
     "river_call_detail",
