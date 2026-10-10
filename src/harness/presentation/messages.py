@@ -899,7 +899,7 @@ _STACK_KEYS = frozenset(
 # Частоты чарта точки открытия печатаются в строке вердикта словами
 # (`_chart_verdict_line`) и в общем переборе `detail` не повторяются.
 _CHART_FREQUENCIES_KEY = "chart_frequencies"
-# Каким чартом судили стол меньше 8 мест — тоже в строке вердикта (`_chart_table_mark`).
+# Каким чартом судили стол на 4–7 мест — тоже в строке вердикта (`_chart_table_mark`).
 _CHART_SEATS_KEY = "chart_seats"
 _CHART_POSITION_KEY = "chart_position"
 _CHART_ACTION_ORDER = ("raise", "shove", "limp", "fold")
@@ -1390,7 +1390,8 @@ def _payoff_line(detail: PostflopLineDetail, big_blind: int) -> str | None:
 def _alternatives_line(detail: PostflopLineDetail, big_blind: int) -> str | None:
     """«альтернатива: ставка 50% — нужно 33% фолдов; олл-ин 16.6BB в 18.7BB — нужно
     47% фолдов» — пороги ядра у последнего чека или бета героя (§12). Ставки 50%
-    нет, когда ядро её не положило: эффективный стек не больше половины банка."""
+    нет, когда ядро её не положило: эффективный стек не больше половины банка или
+    сыгранный бет и есть ставка около 50%."""
     alt = detail.alternatives
     if alt is None:
         return None
@@ -1439,7 +1440,7 @@ def _chart_frequencies_text(frequencies: Mapping[str, float]) -> str:
 
 
 def _chart_table_mark(point: PointVerdict) -> str:
-    """« · чарт 8-max UTG+1» — точка за столом меньше 8 мест судима 8-max чартом по
+    """« · чарт 8-max UTG+1» — точка за столом на 4–7 мест судима 8-max чартом по
     позиции от конца (решение владельца 2026-10-10); за своим столом пометки нет."""
     seats = point.detail.get(_CHART_SEATS_KEY)
     if seats is None:

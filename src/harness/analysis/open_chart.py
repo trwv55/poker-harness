@@ -17,11 +17,12 @@
 Правило «судить против диапазона, а не против вскрытой карты» выполняется по
 построению: эталон — стратегия, результат раздачи в вердикт не входит.
 
-**Стол меньше 8 мест судится 8-max чартом по позиции от конца** (решение владельца
-2026-10-10, `chart_position`): позиция берётся та, у которой в 8-max столько же
+**Стол на 4–7 мест судится 8-max чартом по позиции от конца** (решение владельца
+2026-10-10, `chart_table`): позиция берётся та, у которой в 8-max столько же
 игроков позади до BB (на 7 местах BTN — BTN, UTG — UTG+1). Зона та же, `strict`;
 в `detail` точка несёт `chart_seats` и `chart_position` — каким чартом судили.
-Стол на 8 мест судится своим чартом, как прежде; на 9 местах чарта нет.
+Стол на 8 мест судится своим чартом, как прежде; на 9 и на 3 местах и в хедз-апе
+чарта нет — точка без вердикта с причиной.
 """
 
 from __future__ import annotations
@@ -49,9 +50,12 @@ from harness.normalizer import POSITIONS_BY_COUNT
 
 MISMATCH_BELOW = 0.30
 
-# Раскладка, для которой в справочнике есть чарты; стол меньше судится ими по
-# позиции от конца (`chart_position`).
+# Раскладка, для которой в справочнике есть чарты; стол от `MIN_SHIFTED_SEATS`
+# мест и меньше `CHART_SEATS` судится ими по позиции от конца (`chart_table`).
+# Столу на 3 места и хедз-апу нужны свои чарты (решение владельца 2026-10-10).
 CHART_SEATS = 8
+MIN_SHIFTED_SEATS = 4
+_HEADS_UP = 2
 
 # Порядок при равных частотах «лучшего» действия: активное раньше пассивного —
 # то же предпочтение, что у пуш-фолда при EV ровно ноль (`preflop._best_of`).
@@ -111,13 +115,15 @@ def chart_exists(state: TableState, ante_type: str) -> bool:
 def chart_table(seats: int, position: str) -> tuple[int, str]:
     """Раскладка и позиция чарта, которым судится открытие за столом на `seats` мест.
 
-    Стол меньше `CHART_SEATS` — 8-max и позиция с тем же числом игроков позади до
-    BB (`test_a_seven_handed_button_is_judged_by_the_eight_max_button`,
+    Стол от `MIN_SHIFTED_SEATS` до `CHART_SEATS` мест, не включая 8, — 8-max и
+    позиция с тем же числом игроков позади до BB
+    (`test_a_seven_handed_button_is_judged_by_the_eight_max_button`,
     `test_a_seven_handed_utg_is_judged_by_the_eight_max_utg1`,
-    `test_a_six_handed_table_is_judged_by_position_from_the_end`); остальные — как
-    есть.
+    `test_a_six_handed_table_is_judged_by_position_from_the_end`,
+    `test_a_four_handed_table_is_judged_by_position_from_the_end`); остальные — как
+    есть (`test_the_chart_table_counts_the_players_behind`).
     """
-    if seats >= CHART_SEATS or seats not in POSITIONS_BY_COUNT:
+    if not MIN_SHIFTED_SEATS <= seats < CHART_SEATS or seats not in POSITIONS_BY_COUNT:
         return seats, position
     order = _preflop_order(seats)
     if position not in order:
@@ -128,10 +134,9 @@ def chart_table(seats: int, position: str) -> tuple[int, str]:
 
 
 def _preflop_order(seats: int) -> list[str]:
-    """Порядок хода на префлопе: от первого после BB до BB; в хедз-апе первой
-    ходит кнопка (она же SB)."""
+    """Порядок хода на префлопе от трёх мест: от первого после BB до BB."""
     order = POSITIONS_BY_COUNT[seats]
-    return list(order) if seats == 2 else [*order[2:], *order[:2]]
+    return [*order[2:], *order[:2]]
 
 
 def open_chart_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) -> PointVerdict:
@@ -207,14 +212,24 @@ def _missing_reason(seats: int, chart_seats: int, chart_pos: str, ante_type: str
 
     Называется первое недостающее, а не все три сразу: «нет чарта для 7 мест,
     позиции BTN и анте per_player» обвиняла бы анте, которое в справочнике есть
-    (`test_a_missing_chart_names_the_real_reason`).
+    (`test_a_missing_chart_names_the_real_reason`). Хедз-ап назван хедз-апом
+    (`test_three_handed_and_heads_up_tables_get_no_chart_verdict`).
     """
     keys = load_chart_book().all_keys()
     if not any(key.seats == chart_seats for key in keys):
-        return f"чарта открытия для стола на {seats} мест в справочнике нет"
+        if seats == _HEADS_UP:
+            return "чарта открытия для хедз-апа в справочнике нет"
+        return f"чарта открытия для стола на {seats} {_seats_word(seats)} в справочнике нет"
     if not any(key.seats == chart_seats and key.position == chart_pos for key in keys):
         return f"чарта открытия для позиции {chart_pos} стола на {chart_seats} мест в справочнике нет"
     return f"чарта открытия для анте «{ante_type}» в справочнике нет"
+
+
+def _seats_word(seats: int) -> str:
+    """Слово «место» в форме, согласованной с числом мест."""
+    if seats % 10 in (2, 3, 4) and seats % 100 not in (12, 13, 14):
+        return "места"
+    return "мест"
 
 
 def _hero_class(hand: CanonicalHand) -> str | None:

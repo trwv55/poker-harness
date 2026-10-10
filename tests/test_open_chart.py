@@ -1,7 +1,7 @@
 """Вердикт по чарту: открытие первым при стеке от 13bb (`analysis.open_chart`).
 
 Раздачи — синтетика 8-max, чтобы в справочнике владельца был чарт для стола;
-столы меньше 8 мест судятся 8-max чартом по позиции от конца (решение владельца
+столы на 4–7 мест судятся 8-max чартом по позиции от конца (решение владельца
 2026-10-10).
 Где частоты руки нужны точными, они берутся из чарта в репозитории (CO 35bb:
 AJo — рейз 100%, 22 — рейз 42% и фолд 58%); где нужен порог 30% — из
@@ -38,6 +38,8 @@ _SB, _BB, _ANTE = 50, 100, 12
 _EIGHT_MAX = ("SB", "BB", "UTG", "UTG+1", "LJ", "HJ", "CO", "BTN")
 _SEVEN_MAX = ("SB", "BB", "UTG", "UTG+1", "HJ", "CO", "BTN")
 _SIX_MAX = ("SB", "BB", "UTG", "HJ", "CO", "BTN")
+_FOUR_MAX = ("SB", "BB", "UTG", "BTN")
+_THREE_MAX = ("SB", "BB", "BTN")
 _NINE_MAX = ("SB", "BB", "UTG", "UTG+1", "UTG+2", "LJ", "HJ", "CO", "BTN")
 
 
@@ -481,13 +483,18 @@ def test_a_chart_leak_is_shown_without_a_price():
         (6, "UTG", (8, "LJ")),
         (6, "HJ", (8, "HJ")),
         (6, "BTN", (8, "BTN")),
-        (3, "BTN", (8, "BTN")),
-        (2, "BTN", (8, "SB")),
+        (4, "UTG", (8, "CO")),
+        (4, "BTN", (8, "BTN")),
+        (4, "SB", (8, "SB")),
+        (3, "BTN", (3, "BTN")),
+        (3, "SB", (3, "SB")),
+        (2, "BTN", (2, "BTN")),
         (9, "UTG+2", (9, "UTG+2")),
     ],
 )
 def test_the_chart_table_counts_the_players_behind(seats, position, chart):
-    """Позиция 8-max — та, у которой столько же игроков позади до BB; 8 и 9 мест — как есть."""
+    """На 4–7 местах позиция 8-max — та, у которой столько же игроков позади до BB;
+    8, 9, 3 места и хедз-ап — как есть."""
     assert open_chart.chart_table(seats, position) == chart
 
 
@@ -518,6 +525,30 @@ def test_a_six_handed_table_is_judged_by_position_from_the_end():
     eight = _same_hand_on_eight_max("LJ", ("Ah", "Jd"), 35.0, "raise")
     assert (point.detail["chart_seats"], point.detail["chart_position"]) == (8, "LJ")
     assert point.detail["chart_frequencies"] == eight.detail["chart_frequencies"]
+
+
+def test_a_four_handed_table_is_judged_by_position_from_the_end():
+    """4 места: UTG — трое позади до BB, как у CO за 8-max."""
+    point = _point(_hand("UTG", ("Ah", "Jd"), 35.0, "raise", table=_FOUR_MAX))
+    eight = _same_hand_on_eight_max("CO", ("Ah", "Jd"), 35.0, "raise")
+    assert point.spot == SpotKind.OPEN_CHART and point.zone == "strict"
+    assert (point.detail["chart_seats"], point.detail["chart_position"]) == (8, "CO")
+    assert point.detail["chart_frequencies"] == eight.detail["chart_frequencies"]
+
+
+def test_three_handed_and_heads_up_tables_get_no_chart_verdict():
+    """3 места и хедз-ап 8-max чартом не судятся: причина словами игрока."""
+    from tests.test_postflop_line import P, _fold, _raise
+    from tests.test_postflop_line import _hand as _heads_up_hand
+
+    three = _point(_hand("BTN", ("Ah", "Jd"), 35.0, "raise", table=_THREE_MAX))
+    assert three.spot == SpotKind.OPEN_CHART and three.best_action == ""
+    assert three.detail["unjudged"] == "чарта открытия для стола на 3 места в справочнике нет"
+    assert "chart_seats" not in three.detail
+
+    heads_up = _point(_heads_up_hand([_raise(P, "Hero", 300), _fold(P, "V")], button="Hero"))
+    assert heads_up.spot == SpotKind.OPEN_CHART and heads_up.best_action == ""
+    assert heads_up.detail["unjudged"] == "чарта открытия для хедз-апа в справочнике нет"
 
 
 def test_an_eight_max_point_carries_no_mark_of_another_table():

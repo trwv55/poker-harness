@@ -1756,9 +1756,11 @@ def verdict_for(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict:
         dp.action.kind in (ActionKind.BET, ActionKind.RAISE)
         and not state.opened_voluntarily
         and not state.hero.acted
+        and not state.hero_all_in_after
     ):
         # Опен первым: порог фолдов вместо шансов банка колла (решение владельца
-        # 2026-10-10). Вердикт, зона и цена точки от него не меняются.
+        # 2026-10-10). Вердикт, зона и цена точки от него не меняются. Шов первым
+        # порога не несёт: там вердикт равновесия.
         threshold = open_threshold(dp, en)
         detail = {**point.detail, OPEN_THRESHOLD_DETAIL: threshold.model_dump(mode="json")}
         point = point.model_copy(update={"detail": detail})
@@ -1775,8 +1777,9 @@ def _preflop_verdict(dp: DecisionPoint, en: EnrichedHand, state: TableState) -> 
     if spot is SpotKind.OPEN_CHART:
         # Стол без СВОЕГО чарта (хедз-ап финалки, 6-, 7-, 9-max) на 13–15bb: шов и
         # фолд судит равновесие пуш-фолда, как до справочника — посчитанное для
-        # этого стола, с ценой. Рейз там судит 8-max чарт по позиции от конца
-        # (решение владельца 2026-10-10), а на 9-max вердикта не получает.
+        # этого стола, с ценой. Рейз там судит 8-max чарт по позиции от конца на
+        # 4–7 местах (решение владельца 2026-10-10), а на 9, 3 местах и в хедз-апе
+        # вердикта не получает.
         if (
             not chart_exists(state, en.hand.ante_type)
             and dp.eff_stack_bb <= PUSHFOLD_MAX_EFF_BB

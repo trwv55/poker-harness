@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from fractions import Fraction
 
+import pytest
+
 from harness.analysis import analyze_hand
+from harness.analysis.postflop_line import PLAYED_HALF_POT_PCT
 from harness.contracts import (
     OPEN_THRESHOLD_DETAIL,
     POSTFLOP_LINE_DETAIL,
@@ -32,6 +35,7 @@ from tests.test_postflop_line import (
     _fold,
     _hand,
     _ip,
+    _raise,
 )
 from tests.test_postflop_line_text import _text
 
@@ -69,8 +73,17 @@ def test_a_limp_a_fold_and_an_answer_to_an_open_carry_no_open_threshold():
         assert OPEN_THRESHOLD_DETAIL not in analyze_hand(en).points[-1].detail
 
 
-def test_an_all_in_open_is_cut_by_the_deepest_stack_that_can_call():
-    """Шов 100BB против стека 20BB: при колле теряется только то, что соперник уравняет."""
+def test_an_open_is_cut_by_the_deepest_stack_that_can_call():
+    """Рейз до 2.5BB против стека 2BB: при колле теряется только то, что соперник уравняет."""
+    en = _hand([_raise(P, "Hero", 250), _fold(P, "V")], seats=(("Hero", 10_000), ("V", 200)))
+    threshold = open_threshold_detail(_preflop_point(en))
+    assert threshold is not None
+    assert (threshold.risk, threshold.pot) == (200 - 50, 150)
+    assert threshold.fold_share == 150 / 300
+
+
+def test_an_all_in_open_carries_no_open_threshold():
+    """Шов первым: там вердикт равновесия — ни данных порога, ни строки опена."""
     shove = RawAction(
         street=P,
         label="Hero",
@@ -80,10 +93,11 @@ def test_an_all_in_open_is_cut_by_the_deepest_stack_that_can_call():
         raw_line="Hero: raise",
     )
     en = _hand([shove], seats=(("Hero", 10_000), ("V", 2_000)), button="Hero")
-    threshold = open_threshold_detail(_preflop_point(en))
-    assert threshold is not None
-    assert (threshold.risk, threshold.pot) == (2_000 - 50, 150)
-    assert threshold.fold_share == 1_950 / 2_100
+    assert OPEN_THRESHOLD_DETAIL not in _preflop_point(en).detail
+    assert "опен " not in _text(en)
+    table_shove = _table_hand("CO", ("Ah", "Ad"), 35.0, "shove")
+    assert OPEN_THRESHOLD_DETAIL not in _preflop_point(table_shove).detail
+    assert "опен " not in _text(table_shove)
 
 
 def test_an_open_prints_the_fold_threshold_instead_of_the_pot_odds():
@@ -158,11 +172,12 @@ def test_no_half_pot_bet_when_the_stack_is_not_deeper_than_half_the_pot():
 
 
 def test_the_last_bet_keeps_its_payoff_and_gets_the_alternatives():
-    en = _ip([*_HERO_OPENS, _check(F, "V"), _bet(F, "Hero", 300), _fold(F, "V")])
+    """Бет 75% банка: 450 / (600 + 450) = 42.9% → «43%»."""
+    en = _ip([*_HERO_OPENS, _check(F, "V"), _bet(F, "Hero", 450), _fold(F, "V")])
     (flop,) = _lines(en)
     assert flop is not None and flop.fold_threshold is not None and flop.alternatives is not None
     lines = _text(en).splitlines()
-    assert "    окупается: от 33% фолдов" in lines
+    assert "    окупается: от 43% фолдов" in lines
     assert any(line.startswith("    альтернатива: ставка 50%") for line in lines)
 
 
@@ -187,3 +202,24 @@ def test_a_hand_that_ends_preflop_gets_no_alternatives():
     en = _table_hand("BTN", ("Kh", "9h"), 35.0, "raise")
     assert POSTFLOP_LINE_DETAIL not in _preflop_point(en).detail
     assert "альтернатива:" not in _text(en)
+
+
+# Банк 20BB к флопу: рейз до 10BB и колл; 1% банка — 20 фишек, 0.1% — 2.
+_BIG_POT_OPEN = [_raise(P, "Hero", 1_000), _call(P, "V", 900)]
+
+
+@pytest.mark.parametrize(
+    ("bet", "half_pot_printed"),
+    [(898, True), (900, False), (1_100, False), (1_102, True)],
+    ids=["44.9%", "45%", "55%", "55.1%"],
+)
+def test_a_played_bet_near_half_pot_is_not_offered_again(bet, half_pot_printed):
+    """Бет от 45% до 55% банка включительно — и есть ставка 50%: остаётся только олл-ин."""
+    assert PLAYED_HALF_POT_PCT == (45, 55)
+    en = _ip([*_BIG_POT_OPEN, _check(F, "V"), _bet(F, "Hero", bet), _fold(F, "V")])
+    (flop,) = _lines(en)
+    assert flop is not None and flop.alternatives is not None
+    assert (flop.alternatives.half_pot is not None) is half_pot_printed
+    (line,) = [row for row in _text(en).splitlines() if row.startswith("    альтернатива:")]
+    assert ("ставка 50%" in line) is half_pot_printed
+    assert "олл-ин 90.0BB в 20.0BB" in line
