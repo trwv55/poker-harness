@@ -1945,7 +1945,7 @@ def test_the_raw_data_block_names_what_each_number_means():
         "Итог",
         "банк до хода",
         "доставить",
-        "эфф. ",
+        "эфф. стек ",
         "SPR",
         "живых",
         "вердикт",

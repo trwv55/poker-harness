@@ -1087,11 +1087,11 @@ def _point_title(
 def _decision_lines(
     dp: DecisionPoint, hand: CanonicalHand, detail: PostflopLineDetail | None = None
 ) -> list[str]:
-    """Числа точки решения: заголовок, банк, доставить, эфф., SPR, шансы банка.
+    """Числа точки решения: заголовок, банк, доставить, эфф. стек, SPR, шансы банка.
 
     Строка чисел несёт только то, что есть: «доставить» — при `to_call > 0`, SPR —
     на постфлопе и когда он посчитан; на префлопе стоит «банк до хода», на
-    постфлопе «банк»; эффективный стек подписан «эфф.» (спека §4.7). Шансы банка —
+    постфлопе «банк»; эффективный стек подписан «эфф. стек» (спека §4.7). Шансы банка —
     одной фразой, без повтора банка и доплаты, которые стоят строкой выше.
     """
     postflop = dp.street is not Street.PREFLOP
@@ -1101,7 +1101,7 @@ def _decision_lines(
     ]
     if dp.to_call > 0:
         numbers.append(f"доставить {_raw_bb(dp.to_call, big_blind)}")
-    numbers.append(f"эфф. {_raw_bb(dp.eff_stack, big_blind)}")
+    numbers.append(f"эфф. стек {_raw_bb(dp.eff_stack, big_blind)}")
     if postflop and dp.spr is not None:
         numbers.append(f"SPR {dp.spr:.1f}")
     numbers.append(f"живых {dp.live_total} (после вас {dp.live_behind})")
