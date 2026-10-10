@@ -33,7 +33,7 @@
 
 from __future__ import annotations
 
-from harness.analysis.classifier import unjudged_point
+from harness.analysis.classifier import postflop_reason, unjudged_point
 from harness.analysis.tools.turn_flop_call import (
     TurnFlopCallRequirement,
     turn_flop_call_requirement,
@@ -69,6 +69,10 @@ _VISIBLE_BOARD: dict[Street, tuple[tuple[Street, ...], int]] = {
 # (SESSIONS_UX — не рассказывать о том, чего не умеем).
 _NO_BEST_ACTION = "требование к ставящему диапазону посчитано, лучшего действия нет"
 
+# Граница инструмента колла: перед героем нет ставки. У чека и ставки её
+# заменяет `postflop_reason`.
+_NO_BET = "перед героем нет ставки: колл не оценивается"
+
 _TOOL = "turn_flop_call"
 
 
@@ -82,12 +86,14 @@ def turn_flop_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | Non
     hero = en.hand.dealt.get(en.hand.hero_label, [])
     board = [card for street in streets for card in en.hand.boards.get(street, [])]
     if dp.to_call <= 0:
-        return unjudged_point(dp, SpotKind.POSTFLOP, "перед героем нет ставки: колл не оценивается")
+        return unjudged_point(dp, SpotKind.POSTFLOP, postflop_reason(dp, _NO_BET))
     if dp.live_total != _HEADS_UP:
         return unjudged_point(
             dp,
             SpotKind.POSTFLOP,
-            f"живых в руке {dp.live_total}: перебор считает требование к одному диапазону",
+            postflop_reason(
+                dp, f"живых в руке {dp.live_total}: перебор считает требование к одному диапазону"
+            ),
         )
     if len(hero) != _HERO_CARDS:
         return unjudged_point(dp, SpotKind.POSTFLOP, "карты героя неизвестны")
@@ -103,11 +109,13 @@ def turn_flop_verdict(dp: DecisionPoint, en: EnrichedHand) -> PointVerdict | Non
     except ValueError as failure:
         # Карты, которых нет в колоде, борд не той длины или разъехавшийся банк:
         # считать по ним нельзя, а подправить их значило бы соврать про деньги
-        # (CLAUDE.md).
+        # (CLAUDE.md). Причина о данных остаётся у любого действия, рейз не исключение.
         return unjudged_point(dp, SpotKind.POSTFLOP, str(failure))
 
     detail = {TURN_FLOP_CALL_DETAIL: _detail(requirement, dp).model_dump(mode="json")}
-    return unjudged_point(dp, SpotKind.POSTFLOP, _NO_BEST_ACTION, detail, tools=[_TOOL])
+    return unjudged_point(
+        dp, SpotKind.POSTFLOP, postflop_reason(dp, _NO_BEST_ACTION), detail, tools=[_TOOL]
+    )
 
 
 def _detail(requirement: TurnFlopCallRequirement, dp: DecisionPoint) -> TurnFlopCallDetail:

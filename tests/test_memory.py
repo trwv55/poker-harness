@@ -252,6 +252,92 @@ async def test_a_river_point_survives_the_round_trip_through_the_database(db):
     )
     assert row is not None
     assert row.judged is False
+    assert row.detail[RIVER_CALL_DETAIL] == numbers
+
+
+async def test_a_postflop_line_survives_the_round_trip_through_the_database(db):
+    """Постфлоп-линия лежит в jsonb-колонке `detail` и возвращается целой.
+
+    Гейт 12 спеки постфлоп-линии: ни поля, ни колонки под неё нет, поэтому
+    проверяется то же, что у риверной точки, — запись и чтение `detail` без
+    потерь, и `judged` остаётся ложью.
+    """
+    from harness.contracts import (
+        POSTFLOP_LINE_DETAIL,
+        PointVerdict,
+        SpotKind,
+        Street,
+        Zone,
+        postflop_line_detail,
+    )
+    from harness.memory.models import DecisionPointRow
+
+    session_id = await _make_session(db)
+    raw = RawHand.model_validate(make_min_raw())
+    hid = await HandsRepo(db).save_raw(session_id=session_id, raw=raw)
+    line = {
+        "hand": {
+            "category": "no_pair",
+            "strength": "weak",
+            "combination": "high_card",
+            "ranks": ["5"],
+            "plays": "hand",
+            "kicker": None,
+        },
+        "draw": {
+            "kinds": ["open_ended"],
+            "out_ranks": ["A", "6"],
+            "outs": ["As", "Ah", "Ad", "Ac", "6s", "6h", "6d", "6c"],
+            "unseen": 46,
+            "hit_next": 0.17391304347826086,
+            "hit_by_river": None,
+        },
+        "draw_missed": False,
+        "backdoors": [],
+        "overcards": None,
+        "line": {
+            "action": "probe",
+            "barrel": None,
+            "size_pct": 0.5617977528089888,
+            "size_tag": "standard",
+            "purpose": "semibluff",
+        },
+        "fold_threshold": {
+            "bluff": 0.3597122302158273,
+            "semibluff": 0.1614092585006145,
+            "semibluff_free": False,
+        },
+        "draw_call": None,
+        "showdown": None,
+    }
+    point = PointVerdict(
+        dp_index=2,
+        street=Street.TURN,
+        spot=SpotKind.POSTFLOP,
+        zone=Zone.STRICT,
+        action_taken="bet",
+        best_action="",
+        ev_diff_bb=0.0,
+        detail={
+            POSTFLOP_LINE_DETAIL: line,
+            "unjudged": "частота фолдов оппонента зависит от его диапазона",
+        },
+    )
+    result = AnalysisResult(hand_no=raw.hand_no, points=[point], ranked=[])
+    await AnalysesRepo(db).save(hand_id=hid, result=result, decision_points=[])
+
+    got = await AnalysesRepo(db).get_by_hand(hid)
+    assert got is not None
+    restored = postflop_line_detail(got.result.points[0])
+    assert restored is not None
+    assert restored.model_dump(mode="json") == line
+
+    row = await db.scalar(
+        select(DecisionPointRow).where(DecisionPointRow.hand_id == hid)
+    )
+    assert row is not None
+    assert row.judged is False
+    assert row.detail[POSTFLOP_LINE_DETAIL] == line
 
 
 async def test_set_explanation_without_text_keeps_the_saved_one(db):

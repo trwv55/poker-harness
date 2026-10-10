@@ -323,14 +323,36 @@ def action_name(dp: DecisionPoint) -> str:
     return str(taken.kind)
 
 
+# Блайнды защищают банк, в который уже вложились; остальные на опен отвечают.
+_BLINDS = ("SB", "BB")
+
+
 def unpriced_reason(dp: DecisionPoint, state: TableState) -> str:
     """Почему префлоп-точка осталась без вердикта — по-человечески, а не «прочее».
 
     Причина попадает в `detail` и дальше в сводку: игрок должен видеть не только
     то, что спот не разобран, но и чем именно он не подошёл. Без этого пробел в
     охвате выглядит как подтверждение правильной игры.
+
+    Ответ на опен глубже пуш-фолда называет, чего не хватает: чарта ответа
+    позиции героя на опен позиции открывшего на глубине `open_depth_bb`, целым
+    числом с половиной вверх (спека постфлоп-линии, §4.9;
+    `test_a_deep_answer_to_an_open_names_the_missing_defence_chart`,
+    `test_the_open_depth_in_the_reason_rounds_a_half_up`). «Защита» — только у
+    блайндов, остальным — «ответ»
+    (`test_a_deep_answer_off_the_blinds_names_a_missing_response_chart`). Опен —
+    единственное повышение до героя, сделанное первым вошедшим; герой на этой
+    улице ещё не ходил.
     """
     if dp.eff_stack_bb > PUSHFOLD_MAX_EFF_BB:
+        opener = state.aggressor
+        if opener is not None and state.opened_by_aggressor and not state.hero.acted:
+            hero, depth = state.hero.position, _open_depth_half_up(state)
+            if hero in _BLINDS:
+                return (
+                    f"нет чарта защиты {hero} против опена {opener.position} на {depth} ББ"
+                )
+            return f"нет чарта ответа {hero} на опен {opener.position} на {depth} ББ"
         return (
             f"глубже пуш-фолд-зоны: эффективный стек {dp.eff_stack_bb:.1f}bb "
             f"> {PUSHFOLD_MAX_EFF_BB:.0f}bb"
@@ -356,6 +378,34 @@ def unpriced_reason(dp: DecisionPoint, state: TableState) -> str:
             "а модель считает эквити против одного диапазона"
         )
     return "перед героем олл-ин, но сыгран не колл и не пас"
+
+
+# Причины «вердикта нет» постфлоп-точки (спека постфлоп-линии, §4.9): у ставки и
+# рейза не хватает частоты фолдов соперника, у чека причины нет вовсе — пустая
+# строка.
+POSTFLOP_FOLD_FREQUENCY_REASON = "частота фолдов оппонента зависит от его диапазона"
+POSTFLOP_CHECK_REASON = ""
+
+
+def postflop_reason(dp: DecisionPoint, boundary: str) -> str:
+    """Причина «вердикта нет» постфлоп-точки на границе инструмента колла.
+
+    `boundary` — граница применимости, которую инструмент колла назвал бы сам
+    (нет ставки перед героем, живых больше двух, лучшее действие не названо,
+    фолд не доказан); она остаётся у колла и фолда. Ставка и рейз получают
+    `POSTFLOP_FOLD_FREQUENCY_REASON`, чек — `POSTFLOP_CHECK_REASON`
+    (`test_postflop_reasons_name_what_a_verdict_lacks`). Отказ по данным сюда не
+    идёт: карты героя неизвестны, борд не той длины, перебор не принял карты —
+    причина о данных у любого действия, и у рейза тоже
+    (`test_a_raise_keeps_the_data_reason_where_the_call_tool_refuses_on_data`,
+    `test_a_raise_on_a_short_board_keeps_the_data_reason`).
+    """
+    kind = dp.action.kind
+    if kind in (ActionKind.BET, ActionKind.RAISE):
+        return POSTFLOP_FOLD_FREQUENCY_REASON
+    if kind is ActionKind.CHECK:
+        return POSTFLOP_CHECK_REASON
+    return boundary
 
 
 def unjudged_point(
@@ -414,6 +464,11 @@ def classify(dp: DecisionPoint, en: EnrichedHand) -> SpotKind:
     return spot_for(dp, table_state(dp, en))
 
 
+def _open_depth_half_up(state: TableState) -> int:
+    """`open_depth_bb` целым числом, половина вверх: 36.5 → 37 (а не банковское 36)."""
+    return (2 * _open_depth_chips(state) + state.bb) // (2 * state.bb)
+
+
 def open_depth_bb(state: TableState) -> float:
     """Глубина открытия первым в мерах чарта: стек ДО анте, в bb.
 
@@ -424,9 +479,13 @@ def open_depth_bb(state: TableState) -> float:
     что у движка в неоткрытом банке (`engine.replay._effective_stack`, случай 2):
     стек героя, но не больше, чем у самого глубокого живого соперника.
     """
+    return _open_depth_chips(state) / state.bb
+
+
+def _open_depth_chips(state: TableState) -> int:
+    """Числитель `open_depth_bb` в фишках."""
     others = [s.stack for s in state.seats if s.live and s.label != state.hero.label]
-    depth = min(state.hero.stack, max(others)) if others else state.hero.stack
-    return depth / state.bb
+    return min(state.hero.stack, max(others)) if others else state.hero.stack
 
 
 def spot_for(dp: DecisionPoint, state: TableState) -> SpotKind:

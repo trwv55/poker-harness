@@ -62,6 +62,14 @@
 (`_postflop_call_lines`): считают их разные инструменты, но подписи у чисел
 одни и те же.
 
+**Точка решения в разборе — макет владельца** (2026-10-09, спека постфлоп-линии, §2,
+§7): заголовок «N. Улица карты · позиция · сыграно: …», строка чисел, шансы банка и
+строки «рука → ценность на вскрытии → дро → бэкдор → оверкарты → линия → окупается →
+вердикта нет», каждая только когда ей есть что сказать
+(`test_the_reference_hand_prints_the_owners_layout_line_by_line`). Описание сыгранного,
+а не вердикт: ключ `postflop_line` читается только через `postflop_line_detail`, сырым
+словарём не печатается.
+
 **Форма «около нуля» в сводке скана — вердикт, а не отказ.** У части точек
 интервал EV лежит по обе стороны нуля: при одних моделях поведения оппонентов
 лучше входить, при других пасовать. Раньше такая точка до игрока не доходила
@@ -91,15 +99,18 @@ from typing import Any, Literal, NamedTuple
 from pydantic import BaseModel, model_validator
 
 from harness.contracts.analysis import (
+    POSTFLOP_LINE_DETAIL,
     RIVER_CALL_DETAIL,
     TURN_FLOP_CALL_DETAIL,
     AnalysisResult,
     EvInterval,
     PointVerdict,
+    PostflopLineDetail,
     ScanItem,
     ScanSummary,
     SpotKind,
     Zone,
+    postflop_line_detail,
     river_call_detail,
     turn_flop_call_detail,
 )
@@ -117,6 +128,7 @@ from harness.contracts.calcs import (
     ThresholdResult,
     Window,
 )
+from harness.contracts.canonical import CanonicalHand
 from harness.contracts.enriched import (
     DecisionPoint,
     EnrichedHand,
@@ -136,8 +148,16 @@ from harness.contracts.history import (
     SessionSummary,
     is_judged,
 )
+from harness.contracts.postflop import (
+    ActionTag,
+    Combination,
+    DrawKind,
+    HandCategory,
+    HandStrength,
+    Purpose,
+)
 from harness.contracts.raw import ActionKind, Street
-from harness.explanation.hand_replay import HandReplay, bb, chips, signed_bb
+from harness.explanation.hand_replay import HandReplay, bb, cards_text, chips, signed_bb
 from harness.presentation.keyboards import (
     MAIN_MENU,
     MENU_LEAKS,
@@ -979,9 +999,18 @@ def _detail_lines(point: PointVerdict) -> list[str]:
 
     Числа инструментов колла (`RIVER_CALL_DETAIL`, `TURN_FLOP_CALL_DETAIL`) идут
     первыми словами игрока; причина отказа ядра стоит строкой «вердикта нет: …»
-    выше; остальные ключи печатаются по таблице подписей.
+    выше; постфлоп-линия (`POSTFLOP_LINE_DETAIL`) печатается своими строками в
+    `_postflop_line_lines` и сырым словарём не печатается
+    (`test_the_postflop_line_is_not_printed_as_a_raw_dictionary`); остальные ключи
+    печатаются по таблице подписей.
     """
-    skip = (RIVER_CALL_DETAIL, TURN_FLOP_CALL_DETAIL, _UNJUDGED_KEY, _CHART_FREQUENCIES_KEY)
+    skip = (
+        RIVER_CALL_DETAIL,
+        TURN_FLOP_CALL_DETAIL,
+        POSTFLOP_LINE_DETAIL,
+        _UNJUDGED_KEY,
+        _CHART_FREQUENCIES_KEY,
+    )
     lines = _postflop_call_lines(point)
     for key, value in point.detail.items():
         if key in skip:
@@ -990,13 +1019,36 @@ def _detail_lines(point: PointVerdict) -> list[str]:
     return lines
 
 
-def _played_words(dp: DecisionPoint, big_blind: int) -> str:
+def _half_up_percent(share: float) -> int:
+    """Доля в целый процент: к ближайшему, половина вверх.
+
+    Не `round` (он округляет половину к чётному) и не `:.0f`: «28.5% банка» обязано
+    дать 29 (`test_a_percent_of_the_pot_rounds_half_up`). Поправка `1e-9` снимает
+    двоичный хвост доли вроде `0.285 · 100 = 28.499999999999996`: доли здесь —
+    отношения целых фишек, и до настоящей «ровно чуть меньше половины» им дальше.
+    """
+    return int(100.0 * share + 0.5 + 1e-9)
+
+
+def _percent(share: float) -> str:
+    return f"{_half_up_percent(share)}%"
+
+
+def _approx_percent(share: float) -> str:
+    """Константа владельца (§4.2.1) с `≈` и без хвоста нулей: `≈4%`, `≈6.5%`, `≈1.5%`."""
+    return f"≈{round(100.0 * share, 1):g}%"
+
+
+def _played_words(dp: DecisionPoint, big_blind: int, size_pct: float | None = None) -> str:
     """Что сыграно и на какую сумму — каждому действию своё число.
 
     Колл называет ДОПЛАТУ (`to_call`), бет и рейз — итог, до которого подняли
     (`CanonicalAction.committed_after` — накопленное за улицу), чек и фолд не
     несут суммы вовсе: денег в них нет
-    (`test_the_action_of_a_point_prints_the_number_that_belongs_to_it`).
+    (`test_the_action_of_a_point_prints_the_number_that_belongs_to_it`). Слово «до»
+    стоит только у рейза; процент банка в скобках — у ставки и рейза, когда ядро его
+    посчитало (`size_pct`: на префлопе его нет), тег размера не печатается
+    (`test_a_bet_and_a_raise_print_the_percent_of_the_pot_and_not_the_size_tag`).
     """
     kind = dp.action.kind
     word = _action_word(kind.value)
@@ -1004,33 +1056,336 @@ def _played_words(dp: DecisionPoint, big_blind: int) -> str:
     if kind is ActionKind.CALL:
         return f"{word} {_raw_bb(dp.to_call, big_blind)}{all_in}"
     if kind in (ActionKind.BET, ActionKind.RAISE):
-        return f"{word} до {_raw_bb(dp.action.committed_after, big_blind)}{all_in}"
+        until = " до" if kind is ActionKind.RAISE else ""
+        share = "" if size_pct is None else f" ({_percent(size_pct)} банка)"
+        return f"{word}{until} {_raw_bb(dp.action.committed_after, big_blind)}{share}{all_in}"
     return f"{word}{all_in}"
 
 
-def _decision_lines(dp: DecisionPoint, big_blind: int) -> list[str]:
-    """Числа точки решения: что сыграно, сколько в банке, доставить, SPR, шансы банка."""
-    spr = "—" if dp.spr is None else f"{dp.spr:.1f}"
-    lines = [
-        (
-            f"{dp.index + 1}. {_STREET_WORD.get(dp.street, dp.street.value).lower()} · "
-            f"позиция {dp.position} · сыграно: {_played_words(dp, big_blind)}"
-        ),
-        (
-            f"    банк до хода {_raw_bb(dp.pot_before, big_blind)} · "
-            f"доставить {_raw_bb(dp.to_call, big_blind)} · "
-            f"эфф. стек {_raw_bb(dp.eff_stack, big_blind)} · SPR {spr} · "
-            f"живых {dp.live_total} (после вас {dp.live_behind})"
-        ),
+def _point_title(
+    dp: DecisionPoint, hand: CanonicalHand, detail: PostflopLineDetail | None
+) -> str:
+    """Заголовок точки: номер, улица, позиция, карты, что сыграно (макет §2 спеки).
+
+    Префлоп несёт карты героя, постфлоп — карты, пришедшие на этой улице (флоп три
+    подряд, тёрн и ривер одну); масти — форматом блока «Что было:». Карт, которых в
+    руке нет, в заголовке нет.
+    """
+    size_pct = None if detail is None or detail.line is None else detail.line.size_pct
+    played = f"сыграно: {_played_words(dp, hand.bb, size_pct)}"
+    street = _STREET_WORD.get(dp.street, dp.street.value)
+    if dp.street is Street.PREFLOP:
+        hero_cards = hand.dealt.get(hand.hero_label, [])
+        shown = cards_text(hero_cards) if hero_cards else ""
+        head = f"{dp.index + 1}. {street}"
+        return " · ".join(part for part in (head, dp.position, shown, played) if part)
+    arrived = hand.boards.get(dp.street, [])
+    head = f"{dp.index + 1}. {street}" + (f" {cards_text(arrived)}" if arrived else "")
+    return f"{head} · {dp.position} · {played}"
+
+
+def _decision_lines(
+    dp: DecisionPoint, hand: CanonicalHand, detail: PostflopLineDetail | None = None
+) -> list[str]:
+    """Числа точки решения: заголовок, банк, доставить, эфф., SPR, шансы банка.
+
+    Строка чисел несёт только то, что есть: «доставить» — при `to_call > 0`, SPR —
+    на постфлопе и когда он посчитан; на префлопе стоит «банк до хода», на
+    постфлопе «банк»; эффективный стек подписан «эфф.» (спека §4.7). Шансы банка —
+    одной фразой, без повтора банка и доплаты, которые стоят строкой выше.
+    """
+    postflop = dp.street is not Street.PREFLOP
+    big_blind = hand.bb
+    numbers = [
+        f"{'банк' if postflop else 'банк до хода'} {_raw_bb(dp.pot_before, big_blind)}"
     ]
     if dp.to_call > 0:
+        numbers.append(f"доставить {_raw_bb(dp.to_call, big_blind)}")
+    numbers.append(f"эфф. {_raw_bb(dp.eff_stack, big_blind)}")
+    if postflop and dp.spr is not None:
+        numbers.append(f"SPR {dp.spr:.1f}")
+    numbers.append(f"живых {dp.live_total} (после вас {dp.live_behind})")
+    lines = [_point_title(dp, hand, detail), "    " + " · ".join(numbers)]
+    if dp.to_call > 0:
         equity = _fmt_pct(100.0 * _required_equity(dp.to_call, dp.pot_before))
-        lines.append(
-            f"    шансы банка: доставить {_raw_bb(dp.to_call, big_blind)} "
-            f"в банк {_raw_bb(dp.pot_before, big_blind)} — "
-            f"колл окупается от {equity} эквити"
-        )
+        lines.append(f"    шансы банка: колл окупается от {equity} эквити")
     return lines
+
+
+# --- постфлоп-линия: рука, дро, линия, окупается (спека 2026-10-09, §4, §7) -----------
+
+# Ранги во множественном числе родительного падежа: «пара дам», «каре тузов».
+_RANK_GENITIVE: dict[str, str] = {
+    "A": "тузов",
+    "K": "королей",
+    "Q": "дам",
+    "J": "валетов",
+    "T": "десяток",
+    "9": "девяток",
+    "8": "восьмёрок",
+    "7": "семёрок",
+    "6": "шестёрок",
+    "5": "пятёрок",
+    "4": "четвёрок",
+    "3": "троек",
+    "2": "двоек",
+}
+
+# Вид дро. Стрит-дро несёт ранги аутов в скобках (`Draw.out_ranks`); флеш — нет.
+_DRAW_KIND_WORD: dict[DrawKind, str] = {
+    DrawKind.FLUSH: "флеш",
+    DrawKind.OPEN_ENDED: "двусторонний стрит",
+    DrawKind.DOUBLE_GUTSHOT: "двойной гатшот",
+    DrawKind.GUTSHOT: "гатшот",
+}
+
+# Тип действия героя. Нет в словаре — тип не печатается: обычная ставка, обычный
+# колл и пасы (спека §4.5: «у обычного колла и обычной ставки тип не печатается,
+# только назначение»; у фолда строки «линия» нет вовсе). Баррель — отдельно:
+# слово зависит от номера.
+_ACTION_TAG_WORD: dict[ActionTag, str] = {
+    ActionTag.CBET: "с-бет",
+    ActionTag.REPEAT_BET: "повторная ставка",
+    ActionTag.DELAYED_CBET: "отложенный с-бет",
+    ActionTag.PROBE: "проба",
+    ActionTag.DONK: "донк",
+    ActionTag.BET_AFTER_CHECK: "ставка после чека",
+    ActionTag.CHECK_CALL: "чек-колл",
+    ActionTag.CHECK_RAISE: "чек-рейз",
+    ActionTag.RAISE: "рейз",
+    ActionTag.THREE_BET: "3-бет",
+    ActionTag.RERAISE: "ререйз",
+    ActionTag.FLOAT: "флоат",
+}
+_BARREL_WORD: dict[int, str] = {2: "второй баррель", 3: "третий баррель"}
+_UNPRINTED_TAGS = frozenset({ActionTag.BET, ActionTag.CALL, ActionTag.FOLD, ActionTag.CHECK_FOLD})
+_NO_LINE_TAGS = frozenset({ActionTag.FOLD, ActionTag.CHECK_FOLD})
+
+_PURPOSE_WORD: dict[Purpose, str] = {
+    Purpose.VALUE: "вэлью",
+    Purpose.MEDIUM_HAND: "ставка со средней рукой",
+    Purpose.SEMIBLUFF: "полублеф",
+    Purpose.BLUFF: "блеф",
+    Purpose.CALL_STRONG: "колл с сильной рукой",
+    Purpose.BLUFF_CATCH: "ловля блефа",
+    Purpose.CALL_WITH_DRAW: "колл с дро",
+}
+
+
+def _ranks_genitive(ranks: Sequence[str]) -> list[str]:
+    return [_RANK_GENITIVE.get(rank, rank) for rank in ranks]
+
+
+def _combination_words(combination: Combination, ranks: Sequence[str]) -> str:
+    """Комбинация словами по рангам, которые ядро назвало (`HandStrength.ranks`)."""
+    genitive = _ranks_genitive(ranks)
+    top = ranks[0] if ranks else ""
+    match combination:
+        case Combination.PAIR:
+            return f"пара {genitive[0]}"
+        case Combination.TWO_PAIR:
+            return f"две пары ({' и '.join(genitive)})"
+        case Combination.TRIPS:
+            return f"трипс {genitive[0]}"
+        case Combination.STRAIGHT:
+            return f"стрит (старшая {top})"
+        case Combination.FLUSH:
+            return f"флеш (старшая {top})"
+        case Combination.FULL_HOUSE:
+            return f"фулл-хаус (тройка {genitive[0]}, пара {genitive[1]})"
+        case Combination.QUADS:
+            return f"каре {genitive[0]}"
+        case Combination.STRAIGHT_FLUSH:
+            return f"стрит-флеш (старшая {top})"
+        case Combination.HIGH_CARD:
+            return f"старшая {top}, без пары"
+
+
+def _hand_words(hand: HandStrength) -> str:
+    """Рука героя одной фразой: «старшая 5, без пары», «топ-пара королей, слабый кикер»."""
+    genitive = _ranks_genitive(hand.ranks[:1])
+    named = genitive[0] if genitive else ""
+    match hand.category:
+        case HandCategory.NO_PAIR:
+            return f"старшая {hand.ranks[0]}, без пары"
+        case HandCategory.ON_BOARD:
+            plays = f"играет кикер {hand.kicker}" if hand.plays == "kicker" else "играет борд"
+            return f"{_combination_words(hand.combination, hand.ranks)} на борде, {plays}"
+        case HandCategory.WEAK_FLUSH | HandCategory.WEAK_STRAIGHT:
+            return f"слабый {_combination_words(hand.combination, hand.ranks)}"
+        case HandCategory.SET:
+            return f"сет {named}"
+        case HandCategory.OVERPAIR:
+            return f"оверпара {named}"
+        case HandCategory.TOP_PAIR_STRONG_KICKER:
+            return f"топ-пара {named}, сильный кикер"
+        case HandCategory.TOP_PAIR_WEAK_KICKER:
+            return f"топ-пара {named}, слабый кикер"
+        case HandCategory.MIDDLE_PAIR:
+            return f"средняя пара {named}"
+        case HandCategory.WEAK_PAIR:
+            return f"слабая пара {named}"
+        case (
+            HandCategory.STRAIGHT_FLUSH
+            | HandCategory.QUADS
+            | HandCategory.FULL_HOUSE
+            | HandCategory.FLUSH
+            | HandCategory.STRAIGHT
+            | HandCategory.TRIPS
+            | HandCategory.TWO_PAIR
+        ):
+            return _combination_words(hand.combination, hand.ranks)
+
+
+def _hand_line(detail: PostflopLineDetail) -> str | None:
+    """«рука: …» и, на ривере после несобранного дро, «· дро не закрылось»."""
+    if detail.hand is None:
+        return None
+    missed = " · дро не закрылось" if detail.draw_missed else ""
+    return f"    рука: {_hand_words(detail.hand)}{missed}"
+
+
+def _showdown_line(detail: PostflopLineDetail) -> str | None:
+    """Ценность на вскрытии — только крайние случаи, словами и без числа комбо (§4.8).
+
+    Натс — когда проигрышей нет (раньше нуля выигрышей: рука, которой нечего
+    проигрывать, не «нулевая»); нулевая — когда выигрышей нет. Иначе строки нет.
+    Классы делящих рук называются один раз на пару рангов: «53o» и «53s» — «5-3».
+    """
+    value = detail.showdown
+    if value is None:
+        return None
+    if value.losses == 0:
+        return "    ценность на вскрытии: натс (не проигрывает ни одной руке)"
+    if value.wins > 0:
+        return None
+    lost = "не выигрывает ни у одной руки"
+    named: list[str] = []
+    for hand_class in value.ties_with:
+        ranks = hand_class[:2]
+        text = ranks[0] + ranks[1] if ranks[0] == ranks[1] else f"{ranks[0]}-{ranks[1]}"
+        if text not in named:
+            named.append(text)
+    shared = f", делит банк только с {', '.join(named)}" if named else ""
+    return f"    ценность на вскрытии: нулевая ({lost}{shared})"
+
+
+def _draw_line(detail: PostflopLineDetail) -> str | None:
+    """«дро: вид (ранги аутов) · N аутов · шанс собрать …» — флоп и тёрн разными словами."""
+    draw = detail.draw
+    if draw is None:
+        return None
+    ranks = f" ({', '.join(draw.out_ranks)})" if draw.out_ranks else ""
+    kinds = " + ".join(
+        _DRAW_KIND_WORD[kind] + (ranks if kind is not DrawKind.FLUSH else "")
+        for kind in draw.kinds
+    )
+    outs = len(draw.outs)
+    outs_word = _plural_form(outs, "аут", "аута", "аутов")
+    next_pct = _fmt_pct(100.0 * draw.hit_next)
+    if draw.hit_by_river is None:
+        chance = f"шанс собрать на ривере {next_pct}"
+    else:
+        chance = (
+            f"шанс собрать: на тёрне {next_pct}, "
+            f"тёрн + ривер {_fmt_pct(100.0 * draw.hit_by_river)}"
+        )
+    return f"    дро: {kinds} · {outs} {outs_word} · {chance}"
+
+
+def _backdoor_line(detail: PostflopLineDetail) -> str | None:
+    """«бэкдор: флеш ≈4% · стрит ≈3%» — цифры помечены `≈` (константы владельца, §4.2.1)."""
+    if not detail.backdoors:
+        return None
+    kinds = {"flush": "флеш", "straight": "стрит"}
+    parts = [f"{kinds[b.kind]} {_approx_percent(b.approx)}" for b in detail.backdoors]
+    return f"    бэкдор: {' · '.join(parts)}"
+
+
+def _overcards_line(detail: PostflopLineDetail) -> str | None:
+    """«оверкарты: 2 (A, K) · ≈12% к риверу, если пара будет лучшей» (флоп); на тёрне
+    — «≈3% на ривере»."""
+    over = detail.overcards
+    if over is None:
+        return None
+    named = ", ".join(card[0] for card in over.cards)
+    if over.approx_by_river is not None:
+        chance = f"{_approx_percent(over.approx_by_river)} к риверу"
+    else:
+        chance = f"{_approx_percent(over.approx_next)} на ривере"
+    return f"    оверкарты: {len(over.cards)} ({named}) · {chance}, если пара будет лучшей"
+
+
+def _line_line(detail: PostflopLineDetail) -> str | None:
+    """«линия: проба · полублеф» — тип и назначение; у чека и фолда строки нет."""
+    line = detail.line
+    if line is None or line.action in _NO_LINE_TAGS:
+        return None
+    if line.action is ActionTag.BARREL:
+        kind = _BARREL_WORD.get(line.barrel or 0, "баррель")
+    else:
+        kind = "" if line.action in _UNPRINTED_TAGS else _ACTION_TAG_WORD[line.action]
+    purpose = "" if line.purpose is None else _PURPOSE_WORD[line.purpose]
+    parts = [part for part in (kind, purpose) if part]
+    return f"    линия: {' · '.join(parts)}" if parts else None
+
+
+def _payoff_line(detail: PostflopLineDetail, big_blind: int) -> str | None:
+    """«окупается: …» — порог фолдов у блефа и полублефа, доплата у колла с дро (§4.6).
+
+    У вэлью и средней руки порога нет — ядро его не кладёт, и печатать нечего. Сумма
+    «добрать позже» — фишки ядра в ББ, вверх до десятой: требование не занижается
+    (`test_the_amount_to_win_later_rounds_up_to_a_tenth`).
+    """
+    line = detail.line
+    fold = detail.fold_threshold
+    if (
+        fold is not None
+        and line is not None
+        and line.purpose in (Purpose.BLUFF, Purpose.SEMIBLUFF)
+    ):
+        if line.purpose is Purpose.BLUFF:
+            return f"    окупается: от {_percent(fold.bluff)} фолдов"
+        head = f"как чистый блеф от {_percent(fold.bluff)} фолдов"
+        if fold.semibluff_free:
+            return f"    окупается: {head}; с учётом аутов окупается и без фолдов"
+        if fold.semibluff is not None:
+            return f"    окупается: {head}; с учётом аутов от {_percent(fold.semibluff)} фолдов"
+        return f"    окупается: {head}"
+    call = detail.draw_call
+    if call is None:
+        return None
+    if call.by_pot_odds:
+        return "    окупается: по шансам банка"
+    if call.beyond_stack:
+        return "    окупается: добрать столько нельзя — колл не окупается добором"
+    if call.implied_needed_chips is not None:
+        return f"    окупается: нужно добрать позже {_bb_up(call.implied_needed_chips, big_blind)} ББ"
+    return None
+
+
+def _bb_up(value_chips: int, big_blind: int) -> str:
+    """Фишки в ББ одним знаком, вверх до десятой: 1 234 при ББ 100 — «12.4»."""
+    tenths = -(-10 * value_chips // big_blind)
+    return f"{tenths / 10:.1f}"
+
+
+def _postflop_line_lines(detail: PostflopLineDetail | None, big_blind: int) -> list[str]:
+    """Строки постфлоп-линии в порядке макета: рука → ценность на вскрытии → дро →
+    бэкдор → оверкарты → линия → окупается. Каждая — только когда ей есть что
+    сказать (`test_an_empty_field_prints_no_line`)."""
+    if detail is None:
+        return []
+    candidates = (
+        _hand_line(detail),
+        _showdown_line(detail),
+        _draw_line(detail),
+        _backdoor_line(detail),
+        _overcards_line(detail),
+        _line_line(detail),
+        _payoff_line(detail, big_blind),
+    )
+    return [text for text in candidates if text is not None]
 
 
 def _chart_frequencies_text(frequencies: Mapping[str, float]) -> str:
@@ -1071,6 +1426,12 @@ def _verdict_lines(point: PointVerdict) -> list[str]:
     """
     if not is_judged(point):
         reason = point.detail.get(_UNJUDGED_KEY)
+        if reason == "":
+            # Пустая причина — ядро сказало, что говорить нечего (чек на постфлопе,
+            # спека §4.9): строки нет. Ключа нет вовсе — причина не названа, и точка
+            # честно говорит, что вердикта нет (`test_a_point_without_a_verdict_and_
+            # without_a_reason_still_says_so`).
+            return []
         return [f"    вердикта нет: {reason}" if reason else "    вердикта нет."]
     if point.mismatch is not None:
         return [_chart_verdict_line(point)]
@@ -1139,13 +1500,21 @@ def _raw_blocks(res: AnalysisResult, en: EnrichedHand) -> list[list[str]]:
     blocks: list[list[str]] = []
     for point in res.points:
         dp = decisions.get(point.dp_index)
-        street = _STREET_WORD.get(point.street, point.street.value).lower()
+        street = _STREET_WORD.get(point.street, point.street.value)
+        line = postflop_line_detail(point)
         block = (
-            _decision_lines(dp, hand.bb)
+            _decision_lines(dp, hand, line)
             if dp is not None
             else [f"{point.dp_index + 1}. {street}"]
         )
-        blocks.append([*block, *_verdict_lines(point), *_detail_lines(point)])
+        blocks.append(
+            [
+                *block,
+                *_postflop_line_lines(line, hand.bb),
+                *_verdict_lines(point),
+                *_detail_lines(point),
+            ]
+        )
     return blocks
 
 

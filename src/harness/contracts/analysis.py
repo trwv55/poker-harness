@@ -20,6 +20,16 @@ from typing import Any
 
 from pydantic import BaseModel, model_validator
 
+from harness.contracts.postflop import (
+    Backdoor,
+    Draw,
+    DrawCall,
+    FoldThreshold,
+    HandStrength,
+    Line,
+    Overcards,
+    ShowdownValue,
+)
 from harness.contracts.ranges import Range
 from harness.contracts.raw import Street
 
@@ -184,6 +194,34 @@ class TurnFlopCallDetail(BaseModel):
         return self
 
 
+# Ключ и тип постфлоп-линии героя (спека `2026-10-09-postflop-line-design.md`,
+# §5) — рядом с соседними деталями и по той же причине: читает их
+# `presentation`. Описание сыгранного, а не вердикт: зоны, цены и лучшего
+# действия здесь нет.
+POSTFLOP_LINE_DETAIL = "postflop_line"
+
+
+class PostflopLineDetail(BaseModel):
+    """Рука, дро, линия и пороги героя в постфлоп-точке (спека, §5.2).
+
+    Считает `analysis.postflop_line`; доли — в долях единицы. Карты героя
+    неизвестны — `hand`, `draw`, `overcards`, `showdown` пусты, `backdoors` —
+    пустой список, у линии нет назначения
+    (`test_unknown_hero_cards_leave_the_cards_empty_and_the_line_without_purpose`).
+    `line` — `None` у чека.
+    """
+
+    hand: HandStrength | None
+    draw: Draw | None
+    draw_missed: bool
+    backdoors: list[Backdoor]
+    overcards: Overcards | None
+    line: Line | None
+    fold_threshold: FoldThreshold | None
+    draw_call: DrawCall | None
+    showdown: ShowdownValue | None
+
+
 class PointVerdict(BaseModel):
     dp_index: int
     street: Street
@@ -262,6 +300,18 @@ def turn_flop_call_detail(point: PointVerdict) -> TurnFlopCallDetail | None:
     if raw is None:
         return None
     return TurnFlopCallDetail.model_validate(raw)
+
+
+def postflop_line_detail(point: PointVerdict) -> PostflopLineDetail | None:
+    """Постфлоп-линия точки из `detail` — или `None`, если её там нет.
+
+    Чужое содержимое под ключом роняет разбор — то же правило, что у
+    `river_call_detail` (`test_a_foreign_shape_under_the_postflop_line_key_is_not_swallowed`).
+    """
+    raw = point.detail.get(POSTFLOP_LINE_DETAIL)
+    if raw is None:
+        return None
+    return PostflopLineDetail.model_validate(raw)
 
 
 class AnalysisResult(BaseModel):
