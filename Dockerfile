@@ -68,6 +68,12 @@ RUN uv sync --frozen --no-dev --no-editable
 
 FROM python:3.12-slim
 
+# Коммит, из которого собран образ: правило CLAUDE.md «сверить SHA работающего
+# контейнера» иначе проверить нечем. Передаётся при сборке:
+# `docker compose build --build-arg GIT_SHA=$(git rev-parse HEAD)`; без аргумента — unknown.
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.revision=$GIT_SHA
+
 # Непривилегированный пользователь: в /data лежат присланные игроками файлы, и
 # владеть ими root не должен. Каталог заводится ЗДЕСЬ и с этим владельцем именно
 # для того, чтобы пустой именованный том Docker при первом монтировании
