@@ -511,7 +511,7 @@ jsonb — для версионированных документов-конт�
 | `opponent_links` | PK `(owner_player_id, room_tournament_id, participant_label)`, opponent_id | сшивка «участник этого турнира — этот оппонент». Турнир записан так, как его нумерует рум, а не строкой `tournaments`: один файл бывает загружен дважды, и привязка не имеет права от этого раздваиваться — внешнего ключа на `tournaments` поэтому нет |
 | `notes` | id, owner_player_id, **opponent_id UNIQUE**, color_id?, text, updated_at | ник набирается со стола или руками: кнопка под разбором скриншота либо команда `/note` (в HH ники анонимны). До миграции 0007 заметка держала ник строкой и различала регистр, а сшивка — нет: один ник в разном написании был одним оппонентом для статистики и двумя для заметок. `color_id` — цвет того же владельца: составной FK `(color_id, owner_player_id)` → `note_colors(id, player_id)`, без каскада — удаление цвета обнуляет ссылку кодом в той же транзакции (миграция 0013) |
 | `note_colors` | id, player_id, name, meaning, created_at, UNIQUE `(player_id, lower(name))`, UNIQUE `(id, player_id)` | цвета заметок, названные игроком: имя и подпись его словами, не больше 12 на игрока; у нового игрока цветов нет. Регистр имени не различается, написание хранится первое (миграция 0013; до неё цвет был ключом из набора в коде, одним на всех) |
-| `eval_cases` | id, kind: vision_field / verdict_confirm / verdict_dispute / agent_routing, hand_id?, field?, ground_truth jsonb, source: escalation / disagree_button / manual / agent_miss_button, created_at | этажи 2, 4 и 5; копится сам. `hand_id` пуст у `agent_routing`, если вопрос был без руки (миграция 0014) |
+| `eval_cases` | id, kind: vision_field / verdict_confirm / verdict_dispute / agent_routing, hand_id?, field?, ground_truth jsonb, source: escalation / disagree_button / manual / agent_miss_button, created_at | этажи 2, 4 и 5; копится сам. `hand_id` у `agent_routing` в v1 всегда пуст (миграция 0014 сделала колонку nullable); заполнять его из `sessions.last_analysis_id` — позднейшее улучшение, рука восстанавливается через `job_id`/`trace_id` в `ground_truth` |
 | `jobs` | id, **type**, status, payload jsonb, **session_id NOT NULL**, player_id, hand_id?, attempts, max_attempts, priority, locked_by?, locked_at?, created_at, finished_at?, error? | очередь + журнал (§8) |
 | `traces` | id, job_id, hand_id?, spans jsonb | что вернул каждый сервис, какие диапазоны предположены |
 | `llm_calls` | id, trace_id, provider, model, purpose, tokens_in, tokens_out, cost, latency_ms, status | учёт себестоимости; точка данных лимитера |
@@ -577,12 +577,12 @@ instructions=None, trace_id) -> (schema_instance, meta)` — единствен�
   второго провайдера при упоре в квоту. Каскад «дёшево → дорого при непройденной проверке»
   из закладок вышел — он реализован (`vision_extract_fallback`).
 - **Три уровня времени.** Таймаут на запрос к провайдеру (`LLM_REQUEST_TIMEOUT_S`, обёртка
-  `_MeteredModel`) снимает один зависший запрос, не трогая остальных. Дедлайн лимитера
+  `_MeteredModel`) обрывает зависший запрос через 60 с вместо ожидания бюджета задачи, но не спасает ход: запрос закрывается ошибкой `LLMProviderError`, попытка агента одна, поэтому ход падает целиком, расчёты этого хода теряются, а игрок получает сообщение о сбое. Дедлайн лимитера
   абсолютный и отсчитывается на ожидание слота; часы между попытками не останавливаются ни на
   время ответа модели, ни на бэкофф-паузу, и расходуют бюджет следующего `slot()`. Бюджет ЗАДАЧИ
   (`pipeline._JOB_DEADLINE_S`) сверху снимает попытку целиком, вместе с уже посчитанными числами.
-  Прежний дефект — запрос без собственного таймаута, из-за чего один зависший вызов съедал
-  бюджет задачи, — закрыт.
+  Закрыто только то, что у запроса не было собственного таймаута и зависший вызов ждал
+  бюджет задачи (120 с); последствие — потеря работы хода — осталось, просто наступает раньше.
 
 ---
 
@@ -673,7 +673,7 @@ LLM не выдаст игроку «другой разбор той же ру�
 | Свободный текст | `handle_text` | меню → начатый ввод (ник, заметка) → ручной ответ по эскалации → агент (`is_dev`, задача `agent`; тратит одну единицу квоты), в этом порядке |
 | «Диапазоны» (инлайн) | `_ranges_reply` | PNG матрицы из `analyses.range_images` |
 | «Не согласен» (инлайн) | `_disagree_reply` | запись в `eval_cases` (kind=`verdict_dispute`) |
-| «Не то посчитано» (инлайн, под ответом агента) | `_agent_miss_reply` | запись в `eval_cases` (kind=`agent_routing`, source=`agent_miss_button`, `hand_id` пуст у вопроса без руки) |
+| «Не то посчитано» (инлайн, под ответом агента) | `_agent_miss_reply` | запись в `eval_cases` (kind=`agent_routing`, source=`agent_miss_button`, `hand_id` в v1 всегда пуст) |
 | «🃏 {ник}» (инлайн, под разбором) | `_note_prompt_from_button` | ввод заметки на оппонента этой раздачи |
 | Кнопки заметки на экране «Заметки» | `_dispatch_ui` | изменить текст, сменить цвет, удалить |
 | Кнопки эскалации | `handle_escalation_callback`; «ввести вручную» — через `jobs.payload`, не через FSM в памяти | §8.3 |
