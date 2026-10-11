@@ -43,7 +43,9 @@ class AgentDraft(ModelOutput, BaseModel):
 @dataclass(frozen=True)
 class AgentTurn:
     """Итог хода. `from_context` — ответ стоит на сводке разбора, расчётов в
-    ходе нет (`test_an_answer_from_the_context_alone_passes_without_a_call`)."""
+    ходе нет (`test_an_answer_from_the_context_alone_passes_without_a_call`).
+    `drafts` — тексты модели, которые игрок не увидел: для журнала, не для
+    игрока (`test_the_journal_keeps_the_rejected_drafts`)."""
 
     state: Literal["prose", "numbers", "refusal"]
     prose: str | None
@@ -52,6 +54,7 @@ class AgentTurn:
     messages: tuple[ModelMessage, ...]
     violations: tuple[tuple[str, ...], ...]
     calls: tuple[dict[str, Any], ...]
+    drafts: tuple[str, ...] = ()
 
     def journal(self) -> dict[str, Any]:
         """Запись `agent_turn` в `traces.spans` (спека §8, «Журнал»;
@@ -63,6 +66,7 @@ class AgentTurn:
             "checks": [list(v) for v in self.violations],
             "rewrite": len(self.violations) == 2,
             "from_context": self.from_context,
+            "drafts": list(self.drafts),
         }
 
 
@@ -123,6 +127,7 @@ async def run_agent_turn(
     found = _violations(draft.answer, messages, context)
     violations: list[tuple[str, ...]] = [tuple(found)]
     prose: str | None = draft.answer.strip() if not found else None
+    drafts: list[str] = [draft.answer] if found or not grounded else []
 
     if grounded and found:
         draft, meta = await llm(
@@ -133,6 +138,8 @@ async def run_agent_turn(
         second = _violations(draft.answer, messages, context)
         violations.append(tuple(second))
         prose = draft.answer.strip() if not second else None
+        if second:
+            drafts.append(draft.answer)
 
     state: Literal["prose", "numbers", "refusal"]
     if not grounded:
@@ -149,4 +156,5 @@ async def run_agent_turn(
         messages=tuple(messages),
         violations=tuple(violations),
         calls=tuple(run_state.calls),
+        drafts=tuple(drafts),
     )

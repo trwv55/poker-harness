@@ -61,7 +61,7 @@ import structlog
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from harness.agent.history import dump_history, load_history, trim_history
+from harness.agent.history import dump_history, load_history, seen_history, trim_history
 from harness.agent.run import run_agent_turn
 from harness.analysis import analyze_hand
 from harness.analysis.player_stats import player_stats_by_label
@@ -1325,7 +1325,8 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
     """Ход агента: контекст, история вечера, модель, проверки, журнал, ответ.
 
     Чекпоинта нет, как у `_run_question`; у задачи `agent` одна попытка
-    (`JobsQueue.enqueue`), сбой уходит игроку существующим путём `failed_msg`.
+    (`JobsQueue.enqueue`, `test_an_agent_job_gets_a_single_attempt`), сбой уходит
+    игроку общим путём `failed_msg` — у этой станции своего нет.
     Под `result_message_id` ложится только итоговый ответ: прогресса у хода нет,
     «печатает» — действие в чате, не сообщение. История пишется только в
     открытую сессию (`SessionsRepo.save_agent_history`).
@@ -1359,11 +1360,6 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
                 await typing
 
         trace.record("agent_turn", question=payload["text"], **turn.journal())
-        await sessions.save_agent_history(
-            job.session_id,
-            dump_history(trim_history(turn.messages, deps.agent_history_max_tokens)),
-        )
-        await session.commit()
         msg = agent_turn_msg(
             turn.state,
             turn.prose,
@@ -1371,6 +1367,15 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
             from_context=turn.from_context,
             job_id=job.id,
         )
+        # В историю — только то, что игрок видел (решение контроллера по вопросу
+        # владельца 2): без прозы на месте ответа модели — текст, который ушёл игроку.
+        seen = seen_history(
+            turn.messages, final_answer=None if turn.state == "prose" else msg.text
+        )
+        await sessions.save_agent_history(
+            job.session_id, dump_history(trim_history(seen, deps.agent_history_max_tokens))
+        )
+        await session.commit()
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
         await session.commit()
 

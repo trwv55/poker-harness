@@ -11,6 +11,7 @@ from typing import Any
 
 from pydantic_ai.messages import (
     ModelMessage,
+    ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
     ToolCallPart,
@@ -21,11 +22,14 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from sqlalchemy import text as sql_text
 
 from harness.agent.history import (
+    REWRITE_HEAD,
     allowed_from_history,
     calcs_in_history,
     dump_history,
     load_history,
+    seen_history,
     trim_history,
+    turns,
 )
 from harness.agent.prompt import instructions_for, load_system_prompt
 from harness.agent.run import MAX_CALCS_PER_TURN, run_agent_turn
@@ -85,12 +89,14 @@ _VPIP = ("hero_frequency", {"stat": "vpip"})
 _GOOD = "Вы входите в банк в 100.0% раздач (2 из 2)."
 
 
-async def _turn(db_factory, session, script, *, scope, text="вопрос", history=(), context=None):
+async def _turn(
+    db_factory, session, script, *, scope, text="вопрос", history=(), context=None, system=_SYSTEM
+):
     player_id, session_id, trace_id = scope
     llm = LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script))
     return await run_agent_turn(
         session, llm, player_id=player_id, session_id=session_id, text=text,
-        trace_id=trace_id, history=history, context=context, system_prompt=_SYSTEM,
+        trace_id=trace_id, history=history, context=context, system_prompt=system,
     )
 
 
@@ -213,8 +219,11 @@ async def test_trimming_drops_whole_turns_and_their_numbers(db_factory):
 
 
 async def test_trimming_leaves_no_orphan_tool_return(db_factory):
-    """Первый оставшийся запрос не начинается с ответа на вызов, которого нет:
-    провайдер такую историю отвергает."""
+    """Регрессия: обрезка по ходам не отрывает вызов от ответа. Ответ на
+    последний вызов прошлого хода (`final_result`) остаётся в своём ходе, и
+    оставшаяся история начинается репликой игрока, а не ответом на вызов,
+    которого нет, — такую историю провайдер отвергает. Падает, если `turns()`
+    начнёт резать ход на любом запросе."""
     async with db_factory() as session:
         scope = await _seeded(session, tg_user_id=8113)
         first = await _turn(db_factory, session, _TurnScript([([_VPIP], _GOOD)]), scope=scope)
@@ -327,3 +336,88 @@ def _tokens_of_last_turn(messages: list[ModelMessage] | tuple[ModelMessage, ...]
     from harness.agent.history import estimate_tokens, turns
 
     return estimate_tokens(turns(list(messages))[-1])
+
+
+# --- правки по ревью: потолок истории, сохраняемая история, черновики в журнале -------
+
+
+async def test_a_long_system_prompt_does_not_eat_the_history_budget(db_factory):
+    """Инструкции каждого запроса — промпт и сводка — в историю не попадают и
+    потолок не тратят: четыре хода с расчётом при промпте в 7000 знаков влезают в
+    30 000, хотя вместе с инструкциями весили бы больше."""
+    system = "Синтетический системный промпт. " * 220
+    assert len(system) >= 7000
+    history: tuple[ModelMessage, ...] = ()
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8121)
+        for _ in range(4):
+            turn = await _turn(
+                db_factory, session, _TurnScript([([_VPIP], _GOOD)]),
+                scope=scope, history=history, system=system,
+            )
+            history = turn.messages
+    with_instructions = len(ModelMessagesTypeAdapter.dump_json(list(history))) // 3
+    assert with_instructions > 30_000, "сценарий не нагружает потолок — проверять нечего"
+    kept = trim_history(history, max_tokens=30_000)
+    assert len(turns(kept)) == 4
+    assert all(m.instructions is None for m in kept if isinstance(m, ModelRequest))
+
+
+def _stored_text(messages) -> str:
+    return ModelMessagesTypeAdapter.dump_json(list(messages)).decode()
+
+
+async def test_the_saved_history_keeps_no_rejected_draft_and_no_rewrite_request(db_factory):
+    """Решение контроллера (вопрос владельца 2): в истории — то, что игрок
+    видел, и вызовы расчётов. Следующий ход принимает такую историю."""
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8122)
+        script = _TurnScript([
+            ([_VPIP], "Вы входите в 43.0% раздач."),
+            ([], "Вы входите в 44.0% раздач."),
+        ])
+        first = await _turn(db_factory, session, script, scope=scope)
+        assert first.state == "numbers"
+        saved = load_history(dump_history(seen_history(first.messages, final_answer="ПОКАЗАНО-СИНТ")))
+        stored = _stored_text(saved)
+        assert "43.0" not in stored and "44.0" not in stored and REWRITE_HEAD not in stored
+        assert "ПОКАЗАНО-СИНТ" in stored and calcs_in_history(saved) == {"hero_frequency"}
+        second = await _turn(
+            db_factory, session, _TurnScript([([], "Те же 100.0% (2 из 2).")]),
+            scope=scope, history=saved,
+        )
+    assert second.state == "prose"
+
+
+async def test_a_refused_answer_is_saved_as_the_refusal_the_player_saw(db_factory):
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8123)
+        script = _TurnScript([([], "На BB вы минусовой, это нормально.")])
+        turn = await _turn(db_factory, session, script, scope=scope)
+    stored = _stored_text(seen_history(turn.messages, final_answer="ОТКАЗ-СИНТ"))
+    assert "минусовой" not in stored and "ОТКАЗ-СИНТ" in stored
+
+
+async def test_a_passed_prose_is_saved_as_it_is(db_factory):
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8124)
+        script = _TurnScript([([_VPIP], "Вы входите в 43.0% раздач."), ([], _GOOD)])
+        turn = await _turn(db_factory, session, script, scope=scope)
+    stored = _stored_text(seen_history(turn.messages, final_answer=None))
+    assert _GOOD in stored and "43.0" not in stored and REWRITE_HEAD not in stored
+
+
+async def test_the_journal_keeps_the_rejected_drafts(db_factory):
+    """Решение контроллера (вопрос владельца 3): черновики, которых игрок не
+    видел, — в журнале, для evals и «не то посчитано»."""
+    bad, worse = "Вы входите в 43.0% раздач.", "Вы входите в 44.0% раздач."
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8125)
+        numbers = await _turn(db_factory, session, _TurnScript([([_VPIP], bad), ([], worse)]), scope=scope)
+        rewritten = await _turn(db_factory, session, _TurnScript([([_VPIP], bad), ([], _GOOD)]), scope=scope)
+        clean = await _turn(db_factory, session, _TurnScript([([_VPIP], _GOOD)]), scope=scope)
+        refused = await _turn(db_factory, session, _TurnScript([([], "Без расчёта.")]), scope=scope)
+    assert numbers.journal()["drafts"] == [bad, worse]
+    assert rewritten.journal()["drafts"] == [bad]
+    assert clean.journal()["drafts"] == []
+    assert refused.journal()["drafts"] == ["Без расчёта."]

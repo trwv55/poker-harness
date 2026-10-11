@@ -180,8 +180,9 @@ async def _perform(
 
     Удачный расчёт возвращается `ToolReturn`: модель видит тот же текст
     выжимки, а метаданные (имя расчёта, разрешённые числа, частота) остаются в
-    истории для проверок агента и модели не уходят
-    (`test_history_survives_serialization`).
+    истории для проверок агента (`test_history_survives_serialization`); что
+    модели они не уходят — контракт pydantic-ai (`ToolReturn.metadata`), тестом
+    здесь не закреплено.
     """
     params_json = params.model_dump(mode="json")
     if len(run_state.results) >= run_state.max_calcs:

@@ -2188,6 +2188,51 @@ async def test_the_next_agent_job_sees_the_evening_history(
     assert any(text.startswith("Те же 100.0% (2 из 2).") for text in _all_texts(fake_sender))
 
 
+async def test_after_a_numbers_only_turn_the_next_turn_sees_only_what_the_player_saw(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    """Состояние 2: отвергнутые черновики и просьба переписать в историю вечера не
+    попадают (решение контроллера, вопрос владельца 2), а в журнале остаются
+    (вопрос 3)."""
+    from pydantic_ai.messages import ModelMessagesTypeAdapter
+    from pydantic_ai.models.function import FunctionModel
+
+    from harness.agent.history import REWRITE_HEAD
+    from tests.test_agent import _VPIP, _TurnScript
+
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    player_id, session_id = await _make_scope(db_factory)
+    await _seed_two_hands(db_factory, session_id)
+    bad, worse = "Вы входите в 43.0% раздач.", "Вы входите в 44.0% раздач."
+    script = _TurnScript([([_VPIP], bad), ([], worse), ([], "Те же 100.0% (2 из 2).")])
+    seen_by_model: list[str] = []
+
+    def model(messages, info):
+        seen_by_model.append(ModelMessagesTypeAdapter.dump_json(messages).decode())
+        return script(messages, info)
+
+    llm_deps = replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(model)))
+    jobs = []
+    for question in ("первый", "второй"):
+        jobs.append(await queue.enqueue(type="agent", player_id=player_id, session_id=session_id,
+                                        payload={"text": question}))
+        job = await queue.claim("w1")
+        assert job is not None
+        await run_job(job, llm_deps)
+
+    assert [await job_status(db_factory, jid) for jid in jobs] == ["done", "done"]
+    last_request = seen_by_model[-1]
+    assert bad not in last_request and worse not in last_request
+    assert REWRITE_HEAD not in last_request
+    assert "Посчитано: ваша частота." in last_request
+    async with db_factory() as session:
+        spans = (await session.execute(
+            text("select spans from traces where job_id = :j"), {"j": jobs[0]}
+        )).scalar_one()
+    turn = next(s for s in spans if s["name"] == "agent_turn")
+    assert turn["state"] == "numbers" and turn["drafts"] == [bad, worse]
+
+
 async def test_a_failing_typing_indicator_does_not_fail_the_agent_turn(
     db_factory, queue, deps, fake_sender, monkeypatch
 ):

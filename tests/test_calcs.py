@@ -557,7 +557,7 @@ def test_the_bot_does_not_load_the_dictionary():
     """
     code = (
         "import sys, harness.bot.main;"
-        "print(sorted({m for m in sys.modules} & {'harness.calcs', 'pokerkit', 'eval7'}))"
+        "print(sorted({m for m in sys.modules} & {'harness.calcs', 'harness.agent', 'pokerkit', 'eval7'}))"
     )
     result = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, check=True

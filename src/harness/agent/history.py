@@ -24,10 +24,13 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelMessagesTypeAdapter,
     ModelRequest,
+    ModelResponse,
+    ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
 )
 
+from harness.contracts import CalcName
 from harness.explanation.faithfulness import numbers_in
 
 __all__ = [
@@ -38,6 +41,7 @@ __all__ = [
     "estimate_tokens",
     "load_history",
     "player_numbers",
+    "seen_history",
     "stats_in_history",
     "trim_history",
     "turns",
@@ -52,23 +56,32 @@ REWRITE_HEAD = "Ответ не прошёл проверку:"
 # срабатывает раньше, а не позже.
 _BYTES_PER_TOKEN = 3
 
+_CALC_TOOLS = frozenset(name.value for name in CalcName)
+
 
 def load_history(raw: list[dict[str, Any]] | None) -> list[ModelMessage]:
     return ModelMessagesTypeAdapter.validate_python(raw) if raw else []
 
 
-def dump_history(messages: Sequence[ModelMessage]) -> list[dict[str, Any]]:
-    """Сообщения в JSON без инструкций: системный промпт и сводка пересобираются
-    на каждом ходе, хранить их копию в каждой строке незачем."""
-    bare = [
+def _bare(messages: Sequence[ModelMessage]) -> list[ModelMessage]:
+    """Сообщения без инструкций: системный промпт и сводка пересобираются на
+    каждом ходе, хранить их копию в каждом запросе незачем."""
+    return [
         dataclasses.replace(m, instructions=None) if isinstance(m, ModelRequest) else m
         for m in messages
     ]
-    return ModelMessagesTypeAdapter.dump_python(bare, mode="json")
+
+
+def dump_history(messages: Sequence[ModelMessage]) -> list[dict[str, Any]]:
+    """Сообщения в JSON — без инструкций (`_bare`)."""
+    return ModelMessagesTypeAdapter.dump_python(_bare(messages), mode="json")
 
 
 def estimate_tokens(messages: Sequence[ModelMessage]) -> int:
-    return len(ModelMessagesTypeAdapter.dump_json(list(messages))) // _BYTES_PER_TOKEN
+    """Размер того, что хранится, — без инструкций: системный промпт в каждом
+    запросе хода съедал бы потолок, хотя в историю не попадает
+    (`test_a_long_system_prompt_does_not_eat_the_history_budget`)."""
+    return len(ModelMessagesTypeAdapter.dump_json(_bare(messages))) // _BYTES_PER_TOKEN
 
 
 def _text(part: UserPromptPart) -> str:
@@ -89,7 +102,12 @@ def _player_parts(message: ModelMessage) -> list[UserPromptPart]:
 
 
 def turns(messages: list[ModelMessage]) -> list[list[ModelMessage]]:
-    """Ходы: каждый начинается запросом с репликой игрока."""
+    """Ходы: каждый начинается запросом с репликой игрока.
+
+    Реплика игрока — отдельный запрос (pydantic-ai, как установлен), поэтому
+    ответ на последний вызов хода — в том числе на вывод `final_result` —
+    остаётся в своём ходе и уходит вместе с ним при обрезке.
+    """
     result: list[list[ModelMessage]] = []
     for message in messages:
         if _player_parts(message) or not result:
@@ -102,20 +120,78 @@ def turns(messages: list[ModelMessage]) -> list[list[ModelMessage]]:
 def trim_history(messages: Sequence[ModelMessage], max_tokens: int) -> list[ModelMessage]:
     """Самые старые ходы — прочь целиком, пока история не влезет в потолок.
 
-    Первый оставшийся запрос чистится от ответов инструментов: pydantic-ai
-    склеивает соседние запросы, и ответ на вызов из выброшенного хода мог
-    оказаться в одном запросе с новой репликой — провайдер такую историю
-    отвергает (`test_trimming_leaves_no_orphan_tool_return`).
+    Ход режется только целиком (`turns`), поэтому вызов инструмента не
+    отрывается от своего ответа, и оставшаяся история начинается репликой
+    игрока (`test_trimming_leaves_no_orphan_tool_return`). Возвращается без
+    инструкций — так, как будет храниться.
     """
-    kept = turns(list(messages))
+    kept = turns(_bare(messages))
     while kept and estimate_tokens([m for turn in kept for m in turn]) > max_tokens:
         kept.pop(0)
-    flat = [m for turn in kept for m in turn]
-    if flat and isinstance(flat[0], ModelRequest):
-        head = flat[0]
-        parts = [p for p in head.parts if not isinstance(p, ToolReturnPart)]
-        flat[0] = dataclasses.replace(head, parts=parts)
-    return flat
+    return [m for turn in kept for m in turn]
+
+
+def _is_output_call(part: object) -> bool:
+    """Вызов вывода (`final_result`), а не расчёта: инструменты агента — ровно
+    имена `CalcName` (`test_the_tool_set_covers_every_calculation_name_exactly_once`)."""
+    return isinstance(part, ToolCallPart) and part.tool_name not in _CALC_TOOLS
+
+
+def seen_history(
+    messages: Sequence[ModelMessage], *, final_answer: str | None
+) -> list[ModelMessage]:
+    """История к сохранению: только то, что игрок видел, плюс вызовы расчётов.
+
+    Уходят просьба переписать и отвергнутые черновики — вызов вывода перед
+    просьбой и ответ на него (решение контроллера по вопросу владельца 2,
+    `test_the_saved_history_keeps_no_rejected_draft_and_no_rewrite_request`).
+    `final_answer` — текст, который игрок получил вместо прозы (состояния
+    «числа» и «отказ»): он подменяет ответ последнего вызова вывода; `None` —
+    проза прошла и остаётся как есть.
+    """
+    rejected: set[str] = set()
+    last_output: ToolCallPart | None = None
+    for index, message in enumerate(messages):
+        if not isinstance(message, ModelResponse):
+            continue
+        for part in message.parts:
+            if not _is_output_call(part):
+                continue
+            assert isinstance(part, ToolCallPart)
+            last_output = part
+            after = messages[index + 1 : index + 3]
+            if any(
+                isinstance(m, ModelRequest)
+                and any(
+                    isinstance(p, UserPromptPart) and _text(p).startswith(REWRITE_HEAD)
+                    for p in m.parts
+                )
+                for m in after
+            ):
+                rejected.add(part.tool_call_id)
+
+    kept: list[ModelMessage] = []
+    for message in messages:
+        if isinstance(message, ModelResponse):
+            parts = []
+            for part in message.parts:
+                if isinstance(part, ToolCallPart) and part.tool_call_id in rejected:
+                    continue
+                if part is last_output and final_answer is not None:
+                    part = dataclasses.replace(part, args={"answer": final_answer})
+                parts.append(part)
+            if parts:
+                kept.append(dataclasses.replace(message, parts=parts))
+            continue
+        request_parts = [
+            part
+            for part in message.parts
+            if not (isinstance(part, ToolReturnPart) and part.tool_call_id in rejected)
+            and not (isinstance(part, UserPromptPart) and _text(part).startswith(REWRITE_HEAD))
+        ]
+        if request_parts:
+            kept.append(dataclasses.replace(message, parts=request_parts))
+    return kept
 
 
 def _metadata(messages: Sequence[ModelMessage]) -> list[dict[str, Any]]:
