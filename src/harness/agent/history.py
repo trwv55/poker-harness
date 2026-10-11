@@ -8,10 +8,9 @@
 
 Числа, которые назвал сам игрок, тоже разрешены (решение владельца R1,
 `test_a_number_the_player_typed_is_allowed`). Просьба переписать ответ уходит
-модели такой же репликой, но игроку не принадлежит: её числа — это список
-нарушений, и разрешать их нельзя
-(`test_the_rewrite_request_does_not_allow_the_numbers_it_lists`). Она же не
-открывает новый ход (`test_a_rewrite_stays_in_the_turn_of_its_question`).
+модели репликой, но игроку не принадлежит; в сохранённую историю она не
+попадает (`seen_history`), а опознаётся по месту в ходе, а не по тексту
+(`test_a_player_message_that_looks_like_a_rewrite_request_is_kept`).
 """
 
 from __future__ import annotations
@@ -34,7 +33,6 @@ from harness.contracts import CalcName
 from harness.explanation.faithfulness import numbers_in
 
 __all__ = [
-    "REWRITE_HEAD",
     "allowed_from_history",
     "calcs_in_history",
     "dump_history",
@@ -46,10 +44,6 @@ __all__ = [
     "trim_history",
     "turns",
 ]
-
-# Начало просьбы переписать (`agent.run._rewrite_request`): по нему реплика кода
-# отличается от реплики игрока.
-REWRITE_HEAD = "Ответ не прошёл проверку:"
 
 # Оценка, а не счёт токенизатора: байты JSON / 3. Кириллица в UTF-8 — два байта
 # на букву и около половины токена на букву, так что оценка завышает — потолок
@@ -92,13 +86,11 @@ def _text(part: UserPromptPart) -> str:
 
 
 def _player_parts(message: ModelMessage) -> list[UserPromptPart]:
+    """Реплики в запросе. В сохранённой истории это всегда реплики игрока:
+    просьбу переписать `seen_history` туда не пускает."""
     if not isinstance(message, ModelRequest):
         return []
-    return [
-        part
-        for part in message.parts
-        if isinstance(part, UserPromptPart) and not _text(part).startswith(REWRITE_HEAD)
-    ]
+    return [part for part in message.parts if isinstance(part, UserPromptPart)]
 
 
 def turns(messages: list[ModelMessage]) -> list[list[ModelMessage]]:
@@ -138,56 +130,61 @@ def _is_output_call(part: object) -> bool:
 
 
 def seen_history(
-    messages: Sequence[ModelMessage], *, final_answer: str | None
+    messages: Sequence[ModelMessage],
+    *,
+    start: int,
+    rewrite_at: int | None,
+    final_answer: str | None,
 ) -> list[ModelMessage]:
-    """История к сохранению: только то, что игрок видел, плюс вызовы расчётов.
+    """История к сохранению: реплики игрока, вызовы расчётов с ответами и один
+    ответ модели на ход — тот, что ушёл игроку.
 
-    Уходят просьба переписать и отвергнутые черновики — вызов вывода перед
-    просьбой и ответ на него (решение контроллера по вопросу владельца 2,
-    `test_the_saved_history_keeps_no_rejected_draft_and_no_rewrite_request`).
-    `final_answer` — текст, который игрок получил вместо прозы (состояния
-    «числа» и «отказ»): он подменяет ответ последнего вызова вывода; `None` —
-    проза прошла и остаётся как есть.
+    `messages[:start]` — история вечера, уже прошедшая эту чистку, берётся как
+    есть. В сообщениях хода (`messages[start:]`):
+
+    * ответы модели сводятся к вызовам расчётов и последнему вызову вывода —
+      текст и рассуждения рядом с вызовами игрок не видел
+      (`test_text_next_to_a_rejected_draft_is_not_saved`,
+      `test_text_next_to_the_final_answer_is_not_saved`);
+    * прежние вызовы вывода — отвергнутые черновики — уходят вместе с ответами
+      на них, реплики в сообщении `rewrite_at` (просьба переписать — первое
+      сообщение второго прогона) тоже
+      (`test_the_saved_history_keeps_no_rejected_draft_and_no_rewrite_request`);
+    * `final_answer` — текст, который игрок получил вместо прозы (состояния
+      «числа» и «отказ»), подменяет ответ последнего вызова вывода; `None` —
+      проза прошла и остаётся как есть
+      (`test_a_refused_answer_is_saved_as_the_refusal_the_player_saw`).
     """
-    rejected: set[str] = set()
-    last_output: ToolCallPart | None = None
-    for index, message in enumerate(messages):
-        if not isinstance(message, ModelResponse):
-            continue
-        for part in message.parts:
-            if not _is_output_call(part):
-                continue
-            assert isinstance(part, ToolCallPart)
-            last_output = part
-            after = messages[index + 1 : index + 3]
-            if any(
-                isinstance(m, ModelRequest)
-                and any(
-                    isinstance(p, UserPromptPart) and _text(p).startswith(REWRITE_HEAD)
-                    for p in m.parts
-                )
-                for m in after
-            ):
-                rejected.add(part.tool_call_id)
+    turn = list(messages[start:])
+    outputs = [
+        part
+        for message in turn
+        if isinstance(message, ModelResponse)
+        for part in message.parts
+        if _is_output_call(part)
+    ]
+    final = outputs[-1] if outputs else None
+    dropped = {part.tool_call_id for part in outputs if part is not final and isinstance(part, ToolCallPart)}
 
-    kept: list[ModelMessage] = []
-    for message in messages:
+    kept: list[ModelMessage] = list(messages[:start])
+    for offset, message in enumerate(turn):
         if isinstance(message, ModelResponse):
-            parts = []
+            parts: list[ToolCallPart] = []
             for part in message.parts:
-                if isinstance(part, ToolCallPart) and part.tool_call_id in rejected:
+                if not isinstance(part, ToolCallPart) or part.tool_call_id in dropped:
                     continue
-                if part is last_output and final_answer is not None:
+                if part is final and final_answer is not None:
                     part = dataclasses.replace(part, args={"answer": final_answer})
                 parts.append(part)
             if parts:
                 kept.append(dataclasses.replace(message, parts=parts))
             continue
+        is_rewrite = rewrite_at is not None and start + offset == rewrite_at
         request_parts = [
             part
             for part in message.parts
-            if not (isinstance(part, ToolReturnPart) and part.tool_call_id in rejected)
-            and not (isinstance(part, UserPromptPart) and _text(part).startswith(REWRITE_HEAD))
+            if not (isinstance(part, ToolReturnPart) and part.tool_call_id in dropped)
+            and not (is_rewrite and isinstance(part, UserPromptPart))
         ]
         if request_parts:
             kept.append(dataclasses.replace(message, parts=request_parts))

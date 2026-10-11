@@ -61,7 +61,7 @@ import structlog
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from harness.agent.history import dump_history, load_history, seen_history, trim_history
+from harness.agent.history import dump_history, load_history, trim_history
 from harness.agent.run import run_agent_turn
 from harness.analysis import analyze_hand
 from harness.analysis.player_stats import player_stats_by_label
@@ -1369,9 +1369,7 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
         )
         # В историю — только то, что игрок видел (решение контроллера по вопросу
         # владельца 2): без прозы на месте ответа модели — текст, который ушёл игроку.
-        seen = seen_history(
-            turn.messages, final_answer=None if turn.state == "prose" else msg.text
-        )
+        seen = turn.saved_messages(None if turn.state == "prose" else msg.text)
         await sessions.save_agent_history(
             job.session_id, dump_history(trim_history(seen, deps.agent_history_max_tokens))
         )

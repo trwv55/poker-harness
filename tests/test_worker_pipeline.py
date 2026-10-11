@@ -2197,7 +2197,7 @@ async def test_after_a_numbers_only_turn_the_next_turn_sees_only_what_the_player
     from pydantic_ai.messages import ModelMessagesTypeAdapter
     from pydantic_ai.models.function import FunctionModel
 
-    from harness.agent.history import REWRITE_HEAD
+    from harness.agent.run import REWRITE_HEAD
     from tests.test_agent import _VPIP, _TurnScript
 
     monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from itertools import pairwise
 from typing import Any
 
 from pydantic_ai.messages import (
@@ -14,6 +15,7 @@ from pydantic_ai.messages import (
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
+    TextPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -22,17 +24,15 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from sqlalchemy import text as sql_text
 
 from harness.agent.history import (
-    REWRITE_HEAD,
     allowed_from_history,
     calcs_in_history,
     dump_history,
     load_history,
-    seen_history,
     trim_history,
     turns,
 )
 from harness.agent.prompt import instructions_for, load_system_prompt
-from harness.agent.run import MAX_CALCS_PER_TURN, run_agent_turn
+from harness.agent.run import MAX_CALCS_PER_TURN, REWRITE_HEAD, run_agent_turn
 from harness.contracts import CalcName
 from harness.explanation.agent_checks import agent_context
 from harness.platform.llm import LLM
@@ -52,8 +52,13 @@ class _TurnScript:
     `test_question_routing.py` истории нет, у агента — есть).
     """
 
-    def __init__(self, runs: list[tuple[list[tuple[str, dict[str, Any]]], str]]) -> None:
+    def __init__(
+        self, runs: list[tuple[list[tuple[str, dict[str, Any]]], str]], *, chatter: bool = False
+    ) -> None:
+        """`chatter` — модель пишет текст рядом с вызовом вывода, как живые
+        провайдеры («Итак: …»); `FunctionModel` сам этого не делает."""
         self.runs = runs
+        self.chatter = chatter
         self.run = -1
         self.requests = 0
         self.instructions: list[str] = []
@@ -82,7 +87,10 @@ class _TurnScript:
             name, args = calls[step]
             return ModelResponse(parts=[ToolCallPart(tool_name=name, args=args)])
         assert info.output_tools
-        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {"answer": answer})])
+        output = ToolCallPart(info.output_tools[0].name, {"answer": answer})
+        if self.chatter:
+            return ModelResponse(parts=[TextPart(f"Итак: {answer}"), output])
+        return ModelResponse(parts=[output])
 
 
 _VPIP = ("hero_frequency", {"stat": "vpip"})
@@ -285,14 +293,13 @@ async def test_the_rewrite_request_does_not_allow_the_numbers_it_lists(db_factor
 
 
 async def test_a_rewrite_stays_in_the_turn_of_its_question(db_factory):
-    """Обрезка не отрывает попытку переписать от вопроса и его расчётов."""
-    from harness.agent.history import turns
-
+    """В сохранённой истории ход с попыткой переписать — один ход: обрезка не
+    отрывает ответ от вопроса и его расчётов."""
     async with db_factory() as session:
         scope = await _seeded(session, tg_user_id=8118)
         script = _TurnScript([([_VPIP], "Вы входите в 43.0% раздач."), ([], _GOOD)])
         turn = await _turn(db_factory, session, script, scope=scope)
-    assert len(turns(list(turn.messages))) == 1
+    assert len(turns(turn.saved_messages(None))) == 1
 
 
 async def test_a_frequency_term_is_allowed_by_its_calculation(db_factory):
@@ -378,7 +385,7 @@ async def test_the_saved_history_keeps_no_rejected_draft_and_no_rewrite_request(
         ])
         first = await _turn(db_factory, session, script, scope=scope)
         assert first.state == "numbers"
-        saved = load_history(dump_history(seen_history(first.messages, final_answer="ПОКАЗАНО-СИНТ")))
+        saved = load_history(dump_history(first.saved_messages("ПОКАЗАНО-СИНТ")))
         stored = _stored_text(saved)
         assert "43.0" not in stored and "44.0" not in stored and REWRITE_HEAD not in stored
         assert "ПОКАЗАНО-СИНТ" in stored and calcs_in_history(saved) == {"hero_frequency"}
@@ -394,7 +401,7 @@ async def test_a_refused_answer_is_saved_as_the_refusal_the_player_saw(db_factor
         scope = await _seeded(session, tg_user_id=8123)
         script = _TurnScript([([], "На BB вы минусовой, это нормально.")])
         turn = await _turn(db_factory, session, script, scope=scope)
-    stored = _stored_text(seen_history(turn.messages, final_answer="ОТКАЗ-СИНТ"))
+    stored = _stored_text(turn.saved_messages("ОТКАЗ-СИНТ"))
     assert "минусовой" not in stored and "ОТКАЗ-СИНТ" in stored
 
 
@@ -403,7 +410,7 @@ async def test_a_passed_prose_is_saved_as_it_is(db_factory):
         scope = await _seeded(session, tg_user_id=8124)
         script = _TurnScript([([_VPIP], "Вы входите в 43.0% раздач."), ([], _GOOD)])
         turn = await _turn(db_factory, session, script, scope=scope)
-    stored = _stored_text(seen_history(turn.messages, final_answer=None))
+    stored = _stored_text(turn.saved_messages(None))
     assert _GOOD in stored and "43.0" not in stored and REWRITE_HEAD not in stored
 
 
@@ -421,3 +428,65 @@ async def test_the_journal_keeps_the_rejected_drafts(db_factory):
     assert rewritten.journal()["drafts"] == [bad]
     assert clean.journal()["drafts"] == []
     assert refused.journal()["drafts"] == ["Без расчёта."]
+
+
+# --- правки по второму ревью: текст рядом с вызовами, просьба переписать по месту ----
+
+
+def _alternates(messages) -> bool:
+    """Ответы модели не стоят подряд: между ними всегда запрос."""
+    kinds = [type(m) for m in messages]
+    return all(not (a is ModelResponse and b is ModelResponse) for a, b in pairwise(kinds))
+
+
+async def test_text_next_to_a_rejected_draft_is_not_saved(db_factory):
+    bad = "Вы входите в 43.0% раздач."
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8126)
+        script = _TurnScript([([_VPIP], bad), ([], _GOOD)], chatter=True)
+        turn = await _turn(db_factory, session, script, scope=scope)
+        assert turn.state == "prose"
+        saved = load_history(dump_history(turn.saved_messages(None)))
+        stored = _stored_text(saved)
+        assert "43.0" not in stored and "Итак" not in stored and REWRITE_HEAD not in stored
+        assert _GOOD in stored and _alternates(saved)
+        assert not any(isinstance(p, TextPart) for m in saved for p in m.parts)
+        nxt = await _turn(
+            db_factory, session, _TurnScript([([], "Те же 100.0% (2 из 2).")]),
+            scope=scope, history=saved,
+        )
+    assert nxt.state == "prose"
+
+
+async def test_text_next_to_the_final_answer_is_not_saved(db_factory):
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8127)
+        bad, worse = "Вы входите в 43.0% раздач.", "Вы входите в 44.0% раздач."
+        script = _TurnScript([([_VPIP], bad), ([], worse)], chatter=True)
+        turn = await _turn(db_factory, session, script, scope=scope)
+    assert turn.state == "numbers"
+    saved = turn.saved_messages("ПОКАЗАНО-СИНТ")
+    stored = _stored_text(saved)
+    assert "Итак" not in stored and "44.0" not in stored and "43.0" not in stored
+    assert "ПОКАЗАНО-СИНТ" in stored and _alternates(saved)
+
+
+async def test_a_player_message_that_looks_like_a_rewrite_request_is_kept(db_factory):
+    """Просьба переписать опознаётся по месту в ходе, а не по тексту: реплика
+    игрока с той же фразой — его реплика, её числа разрешены, а ответ прошлого
+    хода не считается отвергнутым черновиком."""
+    player_text = REWRITE_HEAD + " у меня 12 BB"
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8128)
+        first = await _turn(db_factory, session, _TurnScript([([_VPIP], _GOOD)]), scope=scope)
+        history = first.saved_messages(None)
+        second = await _turn(
+            db_factory, session,
+            _TurnScript([([_VPIP], _GOOD + " При ваших 12 BB это важно.")]),
+            scope=scope, text=player_text, history=history,
+        )
+    assert second.state == "prose" and len(second.violations) == 1
+    saved = second.saved_messages(None)
+    stored = _stored_text(saved)
+    assert player_text in stored and stored.count(_GOOD) == 2
+    assert len(turns(saved)) == 2

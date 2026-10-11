@@ -13,25 +13,30 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel
-from pydantic_ai.messages import ModelMessage
+from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from harness.agent import prompt as _prompt
 from harness.agent.history import (
-    REWRITE_HEAD,
     allowed_from_history,
     calcs_in_history,
     player_numbers,
+    seen_history,
     stats_in_history,
 )
 from harness.calcs.routing import CalcRun, tools_for
 from harness.contracts import CalcName, CalcResult, ModelOutput
 from harness.explanation.agent_checks import STAT_LABEL, AgentContext, check_agent_answer
+from harness.explanation.faithfulness import numbers_in
 from harness.platform.llm import LLM
 
-__all__ = ["MAX_CALCS_PER_TURN", "AgentDraft", "AgentTurn", "run_agent_turn"]
+__all__ = ["MAX_CALCS_PER_TURN", "REWRITE_HEAD", "AgentDraft", "AgentTurn", "run_agent_turn"]
 
 MAX_CALCS_PER_TURN = 8
+
+# Начало просьбы переписать. Опознаётся она не по нему, а по месту в ходе
+# (`AgentTurn.rewrite_at`): игрок может напечатать ту же фразу.
+REWRITE_HEAD = "Ответ не прошёл проверку:"
 
 
 class AgentDraft(ModelOutput, BaseModel):
@@ -55,6 +60,19 @@ class AgentTurn:
     violations: tuple[tuple[str, ...], ...]
     calls: tuple[dict[str, Any], ...]
     drafts: tuple[str, ...] = ()
+    # Где в `messages` кончается история вечера и где лежит просьба переписать —
+    # по ним `saved_messages` чистит ход, не читая текст реплик.
+    history_len: int = 0
+    rewrite_at: int | None = None
+
+    def saved_messages(self, final_answer: str | None) -> list[ModelMessage]:
+        """Что сохранить в историю вечера (`history.seen_history`)."""
+        return seen_history(
+            self.messages,
+            start=self.history_len,
+            rewrite_at=self.rewrite_at,
+            final_answer=final_answer,
+        )
 
     def journal(self) -> dict[str, Any]:
         """Запись `agent_turn` в `traces.spans` (спека §8, «Журнал»;
@@ -71,9 +89,12 @@ class AgentTurn:
 
 
 def _violations(
-    answer: str, messages: Sequence[ModelMessage], context: AgentContext | None
+    answer: str,
+    messages: Sequence[ModelMessage],
+    context: AgentContext | None,
+    said: frozenset[float],
 ) -> list[str]:
-    allowed = allowed_from_history(messages) | player_numbers(messages)
+    allowed = allowed_from_history(messages) | said
     labels = frozenset(STAT_LABEL + stat for stat in stats_in_history(messages))
     if context is not None:
         allowed |= context.allowed
@@ -86,6 +107,25 @@ def _violations(
         hero_class=context.hero_class if context else None,
         board_ranks=context.board_ranks if context else (),
     )
+
+
+def _rewrite_index(messages: Sequence[ModelMessage], since: int, request: str) -> int:
+    """Номер сообщения с просьбой переписать — первая реплика второго прогона.
+
+    Ищется только среди сообщений, которых не было после первого прогона
+    (`since` — его последнее сообщение, на случай если библиотека склеит
+    просьбу с ним), и по точному тексту просьбы: реплик игрока там нет.
+    """
+    for index in range(max(since, 0), len(messages)):
+        message = messages[index]
+        if isinstance(message, ModelRequest) and any(
+            isinstance(part, UserPromptPart) and request in (
+                [part.content] if isinstance(part.content, str) else list(part.content)
+            )
+            for part in message.parts
+        ):
+            return index
+    raise RuntimeError("просьба переписать не нашлась в сообщениях второго прогона")
 
 
 def _rewrite_request(violations: Sequence[str]) -> str:
@@ -123,19 +163,26 @@ async def run_agent_turn(
         message_history=history, instructions=instructions, trace_id=trace_id,
     )
     messages = meta.messages
+    # Числа игрока (решение R1): его реплики в истории вечера и текущая. Не из
+    # `messages`: после попытки переписать там и просьба кода с выдуманными числами.
+    said = player_numbers(history) | frozenset(numbers_in(text))
     grounded = context is not None or bool(calcs_in_history(messages))
-    found = _violations(draft.answer, messages, context)
+    found = _violations(draft.answer, messages, context, said)
     violations: list[tuple[str, ...]] = [tuple(found)]
     prose: str | None = draft.answer.strip() if not found else None
     drafts: list[str] = [draft.answer] if found or not grounded else []
 
+    rewrite_at: int | None = None
     if grounded and found:
+        request = _rewrite_request(found)
+        first_len = len(messages)
         draft, meta = await llm(
-            "agent", AgentDraft, prompt=_rewrite_request(found), tools=tools,
+            "agent", AgentDraft, prompt=request, tools=tools,
             message_history=messages, instructions=instructions, trace_id=trace_id,
         )
         messages = meta.messages
-        second = _violations(draft.answer, messages, context)
+        rewrite_at = _rewrite_index(messages, first_len - 1, request)
+        second = _violations(draft.answer, messages, context, said)
         violations.append(tuple(second))
         prose = draft.answer.strip() if not second else None
         if second:
@@ -157,4 +204,6 @@ async def run_agent_turn(
         violations=tuple(violations),
         calls=tuple(run_state.calls),
         drafts=tuple(drafts),
+        history_len=len(history),
+        rewrite_at=rewrite_at,
     )
