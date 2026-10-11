@@ -31,7 +31,7 @@ status='running'`) — вторая линия защиты и настояща�
 `hh_scan` — 200 не срочен, `eval_run` — 900 самый терпеливый) `enqueue`
 подставляет сама по `type`, если вызывающий явно не передал `priority`.
 `question` — вопрос игрока о своей игре — тоже 100: игрок ждёт ответа так же,
-как разбора. CHECK-констрейнт `jobs.type_allowed` ограничивает `type` этими же
+как разбора; сообщение агенту (`agent`) — тоже 100. CHECK-констрейнт `jobs.type_allowed` ограничивает `type` этими же
 значениями, поэтому на сегодня таблица покрывает все возможные типы. Дефолт
 `.get(type, 100)` в `enqueue` — не признание неполноты, а решение о том, что
 делать с ПЯТЫМ типом, когда его добавят: пятый тип задачи почти наверняка
@@ -39,6 +39,13 @@ status='running'`) — вторая линия защиты и настояща�
 уехать в конец очереди по недосмотру (round 5, Item K.10: раньше таблица тут
 называлась «исчерпывающей», и это спорило с `.get(..., 100)` двумя сотнями
 строк ниже).
+
+Число попыток `enqueue` тоже берёт по `type`, если не передан явный
+`max_attempts`: задаче `agent` — одна попытка (решение владельца 2026-10-11:
+упавший ход агента не повторяется, игрок сразу получает отказ), остальным
+типам — дефолт колонки `jobs.max_attempts` (3)
+(`test_an_agent_job_gets_a_single_attempt`,
+`test_other_job_types_keep_three_attempts`).
 """
 
 from __future__ import annotations
@@ -71,6 +78,13 @@ _DEFAULT_PRIORITY_BY_TYPE: dict[str, int] = {
     "question": 100,
     "hh_scan": 200,
     "eval_run": 900,
+    "agent": 100,
+}
+
+# Только отличия от дефолта колонки `jobs.max_attempts` (3); тип вне таблицы
+# получает дефолт колонки — см. модульный докстринг.
+_DEFAULT_MAX_ATTEMPTS_BY_TYPE: dict[str, int] = {
+    "agent": 1,
 }
 
 # Единственный SQL, которому доверена сама атомарность захвата: WHERE-подзапрос
@@ -136,13 +150,19 @@ class JobsQueue:
         session_id: int,
         payload: dict,
         priority: int | None = None,
+        max_attempts: int | None = None,
     ) -> int:
         """Поставить задачу в очередь. `priority=None` — дефолт по `type` (см.
         модульный докстринг); явный `priority` переопределяет его — нужен эскалации
         и ручным сценариям, где приоритет диктует не тип задачи, а обстоятельство.
+        `max_attempts` устроен так же: `None` — дефолт по `type`, явное значение
+        его переопределяет (`test_an_explicit_max_attempts_overrides_the_type_default`).
         """
         resolved_priority = (
             _DEFAULT_PRIORITY_BY_TYPE.get(type, 100) if priority is None else priority
+        )
+        resolved_attempts = (
+            _DEFAULT_MAX_ATTEMPTS_BY_TYPE.get(type) if max_attempts is None else max_attempts
         )
         async with self._session_factory() as session:
             job = Job(
@@ -152,6 +172,8 @@ class JobsQueue:
                 payload=payload,
                 priority=resolved_priority,
             )
+            if resolved_attempts is not None:
+                job.max_attempts = resolved_attempts
             session.add(job)
             await session.commit()
             return job.id

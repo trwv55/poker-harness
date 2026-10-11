@@ -340,3 +340,46 @@ async def test_claim_propagates_unrelated_integrity_error(db_factory):
         async with db_factory() as session:
             await session.execute(text("drop index if exists test_only_locked_by_conflict"))
             await session.commit()
+
+
+async def test_an_agent_job_is_as_urgent_as_a_hand_analysis(db_factory):
+    """Сообщение агенту ждут так же, как разбор, — приоритет 100 по типу."""
+    q = JobsQueue(db_factory)
+    player_id, session_id = await _make_scope(db_factory)
+    jid = await q.enqueue(type="agent", player_id=player_id, session_id=session_id, payload={})
+    async with db_factory() as session:
+        job = await session.get(Job, jid)
+    assert job is not None and job.priority == 100
+
+
+async def test_an_agent_job_gets_a_single_attempt(db_factory):
+    """Ход агента не повторяется: упал — игрок сразу получает отказ, а не ждёт ретрая."""
+    q = JobsQueue(db_factory)
+    player_id, session_id = await _make_scope(db_factory)
+    jid = await q.enqueue(type="agent", player_id=player_id, session_id=session_id, payload={})
+    async with db_factory() as session:
+        job = await session.get(Job, jid)
+    assert job is not None and job.max_attempts == 1
+
+
+async def test_other_job_types_keep_three_attempts(db_factory):
+    q = JobsQueue(db_factory)
+    player_id, session_id = await _make_scope(db_factory)
+    ids = [
+        await q.enqueue(type=job_type, player_id=player_id, session_id=session_id, payload={})
+        for job_type in ("screenshot_analyze", "hh_scan", "deep_dive", "eval_run", "question")
+    ]
+    async with db_factory() as session:
+        attempts = [(await session.get(Job, jid)).max_attempts for jid in ids]
+    assert attempts == [3, 3, 3, 3, 3]
+
+
+async def test_an_explicit_max_attempts_overrides_the_type_default(db_factory):
+    q = JobsQueue(db_factory)
+    player_id, session_id = await _make_scope(db_factory)
+    jid = await q.enqueue(
+        type="agent", player_id=player_id, session_id=session_id, payload={}, max_attempts=2
+    )
+    async with db_factory() as session:
+        job = await session.get(Job, jid)
+    assert job is not None and job.max_attempts == 2

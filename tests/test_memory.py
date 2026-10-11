@@ -20,7 +20,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from harness.contracts import AnalysisResult, PointFilter, RawHand, ScanSummary, Window
 from harness.engine import enrich
-from harness.memory.models import EvalCase, Job
+from harness.memory.models import EvalCase, Job, Player, Trace
+from harness.memory.models import Session as SessionRow
 from harness.memory.repos import (
     _SESSIONS_LOCK_NS,
     _UPSERT_CHUNK,
@@ -30,6 +31,7 @@ from harness.memory.repos import (
     HandsRepo,
     JobsRepo,
     PlayersRepo,
+    QuotaRepo,
     SessionsRepo,
     TournamentsRepo,
 )
@@ -2906,3 +2908,149 @@ def test_migration_0009_rolls_back_the_rows_its_constraint_forbids(pg_at_head):
 
     assert (left, calls) == (0, 0)
     assert back > 0, "после повторного наката тип задачи снова не принимается"
+
+
+async def test_the_evening_history_is_written_read_and_erased_by_new(db):
+    session_id = await _make_session(db)
+    repo = SessionsRepo(db)
+    assert (await repo.agent_state(session_id)).history is None
+
+    assert await repo.save_agent_history(session_id, [{"kind": "request", "parts": []}]) is True
+    assert (await repo.agent_state(session_id)).history == [{"kind": "request", "parts": []}]
+
+    row = await db.get(SessionRow, session_id)
+    await repo.close_active(row.player_id)
+    assert (await repo.agent_state(session_id)).history is None
+
+
+async def test_history_is_not_written_into_a_closed_session(db):
+    """Ход, закончившийся после `/new`, не воскрешает историю закрытого вечера."""
+    session_id = await _make_session(db)
+    repo = SessionsRepo(db)
+    row = await db.get(SessionRow, session_id)
+    await repo.close_active(row.player_id)
+
+    assert await repo.save_agent_history(session_id, [{"kind": "request", "parts": []}]) is False
+    assert (await repo.agent_state(session_id)).history is None
+
+
+async def test_the_last_analysis_pointer_is_set_and_reset(db):
+    session_id = await _make_session(db)
+    raw = RawHand.model_validate(make_min_raw())
+    hand_id = await HandsRepo(db).save_raw(session_id=session_id, raw=raw)
+    analysis_id = await AnalysesRepo(db).save(
+        hand_id=hand_id, result=AnalysisResult(hand_no="SYN1", points=[]), decision_points=[]
+    )
+    repo = SessionsRepo(db)
+    await repo.set_last_analysis(session_id, analysis_id)
+    assert (await repo.agent_state(session_id)).last_analysis_id == analysis_id
+    record = await AnalysesRepo(db).get(analysis_id)
+    assert record is not None and record.hand_id == hand_id
+    await repo.set_last_analysis(session_id, None)
+    assert (await repo.agent_state(session_id)).last_analysis_id is None
+
+
+async def test_an_agent_miss_is_stored_without_a_hand(db):
+    case_id = await EvalCasesRepo(db).add(
+        kind="agent_routing",
+        hand_id=None,
+        ground_truth={"question": "как часто я вхожу в банк", "calls": []},
+        source="agent_miss_button",
+    )
+    row = await db.get(EvalCase, case_id)
+    assert row.hand_id is None and row.kind == "agent_routing"
+
+
+async def test_an_agent_turn_is_found_only_for_its_player(db):
+    session_id = await _make_session(db)
+    row = await db.get(SessionRow, session_id)
+    job = Job(type="agent", player_id=row.player_id, session_id=session_id, payload={"text": "вопрос"})
+    db.add(job)
+    await db.flush()
+    db.add(Trace(job_id=job.id, spans=[{"name": "agent_turn", "state": "prose", "calls": []}]))
+    await db.flush()
+
+    found = await JobsRepo(db).agent_turn(job.id, row.player_id)
+    assert found is not None and found.question == "вопрос" and found.turn["state"] == "prose"
+    assert await JobsRepo(db).agent_turn(job.id, row.player_id + 1) is None
+
+
+async def test_an_agent_message_spends_the_daily_quota_and_a_failed_one_does_not(db):
+    session_id = await _make_session(db)
+    row = await db.get(SessionRow, session_id)
+    player = await db.get(Player, row.player_id)
+    player.quota_daily = 2
+    db.add(Job(type="agent", player_id=player.id, session_id=session_id, payload={}, status="done"))
+    db.add(Job(type="agent", player_id=player.id, session_id=session_id, payload={}, status="failed"))
+    await db.flush()
+
+    quota = await QuotaRepo(db).check(player.id)
+    assert (quota.left, quota.total) == (1, 2)
+
+
+def test_migration_0014_adds_the_agent_and_rolls_back_without_its_rows():
+    """Вперёд: колонки и новые значения CHECK. Назад: строки агента удалены,
+    иначе старые CHECK их не примут; `eval_cases` без руки удалены по той же причине."""
+    from alembic import command
+    from sqlalchemy import create_engine
+    from testcontainers.community.postgres import PostgresContainer
+
+    from tests.conftest import alembic_config
+
+    with PostgresContainer("postgres:16-alpine") as container:
+        dsn = container.get_connection_url(driver="psycopg")
+        config = alembic_config(dsn)
+        command.upgrade(config, "0014")
+        engine = create_engine(dsn)
+        try:
+            with engine.begin() as conn:
+                player = conn.execute(
+                    text("insert into players (tg_user_id) values (9201) returning id")
+                ).scalar_one()
+                session_id = conn.execute(
+                    text(
+                        "insert into sessions (player_id, started_at, title, agent_history) "
+                        "values (:p, now(), 'вечер', '[]'::jsonb) returning id"
+                    ),
+                    {"p": player},
+                ).scalar_one()
+                job = conn.execute(
+                    text(
+                        "insert into jobs (type, payload, session_id, player_id) "
+                        "values ('agent', '{}'::jsonb, :s, :p) returning id"
+                    ),
+                    {"s": session_id, "p": player},
+                ).scalar_one()
+                trace = conn.execute(
+                    text("insert into traces (job_id) values (:j) returning id"), {"j": job}
+                ).scalar_one()
+                conn.execute(
+                    text(
+                        "insert into llm_calls (trace_id, provider, model, purpose) "
+                        "values (:t, 'anthropic', 'm', 'agent')"
+                    ),
+                    {"t": trace},
+                )
+                conn.execute(
+                    text(
+                        "insert into eval_cases (kind, hand_id, ground_truth, source) "
+                        "values ('agent_routing', null, '{}'::jsonb, 'agent_miss_button')"
+                    )
+                )
+            command.downgrade(config, "0013")
+            with engine.begin() as conn:
+                assert conn.execute(text("select count(*) from jobs")).scalar_one() == 0
+                assert conn.execute(text("select count(*) from llm_calls")).scalar_one() == 0
+                assert conn.execute(text("select count(*) from eval_cases")).scalar_one() == 0
+                columns = {
+                    row[0]
+                    for row in conn.execute(
+                        text(
+                            "select column_name from information_schema.columns "
+                            "where table_name = 'sessions'"
+                        )
+                    )
+                }
+                assert "agent_history" not in columns and "last_analysis_id" not in columns
+        finally:
+            engine.dispose()
