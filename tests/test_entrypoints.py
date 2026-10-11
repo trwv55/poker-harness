@@ -45,7 +45,7 @@ import pytest
 import harness.bot.main as bot_main
 import harness.worker.main as worker_main
 from harness.platform.config import InvalidEnvVar
-from harness.platform.queue import JobsQueue
+from harness.platform.queue import JobsQueue, Reaped
 from harness.presentation import Btn, Msg
 from harness.worker.main import TelegramDeliveryError
 from harness.worker.pipeline import Deps
@@ -207,9 +207,13 @@ class _IdleQueue:
     async def claim(self, worker_id: str) -> None:
         self.claims += 1
 
-    async def reap(self) -> int:
+    async def reap(self) -> Reaped:
         self.reaps += 1
-        return 0
+        return Reaped(failed=(), requeued=())
+
+
+async def _notify_nobody(job_ids: tuple[int, ...]) -> None:
+    raise AssertionError(f"очередь пуста, сообщать некому: {job_ids}")
 
 
 def _deps_with(queue: _IdleQueue) -> Deps:
@@ -244,7 +248,9 @@ async def test_sigterm_stops_both_loops_instead_of_waiting_for_sigkill():
                 )
             ),
             asyncio.create_task(
-                worker_main.reap_loop(cast(JobsQueue, queue), interval_s=60.0, stop=stop)
+                worker_main.reap_loop(
+                    cast(JobsQueue, queue), notify=_notify_nobody, interval_s=60.0, stop=stop
+                )
             ),
         ]
         await asyncio.sleep(0.05)  # дать циклам реально закрутиться
@@ -257,6 +263,45 @@ async def test_sigterm_stops_both_loops_instead_of_waiting_for_sigkill():
     finally:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.remove_signal_handler(sig)
+
+
+class _ReapingQueue:
+    """Первый `reap()` закрыл одну задачу `failed` и вернул одну в очередь, дальше пусто."""
+
+    def __init__(self) -> None:
+        self.reaps = 0
+
+    async def reap(self) -> Reaped:
+        self.reaps += 1
+        if self.reaps == 1:
+            return Reaped(failed=(7,), requeued=(8,))
+        return Reaped(failed=(), requeued=())
+
+
+async def test_the_reaper_loop_hands_only_failed_jobs_to_the_notifier():
+    """Цикл reaper'а передаёт уведомителю задачи, закрытые `failed`, — и только их."""
+    stop = asyncio.Event()
+    queue = _ReapingQueue()
+    notified: list[tuple[int, ...]] = []
+
+    async def notify(job_ids: tuple[int, ...]) -> None:
+        notified.append(job_ids)
+
+    async def stop_after_three_reaps() -> None:
+        while queue.reaps < 3:
+            await asyncio.sleep(0.005)
+        stop.set()
+
+    await asyncio.wait_for(
+        asyncio.gather(
+            worker_main.reap_loop(
+                cast(JobsQueue, queue), notify=notify, interval_s=0.01, stop=stop
+            ),
+            stop_after_three_reaps(),
+        ),
+        timeout=5.0,
+    )
+    assert notified == [(7,)]
 
 
 async def test_shutdown_cancels_work_that_outlives_the_grace_window(monkeypatch):

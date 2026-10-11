@@ -2950,6 +2950,36 @@ async def test_the_last_analysis_pointer_is_set_and_reset(db):
     assert (await repo.agent_state(session_id)).last_analysis_id is None
 
 
+async def test_an_analysis_is_never_answered_by_another_one_of_the_same_hand(db):
+    session_id = await _make_session(db)
+    raw = RawHand.model_validate(make_min_raw())
+    hand_id = await HandsRepo(db).save_raw(session_id=session_id, raw=raw)
+    repo = AnalysesRepo(db)
+    ids = [
+        await repo.save(
+            hand_id=hand_id, result=AnalysisResult(hand_no="SYN1", points=[]), decision_points=[]
+        )
+        for _ in range(2)
+    ]
+    for analysis_id in ids:
+        record = await repo.get(analysis_id)
+        assert record is None or record.id == analysis_id
+
+
+async def test_a_deleted_analysis_clears_the_pointer_to_it(db):
+    session_id = await _make_session(db)
+    raw = RawHand.model_validate(make_min_raw())
+    hand_id = await HandsRepo(db).save_raw(session_id=session_id, raw=raw)
+    analysis_id = await AnalysesRepo(db).save(
+        hand_id=hand_id, result=AnalysisResult(hand_no="SYN1", points=[]), decision_points=[]
+    )
+    repo = SessionsRepo(db)
+    await repo.set_last_analysis(session_id, analysis_id)
+
+    await db.execute(text("delete from analyses where id = :a"), {"a": analysis_id})
+    assert (await repo.agent_state(session_id)).last_analysis_id is None
+
+
 async def test_an_agent_miss_is_stored_without_a_hand(db):
     case_id = await EvalCasesRepo(db).add(
         kind="agent_routing",

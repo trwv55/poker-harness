@@ -59,6 +59,7 @@ def upgrade() -> None:
         'analyses',
         ['last_analysis_id'],
         ['id'],
+        ondelete='SET NULL',
     )
     op.drop_constraint('type_allowed', 'jobs', type_='check')
     op.create_check_constraint('type_allowed', 'jobs', _JOB_TYPES_NEW)

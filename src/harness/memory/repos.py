@@ -901,7 +901,10 @@ class AnalysesRepo:
     async def get(self, analysis_id: int) -> AnalysisRecord | None:
         """Разбор по его номеру — через `get_by_hand`, чтобы точки собирались одним путём."""
         hand_id = await self.db.scalar(select(Analysis.hand_id).where(Analysis.id == analysis_id))
-        return None if hand_id is None else await self.get_by_hand(hand_id)
+        record = None if hand_id is None else await self.get_by_hand(hand_id)
+        # `analyses.hand_id` не уникален в схеме: чужой разбор той же руки — не ответ
+        # (`test_an_analysis_is_never_answered_by_another_one_of_the_same_hand`).
+        return record if record is not None and record.id == analysis_id else None
 
 
 class TournamentsRepo:
@@ -977,6 +980,8 @@ class TournamentsRepo:
 
 @dataclass(frozen=True, slots=True)
 class AgentTurnRecord:
+    """Ход агента: вопрос из `jobs.payload` и запись `agent_turn` последнего трейса."""
+
     job_id: int
     trace_id: int
     question: str

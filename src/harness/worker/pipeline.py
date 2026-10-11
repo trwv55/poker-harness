@@ -122,7 +122,7 @@ from harness.presentation import (
     vision_gave_up_msg,
 )
 
-__all__ = ["Deps", "Sender", "run_job"]
+__all__ = ["Deps", "Sender", "notify_reaped_failures", "run_job"]
 
 _log = structlog.get_logger(__name__)
 
@@ -1343,6 +1343,45 @@ async def _notify_failure(deps: Deps, job: JobModel, reason: str) -> None:
         # уронить обработку провала задачи (задача уже честно `failed` в БД,
         # доложить о ней — только best-effort поверх этого).
         _log.exception("job_failure_notify_failed", job_id=job.id)
+
+
+async def notify_reaped_failures(deps: Deps, job_ids: Sequence[int]) -> None:
+    """Сообщить игрокам о задачах, которые `JobsQueue.reap()` закрыл `failed`.
+
+    Воркер такой задачи умер, и `failed_msg` из `run_job` до игрока не дошёл:
+    без этого шага провал по reaper'у был бы молчаливым. Причина — общая
+    `_PUBLIC_FAILURE_REASON_DEFAULT`: исключения, которое можно было бы
+    классифицировать, у reaper'а нет.
+
+    Один раз на задачу: отправленное сообщение записывается в
+    `result_message_id`, и задача, у которой он уже есть, пропускается — без
+    повторной отправки и без правки, чтобы не затереть результат, который
+    умерший воркер успел доставить
+    (`test_a_job_failed_by_the_reaper_tells_its_player_once`). Сбой уведомления
+    одной задачи не мешает остальным.
+    """
+    for job_id in job_ids:
+        try:
+            async with deps.db_factory() as session:
+                job = await session.get(JobModel, job_id)
+                if job is None or job.status != "failed":
+                    continue
+                if (job.payload or {}).get("result_message_id") is not None:
+                    continue
+                chat_id = await _chat_id(session, job.player_id)
+                # `worker_id=None`: `reap()` снял `locked_by`, и сверка владельца
+                # в `_send_idempotent` пропускает только задачу без владельца.
+                await _send_idempotent(
+                    deps,
+                    session,
+                    job_id,
+                    None,
+                    "result_message_id",
+                    chat_id,
+                    failed_msg(_PUBLIC_FAILURE_REASON_DEFAULT),
+                )
+        except Exception:  # noqa: BLE001 — уведомление best-effort, как `_notify_failure`
+            _log.exception("reaped_job_notify_failed", job_id=job_id)
 
 
 async def run_job(job: JobModel, deps: Deps) -> None:

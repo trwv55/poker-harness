@@ -91,6 +91,7 @@ from harness.worker.pipeline import (
     _hand_analysis_msg,
     _hand_zone,
     _public_failure_reason,
+    notify_reaped_failures,
     run_job,
 )
 from tests.conftest import FIXTURE_DAILY, requires_fixtures, requires_prompts
@@ -567,6 +568,39 @@ async def test_failure_before_max_attempts_retries_silently(db_factory, fake_sen
     assert not any("Не получилось" in msg.text for msg in fake_sender.sent)
 
 
+async def test_a_job_failed_by_the_reaper_tells_its_player_once(db_factory, fake_sender, queue, deps):
+    """Зависшая задача на последней попытке: `reap()` закрывает её `failed`, и
+    игрок получает `failed_msg` один раз — повторный вызов не шлёт и не правит.
+    Задача, которую `reap()` вернул в очередь, сообщения не получает: провал не
+    окончательный."""
+    exhausted_player, exhausted_session = await _make_scope(db_factory, tg_user_id=91_001)
+    retried_player, retried_session = await _make_scope(db_factory, tg_user_id=91_002)
+    exhausted = await queue.enqueue(
+        type="agent", player_id=exhausted_player, session_id=exhausted_session, payload={}
+    )
+    retried = await queue.enqueue(
+        type="hh_scan", player_id=retried_player, session_id=retried_session, payload={}
+    )
+    assert await queue.claim("w-dead") is not None
+    assert await queue.claim("w-dead") is not None
+    async with db_factory() as session:
+        await session.execute(text("UPDATE jobs SET locked_at = now() - interval '20 minutes'"))
+        await session.commit()
+
+    reaped = await queue.reap(older_than_minutes=10)
+    assert (reaped.failed, reaped.requeued) == ((exhausted,), (retried,))
+
+    await notify_reaped_failures(deps, reaped.failed)
+    await notify_reaped_failures(deps, reaped.failed)
+
+    assert [msg.text for msg in fake_sender.sent] == [
+        "Не получилось разобрать раздачу: внутренняя ошибка сервиса"
+    ]
+    assert fake_sender.edits == []
+    assert (await job_status(db_factory, exhausted)) == "failed"
+    assert (await job_status(db_factory, retried)) == "queued"
+
+
 # --- фенсинг: переигранная попытка не переписывает нового владельца ---------------
 
 
@@ -606,7 +640,7 @@ async def test_stale_worker_cannot_complete_reclaimed_job(db_factory, fake_sende
             {"id": jid},
         )
         await session.commit()
-    assert await queue.reap(older_than_minutes=10) == 1
+    assert (await queue.reap(older_than_minutes=10)).total == 1
 
     new_owner = await queue.claim("w-new")
     assert new_owner is not None

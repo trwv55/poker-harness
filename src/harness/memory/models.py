@@ -162,8 +162,10 @@ class Session(Base):
     # `use_alter=True`: ключ замыкает цикл `sessions` → `analyses` → `hands` →
     # `sessions`, и без флага `MetaData.sorted_tables` (им чистит базу
     # `tests/conftest.py::db_factory`) падает `CircularDependencyError`.
+    # `ondelete="SET NULL"`: удалённый разбор обнуляет указатель, а не держит
+    # удаление (`test_a_deleted_analysis_clears_the_pointer_to_it`).
     last_analysis_id: Mapped[int | None] = mapped_column(
-        BigInteger, ForeignKey("analyses.id", use_alter=True)
+        BigInteger, ForeignKey("analyses.id", use_alter=True, ondelete="SET NULL")
     )
 
 
