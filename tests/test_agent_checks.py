@@ -68,23 +68,43 @@ def test_real_numbers_stay_numbers(text: str):
     assert numbers_in(strip_card_tokens(text, hero_class="99", board_ranks=("Q", "J", "6"))) != []
 
 
-def test_a_pocket_pair_is_a_card_only_when_the_hero_holds_it():
+def test_a_bare_digit_pair_is_always_a_number():
     """Чисто цифровую пару (`22`…`99`) от суммы шаблоном не отличить (тех-спека
-    §5.7). Решение: пара — карта, только если это класс руки героя в разборе."""
-    assert numbers_in(strip_card_tokens("у вас 99", hero_class="99")) == []
+    §5.7). Решение: она число всегда, даже если герой держит эту пару — иначе
+    выдуманная сумма, равная паре героя, прошла бы без проверки."""
+    assert numbers_in(strip_card_tokens("у вас 99", hero_class="99")) == [99.0]
     assert numbers_in(strip_card_tokens("у вас 99")) == [99.0]
-    assert numbers_in(strip_card_tokens("у вас 99", hero_class="J9s")) == [99.0]
 
 
-@pytest.mark.parametrize("text", ["99 BB", "у вас 99 bb", "99%", "99 раздач", "99 фишек"])
-def test_a_hero_pair_followed_by_a_unit_stays_a_number(text: str):
-    """Пара героя — карта, но та же пара с единицей суммы — сумма: «99 BB»."""
-    assert numbers_in(strip_card_tokens(text, hero_class="99")) == [99.0]
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Стек 22.",
+        "У вас 22 больших блайнда.",
+        "22 блайнда в стеке.",
+        "Ставка 22 бига.",
+        "Пуш на 22.",
+        "22 в стеке.",
+    ],
+)
+def test_an_amount_equal_to_the_hero_pair_is_checked(text: str):
+    assert any("числа" in v for v in _check(text, hero_class="22"))
+    assert _check(text, hero_class="22", allowed=frozenset({22.0})) == []
 
 
-def test_a_hero_pair_amount_with_a_unit_is_checked_as_a_number():
-    assert any("числа" in v for v in _check("Стек 22 BB.", hero_class="22"))
-    assert _check("У вас 22.", hero_class="22") == []
+@pytest.mark.parametrize(
+    ("text", "board"),
+    [
+        ("на борде 8-8-J", ("8", "8", "J")),
+        ("на борде 2-5-8", ("2", "5", "8")),
+        ("на борде K-7-2", ()),
+        ("у вас 98s", ()),
+        ("у вас A5s", ()),
+        ("у вас KQ", ()),
+    ],
+)
+def test_unambiguous_card_tokens_are_still_stripped(text: str, board: tuple[str, ...]):
+    assert numbers_in(strip_card_tokens(text, hero_class="22", board_ranks=board)) == []
 
 
 @pytest.mark.parametrize("text", ["Стек 258 BB", "банк 852", "2580 фишек"])
@@ -244,11 +264,14 @@ def _with_line(
 
 
 def test_the_context_registers_every_number_it_prints():
-    """Тот же инвариант, что у выжимок (`digest.py`): число в сводке — разрешено.
+    """Тот же инвариант, что у выжимок (`digest.py`): число сводки, которое
+    останется числом в сверке ответа, — разрешено.
 
-    Кроме заголовка точки («Точка 1 (dp_index 0)»): там идентификаторы, а не
-    величины, и в реестр они не идут сознательно — то же исключение, что в
-    `test_verdict_text.test_the_digest_registers_every_number_it_prints`."""
+    Исключения два. Обозначения карт (`J♥9♥`, борд) сверка вырезает, и их ранги
+    сводка не разрешает сознательно (`test_a_card_rank_of_the_hand_is_not_an_allowed_number`),
+    поэтому сравнивается текст после `strip_card_tokens`. Заголовок точки
+    («Точка 1 (dp_index 0)») несёт идентификаторы, а не величины, — то же
+    исключение, что в `test_verdict_text.test_the_digest_registers_every_number_it_prints`."""
     ctx = agent_context(_result([_point(dp_index=0, ev_diff_bb=-1.4)]), _postflop_hand())
     body = "\n".join(line for line in ctx.text.splitlines() if not line.startswith("Точка 1 ("))
     cleaned = strip_card_tokens(body, hero_class=ctx.hero_class, board_ranks=ctx.board_ranks)

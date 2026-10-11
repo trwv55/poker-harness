@@ -14,12 +14,13 @@
 явным оборотам; что сказано другими словами, ловит судья (спека №2).
 
 **Обозначения карт — не числа.** `A5s`, `T9o`, `KQ`, карта с мастью, ранги борда
-вырезаются ДО сверки чисел. Чисто цифровая пара (`99`) от суммы шаблоном не
-отличима (тех-спека §5.7); решение — она карта, только если это класс руки
-героя в сводке (`test_a_pocket_pair_is_a_card_only_when_the_hero_holds_it`) и
-сразу за ней не стоит единица суммы («99 BB» — число,
-`test_a_hero_pair_followed_by_a_unit_stays_a_number`). Цифры борда без
-разделителя («258») — сумма, а не борд (`test_digits_without_separators_are_not_a_board`).
+вырезаются ДО сверки чисел. Чисто цифровая пара (`22`…`99`) от суммы шаблоном
+не отличима (тех-спека §5.7); решение — она всегда число, даже если герой
+держит эту пару (`test_a_bare_digit_pair_is_always_a_number`): выдуманная
+сумма, совпавшая с парой героя, иначе прошла бы без проверки. Карту модель
+пишет мастями или словами («пара двоек»); голая «22» вместо карты уходит на
+переписывание — принятая цена. Цифры борда без разделителя («258») — сумма, а
+не борд (`test_digits_without_separators_are_not_a_board`).
 """
 
 from __future__ import annotations
@@ -61,13 +62,11 @@ _EDGE_L = r"(?<!\w)(?<!\d[.,])"
 _EDGE_R = r"(?![\w%]|[.,]\d)"
 _SUITED_CARD_RE = re.compile(_RANK + r"[♠♥♦♣]️?")
 _CLASS_RE = re.compile(_EDGE_L + r"([2-9TJQKA])([2-9TJQKA])([so])?" + _EDGE_R)
+_DIGITS_ONLY_RE = re.compile(r"\d+")
 # Без разделителя ранги борда слипаются, только если рядом буква («KQ7»): три
 # цифры подряд («258») — сумма, а не борд 2-5-8.
 _BOARD_JOIN = r"(?:[-–]|(?<=[TJQKA])|(?=[TJQKA]))"
 _BOARD_RE = re.compile(_EDGE_L + _RANK + r"(?:" + _BOARD_JOIN + _RANK + r"){2,4}" + _EDGE_R)
-# Единица сразу после числа делает цифровую пару суммой, даже если герой держит
-# эту пару: «99 BB», «стек 22 BB», «22 раздачи».
-_AMOUNT_AFTER_RE = re.compile(r"\s*(?:bb|бб|%|фиш|раздач|рук|процент|из\b)", re.IGNORECASE)
 # Точка внутри числа («6.6») предложение не кончает.
 _SENTENCE_RE = re.compile(r"(?:[^.!?\n]|\.(?=\d))+[.!?]?")
 _RANGE_RE = re.compile(r"диапазон|рендж", re.IGNORECASE)
@@ -191,7 +190,13 @@ def agent_context(result: AnalysisResult, enriched: EnrichedHand) -> AgentContex
 def strip_card_tokens(
     text: str, *, hero_class: str | None = None, board_ranks: Sequence[str] = ()
 ) -> str:
-    """Текст без обозначений карт — то, что идёт в сверку чисел."""
+    """Текст без обозначений карт — то, что идёт в сверку чисел.
+
+    Вырезается только однозначное: карта с мастью, класс с буквой (`A5s`,
+    `T9o`, `KQ`, `98s`), ранги борда через дефис. Две цифры без буквы и масти
+    (`22`) остаются числом всегда. `hero_class` сохранён ради интерфейса
+    (`AgentContext.hero_class`, `check_agent_answer`) и на вырезание не влияет.
+    """
     text = _SUITED_CARD_RE.sub(" ", text)
     board = Counter(board_ranks)
 
@@ -203,11 +208,7 @@ def strip_card_tokens(
         return match.group(0)
 
     def class_sub(match: re.Match[str]) -> str:
-        high, low, suit = match.group(1), match.group(2), match.group(3)
-        if high.isdigit() and low.isdigit() and suit is None:
-            amount = _AMOUNT_AFTER_RE.match(match.string, match.end()) is not None
-            return " " if match.group(0) == hero_class and not amount else match.group(0)
-        return " "
+        return match.group(0) if _DIGITS_ONLY_RE.fullmatch(match.group(0)) else " "
 
     return _CLASS_RE.sub(class_sub, _BOARD_RE.sub(board_sub, text))
 
