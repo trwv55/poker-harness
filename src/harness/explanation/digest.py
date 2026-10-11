@@ -14,9 +14,14 @@ f-строка ему не подотчётна, и первый живой пр
 
 Идентификаторы (номер точки, `dp_index`) через книгу НЕ идут: они не величины,
 а регистрация делала бы 0 и 1 разрешёнными в любом разборе.
+
+`prose` — исключение для текста, который собрал код, а не модель (реплей руки):
+регистрируется каждое его число.
 """
 
 from __future__ import annotations
+
+from harness.explanation.faithfulness import numbers_in
 
 __all__ = ["NumberBook"]
 
@@ -68,3 +73,13 @@ class NumberBook:
                 self._allowed.add(float(current))
                 current = ""
         return value
+
+    def prose(self, text: str) -> str:
+        """Текст, собранный КОДОМ из фактов руки (реплей): каждое его число разрешено.
+
+        Для готовых строк, а не для величин: у величины свой формат (`bb`, `pct`,
+        `count`). Модельный текст сюда не попадает никогда — регистрация сделала
+        бы разрешённым выдуманное (`test_prose_registers_every_number_of_a_code_built_text`).
+        """
+        self._allowed.update(numbers_in(text))
+        return text
