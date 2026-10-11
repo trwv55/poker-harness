@@ -92,6 +92,7 @@ from harness.presentation import (
     aliases_msg,
     analysis_unavailable_msg,
     ask_gg_nickname_msg,
+    ask_moved_msg,
     disagreement_saved_msg,
     gg_nickname_saved_msg,
     gg_nickname_too_long_msg,
@@ -695,10 +696,14 @@ async def handle_deep_dive_callback(deps: BotDeps, tg_user_id: int, hand_no: str
 async def handle_question_command(deps: BotDeps, tg_user_id: int, args: str = "") -> Msg | None:
     """`/ask ВОПРОС` — вопрос о своей игре; считает воркер, бот только ставит задачу.
 
-    **Командой, а не свободным текстом.** Свободный текст в этом продукте уже
-    занят: он достаётся заметке, нику в руме или ответу на эскалацию
-    (`handle_text` ниже, `players.pending_input`). Вопрос идёт мимо этой
-    очереди и её не гасит — ожидающий ввод остаётся ждать своего текста
+    У игрока с доступом к агенту (`agent_enabled`) команда снята и отвечает
+    подсказкой (`test_ask_of_a_player_with_the_agent_points_to_plain_text`);
+    у остальных живёт до открытия агента (спека агента №1, §10).
+
+    Для них вопрос идёт командой, а не свободным текстом: свободный текст
+    достаётся заметке, нику в руме или ответу на эскалацию (`handle_text`
+    ниже, `players.pending_input`). Вопрос идёт мимо этой очереди и её не
+    гасит — ожидающий ввод остаётся ждать своего текста
     (`test_a_question_is_not_swallowed_by_a_pending_input`).
 
     **Дневной лимит запросов `/ask` не тратит** (`QUOTA_INTERACTIVE_JOB_TYPES`
@@ -715,6 +720,9 @@ async def handle_question_command(deps: BotDeps, tg_user_id: int, args: str = ""
         if player is None:
             await db.commit()
             return invite_required_msg()
+        if agent_enabled(player):
+            await db.commit()
+            return ask_moved_msg()
         player_id = player.id
         if not question:
             await db.commit()

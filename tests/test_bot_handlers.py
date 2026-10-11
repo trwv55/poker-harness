@@ -2240,8 +2240,19 @@ async def test_a_screenshot_analysis_has_no_tournament_to_bind_to(deps, db_facto
 # --- вопрос о своей игре (`/ask`) ---------------------------------------------------
 
 
+async def test_ask_of_a_player_with_the_agent_points_to_plain_text(db_factory, deps, invited):
+    """У игрока с агентом `/ask` снят: вопрос пишется текстом, задача `question` не ставится."""
+    from harness.presentation import ask_moved_msg
+
+    await _make_dev(db_factory, invited)
+
+    assert await handle_question_command(deps, _TG_USER_ID, "плюсовой ли я на BB") == ask_moved_msg()
+    assert await fetch_all(db_factory, "select id from jobs") == []
+
+
 async def test_a_question_becomes_a_job_for_the_worker(db_factory, deps, invited):
-    """Бот не считает и не говорит: он ставит задачу, дальше говорит воркер.
+    """У игрока без доступа к агенту бот не считает и не говорит: он ставит задачу,
+    дальше говорит воркер.
 
     Вопрос едет в `payload` целиком — воркер читает его оттуда и отдаёт модели.
     """

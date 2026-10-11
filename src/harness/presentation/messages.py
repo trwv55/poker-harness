@@ -3031,6 +3031,11 @@ def question_refusal_msg() -> Msg:
     return Msg(text="На этот вопрос у меня нет расчёта.\n\n" + _WHAT_CAN_BE_COUNTED)
 
 
+def ask_moved_msg() -> Msg:
+    """`/ask` у игрока с агентом: вопрос пишется просто текстом (спека агента №1, §10)."""
+    return Msg(text="Команда больше не нужна — спрашивайте просто текстом.")
+
+
 def question_too_long_msg(limit: int) -> Msg:
     return Msg(text=f"Вопрос длиннее {limit} символов — сократите его.")
 
