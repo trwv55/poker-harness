@@ -264,7 +264,7 @@ async def check_quota(deps: BotDeps, player_id: int) -> QuotaCheck:
     """Пускать ли игрока в интерактивный разбор — скользящее окно 24 ч (спека §9).
 
     Считает `QuotaRepo` (`memory/repos.py`) — та же реализация, из которой воркер
-    берёт числа для подписи «разборов X/Y за 24 ч». Отказ принимается ЗДЕСЬ, до
+    берёт числа для подписи «запросов X/Y за 24 ч». Отказ принимается ЗДЕСЬ, до
     постановки задачи в очередь: воркер, уже взявший задачу, отказывать не вправе.
     """
     async with deps.db_factory() as db:
@@ -701,7 +701,7 @@ async def handle_question_command(deps: BotDeps, tg_user_id: int, args: str = ""
     очереди и её не гасит — ожидающий ввод остаётся ждать своего текста
     (`test_a_question_is_not_swallowed_by_a_pending_input`).
 
-    **Дневной лимит разборов вопрос не тратит** (`QUOTA_INTERACTIVE_JOB_TYPES`
+    **Дневной лимит запросов `/ask` не тратит** (`QUOTA_INTERACTIVE_JOB_TYPES`
     его не перечисляет, `test_a_question_does_not_spend_the_daily_quota`):
     счётчик подписан «запросов X/Y»; `/ask` в него не входит — решение принято
     до агента и планом агента не пересматривается.

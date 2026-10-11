@@ -2582,7 +2582,8 @@ def test_the_agent_numbers_without_a_calculation_show_the_list():
     msg = agent_turn_msg("numbers", None, [], from_context=True, job_id=7)
     assert "не прошёл проверку чисел" in msg.text
     assert "Посчитать могу:" in msg.text
-    assert "Посчитано:" not in msg.text and not msg.buttons
+    assert "Посчитано:" not in msg.text
+    assert [b.callback_data for row in msg.buttons for b in row] == ["agentmiss:7"]
 
 
 def test_the_agent_refusal_lists_what_can_be_counted_and_has_no_button():

@@ -2961,13 +2961,17 @@ def agent_turn_msg(
 
     Числа без прозы и без единого расчёта в ходе (ответ опирался на разбор или
     на прошлый расчёт) чисел не печатают: говорят, что проверку чисел ответ не
-    прошёл, и дают список того, что можно посчитать; кнопки нет, считать было
-    нечего (`test_the_agent_numbers_without_a_calculation_show_the_list`).
+    прошёл, и дают список того, что можно посчитать; кнопка «Не то посчитано» на
+    месте: ответ без нужного расчёта и есть промах маршрута
+    (`test_the_agent_numbers_without_a_calculation_show_the_list`).
     """
     if state == "refusal":
         return agent_refusal_msg()
     if state == "numbers" and not results:
-        return Msg(text=_AGENT_NUMBERS_UNCHECKED + "\n\n" + _WHAT_CAN_BE_COUNTED)
+        return Msg(
+            text=_AGENT_NUMBERS_UNCHECKED + "\n\n" + _WHAT_CAN_BE_COUNTED,
+            buttons=[[agent_miss_button(job_id)]],
+        )
     if results:
         # Расчёт, вызванный дважды, называется один раз: подпись — какие
         # расчёты, а не сколько раз.
@@ -2983,7 +2987,7 @@ def agent_turn_msg(
     head = ""
     if state == "prose" and prose and prose.strip():
         budget = _TELEGRAM_TEXT_LIMIT - len(tail) - 2
-        if budget > 0:
+        if budget > len(_MARKER):
             head = _fitted(prose.strip(), budget) + "\n\n"
     return Msg(text=head + tail, buttons=[[agent_miss_button(job_id)]])
 

@@ -2934,12 +2934,17 @@ async def test_the_wrong_calculation_button_writes_an_eval_case_without_a_hand(d
 
 async def test_the_wrong_calculation_button_of_another_player_writes_nothing(db_factory, deps, invited):
     from harness.bot.handlers import handle_ui_callback
+    from harness.memory.models import Trace
     from harness.presentation import AGENT_MISS_PREFIX, agent_turn_unavailable_msg
 
     other_id, other_session = await _seed_player(db_factory, tg_user_id=_TG_USER_ID + 1)
     async with db_factory() as session:
         job = Job(type="agent", player_id=other_id, session_id=other_session, payload={"text": "x"})
         session.add(job)
+        await session.flush()
+        # След хода у чужой задачи есть: отказ даёт именно сверка владельца, а не
+        # отсутствие трейса.
+        session.add(Trace(job_id=job.id, spans=[{"name": "agent_turn", "state": "prose", "calls": []}]))
         await session.commit()
         job_id = job.id
     reply = await handle_ui_callback(deps, _TG_USER_ID, f"{AGENT_MISS_PREFIX}{job_id}")
