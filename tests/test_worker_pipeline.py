@@ -134,6 +134,7 @@ class FakeSender:
         self.sent: list[Msg] = []
         self.edits: list[tuple[int, Msg]] = []
         self.photos: list[Photo] = []
+        self.typings = 0
         self._next_id = 1000
 
     async def send(self, chat_id: int, msg: Msg) -> int:
@@ -148,6 +149,9 @@ class FakeSender:
         self.photos.append(photo)
         self._next_id += 1
         return self._next_id
+
+    async def typing(self, chat_id: int) -> None:
+        self.typings += 1
 
 
 @pytest.fixture
@@ -2085,6 +2089,161 @@ async def test_a_question_without_a_calculation_shows_the_refusal_not_the_model(
     texts = _all_texts(fake_sender)
     assert any("нет расчёта" in text for text in texts)
     assert not [text for text in texts if "25% рук" in text]
+
+
+# --- задача агента ------------------------------------------------------------------
+
+
+async def _seed_two_hands(db_factory, session_id: int) -> None:
+    from tests.test_calcs import _open_from, _store
+
+    async with db_factory() as session:
+        for index in (1, 2):
+            await _store(session, session_id=session_id,
+                         raw=_open_from("CO", tournament_id="T1", hand_no=f"A{index}"))
+        await session.commit()
+
+
+async def test_an_agent_job_answers_journals_and_keeps_the_evening_history(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    """Задача `agent` целиком: ответ игроку, запись хода в журнал, история вечера."""
+    from pydantic_ai.models.function import FunctionModel
+
+    from tests.test_agent import _GOOD, _VPIP, _TurnScript
+
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    player_id, session_id = await _make_scope(db_factory)
+    await _seed_two_hands(db_factory, session_id)
+
+    jid = await queue.enqueue(type="agent", player_id=player_id, session_id=session_id,
+                              payload={"text": "как часто я вхожу в банк"})
+    job = await queue.claim("w1")
+    assert job is not None
+    script = _TurnScript([([_VPIP], _GOOD)])
+    await run_job(job, replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script))))
+
+    assert (await job_status(db_factory, jid)) == "done"
+    assert any(_GOOD in text and "Посчитано:" in text for text in _all_texts(fake_sender))
+    assert fake_sender.typings >= 1
+    async with db_factory() as session:
+        history = (await session.execute(
+            text("select agent_history from sessions where id = :s"), {"s": session_id}
+        )).scalar_one()
+        spans = (await session.execute(
+            text("select spans from traces where job_id = :j"), {"j": jid}
+        )).scalar_one()
+    assert history
+    turn = next(s for s in spans if s["name"] == "agent_turn")
+    assert turn["state"] == "prose" and turn["calls"][0]["calc"] == "hero_frequency"
+    assert turn["calls"][0]["zone"] == "strict" and turn["rewrite"] is False
+
+
+async def test_an_agent_job_stores_only_the_final_answer_and_no_progress_message(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    """Reaper считает задачу с `result_message_id` доставленной: под этим ключом
+    обязан лежать итоговый ответ, а промежуточных сообщений у хода нет вовсе."""
+    from pydantic_ai.models.function import FunctionModel
+
+    from tests.test_agent import _GOOD, _VPIP, _TurnScript
+
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    player_id, session_id = await _make_scope(db_factory)
+    await _seed_two_hands(db_factory, session_id)
+    jid = await queue.enqueue(type="agent", player_id=player_id, session_id=session_id,
+                              payload={"text": "вопрос"})
+    job = await queue.claim("w1")
+    assert job is not None
+    script = _TurnScript([([_VPIP], _GOOD)])
+    await run_job(job, replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script))))
+
+    assert len(fake_sender.sent) == 1 and _GOOD in fake_sender.sent[0].text
+    async with db_factory() as session:
+        payload = (await session.get(Job, jid)).payload  # type: ignore[union-attr]
+    assert payload["result_message_id"] == 1001 and "progress_message_id" not in payload
+
+
+async def test_the_next_agent_job_sees_the_evening_history(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    """Второй ход вечера получает первый из `sessions.agent_history`: число из
+    расчёта первого хода проходит проверку без нового вызова."""
+    from pydantic_ai.models.function import FunctionModel
+
+    from tests.test_agent import _GOOD, _VPIP, _TurnScript
+
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    player_id, session_id = await _make_scope(db_factory)
+    await _seed_two_hands(db_factory, session_id)
+    script = _TurnScript([([_VPIP], _GOOD), ([], "Те же 100.0% (2 из 2).")])
+    llm_deps = replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script)))
+    for question in ("первый", "второй"):
+        await queue.enqueue(type="agent", player_id=player_id, session_id=session_id,
+                            payload={"text": question})
+        job = await queue.claim("w1")
+        assert job is not None
+        await run_job(job, llm_deps)
+
+    assert any(text.startswith("Те же 100.0% (2 из 2).") for text in _all_texts(fake_sender))
+
+
+async def test_a_failing_typing_indicator_does_not_fail_the_agent_turn(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    from pydantic_ai.models.function import FunctionModel
+
+    from tests.test_agent import _GOOD, _VPIP, _TurnScript
+
+    async def broken_typing(chat_id: int) -> None:
+        raise RuntimeError("синтетический сбой индикатора")
+
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    monkeypatch.setattr(fake_sender, "typing", broken_typing)
+    player_id, session_id = await _make_scope(db_factory)
+    await _seed_two_hands(db_factory, session_id)
+    jid = await queue.enqueue(type="agent", player_id=player_id, session_id=session_id,
+                              payload={"text": "вопрос"})
+    job = await queue.claim("w1")
+    assert job is not None
+    script = _TurnScript([([_VPIP], _GOOD)])
+    await run_job(job, replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script))))
+
+    assert (await job_status(db_factory, jid)) == "done"
+    assert any(_GOOD in text for text in _all_texts(fake_sender))
+
+
+@requires_fixtures
+async def test_a_hand_analysis_becomes_the_agent_context_and_a_new_file_resets_it(
+    db_factory, queue, deps
+):
+    """Разбор руки ставит указатель вечера; новый файл HH его сбрасывает
+    (план агента, отклонение 2): агент не отвечает про старую руку после нового файла."""
+    player_id, session_id = await _make_scope(db_factory)
+    jid, _raw = await _seed_one_hand_deep_dive_job(
+        db_factory, queue, player_id=player_id, session_id=session_id
+    )
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+    assert (await job_status(db_factory, jid)) == "done"
+
+    async def pointer() -> int | None:
+        async with db_factory() as session:
+            return (await session.execute(
+                text("select last_analysis_id from sessions where id = :s"), {"s": session_id}
+            )).scalar_one()
+
+    async with db_factory() as session:
+        analysis_id = (await session.execute(text("select id from analyses"))).scalar_one()
+    assert await pointer() == analysis_id
+
+    scan = await enqueue_hh_scan(queue, FIXTURE_DAILY, player_id=player_id, session_id=session_id)
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+    assert (await job_status(db_factory, scan)) == "done"
+    assert await pointer() is None
 
 
 # --- развилка «Что было»: блок принадлежит разбору раздачи, не скану HH ---------------

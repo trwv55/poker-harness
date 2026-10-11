@@ -39,6 +39,7 @@ from harness.presentation.keyboards import (
 from harness.presentation.messages import (
     Msg,
     Photo,
+    agent_turn_msg,
     alias_bound_msg,
     alias_no_analysis_msg,
     alias_position_unknown_msg,
@@ -133,6 +134,7 @@ __all__ = [
     "Btn",
     "Msg",
     "Photo",
+    "agent_turn_msg",
     "alias_bound_msg",
     "alias_no_analysis_msg",
     "alias_position_unknown_msg",

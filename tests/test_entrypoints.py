@@ -407,6 +407,19 @@ async def test_sender_omits_reply_markup_when_there_are_no_buttons():
     assert json.loads(requests[1].content)["message_id"] == 4242
 
 
+async def test_typing_sends_a_chat_action():
+    """«Печатает…» на время хода агента — `sendChatAction`, а не сообщение."""
+    requests: list[httpx.Request] = []
+    sender, client = _sender_recording_into(requests, httpx.Response(200, json={"ok": True, "result": True}))
+    try:
+        await sender.typing(7)
+    finally:
+        await client.aclose()
+
+    assert [str(r.url).rsplit("/", 1)[-1] for r in requests] == ["sendChatAction"]
+    assert json.loads(requests[0].content) == {"chat_id": 7, "action": "typing"}
+
+
 async def test_sender_sends_the_keyboard_when_there_are_buttons():
     """Обратная половина: убрать `null` можно и выбросив `reply_markup` совсем —
     кнопки перестали бы доезжать молча, а без них у игрока нет ни «разобрать», ни

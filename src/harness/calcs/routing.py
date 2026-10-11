@@ -19,7 +19,8 @@
    выполняется вовсе: он возвращает отказ, а первый результат остаётся
    единственным (`test_the_second_calculation_is_refused`). Перебор срезов
    запрещён не уговором: нарежь достаточно мелко, и отклонение найдётся по
-   случайности.
+   случайности. Это правило `/ask`; у агента потолок 8
+   (`CalcRun(max_calcs=…)`, `test_the_ninth_calculation_is_refused`).
 4. *Нет подходящего расчёта — отказ.* Ответ без единого вызова инструмента
    игроку не показывается вовсе (`result is None`,
    `test_a_question_without_a_calculation_is_refused`), сколько бы уверенно он
@@ -33,11 +34,13 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypeVar
 
 from pydantic import BaseModel
+from pydantic_ai import ToolReturn
 from pydantic_ai.tools import Tool
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -61,6 +64,7 @@ from harness.contracts import (
     ThresholdParams,
     ThresholdSide,
     Window,
+    Zone,
 )
 from harness.explanation.question import (
     QuestionDraft,
@@ -129,38 +133,92 @@ class QuestionOutcome:
 
 
 class CalcRun:
-    """Единственный расчёт вопроса и выжимка его выхода — то, что копит прогон.
+    """Расчёты одного хода и их выжимки — то, что копит прогон.
 
     Не возвращаемое значение, а объект: инструменты замыкаются на нём, и после
     вызова модели вызывающий читает отсюда то, что действительно посчиталось.
-    Пустой `result` — вызова инструмента не было вовсе.
+    `max_calcs=1` — `/ask`: второй успешный вызов получает отказ
+    (`test_the_second_calculation_is_refused`). Агент передаёт 8 (спека агента
+    №1, §5): девятый получает отказ (`test_the_ninth_calculation_is_refused`).
+    `calls` — журнал каждого вызова, удачного или нет: имя, параметры, выход,
+    зона, время (спека агента №1, §8, «Журнал»;
+    `test_the_journal_names_calls_checks_and_the_rewrite`).
     """
 
-    def __init__(self) -> None:
-        self.result: CalcResult | None = None
-        self.digest: Digest | None = None
+    def __init__(self, max_calcs: int = 1) -> None:
+        self.max_calcs = max_calcs
+        self.results: list[CalcResult] = []
+        self.digests: list[Digest] = []
+        self.calls: list[dict[str, Any]] = []
+
+    @property
+    def result(self) -> CalcResult | None:
+        """Первый расчёт хода; `None` — ни одного удачного вызова инструмента."""
+        return self.results[0] if self.results else None
+
+    @property
+    def digest(self) -> Digest | None:
+        return self.digests[0] if self.digests else None
+
+
+_CALC_CAP = "Потолок расчётов на один ответ — {cap}: ответьте по тому, что уже посчитано."
+
+# Зона доверия по инструменту (CLAUDE.md): все шесть расчётов — измерения и
+# арифметика, ни один не опирается на угаданный диапазон.
+_TOOL_ZONE: dict[CalcName, Zone] = {name: Zone.STRICT for name in CalcName}
 
 
 async def _perform(
     db: AsyncSession, player_id: int, run_state: CalcRun, params: CalcParams
-) -> str:
-    """Выполнить расчёт, если он первый, и вернуть модели выжимку его выхода.
+) -> str | ToolReturn:
+    """Выполнить расчёт, если потолок не взят, и вернуть модели выжимку его выхода.
 
     Ошибку параметра (неизвестная позиция) модель получает текстом и вправе
     позвать инструмент заново: неудавшийся вызов расчётом не считается и
-    единственную попытку не тратит
+    попытку из потолка не тратит
     (`test_a_bad_parameter_does_not_spend_the_single_calculation`).
+
+    Удачный расчёт возвращается `ToolReturn`: модель видит тот же текст
+    выжимки, а метаданные (имя расчёта, разрешённые числа, частота) остаются в
+    истории для проверок агента и модели не уходят
+    (`test_history_survives_serialization`).
     """
-    if run_state.result is not None:
-        return _ONE_CALC_ONLY
+    params_json = params.model_dump(mode="json")
+    if len(run_state.results) >= run_state.max_calcs:
+        run_state.calls.append({"calc": params.calc.value, "params": params_json, "refused": True})
+        if run_state.max_calcs == 1:
+            return _ONE_CALC_ONLY
+        return _CALC_CAP.format(cap=run_state.max_calcs)
+    started = time.monotonic()
     try:
         result = await run(db, player_id, params)
     except ValueError as exc:
+        run_state.calls.append({
+            "calc": params.calc.value,
+            "params": params_json,
+            "error": str(exc),
+            "duration_s": round(time.monotonic() - started, 3),
+        })
         return f"Расчёт не выполнен: {exc}"
     digest = question_digest(result)
-    run_state.result = result
-    run_state.digest = digest
-    return digest.text
+    run_state.results.append(result)
+    run_state.digests.append(digest)
+    run_state.calls.append({
+        "calc": result.calc.value,
+        "params": params_json,
+        "output": digest.text,
+        "zone": _TOOL_ZONE[result.calc].value,
+        "duration_s": round(time.monotonic() - started, 3),
+    })
+    stat = getattr(result, "stat", None)
+    return ToolReturn(
+        return_value=digest.text,
+        metadata={
+            "calc": result.calc.value,
+            "allowed": sorted(digest.allowed),
+            "stat": stat.value if stat is not None else None,
+        },
+    )
 
 
 def _window(window: WindowArg, session_id: int) -> Window:
@@ -199,7 +257,7 @@ def tools_for(
 
     async def hero_frequency(
         stat: FrequencyStat, position: str | None = None, window: WindowArg = "all"
-    ) -> str:
+    ) -> str | ToolReturn:
         """Частота самого игрока по его разобранным раздачам.
 
         Args:
@@ -219,7 +277,7 @@ def tools_for(
         opponent: str | None = None,
         position: str | None = None,
         window: WindowArg = "all",
-    ) -> str:
+    ) -> str | ToolReturn:
         """Частота оппонента: названного ником либо поля целиком.
 
         Args:
@@ -250,7 +308,7 @@ def tools_for(
         spot: SpotKind | None = None,
         position: str | None = None,
         window: WindowArg = "all",
-    ) -> str:
+    ) -> str | ToolReturn:
         """Сколько точек решения разобрано, у скольких посчитана цена и какова сумма.
 
         Args:
@@ -273,7 +331,7 @@ def tools_for(
             ),
         )
 
-    async def leaks(window: WindowArg = "all") -> str:
+    async def leaks(window: WindowArg = "all") -> str | ToolReturn:
         """Типы повторяющихся расхождений с ценой каждого.
 
         Args:
@@ -283,7 +341,7 @@ def tools_for(
             db, player_id, run_state, LeaksParams(window=_window(window, session_id))
         )
 
-    async def defense_frequency(pot_before: int, bet: int) -> str:
+    async def defense_frequency(pot_before: int, bet: int) -> str | ToolReturn:
         """Требуемая частота защиты против ставки — арифметика, данных не требует.
 
         Args:
@@ -304,7 +362,7 @@ def tools_for(
         opponent: str | None = None,
         position: str | None = None,
         window: WindowArg = "all",
-    ) -> str:
+    ) -> str | ToolReturn:
         """Частота против порога: утверждение либо число недостающих наблюдений.
 
         Args:

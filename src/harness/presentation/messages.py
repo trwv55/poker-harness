@@ -2915,19 +2915,51 @@ def question_msg(result: CalcResult, prose: str | None) -> Msg:
     if prose is not None and prose.strip():
         lines += [line.strip() for line in prose.strip().splitlines() if line.strip()]
         lines.append("")
-    if isinstance(result, FrequencyResult):
-        numbers = _frequency_answer(result)
-    elif isinstance(result, ThresholdResult):
-        numbers = _threshold_answer(result)
-    elif isinstance(result, CoverageResult):
-        numbers = _coverage_answer(result)
-    elif isinstance(result, LeaksResult):
-        numbers = _leaks_answer(result)
-    else:
-        numbers = _defense_answer(result)
     lines.append(f"Посчитано: {_CALC_WORD[result.calc]}.")
-    lines.extend(line for line in numbers if line)
+    lines.extend(line for line in _calc_answer(result) if line)
     return Msg(text="\n".join(lines))
+
+
+def _calc_answer(result: CalcResult) -> list[str]:
+    """Числа одного расчёта в виде, собранном кодом."""
+    if isinstance(result, FrequencyResult):
+        return _frequency_answer(result)
+    if isinstance(result, ThresholdResult):
+        return _threshold_answer(result)
+    if isinstance(result, CoverageResult):
+        return _coverage_answer(result)
+    if isinstance(result, LeaksResult):
+        return _leaks_answer(result)
+    return _defense_answer(result)
+
+
+def agent_turn_msg(
+    state: Literal["prose", "numbers", "refusal"],
+    prose: str | None,
+    results: Sequence[CalcResult],
+    *,
+    from_context: bool,
+    job_id: int,
+) -> Msg:
+    """Ответ агента. Временное тело (план агента, Task 4): кнопку, подпись по
+    разбору и бюджет сообщения добавляет Task 5.
+
+    Подпись «Посчитано: …» — все расчёты хода, по `CalcResult.calc`
+    (`test_an_agent_job_answers_journals_and_keeps_the_evening_history`).
+    """
+    if state == "refusal":
+        return question_refusal_msg()
+    lines: list[str] = []
+    if state == "prose" and prose and prose.strip():
+        lines += [prose.strip(), ""]
+    if results:
+        lines.append("Посчитано: " + ", ".join(_CALC_WORD[r.calc] for r in results) + ".")
+        if state == "numbers":
+            for result in results:
+                lines.extend(line for line in _calc_answer(result) if line)
+    elif state == "numbers":
+        lines.append("Ответ не прошёл проверку чисел, а расчётов в нём не было.")
+    return Msg(text="\n".join(lines).strip())
 
 
 def question_usage_msg() -> Msg:
