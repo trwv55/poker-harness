@@ -7,7 +7,8 @@
 разрешённым (`test_trimming_drops_whole_turns_and_their_numbers`).
 
 Числа, которые назвал сам игрок, тоже разрешены (решение владельца R1,
-`test_a_number_the_player_typed_is_allowed`). Просьба переписать ответ уходит
+`test_a_number_the_player_typed_is_allowed`); обозначения карт в его репликах
+числами не считаются (`player_text_numbers`). Просьба переписать ответ уходит
 модели репликой, но игроку не принадлежит; в сохранённую историю она не
 попадает (`seen_history`), а опознаётся по месту в ходе, а не по тексту
 (`test_a_player_message_that_looks_like_a_rewrite_request_is_kept`).
@@ -30,6 +31,7 @@ from pydantic_ai.messages import (
 )
 
 from harness.contracts import CalcName
+from harness.explanation.agent_checks import strip_card_tokens
 from harness.explanation.faithfulness import numbers_in
 
 __all__ = [
@@ -39,6 +41,7 @@ __all__ = [
     "estimate_tokens",
     "load_history",
     "player_numbers",
+    "player_text_numbers",
     "seen_history",
     "stats_in_history",
     "trim_history",
@@ -215,11 +218,21 @@ def stats_in_history(messages: Sequence[ModelMessage]) -> frozenset[str]:
     return frozenset(str(meta["stat"]) for meta in _metadata(messages) if meta.get("stat"))
 
 
-def player_numbers(messages: Sequence[ModelMessage]) -> frozenset[float]:
-    """Числа из реплик игрока, оставшихся в истории (решение владельца R1)."""
+def player_text_numbers(text: str, *, board_ranks: Sequence[str] = ()) -> frozenset[float]:
+    """Числа из реплики игрока — без обозначений карт: «K9o» или «K-7-2» числа 9,
+    7 и 2 не разрешают, как и на стороне ответа (`strip_card_tokens`;
+    `test_a_card_rank_the_player_typed_is_not_an_allowed_number`)."""
+    return frozenset(numbers_in(strip_card_tokens(text, board_ranks=board_ranks)))
+
+
+def player_numbers(
+    messages: Sequence[ModelMessage], *, board_ranks: Sequence[str] = ()
+) -> frozenset[float]:
+    """Числа из реплик игрока, оставшихся в истории (решение владельца R1), без
+    обозначений карт (`player_text_numbers`)."""
     return frozenset(
         number
         for message in messages
         for part in _player_parts(message)
-        for number in numbers_in(_text(part))
+        for number in player_text_numbers(_text(part), board_ranks=board_ranks)
     )

@@ -2604,8 +2604,36 @@ def test_an_answer_from_the_hand_says_so_in_its_signature():
 def test_an_answer_from_an_earlier_calculation_says_so_in_its_signature():
     from harness.presentation import agent_turn_msg
 
-    msg = agent_turn_msg("prose", "Синт.", [], from_context=False, job_id=7)
+    msg = agent_turn_msg("prose", "Синт.", [], from_context=False, from_history=True, job_id=7)
     assert "Посчитано: расчёты выше в этом разговоре." in msg.text
+    assert "разбор раздачи" not in msg.text
+
+
+def test_an_answer_with_a_hand_and_earlier_calculations_names_both():
+    """Разбор есть, и в истории вечера остались расчёты: подпись не приписывает
+    ответ одному разбору (M4)."""
+    from harness.presentation import agent_turn_msg
+
+    msg = agent_turn_msg("prose", "Синт.", [], from_context=True, from_history=True, job_id=7)
+    assert "Посчитано: разбор раздачи, расчёты выше в этом разговоре." in msg.text
+
+
+def test_an_answer_from_the_hand_alone_does_not_claim_earlier_calculations():
+    from harness.presentation import agent_turn_msg
+
+    msg = agent_turn_msg("prose", "Синт.", [], from_context=True, from_history=False, job_id=7)
+    assert "расчёты выше" not in msg.text
+
+
+def test_a_prose_answer_without_any_source_is_not_signed():
+    """Без расчёта, разбора и расчётов вечера ход — отказ (`run_agent_turn`);
+    подписать такую прозу нечем, и подпись не выдумывается."""
+    import pytest
+
+    from harness.presentation import agent_turn_msg
+
+    with pytest.raises(ValueError):
+        agent_turn_msg("prose", "Синт.", [], from_context=False, from_history=False, job_id=7)
 
 
 def test_a_long_agent_answer_fits_one_message_by_cutting_the_prose():

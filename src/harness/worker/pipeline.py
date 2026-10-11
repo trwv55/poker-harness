@@ -1365,16 +1365,19 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
             turn.prose,
             list(turn.results),
             from_context=turn.from_context,
+            from_history=turn.from_history,
             job_id=job.id,
         )
+        await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
+        await session.commit()
         # В историю — только то, что игрок видел (решение контроллера по вопросу
         # владельца 2): без прозы на месте ответа модели — текст, который ушёл игроку.
+        # И только после отправки: упавшая отправка истории не трогает
+        # (`test_a_failed_send_leaves_the_evening_history_unchanged`).
         seen = turn.saved_messages(None if turn.state == "prose" else msg.text)
         await sessions.save_agent_history(
             job.session_id, dump_history(trim_history(seen, deps.agent_history_max_tokens))
         )
-        await session.commit()
-        await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
         await session.commit()
 
 

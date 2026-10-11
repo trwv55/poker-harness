@@ -21,13 +21,13 @@ from harness.agent.history import (
     allowed_from_history,
     calcs_in_history,
     player_numbers,
+    player_text_numbers,
     seen_history,
     stats_in_history,
 )
 from harness.calcs.routing import CalcRun, tools_for
 from harness.contracts import CalcName, CalcResult, ModelOutput
 from harness.explanation.agent_checks import STAT_LABEL, AgentContext, check_agent_answer
-from harness.explanation.faithfulness import numbers_in
 from harness.platform.llm import LLM
 
 __all__ = ["MAX_CALCS_PER_TURN", "REWRITE_HEAD", "AgentDraft", "AgentTurn", "run_agent_turn"]
@@ -47,8 +47,10 @@ class AgentDraft(ModelOutput, BaseModel):
 
 @dataclass(frozen=True)
 class AgentTurn:
-    """Итог хода. `from_context` — ответ стоит на сводке разбора, расчётов в
-    ходе нет (`test_an_answer_from_the_context_alone_passes_without_a_call`).
+    """Итог хода. Расчётов в ходе нет — подпись называет, на чём ещё стоит
+    ответ: `from_context` — сводка разбора есть, `from_history` — в истории
+    вечера остались расчёты прошлых ходов
+    (`test_the_signature_flags_name_the_sources_of_a_turn_without_calculations`).
     `drafts` — тексты модели, которые игрок не увидел: для журнала, не для
     игрока (`test_the_journal_keeps_the_rejected_drafts`)."""
 
@@ -56,6 +58,7 @@ class AgentTurn:
     prose: str | None
     results: tuple[CalcResult, ...]
     from_context: bool
+    from_history: bool
     messages: tuple[ModelMessage, ...]
     violations: tuple[tuple[str, ...], ...]
     calls: tuple[dict[str, Any], ...]
@@ -84,6 +87,7 @@ class AgentTurn:
             "checks": [list(v) for v in self.violations],
             "rewrite": len(self.violations) == 2,
             "from_context": self.from_context,
+            "from_history": self.from_history,
             "drafts": list(self.drafts),
         }
 
@@ -155,7 +159,19 @@ async def run_agent_turn(
     """
     system = system_prompt if system_prompt is not None else _prompt.load_system_prompt()
     instructions = _prompt.instructions_for(system, context)
-    run_state = CalcRun(max_calcs=MAX_CALCS_PER_TURN)
+    board = context.board_ranks if context is not None else ()
+    # Числа игрока (решение R1): его реплики в истории вечера и текущая, без
+    # обозначений карт. Не из `messages`: после попытки переписать там и просьба
+    # кода с выдуманными числами.
+    said = player_numbers(history, board_ranks=board) | player_text_numbers(
+        text, board_ranks=board
+    )
+    # Банк и ставку для расчётов защиты модель берёт из сводки, слов игрока или
+    # выходов расчётов вечера, а не выводит сама (решение контроллера по I2).
+    sizes_from = said | allowed_from_history(history)
+    if context is not None:
+        sizes_from |= context.allowed
+    run_state = CalcRun(max_calcs=MAX_CALCS_PER_TURN, sizes_from=sizes_from)
     tools = tools_for(db, player_id, session_id, run_state)
 
     draft, meta = await llm(
@@ -163,9 +179,6 @@ async def run_agent_turn(
         message_history=history, instructions=instructions, trace_id=trace_id,
     )
     messages = meta.messages
-    # Числа игрока (решение R1): его реплики в истории вечера и текущая. Не из
-    # `messages`: после попытки переписать там и просьба кода с выдуманными числами.
-    said = player_numbers(history) | frozenset(numbers_in(text))
     grounded = context is not None or bool(calcs_in_history(messages))
     found = _violations(draft.answer, messages, context, said)
     violations: list[tuple[str, ...]] = [tuple(found)]
@@ -200,6 +213,7 @@ async def run_agent_turn(
         prose=prose,
         results=tuple(run_state.results),
         from_context=context is not None and not run_state.results,
+        from_history=bool(calcs_in_history(history)) and not run_state.results,
         messages=tuple(messages),
         violations=tuple(violations),
         calls=tuple(run_state.calls),

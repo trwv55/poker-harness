@@ -2279,6 +2279,41 @@ async def test_a_failing_typing_indicator_does_not_fail_the_agent_turn(
     assert any(_GOOD in text for text in _all_texts(fake_sender))
 
 
+async def test_a_failed_send_leaves_the_evening_history_unchanged(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    """История вечера пишется только после того, как ответ ушёл игроку (M2):
+    упавшая отправка не оставляет в истории ответа, которого игрок не видел."""
+    from pydantic_ai.models.function import FunctionModel
+
+    from tests.test_agent import _GOOD, _VPIP, _TurnScript
+
+    sent = fake_sender.send
+
+    async def failing_send(chat_id: int, msg: Msg) -> int:
+        if _GOOD in msg.text:
+            raise RuntimeError("синтетический сбой отправки")
+        return await sent(chat_id, msg)
+
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    monkeypatch.setattr(fake_sender, "send", failing_send)
+    player_id, session_id = await _make_scope(db_factory)
+    await _seed_two_hands(db_factory, session_id)
+    jid = await queue.enqueue(type="agent", player_id=player_id, session_id=session_id,
+                              payload={"text": "вопрос"})
+    job = await queue.claim("w1")
+    assert job is not None
+    script = _TurnScript([([_VPIP], _GOOD)])
+    await run_job(job, replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script))))
+
+    assert (await job_status(db_factory, jid)) == "failed"
+    async with db_factory() as session:
+        history = (await session.execute(
+            text("select agent_history from sessions where id = :s"), {"s": session_id}
+        )).scalar_one()
+    assert not history
+
+
 @requires_fixtures
 async def test_a_hand_analysis_becomes_the_agent_context_and_a_new_file_resets_it(
     db_factory, queue, deps

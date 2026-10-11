@@ -143,13 +143,41 @@ class CalcRun:
     `calls` — журнал каждого вызова, удачного или нет: имя, параметры, выход,
     зона, время (спека агента №1, §8, «Журнал»;
     `test_the_journal_names_calls_checks_and_the_rewrite`).
+
+    `sizes_from` — откуда вправе прийти банк и ставка для `defense_frequency` и
+    порога `bet_size`. `None` — `/ask`: размеры из вопроса игрока, не
+    проверяются (`test_ask_does_not_check_the_sizes`). Агент передаёт числа
+    сводки разбора, реплик игрока и выходов расчётов вечера; к ним добавляются
+    выходы расчётов этого хода
+    (`test_a_size_from_an_earlier_calculation_of_the_same_turn_is_computed`).
+    Размер не оттуда — инструмент не считает и отвечает модели отказом
+    (`test_an_invented_pot_is_refused_by_the_tool_and_allows_nothing`,
+    `test_a_pot_from_the_hand_summary_is_computed`).
     """
 
-    def __init__(self, max_calcs: int = 1) -> None:
+    def __init__(self, max_calcs: int = 1, sizes_from: frozenset[float] | None = None) -> None:
         self.max_calcs = max_calcs
+        self.sizes_from = sizes_from
         self.results: list[CalcResult] = []
         self.digests: list[Digest] = []
         self.calls: list[dict[str, Any]] = []
+
+    def unsourced_sizes(self, calc: CalcName, pot_before: int, bet: int) -> str | None:
+        """Отказ модели, если банк или ставка не из разрешённого источника; `None` —
+        размеры годятся. Отказ пишется в журнал ошибкой вызова."""
+        if self.sizes_from is None:
+            return None
+        known = self.sizes_from.union(*(digest.allowed for digest in self.digests))
+        missing = [n for n in (pot_before, bet) if float(n) not in known]
+        if not missing:
+            return None
+        refusal = _UNSOURCED_SIZES.format(numbers=", ".join(str(n) for n in missing))
+        self.calls.append({
+            "calc": calc.value,
+            "params": {"pot_before": pot_before, "bet": bet},
+            "error": refusal,
+        })
+        return refusal
 
     @property
     def result(self) -> CalcResult | None:
@@ -160,6 +188,12 @@ class CalcRun:
     def digest(self) -> Digest | None:
         return self.digests[0] if self.digests else None
 
+
+_UNSOURCED_SIZES = (
+    "Расчёт не выполнен: {numbers} нет ни в сводке раздачи, ни в словах игрока, ни в "
+    "выходе расчётов. Банк и ставку берите оттуда как есть, не выводите сами; если "
+    "их там нет — спросите игрока."
+)
 
 _CALC_CAP = "Потолок расчётов на один ответ — {cap}: ответьте по тому, что уже посчитано."
 
@@ -349,6 +383,9 @@ def tools_for(
             pot_before: банк в фишках ДО ставки соперника.
             bet: размер ставки соперника в фишках.
         """
+        refusal = run_state.unsourced_sizes(CalcName.DEFENSE_FREQUENCY, pot_before, bet)
+        if refusal is not None:
+            return refusal
         return await _perform(
             db, player_id, run_state, DefenseParams(pot_before=pot_before, bet=bet)
         )
@@ -394,6 +431,11 @@ def tools_for(
                     "Порог от размера ставки требует банка до ставки и самой ставки "
                     "в фишках."
                 )
+            refusal = run_state.unsourced_sizes(
+                CalcName.FREQUENCY_VS_THRESHOLD, pot_before, bet
+            )
+            if refusal is not None:
+                return refusal
             threshold: BetSizeThreshold | FieldThreshold = BetSizeThreshold(
                 pot_before=pot_before, bet=bet, side=side
             )

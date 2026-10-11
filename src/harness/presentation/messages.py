@@ -2949,12 +2949,17 @@ def agent_turn_msg(
     results: Sequence[CalcResult],
     *,
     from_context: bool,
+    from_history: bool = False,
     job_id: int,
 ) -> Msg:
     """Ответ агента — одно из трёх состояний (спека агента, §7).
 
     Подпись «Посчитано: …» собирает код по `CalcResult.calc` всех расчётов
-    хода, модель в ней не участвует. В тесноте режется проза, а если и числа не
+    хода, модель в ней не участвует. Без расчётов в ходе подпись называет те
+    источники, что есть: разбор раздачи (`from_context`) и/или расчёты выше в
+    этом разговоре (`from_history`); без обоих прозу подписать нечем — это
+    отказ, а не ответ (`test_an_answer_with_a_hand_and_earlier_calculations_names_both`,
+    `test_a_prose_answer_without_any_source_is_not_signed`). В тесноте режется проза, а если и числа не
     влезают — они, с маркером; подпись не режется никогда
     (`test_a_long_agent_answer_fits_one_message_by_cutting_the_prose`,
     `test_a_huge_list_of_numbers_still_fits_one_message`).
@@ -2977,10 +2982,18 @@ def agent_turn_msg(
         # расчёты, а не сколько раз.
         names = list(dict.fromkeys(_CALC_WORD[r.calc] for r in results))
         signature = "Посчитано: " + ", ".join(names) + "."
-    elif from_context:
-        signature = "Посчитано: разбор раздачи."
     else:
-        signature = "Посчитано: расчёты выше в этом разговоре."
+        sources = [
+            word
+            for word, present in (
+                ("разбор раздачи", from_context),
+                ("расчёты выше в этом разговоре", from_history),
+            )
+            if present
+        ]
+        if not sources:
+            raise ValueError("ответ без расчёта, разбора и расчётов вечера — это отказ")
+        signature = "Посчитано: " + ", ".join(sources) + "."
     numbers = [line for result in results for line in _calc_answer(result) if line]
     numbers_text = _fitted("\n".join(numbers), _TELEGRAM_TEXT_LIMIT - len(signature) - 1)
     tail = "\n".join([signature, numbers_text] if numbers_text else [signature])
