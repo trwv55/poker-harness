@@ -161,6 +161,7 @@ from harness.contracts.postflop import (
 )
 from harness.contracts.raw import ActionKind, Street
 from harness.explanation.hand_replay import HandReplay, bb, cards_text, chips, signed_bb
+from harness.explanation.question import size_bb
 from harness.presentation.keyboards import (
     MAIN_MENU,
     MENU_LEAKS,
@@ -2897,9 +2898,15 @@ def _leaks_answer(result: LeaksResult) -> list[str]:
 
 
 def _defense_answer(result: DefenseResult) -> list[str]:
+    # Размеры агента — в BB, как он их передал; фишки масштаба игроку не показываются
+    # (`test_a_pot_from_the_hand_summary_is_computed_and_shown_in_bb`).
+    if result.pot_before_bb is not None and result.bet_bb is not None:
+        bet, pot = f"{size_bb(result.bet_bb)}BB", f"{size_bb(result.pot_before_bb)}BB"
+    else:
+        bet, pot = chips(result.bet), chips(result.pot_before)
     return [
         (
-            f"Против ставки {chips(result.bet)} в банк {chips(result.pot_before)} "
+            f"Против ставки {bet} в банк {pot} "
             f"защищаться нужно в {_fmt_pct(100.0 * result.defend_frequency)} случаев, "
             f"сдаваться допустимо в {_fmt_pct(100.0 * result.fold_frequency)}."
         ),

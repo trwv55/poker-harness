@@ -50,6 +50,7 @@ __all__ = [
     "check_answer",
     "question_digest",
     "question_prompt",
+    "size_bb",
 ]
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "question.md"
@@ -175,9 +176,24 @@ def _leaks_lines(result: LeaksResult, book: NumberBook) -> list[str]:
     return lines
 
 
+def size_bb(value: float) -> str:
+    """Размер в BB, как его передал агент: до сотых — его масштаб в `calcs.routing`,
+    — и хотя бы один знак после точки (`6.6`, `3.0`)."""
+    return f"{value:.2f}".removesuffix("0")
+
+
 def _defense_lines(result: DefenseResult, book: NumberBook) -> list[str]:
+    if result.pot_before_bb is not None and result.bet_bb is not None:
+        sizes = (
+            f"Банк до ставки: {book.prose(size_bb(result.pot_before_bb))} BB; "
+            f"ставка: {book.prose(size_bb(result.bet_bb))} BB."
+        )
+    else:
+        sizes = (
+            f"Банк до ставки: {book.count(result.pot_before)}; ставка: {book.count(result.bet)}."
+        )
     return [
-        f"Банк до ставки: {book.count(result.pot_before)}; ставка: {book.count(result.bet)}.",
+        sizes,
         (
             f"Требуемая частота защиты: {book.pct(100.0 * result.defend_frequency)}%; "
             f"сдаваться допустимо в {book.pct(100.0 * result.fold_frequency)}% случаев."

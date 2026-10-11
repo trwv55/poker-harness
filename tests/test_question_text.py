@@ -113,6 +113,10 @@ ALL_RESULTS: list[CalcResult] = [
     _coverage(),
     _leaks(),
     _defense(),
+    # Размеры агента в BB (сотые доли BB внутри): печатаются BB, не масштаб.
+    _defense().model_copy(
+        update={"pot_before": 660, "bet": 330, "pot_before_bb": 6.6, "bet_bb": 3.3}
+    ),
     _threshold(ThresholdOutcome.ABOVE, None),
     _threshold(ThresholdOutcome.UNDECIDED, 42),
 ]

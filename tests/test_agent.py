@@ -33,9 +33,11 @@ from harness.agent.history import (
 )
 from harness.agent.prompt import instructions_for, load_system_prompt
 from harness.agent.run import MAX_CALCS_PER_TURN, REWRITE_HEAD, run_agent_turn
-from harness.contracts import CalcName
+from harness.analysis.frequency import defense_from_bet
+from harness.contracts import CalcName, DefenseResult
 from harness.explanation.agent_checks import agent_context
 from harness.platform.llm import LLM
+from harness.presentation.messages import agent_turn_msg
 from tests.conftest import requires_agent_prompt
 from tests.test_hand_replay import _postflop_hand
 from tests.test_question_routing import _TEST_CFG, _seeded
@@ -528,18 +530,24 @@ def _ctx():
     return agent_context(_result([_point(dp_index=0, ev_diff_bb=-1.4)]), _postflop_hand())
 
 
+# Банк 6.6 и ставка CO 3.0 — как их печатает сводка `_ctx()` («Флоп: … (банк 6.6):
+# … CO бет 3.0»); 7.0 в сводке нет.
+_FROM_HAND = {"pot_before_bb": 6.6, "bet_bb": 3.0}
+_INVENTED = {"pot_before_bb": 7.0, "bet_bb": 3.0}
+
+
 async def test_an_invented_pot_is_refused_by_the_tool_and_allows_nothing(db_factory):
     """Решение контроллера (I2, вариант b): банк и ставку, которых нет ни в
     сводке, ни у игрока, ни в выходе расчётов вечера, инструмент не считает."""
     async with db_factory() as session:
         scope = await _seeded(session, tg_user_id=8131)
         script = _TurnScript([
-            ([("defense_frequency", {"pot_before": 777, "bet": 333})], "Сводка разбора есть."),
+            ([("defense_frequency", _INVENTED)], "Сводка разбора есть."),
         ])
         turn = await _turn(db_factory, session, script, scope=scope, context=_ctx())
     assert turn.results == ()
     assert any("сводк" in r and "игрок" in r for r in script.returns)
-    assert not allowed_from_history(turn.messages) & {777.0, 333.0}
+    assert not allowed_from_history(turn.messages) & {7.0, 3.0}
     assert calcs_in_history(turn.messages) == frozenset()
     assert turn.calls[0]["calc"] == "defense_frequency" and "error" in turn.calls[0]
 
@@ -547,32 +555,96 @@ async def test_an_invented_pot_is_refused_by_the_tool_and_allows_nothing(db_fact
 async def test_an_invented_bet_size_threshold_is_refused(db_factory):
     async with db_factory() as session:
         scope = await _seeded(session, tg_user_id=8132)
-        args = {"stat": "fold_to_cbet", "threshold_source": "bet_size", "pot_before": 777, "bet": 333}
+        args = {"stat": "fold_to_cbet", "threshold_source": "bet_size", **_INVENTED}
         script = _TurnScript([([("frequency_vs_threshold", args)], "Сводка разбора есть.")])
         turn = await _turn(db_factory, session, script, scope=scope, context=_ctx())
     assert turn.results == ()
-    assert not allowed_from_history(turn.messages) & {777.0, 333.0}
+    assert not allowed_from_history(turn.messages) & {7.0, 3.0}
 
 
-async def test_a_pot_from_the_hand_summary_is_computed(db_factory):
-    """Блайнды сводки (50/100) — числа контекста: расчёт идёт."""
+async def test_a_pot_from_the_hand_summary_is_computed_and_shown_in_bb(db_factory):
+    """Банк 6.6 и ставка 3.0 — числа сводки в BB, как их печатает разбор: расчёт
+    идёт, и модель и игрок видят те же BB, а не фишки масштаба (решение
+    контроллера по единицам)."""
     async with db_factory() as session:
         scope = await _seeded(session, tg_user_id=8133)
-        script = _TurnScript([
-            ([("defense_frequency", {"pot_before": 100, "bet": 50})], "Сводка разбора есть."),
-        ])
+        script = _TurnScript([([("defense_frequency", _FROM_HAND)], "Сводка разбора есть.")])
         turn = await _turn(db_factory, session, script, scope=scope, context=_ctx())
     assert [r.calc for r in turn.results] == [CalcName.DEFENSE_FREQUENCY]
+    result = turn.results[0]
+    assert isinstance(result, DefenseResult)
+    assert (result.pot_before, result.bet) == (660, 300)  # сотые доли BB, не фишки руки
+    echoed = script.returns[-1]
+    assert "6.6 BB" in echoed and "3.0 BB" in echoed and "660" not in echoed
+    shown = agent_turn_msg("numbers", None, turn.results, from_context=False, job_id=1).text
+    assert "6.6BB" in shown and "3.0BB" in shown
+    assert "660" not in shown and "300" not in shown
+    assert turn.calls[0]["params"]["sizes_bb"] == {"pot_before_bb": 6.6, "bet_bb": 3.0}
+
+
+async def test_sizes_in_bb_give_the_same_result_as_chips_of_the_same_ratio(db_factory):
+    """Выход защиты зависит только от отношения ставки к банку: 7.7/3.3 BB у
+    агента и 7700/3300 фишек у `/ask` — одни и те же частоты и эквити."""
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8137)
+        script = _TurnScript([
+            ([("defense_frequency", {"pot_before_bb": 7.7, "bet_bb": 3.3})], "Посчитано."),
+        ])
+        turn = await _turn(
+            db_factory, session, script, scope=scope, text="банк 7.7 BB, ставка 3.3 BB"
+        )
+    agent = turn.results[0]
+    chips = defense_from_bet(7700, 3300)
+    assert isinstance(agent, DefenseResult)
+    assert (agent.defend_frequency, agent.fold_frequency, agent.required_equity) == (
+        chips.defend_frequency, chips.fold_frequency, chips.required_equity,
+    )
+
+
+async def test_a_non_positive_size_is_refused_by_the_tool(db_factory):
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8138)
+        script = _TurnScript([
+            ([("defense_frequency", {"pot_before_bb": 6.6, "bet_bb": 0})], "Сводка разбора есть."),
+        ])
+        turn = await _turn(db_factory, session, script, scope=scope, context=_ctx())
+    assert turn.results == ()
+    assert any("положительн" in r for r in script.returns)
+    assert "error" in turn.calls[0]
+
+
+def test_agent_tools_take_sizes_in_bb_and_ask_tools_in_chips():
+    """У агента размеры в BB, как в разборе; `/ask` как был — в фишках."""
+    from harness.calcs.routing import CalcRun, tools_for
+
+    def schemas(run_state):
+        tools = {t.name: t for t in tools_for(None, 1, 1, run_state)}  # type: ignore[arg-type]
+        return {
+            name: tools[name].function_schema.json_schema["properties"]
+            for name in ("defense_frequency", "frequency_vs_threshold")
+        }
+
+    agent = schemas(CalcRun(max_calcs=8, sizes_from=frozenset()))
+    ask = schemas(CalcRun())
+    for props in agent.values():
+        assert "pot_before" not in props and "bet" not in props
+        for key in ("pot_before_bb", "bet_bb"):
+            assert "в BB, как в разборе" in props[key]["description"]
+    assert agent["defense_frequency"]["pot_before_bb"]["type"] == "number"
+    for props in ask.values():
+        assert "pot_before" in props and "bet" in props and "pot_before_bb" not in props
+    assert ask["defense_frequency"]["pot_before"]["type"] == "integer"
 
 
 async def test_a_pot_the_player_typed_is_computed(db_factory):
     async with db_factory() as session:
         scope = await _seeded(session, tg_user_id=8134)
         script = _TurnScript([
-            ([("defense_frequency", {"pot_before": 777, "bet": 333})], "Посчитано."),
+            ([("defense_frequency", {"pot_before_bb": 7.7, "bet_bb": 3.3})], "Посчитано."),
         ])
         turn = await _turn(
-            db_factory, session, script, scope=scope, text="банк 777, ставка 333 — сколько защищать?"
+            db_factory, session, script, scope=scope,
+            text="банк 7.7 BB, ставка 3.3 BB — сколько защищать?",
         )
     assert [r.calc for r in turn.results] == [CalcName.DEFENSE_FREQUENCY]
 
@@ -610,7 +682,7 @@ async def test_a_size_from_an_earlier_calculation_of_the_same_turn_is_computed(d
     async with db_factory() as session:
         scope = await _seeded(session, tg_user_id=8136)
         script = _TurnScript([
-            ([_VPIP, ("defense_frequency", {"pot_before": 100, "bet": 2})], _GOOD),
+            ([_VPIP, ("defense_frequency", {"pot_before_bb": 100, "bet_bb": 2})], _GOOD),
         ])
         turn = await _turn(db_factory, session, script, scope=scope)
     assert [r.calc for r in turn.results] == [CalcName.HERO_FREQUENCY, CalcName.DEFENSE_FREQUENCY]

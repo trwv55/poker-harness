@@ -52,6 +52,7 @@ from harness.contracts import (
     CalcResult,
     CoverageParams,
     DefenseParams,
+    DefenseResult,
     FieldThreshold,
     FrequencyStat,
     HeroFrequencyParams,
@@ -71,6 +72,7 @@ from harness.explanation.question import (
     check_answer,
     question_digest,
     question_prompt,
+    size_bb,
 )
 from harness.explanation.verdict_text import Digest, UnfaithfulText
 from harness.memory.repos import OpponentsRepo
@@ -152,7 +154,14 @@ class CalcRun:
     (`test_a_size_from_an_earlier_calculation_of_the_same_turn_is_computed`).
     Размер не оттуда — инструмент не считает и отвечает модели отказом
     (`test_an_invented_pot_is_refused_by_the_tool_and_allows_nothing`,
-    `test_a_pot_from_the_hand_summary_is_computed`).
+    `test_a_pot_from_the_hand_summary_is_computed_and_shown_in_bb`).
+
+    С `sizes_from` размеры у этих двух инструментов в BB, как в разборе
+    (`pot_before_bb`, `bet_bb`), у `/ask` — в фишках
+    (`test_agent_tools_take_sizes_in_bb_and_ask_tools_in_chips`): сводка печатает
+    суммы в BB, и целые фишки из неё не взять. Внутрь расчёта они идут целыми
+    сотыми долями BB (`_BB_SCALE`); выход зависит только от отношения ставки к
+    банку (`test_sizes_in_bb_give_the_same_result_as_chips_of_the_same_ratio`).
     """
 
     def __init__(self, max_calcs: int = 1, sizes_from: frozenset[float] | None = None) -> None:
@@ -162,19 +171,38 @@ class CalcRun:
         self.digests: list[Digest] = []
         self.calls: list[dict[str, Any]] = []
 
-    def unsourced_sizes(self, calc: CalcName, pot_before: int, bet: int) -> str | None:
-        """Отказ модели, если банк или ставка не из разрешённого источника; `None` —
-        размеры годятся. Отказ пишется в журнал ошибкой вызова."""
+    def unsourced_sizes(self, calc: CalcName, pot_before_bb: float, bet_bb: float) -> str | None:
+        """Отказ модели, если банк или ставка (в BB) не из разрешённого источника;
+        `None` — размеры годятся. Отказ пишется в журнал ошибкой вызова."""
         if self.sizes_from is None:
             return None
         known = self.sizes_from.union(*(digest.allowed for digest in self.digests))
-        missing = [n for n in (pot_before, bet) if float(n) not in known]
+        missing = [n for n in (pot_before_bb, bet_bb) if float(n) not in known]
         if not missing:
             return None
-        refusal = _UNSOURCED_SIZES.format(numbers=", ".join(str(n) for n in missing))
+        return self._size_error(
+            calc, pot_before_bb, bet_bb,
+            _UNSOURCED_SIZES.format(numbers=", ".join(size_bb(n) for n in missing)),
+        )
+
+    def chips_for(
+        self, calc: CalcName, pot_before_bb: float, bet_bb: float
+    ) -> tuple[int, int] | str:
+        """Размеры агента в BB → целые сотые BB для расчёта, либо отказ модели:
+        размер не положителен (`test_a_non_positive_size_is_refused_by_the_tool`)
+        или не из разрешённого источника (`unsourced_sizes`)."""
+        pot, bet = round(pot_before_bb * _BB_SCALE), round(bet_bb * _BB_SCALE)
+        if pot <= 0 or bet <= 0:
+            return self._size_error(calc, pot_before_bb, bet_bb, _NON_POSITIVE_SIZE)
+        refusal = self.unsourced_sizes(calc, pot_before_bb, bet_bb)
+        return refusal if refusal is not None else (pot, bet)
+
+    def _size_error(
+        self, calc: CalcName, pot_before_bb: float, bet_bb: float, refusal: str
+    ) -> str:
         self.calls.append({
             "calc": calc.value,
-            "params": {"pot_before": pot_before, "bet": bet},
+            "params": {"pot_before_bb": pot_before_bb, "bet_bb": bet_bb},
             "error": refusal,
         })
         return refusal
@@ -195,6 +223,14 @@ _UNSOURCED_SIZES = (
     "их там нет — спросите игрока."
 )
 
+_NON_POSITIVE_SIZE = (
+    "Расчёт не выполнен: банк и ставка должны быть положительными, в BB, как в разборе."
+)
+
+# Размер агента в BB идёт в расчёт целыми сотыми долями BB: сводка печатает
+# суммы с одним знаком, и сотые их не искажают.
+_BB_SCALE = 100
+
 _CALC_CAP = "Потолок расчётов на один ответ — {cap}: ответьте по тому, что уже посчитано."
 
 # Зона доверия по инструменту (CLAUDE.md): все шесть расчётов — измерения и
@@ -203,7 +239,11 @@ _TOOL_ZONE: dict[CalcName, Zone] = {name: Zone.STRICT for name in CalcName}
 
 
 async def _perform(
-    db: AsyncSession, player_id: int, run_state: CalcRun, params: CalcParams
+    db: AsyncSession,
+    player_id: int,
+    run_state: CalcRun,
+    params: CalcParams,
+    sizes_bb: tuple[float, float] | None = None,
 ) -> str | ToolReturn:
     """Выполнить расчёт, если потолок не взят, и вернуть модели выжимку его выхода.
 
@@ -217,8 +257,14 @@ async def _perform(
     истории для проверок агента (`test_history_survives_serialization`); что
     модели они не уходят — контракт pydantic-ai (`ToolReturn.metadata`), тестом
     здесь не закреплено.
+
+    `sizes_bb` — банк и ставка агента в BB, как он их передал: журнал пишет их
+    рядом с параметрами, а результат защиты несёт их для показа вместо сотых
+    масштаба (`test_a_pot_from_the_hand_summary_is_computed_and_shown_in_bb`).
     """
     params_json = params.model_dump(mode="json")
+    if sizes_bb is not None:
+        params_json["sizes_bb"] = {"pot_before_bb": sizes_bb[0], "bet_bb": sizes_bb[1]}
     if len(run_state.results) >= run_state.max_calcs:
         run_state.calls.append({"calc": params.calc.value, "params": params_json, "refused": True})
         if run_state.max_calcs == 1:
@@ -235,6 +281,8 @@ async def _perform(
             "duration_s": round(time.monotonic() - started, 3),
         })
         return f"Расчёт не выполнен: {exc}"
+    if sizes_bb is not None and isinstance(result, DefenseResult):
+        result = result.model_copy(update={"pot_before_bb": sizes_bb[0], "bet_bb": sizes_bb[1]})
     digest = question_digest(result)
     run_state.results.append(result)
     run_state.digests.append(digest)
@@ -383,11 +431,65 @@ def tools_for(
             pot_before: банк в фишках ДО ставки соперника.
             bet: размер ставки соперника в фишках.
         """
-        refusal = run_state.unsourced_sizes(CalcName.DEFENSE_FREQUENCY, pot_before, bet)
-        if refusal is not None:
-            return refusal
         return await _perform(
             db, player_id, run_state, DefenseParams(pot_before=pot_before, bet=bet)
+        )
+
+    async def defense_frequency_bb(pot_before_bb: float, bet_bb: float) -> str | ToolReturn:
+        """Требуемая частота защиты против ставки — арифметика, данных не требует.
+
+        Args:
+            pot_before_bb: банк ДО ставки соперника — в BB, как в разборе.
+            bet_bb: размер ставки соперника — в BB, как в разборе.
+        """
+        sized = run_state.chips_for(CalcName.DEFENSE_FREQUENCY, pot_before_bb, bet_bb)
+        if isinstance(sized, str):
+            return sized
+        return await _perform(
+            db, player_id, run_state, DefenseParams(pot_before=sized[0], bet=sized[1]),
+            sizes_bb=(pot_before_bb, bet_bb),
+        )
+
+    async def threshold(
+        stat: FrequencyStat,
+        subject: Subject,
+        sizes: tuple[int, int] | None,
+        side: ThresholdSide,
+        opponent: str | None,
+        position: str | None,
+        window: WindowArg,
+        sizes_bb: tuple[float, float] | None = None,
+    ) -> str | ToolReturn:
+        """Общее тело `frequency_vs_threshold`; `sizes` — банк и ставка для расчёта,
+        `None` — порог `field`."""
+        opponent_id: int | None = None
+        if subject is Subject.OPPONENT:
+            if opponent is None:
+                return (
+                    "Для частоты конкретного оппонента нужен его ник в руме; "
+                    "без ника считается поле (`subject=field`)."
+                )
+            opponent_id = await _opponent_id(db, player_id, opponent)
+            if opponent_id is None:
+                return _unknown_opponent(opponent)
+        chosen: BetSizeThreshold | FieldThreshold = (
+            BetSizeThreshold(pot_before=sizes[0], bet=sizes[1], side=side)
+            if sizes is not None
+            else FieldThreshold()
+        )
+        return await _perform(
+            db,
+            player_id,
+            run_state,
+            ThresholdParams(
+                subject=subject,
+                stat=stat,
+                opponent_id=opponent_id,
+                position=position,
+                window=_window(window, session_id),
+                threshold=chosen,
+            ),
+            sizes_bb=sizes_bb,
         )
 
     async def frequency_vs_threshold(
@@ -415,53 +517,67 @@ def tools_for(
             position: позиция за столом; без неё — все позиции.
             window: `evening` — текущий вечер, `all` — вся история разборов.
         """
-        opponent_id: int | None = None
-        if subject is Subject.OPPONENT:
-            if opponent is None:
-                return (
-                    "Для частоты конкретного оппонента нужен его ник в руме; "
-                    "без ника считается поле (`subject=field`)."
-                )
-            opponent_id = await _opponent_id(db, player_id, opponent)
-            if opponent_id is None:
-                return _unknown_opponent(opponent)
+        sizes: tuple[int, int] | None = None
         if threshold_source == "bet_size":
             if pot_before is None or bet is None:
                 return (
                     "Порог от размера ставки требует банка до ставки и самой ставки "
                     "в фишках."
                 )
-            refusal = run_state.unsourced_sizes(
-                CalcName.FREQUENCY_VS_THRESHOLD, pot_before, bet
+            sizes = (pot_before, bet)
+        return await threshold(stat, subject, sizes, side, opponent, position, window)
+
+    async def frequency_vs_threshold_bb(
+        stat: FrequencyStat,
+        subject: Subject = Subject.HERO,
+        threshold_source: Literal["bet_size", "field"] = "field",
+        pot_before_bb: float | None = None,
+        bet_bb: float | None = None,
+        side: ThresholdSide = ThresholdSide.FOLD,
+        opponent: str | None = None,
+        position: str | None = None,
+        window: WindowArg = "all",
+    ) -> str | ToolReturn:
+        """Частота против порога: утверждение либо число недостающих наблюдений.
+
+        Args:
+            stat: какая частота измеряется.
+            subject: чья частота — `hero`, `opponent` или `field`.
+            threshold_source: `bet_size` — арифметика от размера ставки,
+                `field` — измеренная частота поля.
+            pot_before_bb: банк до ставки — в BB, как в разборе; нужен при `bet_size`.
+            bet_bb: размер ставки — в BB, как в разборе; нужен при `bet_size`.
+            side: какая из двух арифметических частот берётся порогом.
+            opponent: ник в руме; нужен при `subject=opponent`.
+            position: позиция за столом; без неё — все позиции.
+            window: `evening` — текущий вечер, `all` — вся история разборов.
+        """
+        if threshold_source != "bet_size":
+            return await threshold(stat, subject, None, side, opponent, position, window)
+        if pot_before_bb is None or bet_bb is None:
+            return (
+                "Порог от размера ставки требует банка до ставки и самой ставки "
+                "в BB, как в разборе."
             )
-            if refusal is not None:
-                return refusal
-            threshold: BetSizeThreshold | FieldThreshold = BetSizeThreshold(
-                pot_before=pot_before, bet=bet, side=side
-            )
-        else:
-            threshold = FieldThreshold()
-        return await _perform(
-            db,
-            player_id,
-            run_state,
-            ThresholdParams(
-                subject=subject,
-                stat=stat,
-                opponent_id=opponent_id,
-                position=position,
-                window=_window(window, session_id),
-                threshold=threshold,
-            ),
+        sized = run_state.chips_for(CalcName.FREQUENCY_VS_THRESHOLD, pot_before_bb, bet_bb)
+        if isinstance(sized, str):
+            return sized
+        return await threshold(
+            stat, subject, sized, side, opponent, position, window,
+            sizes_bb=(pot_before_bb, bet_bb),
         )
 
+    # Агент (`sizes_from` задан) получает размеры в BB, `/ask` — в фишках.
+    in_bb = run_state.sizes_from is not None
     by_name: dict[CalcName, Any] = {
         CalcName.HERO_FREQUENCY: hero_frequency,
         CalcName.OPPONENT_FREQUENCY: opponent_frequency,
         CalcName.COVERAGE: coverage,
         CalcName.LEAKS: leaks,
-        CalcName.DEFENSE_FREQUENCY: defense_frequency,
-        CalcName.FREQUENCY_VS_THRESHOLD: frequency_vs_threshold,
+        CalcName.DEFENSE_FREQUENCY: defense_frequency_bb if in_bb else defense_frequency,
+        CalcName.FREQUENCY_VS_THRESHOLD: (
+            frequency_vs_threshold_bb if in_bb else frequency_vs_threshold
+        ),
     }
     return [
         Tool(function, name=name.value, max_retries=_TOOL_RETRIES)

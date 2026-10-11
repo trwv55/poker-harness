@@ -256,11 +256,19 @@ class DefenseResult(BaseModel):
     тем самым вызовом, с приведённым к его виду банком.
 
     `defend_frequency` + `fold_frequency` = 1.
+
+    `pot_before_bb` / `bet_bb` — размеры так, как их передал агент: в BB, как в
+    разборе. Тогда `pot_before` / `bet` — они же в сотых долях BB (масштаб, а не
+    фишки руки), и показываются игроку и модели именно BB
+    (`test_a_pot_from_the_hand_summary_is_computed_and_shown_in_bb`). У `/ask` оба
+    `None`, размеры в фишках.
     """
 
     calc: CalcName
     pot_before: int
     bet: int
+    pot_before_bb: float | None = None
+    bet_bb: float | None = None
     defend_frequency: float
     fold_frequency: float
     required_equity: float
