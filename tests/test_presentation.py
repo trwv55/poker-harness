@@ -371,7 +371,7 @@ def test_the_hand_analysis_has_status_line_with_zone_time_and_quota():
     msg = _deep_dive(res)
     assert "⏱ 12с" in msg.text
     assert "зона: строго" in msg.text
-    assert "разборов 17/50 за 24 ч" in msg.text
+    assert "запросов 17/50 за 24 ч" in msg.text
 
 
 def test_the_hand_analysis_status_line_shows_assuming_zone_word():
@@ -456,6 +456,12 @@ def test_failed_msg_carries_the_public_reason_with_no_buttons():
     msg = failed_msg("стол расходится с движком по деньгам")
     assert "стол расходится с движком по деньгам" in msg.text
     assert msg.buttons == []
+
+
+def test_failed_msg_of_an_agent_turn_speaks_of_the_question_not_of_a_hand():
+    assert failed_msg("сбой", "agent").text == "Не получилось ответить на вопрос: сбой"
+    assert failed_msg("сбой", "deep_dive").text == "Не получилось разобрать раздачу: сбой"
+    assert failed_msg("сбой").text == "Не получилось разобрать раздачу: сбой"
 
 
 def test_quota_exceeded_msg_states_hours_and_window():
@@ -818,7 +824,7 @@ def test_a_hand_too_long_for_one_message_goes_out_in_two():
     assert len(first.text) <= 4096 and len(second.text) <= 4096
     assert first.text.startswith("Что было:\n")
     assert "Сверка денег с источником" in first.text, "сверка несжимаема и живёт в первом"
-    assert "разборов 17/50" in first.text, "статус-строка не уезжает"
+    assert "запросов 17/50" in first.text, "статус-строка не уезжает"
     assert first.buttons and not second.buttons
     head, blank, rest = second.text.split("\n", 2)
     assert head == f"Рука {res.hand_no}, продолжение разбора:", (
@@ -1642,7 +1648,7 @@ def test_settings_msg_shows_the_nickname_the_quota_and_a_button_to_change_it():
     unknown = settings_msg(None, 17, 50)
 
     assert "Ник в руме: screen_nick" in known.text
-    assert "разборов 17/50 за 24 ч" in known.text
+    assert "запросов 17/50 за 24 ч" in known.text
     assert known.buttons[0][0].callback_data == "setnick"
     assert "не задан" in unknown.text
     assert unknown.buttons[0][0].text == "✏️ Указать ник"
@@ -2547,3 +2553,84 @@ def test_settings_msg_offers_the_note_colours():
     assert ("🎨 Цвета заметок", SETTINGS_COLORS_DATA) in [
         (b.text, b.callback_data) for row in msg.buttons for b in row
     ]
+
+
+# --- ответ агента (план агента, Task 5) ------------------------------------------------
+
+
+def test_the_agent_answer_names_every_calculation_and_carries_the_button():
+    from harness.presentation import AGENT_MISS_PREFIX, agent_turn_msg
+    from tests.test_question_text import _frequency, _leaks
+
+    msg = agent_turn_msg("prose", "Синтетический ответ.", [_frequency(), _leaks()], from_context=False, job_id=7)
+    assert msg.text.startswith("Синтетический ответ.")
+    assert "Посчитано: ваша частота, типы расхождений." in msg.text
+    assert [b.callback_data for row in msg.buttons for b in row] == [f"{AGENT_MISS_PREFIX}7"]
+
+
+def test_the_agent_numbers_without_prose_show_the_calculation_and_the_button():
+    from harness.presentation import agent_turn_msg
+    from tests.test_question_text import _frequency
+
+    msg = agent_turn_msg("numbers", None, [_frequency()], from_context=False, job_id=7)
+    assert "5 из 7" in msg.text and msg.buttons
+
+
+def test_the_agent_numbers_without_a_calculation_show_the_list():
+    from harness.presentation import agent_turn_msg
+
+    msg = agent_turn_msg("numbers", None, [], from_context=True, job_id=7)
+    assert "не прошёл проверку чисел" in msg.text
+    assert "Посчитать могу:" in msg.text
+    assert "Посчитано:" not in msg.text and not msg.buttons
+
+
+def test_the_agent_refusal_lists_what_can_be_counted_and_has_no_button():
+    from harness.presentation import agent_turn_msg
+
+    msg = agent_turn_msg("refusal", "это не покажут", [], from_context=False, job_id=7)
+    assert "Посчитать могу:" in msg.text and not msg.buttons
+    assert "это не покажут" not in msg.text
+
+
+def test_an_answer_from_the_hand_says_so_in_its_signature():
+    from harness.presentation import agent_turn_msg
+
+    msg = agent_turn_msg("prose", "Синт.", [], from_context=True, job_id=7)
+    assert "Посчитано: разбор раздачи." in msg.text
+
+
+def test_an_answer_from_an_earlier_calculation_says_so_in_its_signature():
+    from harness.presentation import agent_turn_msg
+
+    msg = agent_turn_msg("prose", "Синт.", [], from_context=False, job_id=7)
+    assert "Посчитано: расчёты выше в этом разговоре." in msg.text
+
+
+def test_a_long_agent_answer_fits_one_message_by_cutting_the_prose():
+    from harness.presentation import agent_turn_msg
+    from tests.test_question_text import _frequency
+
+    msg = agent_turn_msg("prose", "слово " * 2000, [_frequency()], from_context=False, job_id=7)
+    assert len(msg.text) <= 4096
+    assert "Посчитано: ваша частота." in msg.text and "5 из 7" in msg.text
+
+
+def test_a_huge_list_of_numbers_still_fits_one_message():
+    from harness.presentation import agent_turn_msg
+    from tests.test_question_text import _frequency
+
+    msg = agent_turn_msg(
+        "numbers", None, [_frequency()] * 400, from_context=False, job_id=7
+    )
+    assert len(msg.text) <= 4096
+    assert msg.text.startswith("Посчитано: ваша частота.")
+    assert "показано не целиком" in msg.text
+
+
+def test_a_calculation_called_twice_is_named_once_in_the_signature():
+    from harness.presentation import agent_turn_msg
+    from tests.test_question_text import _frequency
+
+    msg = agent_turn_msg("prose", "Синт.", [_frequency(), _frequency()], from_context=False, job_id=7)
+    assert "Посчитано: ваша частота." in msg.text

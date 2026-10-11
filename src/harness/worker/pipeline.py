@@ -1453,7 +1453,7 @@ async def _notify_failure(deps: Deps, job: JobModel, reason: str) -> None:
                 job.locked_by,
                 "result_message_id",
                 chat_id,
-                failed_msg(reason),
+                failed_msg(reason, job.type),
             )
     except Exception:  # noqa: BLE001 — намеренно: сбой уведомления не должен
         # уронить обработку провала задачи (задача уже честно `failed` в БД,
@@ -1494,7 +1494,7 @@ async def notify_reaped_failures(deps: Deps, job_ids: Sequence[int]) -> None:
                     None,
                     "result_message_id",
                     chat_id,
-                    failed_msg(_PUBLIC_FAILURE_REASON_DEFAULT),
+                    failed_msg(_PUBLIC_FAILURE_REASON_DEFAULT, job.type),
                 )
         except Exception:  # noqa: BLE001 — уведомление best-effort, как `_notify_failure`
             _log.exception("reaped_job_notify_failed", job_id=job_id)

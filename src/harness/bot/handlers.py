@@ -64,6 +64,7 @@ from harness.memory.repos import (
 from harness.parsers.vision_adapter import apply_vision_answer
 from harness.platform.queue import JobsQueue
 from harness.presentation import (
+    AGENT_MISS_PREFIX,
     DISAGREE_PREFIX,
     NEW_SESSION_DATA,
     NOTE_ADD_PREFIX,
@@ -79,6 +80,8 @@ from harness.presentation import (
     SET_NICKNAME_DATA,
     SETTINGS_COLORS_DATA,
     Msg,
+    agent_miss_saved_msg,
+    agent_turn_unavailable_msg,
     alias_bound_msg,
     alias_no_analysis_msg,
     alias_position_unknown_msg,
@@ -198,6 +201,7 @@ UI_CALLBACK_PREFIXES: tuple[str, ...] = (
     SET_NICKNAME_DATA,
     RANGES_PREFIX,
     DISAGREE_PREFIX,
+    AGENT_MISS_PREFIX,
 )
 
 # PokerCraft отдаёт историю раздач текстом; всё остальное сканировать нечем.
@@ -699,8 +703,8 @@ async def handle_question_command(deps: BotDeps, tg_user_id: int, args: str = ""
 
     **Дневной лимит разборов вопрос не тратит** (`QUOTA_INTERACTIVE_JOB_TYPES`
     его не перечисляет, `test_a_question_does_not_spend_the_daily_quota`):
-    счётчик подписан «разборов X/Y», и списывать с него вопрос значило бы
-    показывать игроку число, которое не означает того, что написано рядом.
+    счётчик подписан «запросов X/Y»; `/ask` в него не входит — решение принято
+    до агента и планом агента не пересматривается.
 
     `None` — то же сознательное молчание, что у кнопки «разобрать»: дальше
     говорит воркер.
@@ -870,7 +874,7 @@ async def handle_escalation_callback(deps: BotDeps, tg_user_id: int, data: str) 
 
 
 async def handle_text(deps: BotDeps, tg_user_id: int, text: str) -> Msg | None:
-    """Обычное сообщение: кнопка меню, начатый ввод, число по эскалации — в этом порядке.
+    """Обычное сообщение: кнопка меню, начатый ввод, число по эскалации, агент — в этом порядке.
 
     **Порядок не произволен.** Нижнее меню Телеграма присылает нажатие ОБЫЧНЫМ
     текстом, поэтому подпись кнопки проверяется первой: игрок, нажавший «Мои
@@ -893,7 +897,10 @@ async def handle_text(deps: BotDeps, tg_user_id: int, text: str) -> Msg | None:
 
     **Ник больше не берётся из первого текста** (решение владельца 2026-09-07):
     ввод открывается только `/nick` или кнопкой в «Настройках», и текст без
-    начатого ввода получает честное «не понял», а не тихо оказывается в профиле.
+    начатого ввода у игрока без доступа к агенту (`agent_enabled`) получает
+    честное «не понял», а не тихо оказывается в профиле; у игрока с доступом он
+    уходит агенту (`test_free_text_of_a_dev_becomes_an_agent_job`). Возвращает
+    `None`, когда задача агента поставлена: дальше говорит воркер.
     """
     answer = text.strip()
     async with deps.db_factory() as db:
@@ -931,9 +938,34 @@ async def handle_text(deps: BotDeps, tg_user_id: int, text: str) -> Msg | None:
             await deps.queue.resume(job_id)
             return vision_answer_saved_msg()
 
-        reply = await _apply_pending_input(db, player, pending, answer)
+        if not agent_enabled(player) or not answer:
+            reply = await _apply_pending_input(db, player, pending, answer)
+            await db.commit()
+            return reply
+        if len(answer) > MAX_QUESTION_CHARS:
+            await db.commit()
+            return question_too_long_msg(MAX_QUESTION_CHARS)
+        player_id = player.id
         await db.commit()
-    return reply
+
+    # Квота — до заведения сессии и с той же оговоркой о мягком пределе, что у
+    # `handle_deep_dive_callback`.
+    quota = await check_quota(deps, player_id)
+    if not quota.allowed:
+        return quota_exceeded_msg(quota.hours_to_free)
+    async with deps.db_factory() as db:
+        session_id = (await SessionsRepo(db).active_or_create(player_id)).id
+        await db.commit()
+    await deps.queue.enqueue(
+        type="agent", player_id=player_id, session_id=session_id, payload={"text": answer}
+    )
+    return None
+
+
+def agent_enabled(player: Player) -> bool:
+    """Достаётся ли свободный текст агенту. Единственное место решения о доступе:
+    открытие агента игрокам — правка этой строки (Task 6 плана агента)."""
+    return player.is_dev
 
 
 async def _apply_pending_input(
@@ -1142,7 +1174,40 @@ async def _dispatch_ui(deps: BotDeps, db: AsyncSession, player: Player, data: st
         return await _ranges_reply(db, player, data.removeprefix(RANGES_PREFIX))
     if data.startswith(DISAGREE_PREFIX):
         return await _disagree_reply(db, player, data.removeprefix(DISAGREE_PREFIX))
+    if data.startswith(AGENT_MISS_PREFIX):
+        return await _agent_miss_reply(db, player, data.removeprefix(AGENT_MISS_PREFIX))
     return None
+
+
+async def _agent_miss_reply(db: AsyncSession, player: Player, raw_id: str) -> Msg:
+    """«Не то посчитано»: ход агента — в `eval_cases` кандидатом в набор маршрутизации.
+
+    Номер задачи приходит из кнопки (внешний мир) и сверяется с игроком в
+    `JobsRepo.agent_turn`
+    (`test_the_wrong_calculation_button_of_another_player_writes_nothing`).
+    Руки у вопроса может не быть — `hand_id` пуст. Отклонённые черновики
+    (`drafts`) копируются вместе с остальным: они не видны игроку, а оценке
+    маршрута нужны.
+    """
+    job_id = _button_number(raw_id)
+    record = None if job_id is None else await JobsRepo(db).agent_turn(job_id, player.id)
+    if record is None:
+        return agent_turn_unavailable_msg()
+    await EvalCasesRepo(db).add(
+        kind="agent_routing",
+        hand_id=None,
+        ground_truth={
+            "job_id": record.job_id,
+            "trace_id": record.trace_id,
+            "question": record.question,
+            "calls": record.turn.get("calls", []),
+            "answer": record.turn.get("answer"),
+            "state": record.turn.get("state"),
+            "drafts": record.turn.get("drafts", []),
+        },
+        source="agent_miss_button",
+    )
+    return agent_miss_saved_msg()
 
 
 async def _note_prompt_from_button(db: AsyncSession, player: Player, rest: str) -> Msg:

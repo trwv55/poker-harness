@@ -170,6 +170,7 @@ from harness.presentation.keyboards import (
     MENU_TOURNAMENT,
     NOTE_COLOR_UNSET,
     Btn,
+    agent_miss_button,
     deep_dive_button,
     escalation_buttons,
     note_buttons_for_hand,
@@ -505,7 +506,7 @@ def _plural_form(count: int, one: str, few: str, many: str) -> str:
 
 
 def _quota_line(quota_left: int, quota_total: int) -> str:
-    return f"разборов {quota_left}/{quota_total} за 24 ч"
+    return f"запросов {quota_left}/{quota_total} за 24 ч"
 
 
 def progress_text(
@@ -1707,8 +1708,14 @@ def escalation_msg(job_id: int, field: str, question: str, options: list[str]) -
     return Msg(text=question, buttons=[escalation_buttons(job_id, field, options)])
 
 
-def failed_msg(reason_public: str) -> Msg:
-    """Разбор не удался — честная причина без внутренней кухни, без кнопок."""
+def failed_msg(reason_public: str, job_type: str | None = None) -> Msg:
+    """Задача не удалась — честная причина без внутренней кухни, без кнопок.
+
+    Ход агента — не разбор раздачи, и слова о раздаче в его провале были бы
+    неправдой (`test_a_failed_agent_turn_does_not_speak_of_a_hand`).
+    """
+    if job_type == "agent":
+        return Msg(text=f"Не получилось ответить на вопрос: {reason_public}")
     return Msg(text=f"Не получилось разобрать раздачу: {reason_public}")
 
 
@@ -1727,8 +1734,8 @@ def quota_exceeded_msg(hours_to_free: int) -> Msg:
     """Квота исчерпана — время возврата вместо остатка (он уже нулевой), без кнопок."""
     return Msg(
         text=(
-            f"Дневной лимит разборов исчерпан. Следующий будет доступен через "
-            f"{hours_to_free} ч — лимит считается за скользящие 24 ч."
+            f"Дневной лимит запросов исчерпан. Следующий запрос — через "
+            f"{hours_to_free} ч, лимит считается за скользящие 24 ч."
         )
     )
 
@@ -2611,6 +2618,9 @@ def invite_created_msg(code: str) -> Msg:
 def unknown_text_msg() -> Msg:
     """Текст, который ничего не значит: ни меню, ни ответ на вопрос бота.
 
+    Так отвечают игроку без доступа к агенту; у игрока с доступом свободный
+    текст уходит агенту (`handlers.agent_enabled`).
+
     До задачи 23 такое сообщение молча становилось ником в руме. Молчание было
     бы вторым плохим ответом: игрок не знает, услышали ли его.
     """
@@ -2941,25 +2951,59 @@ def agent_turn_msg(
     from_context: bool,
     job_id: int,
 ) -> Msg:
-    """Ответ агента. Временное тело (план агента, Task 4): кнопку, подпись по
-    разбору и бюджет сообщения добавляет Task 5.
+    """Ответ агента — одно из трёх состояний (спека агента, §7).
 
-    Подпись «Посчитано: …» — все расчёты хода, по `CalcResult.calc`
-    (`test_an_agent_job_answers_journals_and_keeps_the_evening_history`).
+    Подпись «Посчитано: …» собирает код по `CalcResult.calc` всех расчётов
+    хода, модель в ней не участвует. В тесноте режется проза, а если и числа не
+    влезают — они, с маркером; подпись не режется никогда
+    (`test_a_long_agent_answer_fits_one_message_by_cutting_the_prose`,
+    `test_a_huge_list_of_numbers_still_fits_one_message`).
+
+    Числа без прозы и без единого расчёта в ходе (ответ опирался на разбор или
+    на прошлый расчёт) чисел не печатают: говорят, что проверку чисел ответ не
+    прошёл, и дают список того, что можно посчитать; кнопки нет, считать было
+    нечего (`test_the_agent_numbers_without_a_calculation_show_the_list`).
     """
     if state == "refusal":
-        return question_refusal_msg()
-    lines: list[str] = []
-    if state == "prose" and prose and prose.strip():
-        lines += [prose.strip(), ""]
+        return agent_refusal_msg()
+    if state == "numbers" and not results:
+        return Msg(text=_AGENT_NUMBERS_UNCHECKED + "\n\n" + _WHAT_CAN_BE_COUNTED)
     if results:
-        lines.append("Посчитано: " + ", ".join(_CALC_WORD[r.calc] for r in results) + ".")
-        if state == "numbers":
-            for result in results:
-                lines.extend(line for line in _calc_answer(result) if line)
-    elif state == "numbers":
-        lines.append("Ответ не прошёл проверку чисел, а расчётов в нём не было.")
-    return Msg(text="\n".join(lines).strip())
+        # Расчёт, вызванный дважды, называется один раз: подпись — какие
+        # расчёты, а не сколько раз.
+        names = list(dict.fromkeys(_CALC_WORD[r.calc] for r in results))
+        signature = "Посчитано: " + ", ".join(names) + "."
+    elif from_context:
+        signature = "Посчитано: разбор раздачи."
+    else:
+        signature = "Посчитано: расчёты выше в этом разговоре."
+    numbers = [line for result in results for line in _calc_answer(result) if line]
+    numbers_text = _fitted("\n".join(numbers), _TELEGRAM_TEXT_LIMIT - len(signature) - 1)
+    tail = "\n".join([signature, numbers_text] if numbers_text else [signature])
+    head = ""
+    if state == "prose" and prose and prose.strip():
+        budget = _TELEGRAM_TEXT_LIMIT - len(tail) - 2
+        if budget > 0:
+            head = _fitted(prose.strip(), budget) + "\n\n"
+    return Msg(text=head + tail, buttons=[[agent_miss_button(job_id)]])
+
+
+_AGENT_NUMBERS_UNCHECKED = "Ответ не прошёл проверку чисел, и показать мне нечего."
+
+
+def agent_refusal_msg() -> Msg:
+    """Ни расчёта, ни разбора — текста модели ни строки, и список того, что есть."""
+    return Msg(text="На это у меня нет ни расчёта, ни разбора.\n\n" + _WHAT_CAN_BE_COUNTED)
+
+
+def agent_miss_saved_msg() -> Msg:
+    """Ответ на «Не то посчитано»: ход записан кандидатом в набор маршрутизации."""
+    return Msg(text="Записал: посчитано не то. Это пойдёт в проверку.")
+
+
+def agent_turn_unavailable_msg() -> Msg:
+    """Кнопка «Не то посчитано» нажата, а хода агента по ней нет (чужой или пропавший)."""
+    return Msg(text="Этого ответа у меня не сохранилось.")
 
 
 def question_usage_msg() -> Msg:

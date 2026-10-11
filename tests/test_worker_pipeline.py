@@ -598,7 +598,7 @@ async def test_a_job_failed_by_the_reaper_tells_its_player_once(db_factory, fake
     await notify_reaped_failures(deps, reaped.failed)
 
     assert [msg.text for msg in fake_sender.sent] == [
-        "Не получилось разобрать раздачу: внутренняя ошибка сервиса"
+        "Не получилось ответить на вопрос: внутренняя ошибка сервиса"
     ]
     assert fake_sender.edits == []
     assert (await job_status(db_factory, exhausted)) == "failed"
@@ -885,6 +885,27 @@ async def test_hh_scan_closes_transaction_before_executor_call(
 
     assert (await job_status(db_factory, jid)) == "done"
     assert spy_executor.in_transaction_at_submit is False
+
+
+async def test_a_failed_agent_turn_does_not_speak_of_a_hand(
+    db_factory, fake_sender, queue, deps, monkeypatch
+):
+    """Провал хода агента говорит о вопросе, провал разбора — о раздаче."""
+    player_id, session_id = await _make_scope(db_factory)
+    jid = await queue.enqueue(
+        type="agent", player_id=player_id, session_id=session_id, payload={"text": "синт"}
+    )
+
+    async def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("синтетический сбой")
+
+    monkeypatch.setattr(pipeline_module, "_dispatch", _boom)
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    assert (await job_status(db_factory, jid)) == "failed"
+    assert fake_sender.sent[-1].text.startswith("Не получилось ответить на вопрос:")
 
 
 # --- дедлайн задачи: зависшая станция не висит вечно -------------------------------
