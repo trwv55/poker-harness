@@ -11,10 +11,10 @@ schema, prompt=..., images=...) -> (schema_instance, meta)`. Всё, что де
    источником истины не является (спека §7 дословно).
 2. **Каждая попытка обращения к модели — своя строка `llm_calls`**, вставленная ДО
    вызова (`status='started'`) и обновлённая по завершении. "Попытка" здесь — именно
-   одно HTTP-обращение к провайдеру: и бэкофф-ретрай на 429/5xx, и ретрай на
-   невалидную схему — это РАЗНЫЕ попытки, каждая логируется отдельно, иначе окно
-   темпа (`PgLimiter`, считает по `llm_calls`) занижает нагрузку ровно там, где она
-   реальна.
+   одно HTTP-обращение к провайдеру, включая каждый запрос внутри прогона с
+   инструментами: и бэкофф-ретрай на 429/5xx, и ретрай на невалидную схему — это
+   РАЗНЫЕ попытки, каждая логируется отдельно, иначе окно темпа (`PgLimiter`,
+   считает по `llm_calls`) занижает нагрузку ровно там, где она реальна.
 3. **Два независимых механизма ретрая**, оба из спеки §7 дословно:
    - бэкофф с джиттером на 429/5xx (`ModelHTTPError`) — до `_MAX_HTTP_ATTEMPTS`
      попыток ОДНОЙ и той же попытки понять модель, пауза растёт как 2^n;
@@ -37,10 +37,15 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Literal, TypeVar
 
+import anyio
 from pydantic import BaseModel
 from pydantic_ai import Agent, BinaryContent
+from pydantic_ai._genai_prices import fill_response_cost
 from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
-from pydantic_ai.models import Model
+from pydantic_ai.messages import ModelMessage, ModelResponse
+from pydantic_ai.models import Model, ModelRequestParameters
+from pydantic_ai.models.wrapper import WrapperModel
+from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import Tool
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -133,6 +138,14 @@ class CallMeta:
     effort), не выставленный провайдером счёт: CLAUDE.md запрещает выдумывать
     денежные числа, и непомеченная оценка в колонке `llm_calls.cost` была бы ровно
     такой выдумкой. Годится для приблизительного мониторинга, не для биллинга.
+
+    `latency_ms` — длительность прогона целиком, со всеми запросами к провайдеру и
+    вызовами инструментов внутри; длительность каждого запроса — в его строке
+    `llm_calls`.
+
+    `messages` — `result.all_messages()` удачного прогона: переданная история плюс
+    сообщения этого хода
+    (`test_the_history_reaches_the_model_and_comes_back_with_the_new_turn`).
     """
 
     model: str
@@ -140,6 +153,7 @@ class CallMeta:
     tokens_out: int
     cost_usd: float | None
     latency_ms: int
+    messages: tuple[ModelMessage, ...] = ()
 
 
 class LLMSchemaError(Exception):
@@ -244,12 +258,15 @@ class LLM:
             "verdict_text",
             "tournament_text",
             "question_answer",
+            "agent",
         ],
         schema: type[T],
         *,
         prompt: str,
         images: Sequence[bytes] = (),
         tools: Sequence[Tool[None]] = (),
+        message_history: Sequence[ModelMessage] = (),
+        instructions: str | None = None,
         trace_id: int,
     ) -> tuple[T, CallMeta]:
         """`trace_id` — обязательный параметр каждого вызова, а не конструктора:
@@ -279,7 +296,7 @@ class LLM:
 
         Внутри же этой точки бюджет АБСОЛЮТНЫЙ, а не накопитель одного лишь
         времени ожидания лимитера (round 4, Item 1): время самого ответа
-        модели (`agent.run()` внутри `_attempt`) и бэкофф-паузы между
+        модели (каждый запрос внутри `agent.run()`) и бэкофф-паузы между
         HTTP-попытками утекают из тех же 120с, потому что часы между попытками
         не останавливаются — здоровый, но медленный провайдер оставляет
         следующей попытке МЕНЬШЕ бюджета `slot()`, не отдельный полный. Это
@@ -287,19 +304,19 @@ class LLM:
         — в докстринге `limiter._ACQUIRE_TIMEOUT_S`.
 
         `tools` — инструменты, которые модель вправе позвать внутри одного
-        `agent.run()`. Что вызов с инструментами обращается к провайдеру
-        БОЛЬШЕ одного раза (ответ с вызовом инструмента, затем ответ по его
-        результату), а строка `llm_calls` на них по-прежнему одна, закреплено
-        `test_a_tool_call_round_trip_logs_one_row`: окно темпа `PgLimiter`
-        считает такой вызов за один.
+        `agent.run()`. Вызов с инструментами обращается к провайдеру БОЛЬШЕ
+        одного раза (ответ с вызовом инструмента, затем ответ по его
+        результату), и на каждый запрос своя строка `llm_calls`
+        (`test_a_turn_with_two_tool_calls_logs_three_requests`,
+        `test_a_tool_call_round_trip_logs_a_row_per_request`).
+
+        `message_history` уходит модели перед `prompt`, `instructions` — в
+        инструкции этого прогона (`test_instructions_reach_the_model`).
         """
         model: Model | str = (
             self._model_override if self._model_override is not None else self._resolve_model(purpose)
         )
         provider, model_name = _describe_model(model)
-        agent: Agent[None, T] = Agent(
-            model, output_type=schema, retries=0, tools=tools, deps_type=type(None)
-        )
         user_prompt: list[str | BinaryContent] = [
             prompt,
             *(
@@ -310,17 +327,28 @@ class LLM:
 
         async with self._local_semaphore:
             deadline = time.monotonic() + _limiter_module._ACQUIRE_TIMEOUT_S
+            metered = _MeteredModel(
+                model,
+                llm=self,
+                trace_id=trace_id,
+                purpose=purpose,
+                provider=provider,
+                model_name=model_name,
+                deadline=deadline,
+            )
+            agent: Agent[None, T] = Agent(
+                metered,
+                output_type=schema,
+                retries=0,
+                tools=tools,
+                deps_type=type(None),
+                instructions=instructions,
+            )
             last_schema_error: UnexpectedModelBehavior | None = None
             for _schema_attempt in range(_MAX_SCHEMA_ATTEMPTS):
                 try:
                     return await self._attempt(
-                        agent,
-                        user_prompt,
-                        trace_id=trace_id,
-                        purpose=purpose,
-                        provider=provider,
-                        model_name=model_name,
-                        deadline=deadline,
+                        agent, metered, user_prompt, message_history, model_name
                     )
                 except UnexpectedModelBehavior as exc:
                     last_schema_error = exc
@@ -340,7 +368,8 @@ class LLM:
 
         Остальные назначения берут `LLM_VERDICT_MODEL`, и она обязательна:
         на неё падает `question_answer` — единственный вызов модели, который
-        конвейер сегодня делает.
+        конвейер сегодня делает, кроме агента, у которого своя модель
+        (`LLM_AGENT_MODEL`, `test_the_agent_purpose_takes_its_own_model`).
         """
         if purpose == "vision_extract":
             if not self._cfg.llm_vision_model:
@@ -352,139 +381,48 @@ class LLM:
                     "LLM_VISION_FALLBACK_MODEL не задана — второй ступени каскада нет"
                 )
             return self._cfg.llm_vision_fallback_model
+        if purpose == "agent":
+            return self._cfg.llm_agent_model
         return self._cfg.llm_verdict_model
 
     async def _attempt(
         self,
         agent: Agent[None, T],
+        metered: _MeteredModel,
         user_prompt: list[str | BinaryContent],
-        *,
-        trace_id: int,
-        purpose: str,
-        provider: str,
+        message_history: Sequence[ModelMessage],
         model_name: str,
-        deadline: float,
     ) -> tuple[T, CallMeta]:
-        """Один "логический" вызов модели с точки зрения `__call__` — но внутри до
-        `_MAX_HTTP_ATTEMPTS` попыток на 429/5xx, каждая со своей строкой `llm_calls`
-        (см. пункт 2 модульного докстринга). `UnexpectedModelBehavior` (невалидная
-        схема) наружу не оборачивается — `__call__` ловит её напрямую и решает,
-        тратить ли схема-ретрай; эта функция лишь успевает залогировать строку перед
-        тем, как исключение уйдёт выше.
+        """Один прогон агента. Слоты, строки `llm_calls`, таймаут и HTTP-ретраи —
+        внутри `_MeteredModel.request`, на каждый запрос. Здесь — только схема:
+        ответ, не прошедший `schema`, переписывает статус строки ПОСЛЕДНЕГО
+        запроса на `schema_error` (запрос удался, ответ — нет;
+        `test_retry_on_schema_error_then_fail`) и уходит в `__call__`, который
+        решает про схема-ретрай."""
+        started = time.monotonic()
+        try:
+            result = await agent.run(user_prompt, message_history=list(message_history) or None)
+        except UnexpectedModelBehavior:
+            if metered.last_call_id is not None:
+                await self._log_status(metered.last_call_id, "schema_error")
+            raise
+        usage = result.usage
+        return result.output, CallMeta(
+            model=result.response.model_name or model_name,
+            tokens_in=usage.input_tokens or 0,
+            tokens_out=usage.output_tokens or 0,
+            cost_usd=float(usage.cost) if usage.cost is not None else None,
+            latency_ms=round((time.monotonic() - started) * 1000),
+            messages=tuple(result.all_messages()),
+        )
 
-        Третий `except` (fix round 1, discretionary item) ловит ЛЮБОЙ иной сбой
-        (обрыв соединения, таймаут чтения, что угодно не опознанное как 429/5xx или
-        невалидная схема) и закрывает строку `llm_calls` статусом `error` перед тем,
-        как перевыбросить как есть — без него такая строка осталась бы `started`
-        навсегда: у `llm_calls`, в отличие от `jobs`, нет reaper'а, который бы её
-        когда-нибудь закрыл.
-
-        Отмена — ОТДЕЛЬНЫЙ `except` перед ним, не покрывается третьим (fix round
-        2, Item 2): `asyncio.CancelledError` наследуется от `BaseException`, не
-        от `Exception`, и «любой иной сбой» её не ловит — а в асинхронном
-        воркере с таймаутами отмена и есть самый частый вид «сбоя», не редкое
-        исключение из него. Строка `llm_calls` закрывается тем же `status=
-        'error'`, и `CancelledError` ОБЯЗАНА быть перевыброшена — проглоченная
-        отмена ломает распространение отмены по всему дереву задач, а не только
-        эту попытку. Сама запись — под `asyncio.shield` (fix round 4,
-        discretionary item): без него вторая отмена, подоспевшая ровно во
-        время этого `await`, оборвала бы саму запись и вернула бы тот же
-        симптом, который round 2 закрывал этим `except`.
-
-        **Бэкофф-пауза спит СНАРУЖИ `slot()` (round 5, Item C — правка кода,
-        не только текста).** Раньше `_sleep` стоял внутри `async with self.
-        _limiter.slot(...)`, и ретраящаяся корутина держала один из K
-        кросс-процессных слотов 1–4с, ничего при этом не делая. Слот
-        существует, чтобы ограничивать ОДНОВРЕМЕННУЮ НАГРУЗКУ на провайдера, —
-        а спящая корутина провайдера не нагружает; под штормом 429 (ровно тот
-        режим, ради которого лимитер и написан) прежняя форма превращала
-        каждый ретрай в удержанную ёмкость и глушила ещё и тех, кому провайдер
-        ответил бы нормально. Теперь пауза лежит между итерациями цикла, а
-        слот берётся заново на следующей попытке.
-
-        `deadline` — общий бюджет ожидания лимитера на ВСЮ цепочку ретраев
-        (fix round 3, Item 1; считает `__call__`, один раз). Передаётся в
-        `self._limiter.slot()` НЕИЗМЕНЁННЫМ на каждой из `_MAX_HTTP_ATTEMPTS`
-        попыток этой функции — свежего отсчёта здесь больше нет. `agent.run()`
-        им НЕ оборачивается (никакого `wait_for(..., timeout=...)` вокруг
-        вызова модели — таймаут самого запроса к провайдеру не входит в
-        периметр этой задачи, отложен до задачи 18) — но и не исключается из
-        него: `deadline` абсолютный, часы между попытками не останавливаются
-        ни на время `agent.run()`, ни на время бэкофф-паузы, значит и то и
-        другое молча съедает бюджет следующего `slot()` (round 4, Item 1 и
-        round 5, Item C — подробности и обоснование в докстринге
-        `limiter._ACQUIRE_TIMEOUT_S`). «Снаружи слота» и «снаружи дедлайна» —
-        разные вещи, и пауза теперь первое, но не второе.
-        """
-        last_http_error: ModelHTTPError | None = None
-        for http_attempt in range(_MAX_HTTP_ATTEMPTS):
-            async with self._limiter.slot(deadline=deadline):
-                call_id = await self._log_started(
-                    trace_id=trace_id, provider=provider, model=model_name, purpose=purpose
-                )
-                started = time.monotonic()
-                try:
-                    result = await agent.run(user_prompt)
-                except asyncio.CancelledError:
-                    # `shield` (fix round 4, discretionary item): без него ВТОРАЯ
-                    # отмена (teardown TaskGroup'ы, цикл остановки воркера),
-                    # подоспевшая ровно во время этой записи, прервала бы сам
-                    # `_log_finished` — и строка осталась бы `started` навсегда,
-                    # тот же симптом, который чинил round 2, Item 2. `shield` не
-                    # спасает этот `await` от отмены (она всё равно долетит сюда),
-                    # но не даёт ей оборвать УЖЕ запущенную запись — та доходит до
-                    # конца в фоне независимо от исхода этого ожидания.
-                    await asyncio.shield(self._log_finished(call_id, status="error"))
-                    raise
-                except UnexpectedModelBehavior:
-                    await self._log_finished(call_id, status="schema_error")
-                    raise
-                except ModelHTTPError as exc:
-                    await self._log_finished(call_id, status="error")
-                    last_http_error = exc
-                    if http_attempt + 1 >= _MAX_HTTP_ATTEMPTS or not _is_retryable_http_error(exc):
-                        raise LLMProviderError(
-                            f"{purpose}: провайдер вернул {exc.status_code} после "
-                            f"{http_attempt + 1} попыт(ок)"
-                        ) from exc
-                    # Паузы здесь НЕТ намеренно — она сразу за выходом из `slot()`,
-                    # см. ниже и докстринг этой функции (round 5, Item C).
-                except Exception:
-                    await self._log_finished(call_id, status="error")
-                    raise
-                else:
-                    latency_ms = round((time.monotonic() - started) * 1000)
-                    usage = result.usage
-                    cost_usd = float(usage.cost) if usage.cost is not None else None
-                    await self._log_finished(
-                        call_id,
-                        status="ok",
-                        tokens_in=usage.input_tokens,
-                        tokens_out=usage.output_tokens,
-                        cost=usage.cost,
-                        latency_ms=latency_ms,
-                        served_by=_served_by(result.response),
-                    )
-                    return result.output, CallMeta(
-                        model=result.response.model_name or model_name,
-                        tokens_in=usage.input_tokens or 0,
-                        tokens_out=usage.output_tokens or 0,
-                        cost_usd=cost_usd,
-                        latency_ms=latency_ms,
-                    )
-            # СНАРУЖИ `slot()`, и это существенно (round 5, Item C): слот
-            # ограничивает одновременную НАГРУЗКУ на провайдера, а спящая
-            # корутина его не нагружает. До этой строки доводит единственный
-            # путь — ретраибельная `ModelHTTPError` выше; остальные ветки либо
-            # возвращают, либо бросают.
-            await _sleep(_backoff_delay(http_attempt))
-        # Недостижимо по факту цикла (последняя итерация всегда либо возвращает,
-        # либо поднимает `LLMProviderError` выше) — только затем, чтобы pyright не
-        # спотыкался о "функция не всегда возвращает значение": `range(N)` для него
-        # не доказуемо непустой.
-        raise LLMProviderError(
-            f"{purpose}: провайдер недоступен после {_MAX_HTTP_ATTEMPTS} попыт(ок)"
-        ) from last_http_error
+    async def _log_status(self, call_id: int, status: Literal["schema_error"]) -> None:
+        """Переписать только статус — токены и цена удачного запроса остаются."""
+        async with self._session_factory() as session:
+            await session.execute(
+                update(LlmCall).where(LlmCall.id == call_id).values(status=status)
+            )
+            await session.commit()
 
     async def _log_started(self, *, trace_id: int, provider: str, model: str, purpose: str) -> int:
         """Строка вставляется ДО вызова модели, `status='started'` — in-flight
@@ -521,3 +459,162 @@ class LLM:
                 )
             )
             await session.commit()
+
+
+class _MeteredModel(WrapperModel):
+    """Модель, у которой КАЖДЫЙ запрос к провайдеру — свой слот лимитера, своя
+    строка `llm_calls`, свой таймаут и свои HTTP-ретраи.
+
+    Прогон агента с инструментами — несколько запросов; считать его одним значило
+    занижать окно темпа `PgLimiter` ровно там, где нагрузка растёт
+    (`test_a_turn_with_two_tool_calls_logs_three_requests`). Таймаут
+    (`Config.llm_request_timeout_s`) обёрнут вокруг одного запроса, а не прогона:
+    зависший запрос снимается сам, строка закрывается `error`, наружу —
+    `LLMProviderError` (`test_a_hung_provider_request_is_cut_by_the_request_timeout`).
+
+    `deadline` — общий бюджет ожидания лимитера на весь вызов `LLM.__call__`
+    (считается там один раз) и передаётся в каждый `slot()` неизменным —
+    на каждом запросе прогона, каждой HTTP-попытке и каждом схема-ретрае
+    (`test_call_shares_one_deadline_across_retry_attempts`,
+    `test_call_shares_one_deadline_across_schema_retry_attempts`). Часы между
+    попытками не останавливаются: время ответов модели и бэкофф-пауз съедает
+    бюджет следующего `slot()` (подробно — докстринг
+    `limiter._ACQUIRE_TIMEOUT_S`).
+
+    Бэкофф-пауза спит СНАРУЖИ `slot()`: спящая корутина провайдера не нагружает
+    и слот держать не должна (`test_backoff_sleeps_outside_the_concurrency_slot`).
+
+    Отмена закрывает строку `error` под `asyncio.shield` и перевыбрасывается
+    (`test_cancellation_finalizes_row_and_repropagates`); любой иной сбой закрывает
+    строку `error` и уходит как есть (`test_unexpected_exception_finalizes_row_as_error`)
+    — у `llm_calls` нет reaper'а, `started` осталась бы навсегда.
+
+    Цена запроса в строке — оценка библиотеки (`fill_response_cost`, та же функция,
+    что граф агента зовёт после запроса; уже заполненную она не перезаписывает).
+    Без неё колонка `llm_calls.cost` пустела бы: граф ставит цену уже после
+    возврата из `request` (`test_each_request_row_carries_its_own_cost_estimate`).
+
+    `last_call_id` — строка последнего запроса: `_attempt` переписывает ей статус
+    на `schema_error`, если ответ этого запроса не прошёл схему уже после того,
+    как сам запрос удался.
+    """
+
+    def __init__(
+        self,
+        wrapped: Model | str,
+        *,
+        llm: LLM,
+        trace_id: int,
+        purpose: str,
+        provider: str,
+        model_name: str,
+        deadline: float,
+    ) -> None:
+        # `KnownModelName` — подсказка типа, а не ограничение: `infer_model`
+        # принимает любую строку `"<provider>:<model>"` из конфига.
+        super().__init__(wrapped)  # pyright: ignore[reportArgumentType]
+        # Префикс `_meter_` — не стиль: у `Model` есть свой `_provider`, и
+        # одноимённый атрибут обёртки подменил бы его.
+        self._meter_llm = llm
+        self._meter_trace_id = trace_id
+        self._meter_purpose = purpose
+        self._meter_provider = provider
+        self._meter_model_name = model_name
+        self._meter_deadline = deadline
+        self.last_call_id: int | None = None
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        """Учёт запроса идёт в СВОЕЙ задаче asyncio, а не в задаче графа.
+
+        Граф агента зовёт модель внутри `anyio.CancelScope`, а отмена anyio
+        уровневая: пока область отменена, она снова и снова отменяет задачу графа
+        и всё, чего та ждёт, — включая уборку: закрытие строки `llm_calls` и выход
+        из `slot()`. Отдельная задача в эту область не входит; ждём её через
+        `asyncio.shield`, чтобы повторные отмены до неё не доходили, и отменяем её
+        сами ровно один раз — уборка в `_metered_request` доходит до конца.
+        Ожидание этой уборки — под щитом anyio
+        (`test_cancellation_finalizes_row_and_repropagates`).
+        """
+        inner = asyncio.create_task(
+            self._metered_request(messages, model_settings, model_request_parameters)
+        )
+        try:
+            return await asyncio.shield(inner)
+        except asyncio.CancelledError:
+            inner.cancel()
+            with anyio.CancelScope(shield=True):
+                await asyncio.wait({inner})
+            raise
+
+    async def _metered_request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        llm = self._meter_llm
+        timeout_s = llm._cfg.llm_request_timeout_s
+        last_http_error: ModelHTTPError | None = None
+        for http_attempt in range(_MAX_HTTP_ATTEMPTS):
+            async with llm._limiter.slot(deadline=self._meter_deadline):
+                call_id = await llm._log_started(
+                    trace_id=self._meter_trace_id,
+                    provider=self._meter_provider,
+                    model=self._meter_model_name,
+                    purpose=self._meter_purpose,
+                )
+                self.last_call_id = call_id
+                started = time.monotonic()
+                try:
+                    async with asyncio.timeout(timeout_s):
+                        response = await self.wrapped.request(
+                            messages, model_settings, model_request_parameters
+                        )
+                except asyncio.CancelledError:
+                    # `shield`: вторая отмена, подоспевшая во время записи, не
+                    # оборвёт уже запущенный `_log_finished`.
+                    await asyncio.shield(llm._log_finished(call_id, status="error"))
+                    raise
+                except TimeoutError as exc:
+                    # До общего `except Exception`: `asyncio.timeout` поднимает
+                    # именно `TimeoutError`, и он должен стать отказом провайдера.
+                    await llm._log_finished(call_id, status="error")
+                    raise LLMProviderError(
+                        f"{self._meter_purpose}: запрос к провайдеру не уложился в {timeout_s} с"
+                    ) from exc
+                except ModelHTTPError as exc:
+                    await llm._log_finished(call_id, status="error")
+                    last_http_error = exc
+                    if http_attempt + 1 >= _MAX_HTTP_ATTEMPTS or not _is_retryable_http_error(exc):
+                        raise LLMProviderError(
+                            f"{self._meter_purpose}: провайдер вернул {exc.status_code} после "
+                            f"{http_attempt + 1} попыт(ок)"
+                        ) from exc
+                except Exception:
+                    await llm._log_finished(call_id, status="error")
+                    raise
+                else:
+                    fill_response_cost(response)
+                    usage = response.usage
+                    await llm._log_finished(
+                        call_id,
+                        status="ok",
+                        tokens_in=usage.input_tokens,
+                        tokens_out=usage.output_tokens,
+                        cost=usage.cost,
+                        latency_ms=round((time.monotonic() - started) * 1000),
+                        served_by=_served_by(response),
+                    )
+                    return response
+            # СНАРУЖИ `slot()`: сюда доводит только ретраибельная `ModelHTTPError`.
+            await _sleep(_backoff_delay(http_attempt))
+        # Недостижимо по факту цикла — только для pyright (`range(N)` для него не
+        # доказуемо непустой).
+        raise LLMProviderError(
+            f"{self._meter_purpose}: провайдер недоступен после {_MAX_HTTP_ATTEMPTS} попыт(ок)"
+        ) from last_http_error

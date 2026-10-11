@@ -156,6 +156,14 @@ class Config:
     llm_max_per_minute: int
     database_url: str
     telegram_token: str
+    # Модель агента (спека агента №1, §9). Необязательна: умолчание — Sonnet 5.5.
+    # Строка — тот же формат `"<provider>:<model>"`, что у остальных.
+    llm_agent_model: str = "anthropic:claude-sonnet-5-5"
+    # Таймаут ОДНОГО запроса к провайдеру, в секундах. До него запрос ничем не
+    # ограничивался (тех-спека §7, «Известный дефект»).
+    llm_request_timeout_s: int = 60
+    # Потолок истории вечера агента в оценочных токенах (`agent.history.estimate_tokens`).
+    agent_history_max_tokens: int = 30_000
 
     @classmethod
     def from_env(cls) -> Config:
@@ -167,4 +175,7 @@ class Config:
             llm_max_per_minute=_require_int("LLM_MAX_PER_MINUTE"),
             database_url=_require("DATABASE_URL"),
             telegram_token=_require("TELEGRAM_TOKEN"),
+            llm_agent_model=optional_env("LLM_AGENT_MODEL", "anthropic:claude-sonnet-5-5"),
+            llm_request_timeout_s=optional_int("LLM_REQUEST_TIMEOUT_S", 60),
+            agent_history_max_tokens=optional_int("AGENT_HISTORY_MAX_TOKENS", 30_000),
         )

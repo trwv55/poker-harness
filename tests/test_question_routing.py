@@ -273,13 +273,10 @@ async def test_the_question_reaches_the_prompt(db_factory):
     assert any("есть ли у меня третий баррель" in text for text in seen)
 
 
-async def test_a_tool_call_round_trip_logs_one_row(db_factory):
-    """Вызов с инструментами — одна строка `llm_calls`, а не по строке на обращение.
-
-    Внутри такого вызова провайдеру уходит два запроса (выбор инструмента и
-    ответ по его выходу), а окно темпа `PgLimiter` считает его за один: цена
-    вопроса в этом счёте занижена, и знать об этом надо до, а не после
-    телеметрии.
+async def test_a_tool_call_round_trip_logs_a_row_per_request(db_factory):
+    """Вызов с инструментами — строка `llm_calls` на каждое обращение к провайдеру:
+    выбор инструмента и ответ по его выходу — два запроса, и окно темпа
+    `PgLimiter` считает оба.
     """
     async with db_factory() as session:
         scope = await _seeded(session, tg_user_id=7008)
@@ -303,7 +300,7 @@ async def test_a_tool_call_round_trip_logs_one_row(db_factory):
             await session.execute(sql_text("select purpose, status from llm_calls order by id"))
         ).all()
     assert script.requests == 2, "сценарий не сделал двух обращений — проверять нечего"
-    assert [tuple(row) for row in rows] == [("question_answer", "ok")]
+    assert [tuple(row) for row in rows] == [("question_answer", "ok"), ("question_answer", "ok")]
     assert run_state.result is not None
 
 
