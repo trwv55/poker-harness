@@ -137,6 +137,7 @@ git config core.hooksPath .githooks
 ```bash
 rsync -av src/harness/parsers/prompts/      harness@<сервер>:/srv/poker-harness/src/harness/parsers/prompts/
 rsync -av src/harness/explanation/prompts/  harness@<сервер>:/srv/poker-harness/src/harness/explanation/prompts/
+rsync -av src/harness/agent/prompts/        harness@<сервер>:/srv/poker-harness/src/harness/agent/prompts/
 ```
 
 На сервере:
@@ -145,9 +146,11 @@ rsync -av src/harness/explanation/prompts/  harness@<сервер>:/srv/poker-ha
 find src/harness -path '*/prompts/*.md' | sort
 ```
 
-Должно быть ровно три строки:
+Должно быть ровно пять строк:
 
 ```
+src/harness/agent/prompts/system.md
+src/harness/explanation/prompts/question.md
 src/harness/explanation/prompts/tournament.md
 src/harness/explanation/prompts/verdict.md
 src/harness/parsers/prompts/vision.md
