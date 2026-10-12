@@ -44,7 +44,9 @@ from pydantic_ai._genai_prices import fill_response_cost
 from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
 from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models import Model, ModelRequestParameters
+from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.wrapper import WrapperModel
+from pydantic_ai.profiles.anthropic import AnthropicModelProfile
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import Tool
 from sqlalchemy import update
@@ -191,6 +193,27 @@ def _describe_model(model: Model | str) -> tuple[str, str]:
     return model.system, model.model_name
 
 
+# Модели Anthropic, которые отвечают 400 `tool_choice: type "tool" and "any" are not
+# supported for this model.` на принудительный выбор инструмента. Структурный вывод
+# PydanticAI его и шлёт, а собственный список библиотеки
+# (`profiles/anthropic.py`, `anthropic_supports_forced_tool_choice`) этих моделей не
+# знает. С флагом `False` библиотека сама переходит на `tool_choice: auto`.
+_REJECTS_FORCED_TOOL_CHOICE = ("claude-sonnet-5-5",)
+
+
+def _build_model(model: str) -> Model | str:
+    """Строка конфига — как есть, кроме моделей из `_REJECTS_FORCED_TOOL_CHOICE`:
+    им `AnthropicModel` с профилем без принудительного `tool_choice`
+    (`test_the_agent_model_does_not_force_tool_choice`,
+    `test_other_anthropic_models_keep_the_library_profile`)."""
+    provider, sep, name = model.partition(":")
+    if sep and provider == "anthropic" and name.startswith(_REJECTS_FORCED_TOOL_CHOICE):
+        return AnthropicModel(
+            name, profile=AnthropicModelProfile(anthropic_supports_forced_tool_choice=False)
+        )
+    return model
+
+
 def _served_by(response: object) -> str | None:
     """Хостер, фактически обслуживший вызов, — из метаданных ответа шлюза.
 
@@ -317,6 +340,8 @@ class LLM:
             self._model_override if self._model_override is not None else self._resolve_model(purpose)
         )
         provider, model_name = _describe_model(model)
+        if isinstance(model, str):
+            model = _build_model(model)
         user_prompt: list[str | BinaryContent] = [
             prompt,
             *(

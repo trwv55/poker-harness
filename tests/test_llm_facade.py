@@ -31,6 +31,8 @@ from pydantic import BaseModel
 from pydantic_ai import BinaryContent
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart, UserPromptPart
+from pydantic_ai.models import Model, infer_model
+from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import Tool
@@ -42,7 +44,13 @@ from harness.memory.models import Job, LlmCall, Trace
 from harness.memory.repos import PlayersRepo, SessionsRepo
 from harness.platform.config import Config, InvalidEnvVar, MissingEnvVar, optional_env
 from harness.platform.limiter import _ADVISORY_LOCK_CLASS, PgLimiter, PgLimiterTimeout, _engine_of
-from harness.platform.llm import LLM, LLMProviderError, LLMSchemaError, _sniff_image_media_type
+from harness.platform.llm import (
+    LLM,
+    LLMProviderError,
+    LLMSchemaError,
+    _build_model,
+    _sniff_image_media_type,
+)
 
 # Строки моделей ниже никогда не резолвятся в реального провайдера — во всех тестах
 # `model_override` подменяет модель тестовым двойником PydanticAI ДО того, как
@@ -1198,3 +1206,46 @@ async def test_each_request_row_carries_its_own_cost_estimate(db_factory):
     assert all(cost is not None and cost > 0 for (cost,) in rows)
     assert meta.cost_usd is not None
     assert float(sum(cost for (cost,) in rows)) == pytest.approx(meta.cost_usd)
+
+
+def test_the_agent_model_does_not_force_tool_choice(db_factory, monkeypatch):
+    """`claude-sonnet-5-5` отвечает 400 на принудительный `tool_choice`, а профиль
+    библиотеки этого не знает; модель агента строится с флагом, при котором
+    библиотека шлёт `tool_choice: auto`."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-real")
+    llm = LLM(replace_cfg(llm_agent_model="anthropic:claude-sonnet-5-5"), db_factory)
+    model = _build_model(llm._resolve_model("agent"))
+    assert isinstance(model, Model)
+    assert model.profile.get("anthropic_supports_forced_tool_choice") is False
+
+
+def test_other_anthropic_models_keep_the_library_profile(db_factory, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-real")
+    llm = LLM(replace_cfg(llm_verdict_model="anthropic:claude-opus-5"), db_factory)
+    model = _build_model(llm._resolve_model("verdict_text"))
+    assert model == "anthropic:claude-opus-5"
+    assert infer_model(model).profile.get("anthropic_supports_forced_tool_choice") is True
+
+
+async def test_the_overridden_agent_model_is_still_metered(db_factory, monkeypatch):
+    """Запрос модели с переопределённым профилем проходит через счётчик: строка
+    `llm_calls` на запрос, и до провайдера доходит та же модель с флагом."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-real")
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=41)
+    seen: list[object] = []
+
+    async def fake_request(self, messages, model_settings, params):
+        seen.append(self.profile.get("anthropic_supports_forced_tool_choice"))
+        return ModelResponse(
+            parts=[ToolCallPart(params.output_tools[0].name, {"text": "ok"})],
+            model_name=self.model_name,
+        )
+
+    monkeypatch.setattr(AnthropicModel, "request", fake_request)
+    llm = LLM(replace_cfg(llm_agent_model="anthropic:claude-sonnet-5-5"), db_factory)
+    out, _meta = await llm("agent", Out, prompt="п", trace_id=trace_id)
+
+    assert out == Out(text="ok")
+    assert seen == [False]
+    rows = await fetch_all(db_factory, "select purpose, provider, model, status from llm_calls")
+    assert rows == [("agent", "anthropic", "claude-sonnet-5-5", "ok")]
