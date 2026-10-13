@@ -48,11 +48,17 @@ class NumberBook:
         self._allowed.add(rounded)
         return f"{rounded:.1f}"
 
-    def pct(self, value: float) -> str:
-        """Доля в процентах, одним знаком: модель обязана взять её готовой."""
+    def pct(self, value: float, *, trim: bool = False) -> str:
+        """Доля в процентах, одним знаком: модель обязана взять её готовой.
+
+        `trim` — целое без «.0» (`24`, но `38.9`): так печатают выходы агента.
+        Разрешается то же значение, так что «24» и «24.0» в ответе равны
+        (`test_whole_percents_go_without_a_trailing_zero`).
+        """
         rounded = round(value, 1)
         self._allowed.add(rounded)
-        return f"{rounded:.1f}"
+        text = f"{rounded:.1f}"
+        return text.removesuffix(".0") if trim else text
 
     def count(self, value: int) -> str:
         """Штуки (раздачи, повторы, уровни) — целым числом."""

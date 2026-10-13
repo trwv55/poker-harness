@@ -44,6 +44,7 @@ __all__ = [
     "player_text_numbers",
     "seen_history",
     "stats_in_history",
+    "threshold_decided",
     "trim_history",
     "turns",
 ]
@@ -216,6 +217,13 @@ def stats_in_history(messages: Sequence[ModelMessage]) -> frozenset[str]:
     """Частоты (`FrequencyStat.value`) из выходов расчётов — без префикса
     `stat:`; метку с пространством имён собирает вызывающий."""
     return frozenset(str(meta["stat"]) for meta in _metadata(messages) if meta.get("stat"))
+
+
+def threshold_decided(messages: Sequence[ModelMessage]) -> bool:
+    """В сообщениях есть `frequency_vs_threshold` с выводом выше или ниже порога
+    (не «не определено»): только тогда «в плюсе» / «в минусе» допустимы выводом
+    (`test_a_decided_threshold_in_the_conversation_allows_a_profit_conclusion`)."""
+    return any(meta.get("outcome") in ("above", "below") for meta in _metadata(messages))
 
 
 def player_text_numbers(text: str, *, board_ranks: Sequence[str] = ()) -> frozenset[float]:

@@ -326,7 +326,7 @@ async def test_the_journal_names_calls_checks_and_the_rewrite(db_factory):
     assert [c["calc"] for c in journal["calls"]] == ["hero_frequency"]
     call = journal["calls"][0]
     assert call["zone"] == "strict" and call["params"]["stat"] == "vpip"
-    assert "100.0" in call["output"] and call["duration_s"] >= 0
+    assert "100%" in call["output"] and call["duration_s"] >= 0
 
 
 def test_instructions_carry_the_system_prompt_and_the_context():
@@ -693,3 +693,46 @@ def test_ask_does_not_check_the_sizes():
     from harness.calcs.routing import CalcRun
 
     assert CalcRun().unsourced_sizes(CalcName.DEFENSE_FREQUENCY, 777, 333) is None
+
+
+async def test_the_agent_sees_its_own_output_and_ask_the_old_one(db_factory):
+    """Агенту — выход без имени расчёта в скобках, с уровнем данных и выборкой
+    словами; у `/ask` выход прежний (`question_digest`)."""
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8141)
+        script = _TurnScript([([_VPIP], _GOOD)])
+        await _turn(db_factory, session, script, scope=scope)
+    echoed = script.returns[-1]
+    assert "(hero_frequency)" not in echoed and "Оценки у этой величины нет" not in echoed
+    assert "Уровень данных: вы, все позиции." in echoed
+    assert "Выборка мала (меньше 20 возможностей)." in echoed
+
+
+# Порог от ставки 1 BB в банк 100 BB: сбрасывать достаточно ≈1%, а вход в банк
+# героя — 2 из 2, так что вывод расчёта — выше порога.
+_DECIDED = (
+    "frequency_vs_threshold",
+    {"stat": "vpip", "threshold_source": "bet_size", "pot_before_bb": 100, "bet_bb": 1},
+)
+
+
+async def test_a_decided_threshold_in_the_conversation_allows_a_profit_conclusion(db_factory):
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8142)
+        without = await _turn(
+            db_factory, session, _TurnScript([([_VPIP], "Ставка в плюсе."), ([], "Ставка в плюсе.")]),
+            scope=scope,
+        )
+        decided = await _turn(
+            db_factory, session, _TurnScript([([_DECIDED], "Ставка в плюсе.")]),
+            scope=scope, text="банк 100 BB, ставка 1 BB",
+        )
+        later = await _turn(
+            db_factory, session, _TurnScript([([], "Ставка в плюсе.")]),
+            scope=scope, history=decided.messages,
+        )
+    assert without.state == "numbers"
+    assert any("frequency_vs_threshold" in v for v in without.violations[0])
+    assert decided.results[0].outcome.value == "above"  # type: ignore[union-attr]
+    assert decided.state == "prose", decided.violations
+    assert later.state == "prose", later.violations

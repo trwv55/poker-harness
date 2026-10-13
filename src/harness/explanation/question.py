@@ -46,7 +46,9 @@ from harness.explanation.verdict_text import (
 )
 
 __all__ = [
+    "MIN_STAT_OPPORTUNITIES",
     "QuestionDraft",
+    "agent_digest",
     "check_answer",
     "question_digest",
     "question_prompt",
@@ -110,11 +112,14 @@ def _window_line(window: Window, book: NumberBook) -> str:
     return "Окно: вся история разборов этого игрока."
 
 
-def _measurement_phrase(measurement: Measurement, book: NumberBook) -> str:
+def _measurement_phrase(
+    measurement: Measurement, book: NumberBook, *, trim: bool = False
+) -> str:
     """Величина со своим знаменателем; доля — только когда знаменатель ненулевой.
 
     «0 из 0» — не ноль процентов, а отсутствие наблюдений (`Measurement.share`),
-    и печатать при нём долю значило бы назвать число, которого нет.
+    и печатать при нём долю значило бы назвать число, которого нет. `trim` —
+    доля без «.0» (выходы агента).
     """
     counted = (
         f"{book.count(measurement.numerator)} из {book.count(measurement.denominator)}"
@@ -122,7 +127,7 @@ def _measurement_phrase(measurement: Measurement, book: NumberBook) -> str:
     share = measurement.share
     if share is None:
         return f"{counted} (наблюдений нет)"
-    return f"{counted} ({book.pct(100.0 * share)}%)"
+    return f"{counted} ({book.pct(100.0 * share, trim=trim)}%)"
 
 
 def _frequency_lines(result: FrequencyResult, book: NumberBook) -> list[str]:
@@ -137,7 +142,9 @@ def _frequency_lines(result: FrequencyResult, book: NumberBook) -> list[str]:
     return lines
 
 
-def _coverage_lines(result: CoverageResult, book: NumberBook) -> list[str]:
+def _coverage_lines(
+    result: CoverageResult, book: NumberBook, *, trim: bool = False
+) -> list[str]:
     filters = result.filter
     named = [
         ("улица", filters.street.value if filters.street is not None else None),
@@ -145,8 +152,14 @@ def _coverage_lines(result: CoverageResult, book: NumberBook) -> list[str]:
         ("позиция", filters.position),
     ]
     lines = [
-        f"Судимых точек решения: {_measurement_phrase(result.judged, book)} попавших под фильтр.",
-        f"Из судимых с посчитанной ценой: {_measurement_phrase(result.priced, book)}.",
+        (
+            f"Судимых точек решения: {_measurement_phrase(result.judged, book, trim=trim)} "
+            "попавших под фильтр."
+        ),
+        (
+            "Из судимых с посчитанной ценой: "
+            f"{_measurement_phrase(result.priced, book, trim=trim)}."
+        ),
         f"Сумма расхождений по точкам с ценой: {book.bb(result.loss_bb)} bb.",
         (
             "Сумма и покрытие — РАЗНЫЕ множества: складывать их и выдавать за цену "
@@ -159,9 +172,9 @@ def _coverage_lines(result: CoverageResult, book: NumberBook) -> list[str]:
     return lines
 
 
-def _leaks_lines(result: LeaksResult, book: NumberBook) -> list[str]:
+def _leaks_lines(result: LeaksResult, book: NumberBook, *, trim: bool = False) -> list[str]:
     lines = [
-        f"Судимых точек решения: {_measurement_phrase(result.judged, book)}.",
+        f"Судимых точек решения: {_measurement_phrase(result.judged, book, trim=trim)}.",
         _window_line(result.window, book),
         "Список ранжирован по цене, поэтому в него попадают только точки с ценой.",
     ]
@@ -182,18 +195,18 @@ def size_bb(value: float) -> str:
     return f"{value:.2f}".removesuffix("0")
 
 
-def _defense_lines(result: DefenseResult, book: NumberBook) -> list[str]:
+def _defense_sizes(result: DefenseResult, book: NumberBook) -> str:
     if result.pot_before_bb is not None and result.bet_bb is not None:
-        sizes = (
+        return (
             f"Банк до ставки: {book.prose(size_bb(result.pot_before_bb))} BB; "
             f"ставка: {book.prose(size_bb(result.bet_bb))} BB."
         )
-    else:
-        sizes = (
-            f"Банк до ставки: {book.count(result.pot_before)}; ставка: {book.count(result.bet)}."
-        )
+    return f"Банк до ставки: {book.count(result.pot_before)}; ставка: {book.count(result.bet)}."
+
+
+def _defense_lines(result: DefenseResult, book: NumberBook) -> list[str]:
     return [
-        sizes,
+        _defense_sizes(result, book),
         (
             f"Требуемая частота защиты: {book.pct(100.0 * result.defend_frequency)}%; "
             f"сдаваться допустимо в {book.pct(100.0 * result.fold_frequency)}% случаев."
@@ -254,6 +267,125 @@ def question_digest(result: CalcResult) -> Digest:
         lines += _defense_lines(result, book)
     else:
         lines += _threshold_lines(result, book)
+    return Digest(text="\n".join(lines), allowed=book.allowed)
+
+
+# --- выходы для агента ------------------------------------------------------------
+
+# Порог выборки агента: меньше стольких возможностей стата — выборка мала (правило
+# промпта агента; SESSIONS_UX, «Частоты»). Одна константа на весь агент: выход
+# расчёта печатает его в строке о выборке и регистрирует, чтобы модели не нужно
+# было число из промпта (`test_a_small_sample_is_said_in_words_with_the_threshold_registered`).
+MIN_STAT_OPPORTUNITIES = 20
+
+
+def _sample_line(measurement: Measurement, book: NumberBook) -> list[str]:
+    """Выборка словами; без наблюдений строки нет — «наблюдений нет» уже сказано."""
+    if measurement.denominator == 0:
+        return []
+    if measurement.denominator < MIN_STAT_OPPORTUNITIES:
+        return [f"Выборка мала (меньше {book.count(MIN_STAT_OPPORTUNITIES)} возможностей)."]
+    return ["Выборка достаточная."]
+
+
+def _level_line(
+    subject: Subject, position: str | None, opponent: str | None, book: NumberBook
+) -> str:
+    """Уровень данных — по фильтрам, реально применённым к выборке: подлежащее и
+    позиция (`test_every_statistic_names_its_level`). Цифры ника разрешены: модель
+    вправе назвать соперника (`test_digits_in_a_nick_are_allowed_numbers`)."""
+    where = f"позиция {position}" if position is not None else "все позиции"
+    if subject is Subject.FIELD:
+        level = f"поле в этой позиции ({position})" if position is not None else (
+            "поле в целом, все позиции"
+        )
+    elif subject is Subject.OPPONENT:
+        named = f" ({book.token(opponent)})" if opponent is not None else ""
+        level = f"этот соперник{named}, {where}"
+    else:
+        level = f"вы, {where}"
+    return f"Уровень данных: {level}."
+
+
+def _agent_frequency_lines(
+    result: FrequencyResult | ThresholdResult, opponent: str | None, book: NumberBook
+) -> list[str]:
+    phrase = _measurement_phrase(result.measurement, book, trim=True)
+    return [
+        _level_line(result.subject, result.position, opponent, book),
+        f"Величина: {_STAT_BRIEF[result.stat]} — {phrase}.",
+        *_sample_line(result.measurement, book),
+    ]
+
+
+def _agent_threshold_lines(
+    result: ThresholdResult, opponent: str | None, book: NumberBook
+) -> list[str]:
+    lines = _agent_frequency_lines(result, opponent, book)
+    source = (
+        "арифметика от размера ставки"
+        if result.threshold_source == "bet_size"
+        else "измеренная частота поля"
+    )
+    lines.append(f"Порог: {book.pct(100.0 * result.threshold, trim=True)}% ({source}).")
+    if result.reference is not None:
+        lines.append(
+            f"Выборка порога: {_measurement_phrase(result.reference, book, trim=True)} — "
+            "порог тоже измерен, а не известен точно."
+        )
+    lines.append(f"Вывод расчёта: {_OUTCOME_BRIEF[result.outcome]}.")
+    if result.outcome is ThresholdOutcome.UNDECIDED:
+        needed = result.observations_needed
+        lines.append(
+            "Утверждать нельзя: наблюдений для вывода нужно около "
+            f"{book.count(needed)}."
+            if needed is not None
+            else "Утверждать нельзя: при такой доле не хватит никакого числа наблюдений."
+        )
+    return lines
+
+
+def _agent_defense_lines(result: DefenseResult, book: NumberBook) -> list[str]:
+    """Величины по сторонам ставки (`test_the_defense_output_names_the_side_of_each_number`).
+    Кто ставил — герой или соперник — расчёт не знает, поэтому стороны названы
+    ролью, а не именем."""
+    sizes = _defense_sizes(result, book)
+    fold = book.pct(100.0 * result.fold_frequency, trim=True)
+    defend = book.pct(100.0 * result.defend_frequency, trim=True)
+    equity = book.pct(100.0 * result.required_equity, trim=True)
+    return [
+        sizes,
+        (
+            "Для ставящего: ставка окупается на одних фолдах, если соперник сбрасывает "
+            f"чаще {fold}%."
+        ),
+        f"Для защищающегося: защищаться {defend}%, эквити колла {equity}%.",
+    ]
+
+
+def agent_digest(result: CalcResult, *, opponent: str | None = None) -> Digest:
+    """Выход расчёта, который видит модель агента; у `/ask` — `question_digest`.
+
+    Те же числа через ту же книгу (`test_the_agent_digest_registers_every_number_it_prints`),
+    но без служебных строк — имени расчёта в скобках и оговорок «данных игрока
+    нет», «оценки нет» (`test_the_agent_digest_has_no_service_lines`): модель
+    пересказывала их игроку. Проценты — без «.0». У статистики — уровень данных
+    и выборка словами; `opponent` — ник, по которому модель позвала инструмент.
+    """
+    book = NumberBook()
+    lines = [f"Расчёт: {_CALC_BRIEF[result.calc]}."]
+    if isinstance(result, FrequencyResult):
+        lines += _agent_frequency_lines(result, opponent, book)
+        lines.append(_window_line(result.window, book))
+    elif isinstance(result, CoverageResult):
+        lines += _coverage_lines(result, book, trim=True)
+    elif isinstance(result, LeaksResult):
+        lines += _leaks_lines(result, book, trim=True)
+    elif isinstance(result, DefenseResult):
+        lines += _agent_defense_lines(result, book)
+    else:
+        lines += _agent_threshold_lines(result, opponent, book)
+        lines.append(_window_line(result.window, book))
     return Digest(text="\n".join(lines), allowed=book.allowed)
 
 

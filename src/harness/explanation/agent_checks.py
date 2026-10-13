@@ -4,11 +4,22 @@
 бы с первой на первой же правке. Модуль чистый — ни pydantic-ai, ни базы:
 разрешённые числа, метки и признак вызова `leaks` приходят аргументами.
 
-**Диапазон — всегда с меткой.** В v1 диапазоны не считает ни один расчёт
-(они — спека №3), поэтому любое предложение о диапазоне без
-«(допущение)» отвергается, даже если его числа разрешены: приписка любого факта
-руки иначе снимала бы метку (`test_a_range_sentence_with_allowed_numbers_still_needs_the_mark`).
-Исключение для чисел из расчёта диапазонов может вернуться в спеке №3.
+**Допущение — с меткой.** В v1 диапазоны не считает ни один расчёт (они —
+спека №3), поэтому утверждение о том, что соперник держит или сделает («у него
+…», «он сбросит …», «его диапазон широкий»), без «(допущение)» отвергается, даже
+если его числа разрешены (`test_a_range_sentence_with_allowed_numbers_still_needs_the_mark`,
+`test_a_claim_about_what_the_opponent_holds_or_does_needs_the_mark`). Не требуют
+метки предложение с «если», арифметика порога («сбрасывать 24% диапазона») и
+слово «диапазон» без утверждения о составе
+(`test_arithmetic_conditions_and_a_bare_word_need_no_mark`).
+
+**«В плюсе», «в минусе», «окупается» — вывод только по порогу.** Без «если» он
+допустим, только когда в разговоре есть `frequency_vs_threshold` с выводом выше
+или ниже порога (`test_a_profit_conclusion_needs_a_decided_threshold`); условная
+фраза допустима всегда (`test_a_conditional_profit_phrase_is_always_allowed`).
+
+**Отрицание термина — не термин.** «Без флеш-дро», «нет флеш-дро», «не
+флеш-дро» метки не требуют (`test_a_negated_term_is_not_the_term`).
 
 **Граница, а не гарантия.** Допущение, термины и лучшая линия проверяются по
 явным оборотам; что сказано другими словами, ловит судья (спека №2).
@@ -32,14 +43,16 @@ from dataclasses import dataclass
 
 from harness.contracts import (
     AnalysisResult,
+    DrawKind,
     EnrichedHand,
+    PostflopLineDetail,
     Street,
     class_of,
     postflop_line_detail,
 )
 from harness.explanation.digest import NumberBook
 from harness.explanation.faithfulness import error_words_in, unsupported_numbers
-from harness.explanation.hand_replay import hand_replay
+from harness.explanation.hand_replay import cards_text, hand_replay
 from harness.explanation.verdict_text import verdict_digest
 
 __all__ = [
@@ -69,13 +82,33 @@ _BOARD_JOIN = r"(?:[-–]|(?<=[TJQKA])|(?=[TJQKA]))"
 _BOARD_RE = re.compile(_EDGE_L + _RANK + r"(?:" + _BOARD_JOIN + _RANK + r"){2,4}" + _EDGE_R)
 # Точка внутри числа («6.6») предложение не кончает.
 _SENTENCE_RE = re.compile(r"(?:[^.!?\n]|\.(?=\d))+[.!?]?")
-_RANGE_RE = re.compile(r"диапазон|рендж", re.IGNORECASE)
-# «стоило» — только с инфинитивом или «бы»: «ничего не стоило» — не упрёк.
-_BEST_LINE_RE = re.compile(
-    r"лучше было|было лучше|лучше бы|правильн\w* было бы|следовало|надо было|нужно было"
-    r"|стоило\s+(?:бы|[а-яё]+ть)\b",
+# Утверждение о том, что соперник держит или сделает (решение владельца
+# 2026-10-13): «у него …» (кроме «у него 40%» — это число расчёта), «он/соперник
+# держит, заколлирует, сбросит, сфолдит …», «диапазон (его, соперника, BB…)» с
+# утверждением о составе через одно-два слова. Голое слово «диапазон» и
+# арифметика порога («сбрасывать 24% диапазона») — не утверждение.
+_W = r"(?<![а-яёa-z])"
+_RANGE_CLAIM_RE = re.compile(
+    _W + r"у\s+него\s+(?!\d)"
+    + r"|" + _W + r"(?:он|соперник|оппонент)\s+(?:не\s+)?"
+    r"(?:держ|заколл|сброс|сфолд)[а-яё]*"
+    + r"|(?:диапазон|рендж)[а-яё]*(?:\s+[^\s.,;:!?]+){0,2}?\s+"
+    r"(?:широк|узк|сильн|слаб|состо|содерж|полон|полн[аоы]|включа|сдвинут)",
     re.IGNORECASE,
 )
+_CONDITION_RE = re.compile(_W + r"если(?![а-яё])", re.IGNORECASE)
+# Лучшая линия на флопе и тёрне (решение владельца 2026-10-13). «Стоило» убрано:
+# это слово вопроса игрока («стоило ставить?»), а не вердикт.
+_BEST_LINE_RE = re.compile(
+    r"лучш[а-яё]*\s+лини|лучше было|было лучше|лучше бы|правильн[а-яё]*\s+было"
+    r"|правильн[а-яё]*\s+лини|следовало|надо было|нужно было"
+    r"|(?<![A-Za-z])GTO(?![A-Za-z])|(?<![А-Яа-яЁё])ГТО(?![А-Яа-яЁё])",
+    re.IGNORECASE,
+)
+# Вывод о прибыльности: допустим только по решённому порогу в разговоре.
+_PROFIT_RE = re.compile(_W + r"в\s+(?:плюсе|минусе)(?![а-яё])|окуп[а-яё]*", re.IGNORECASE)
+# Отрицание перед термином: «без флеш-дро», «нет …», «не …», «ни …».
+_NEGATION_BEFORE_RE = re.compile(_W + r"(?:без|нет|не|ни)\s+$", re.IGNORECASE)
 _FLOP_TURN_RE = re.compile(r"флоп|т[её]рн", re.IGNORECASE)
 _LEAK_RE = re.compile(r"(?<![а-яё])лик(?:и|ов|ам|ами|ах|а|ом|у|е)?(?![а-яё])", re.IGNORECASE)
 
@@ -130,6 +163,59 @@ _STREET_NAME: dict[Street, str] = {
 }
 
 
+_DRAW_WORD: dict[DrawKind, str] = {
+    DrawKind.FLUSH: "флеш",
+    DrawKind.OPEN_ENDED: "двусторонний стрит",
+    DrawKind.DOUBLE_GUTSHOT: "двойной гатшот",
+    DrawKind.GUTSHOT: "гатшот",
+}
+_BACKDOOR_WORD = {"flush": "флеш", "straight": "стрит"}
+
+
+def _outs_word(count: int) -> str:
+    if count % 10 == 1 and count % 100 != 11:
+        return "аут"
+    if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+        return "аута"
+    return "аутов"
+
+
+def _approx(share: float, book: NumberBook) -> str:
+    """Константа владельца (бэкдоры, оверкарты) — с «≈», как в разборе."""
+    return f"≈{book.pct(100.0 * share, trim=True)}%"
+
+
+def _hero_equity_line(line: PostflopLineDetail, street: Street, book: NumberBook) -> str | None:
+    """Дро, бэкдоры и оверкарты героя из посчитанного разбора — одной строкой, числа
+    через книгу (`test_the_context_carries_the_hero_draws_backdoors_and_overcards`).
+    Нет ни одного — строки нет."""
+    parts: list[str] = []
+    draw = line.draw
+    if draw is not None:
+        kinds = " + ".join(_DRAW_WORD[kind] for kind in draw.kinds)
+        outs = len(draw.outs)
+        chance = f"собрать на следующей улице {book.pct(100.0 * draw.hit_next, trim=True)}%"
+        if draw.hit_by_river is not None:
+            chance += f", к риверу {book.pct(100.0 * draw.hit_by_river, trim=True)}%"
+        parts.append(f"дро — {kinds}, {book.count(outs)} {_outs_word(outs)}, {chance}")
+    if line.backdoors:
+        named = ", ".join(
+            f"{_BACKDOOR_WORD[b.kind]} {_approx(b.approx, book)}" for b in line.backdoors
+        )
+        parts.append(f"бэкдор — {named}")
+    over = line.overcards
+    if over is not None:
+        chance = (
+            f"{_approx(over.approx_by_river, book)} к риверу"
+            if over.approx_by_river is not None
+            else f"{_approx(over.approx_next, book)} на следующей улице"
+        )
+        parts.append(f"оверкарты — {cards_text(over.cards)}, {chance}, если пара будет лучшей")
+    if not parts:
+        return None
+    return f"Рука героя, {_STREET_NAME[street]}: {'; '.join(parts)}."
+
+
 @dataclass(frozen=True, slots=True)
 class AgentContext:
     """Сводка последнего разбора для агента: текст, разрешённые числа, метки
@@ -144,11 +230,14 @@ class AgentContext:
 
 def agent_context(result: AnalysisResult, enriched: EnrichedHand) -> AgentContext:
     """Сводка разбора: ход руки (реплей, код), судимые точки (выжимка вердикта),
-    метки классификатора всех точек. Разрешены числа реплея без обозначений
+    метки классификатора всех точек и дро, бэкдоры, оверкарты героя из них.
+    Разрешены числа реплея без обозначений
     карт: ранг карты героя или борда числом не становится
     (`test_a_card_rank_of_the_hand_is_not_an_allowed_number`). Идентификаторы в
     заголовке точки выжимки не разрешены, как в выжимке вердикта
-    (`test_the_context_registers_every_number_it_prints`)."""
+    (`test_the_context_registers_every_number_it_prints`). Без судимых точек
+    выжимки вердикта нет — только номер раздачи и это словами, без служебного
+    «судимых точек 0» (`test_an_unjudged_hand_prints_no_service_count`)."""
     hand = enriched.hand
     cards = hand.dealt.get(hand.hero_label, [])
     hero_class = class_of(cards[0], cards[1]) if len(cards) == 2 else None
@@ -159,9 +248,17 @@ def agent_context(result: AnalysisResult, enriched: EnrichedHand) -> AgentContex
     replay = hand_replay(enriched).plain
     # Регистрируется копия без карт; модели показывается реплей как есть.
     book.prose(strip_card_tokens(replay, hero_class=hero_class, board_ranks=board))
-    verdict = verdict_digest(result)
+    if result.ranked:
+        verdict = verdict_digest(result)
+        verdict_text, verdict_allowed = verdict.text, verdict.allowed
+    else:
+        verdict_text = (
+            f"Раздача {book.token(result.hand_no)}.\nРешений с вердиктом в этой раздаче нет."
+        )
+        verdict_allowed = frozenset()
     labels: set[str] = set()
     label_lines: list[str] = []
+    equity_lines: list[str] = []
     for point in result.points:
         line = postflop_line_detail(point)
         if line is None:
@@ -177,10 +274,19 @@ def agent_context(result: AnalysisResult, enriched: EnrichedHand) -> AgentContex
         label_lines.append(
             f"Метки классификатора, {_STREET_NAME[point.street]}: {', '.join(found)}."
         )
-    text = "\n\n".join(part for part in (replay, verdict.text, "\n".join(label_lines)) if part)
+        equity = _hero_equity_line(line, point.street, book)
+        if equity is not None:
+            equity_lines.append(equity)
+    # Две точки одной улицы с одной рукой дали бы одну строку дважды.
+    equity_text = "\n".join(dict.fromkeys(equity_lines))
+    text = "\n\n".join(
+        part
+        for part in (replay, verdict_text, "\n".join(label_lines), equity_text)
+        if part
+    )
     return AgentContext(
         text=text,
-        allowed=book.allowed | verdict.allowed,
+        allowed=book.allowed | verdict_allowed,
         labels=frozenset(labels),
         hero_class=hero_class,
         board_ranks=board,
@@ -213,6 +319,13 @@ def strip_card_tokens(
     return _CLASS_RE.sub(class_sub, _BOARD_RE.sub(board_sub, text))
 
 
+def _says_term(pattern: re.Pattern[str], text: str) -> bool:
+    """Термин сказан хотя бы раз без отрицания перед ним."""
+    return any(
+        not _NEGATION_BEFORE_RE.search(text[: match.start()]) for match in pattern.finditer(text)
+    )
+
+
 def check_agent_answer(
     answer: str,
     *,
@@ -221,8 +334,13 @@ def check_agent_answer(
     leaks_called: bool,
     hero_class: str | None = None,
     board_ranks: Sequence[str] = (),
+    threshold_decided: bool = False,
 ) -> list[str]:
-    """Нарушения ответа словами; пустой список — ответ прошёл (спека §6)."""
+    """Нарушения ответа словами; пустой список — ответ прошёл (спека §6).
+
+    `threshold_decided` — в разговоре есть `frequency_vs_threshold` с выводом выше
+    или ниже порога: только тогда «в плюсе» / «в минусе» допустимы выводом.
+    """
     text = answer.strip()
     if not text:
         return ["пустой ответ"]
@@ -236,12 +354,25 @@ def check_agent_answer(
         violations.append(f"числа не из расчёта и не из разбора — {invented}")
     for sentence in _SENTENCE_RE.findall(text):
         quoted = sentence.strip()
-        if _RANGE_RE.search(sentence) and ASSUMPTION_MARK not in sentence:
-            violations.append(f"утверждение о диапазоне без метки {ASSUMPTION_MARK} — «{quoted}»")
+        conditional = bool(_CONDITION_RE.search(sentence))
+        if (
+            _RANGE_CLAIM_RE.search(sentence)
+            and not conditional
+            and ASSUMPTION_MARK not in sentence
+        ):
+            violations.append(
+                f"утверждение о том, что соперник держит или сделает, без метки "
+                f"{ASSUMPTION_MARK} — «{quoted}»"
+            )
         if _BEST_LINE_RE.search(sentence) and _FLOP_TURN_RE.search(sentence):
             violations.append(f"лучшая линия на флопе или тёрне — «{quoted}»")
+        if _PROFIT_RE.search(sentence) and not conditional and not threshold_decided:
+            violations.append(
+                "«в плюсе», «в минусе» или «окупается» выводом без расчёта "
+                f"frequency_vs_threshold с выводом против порога — «{quoted}»"
+            )
     for term, (pattern, needed) in TERM_LABELS.items():
-        if pattern.search(text) and not (needed & labels):
+        if _says_term(pattern, text) and not (needed & labels):
             violations.append(f"термин «{term}» без такой метки классификатора")
     if _LEAK_RE.search(text) and not leaks_called:
         violations.append("слово «лик» без расчёта leaks")

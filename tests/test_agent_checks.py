@@ -12,12 +12,14 @@ import pytest
 from harness.contracts import (
     POSTFLOP_LINE_DETAIL,
     ActionTag,
+    Backdoor,
     Combination,
     Draw,
     DrawKind,
     HandCategory,
     HandStrength,
     Line,
+    Overcards,
     PostflopLineDetail,
     Street,
     StrengthClass,
@@ -146,16 +148,72 @@ def test_a_range_sentence_with_allowed_numbers_still_needs_the_mark():
     метку не снимает: иначе её снимала бы приписка любого факта руки."""
     assert any(
         ASSUMPTION_MARK in v
-        for v in _check("В допущении о диапазоне 1.5% всех рук.", allowed=frozenset({1.5}))
-    )
-    assert any(
-        ASSUMPTION_MARK in v
         for v in _check("Его диапазон очень широкий, банк 6.6.", allowed=frozenset({6.6}))
     )
 
 
 def test_a_decimal_point_does_not_split_a_sentence():
-    assert _check(f"Диапазон на 6.6 банка {ASSUMPTION_MARK}.", allowed=frozenset({6.6})) == []
+    assert _check(
+        f"Его диапазон широкий при банке 6.6 {ASSUMPTION_MARK}.", allowed=frozenset({6.6})
+    ) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "У него широкий диапазон.",
+        "У него тут старшая пара.",
+        "Он держит много слабых пар.",
+        "Он заколлирует любую пару.",
+        "Он сбросит большую часть рук.",
+        "Он сфолдит без пары.",
+        "Соперник сбросит почти всё.",
+        "Его диапазон очень сильный.",
+        "Его рендж состоит из бродвеев.",
+        "Диапазон BB содержит много пар.",
+        "Диапазон соперника полон слабых рук.",
+    ],
+)
+def test_a_claim_about_what_the_opponent_holds_or_does_needs_the_mark(text: str):
+    assert any(ASSUMPTION_MARK in v for v in _check(text))
+    assert _check(text.removesuffix(".") + f" {ASSUMPTION_MARK}.") == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Арифметика порога — не утверждение о составе диапазона.
+        "Сопернику достаточно сбрасывать 25% диапазона, а защищаться 75%.",
+        # Слово «диапазон» без утверждения о его составе.
+        "Это поле целиком, так что про его диапазон это мало говорит.",
+        "Расчёта диапазонов здесь нет.",
+        # Условие — не утверждение.
+        "Если у него широкий диапазон, ставка работает чаще.",
+        "Ставка окупается, если он сбрасывает чаще 25%.",
+        "Если он заколлирует, на тёрне банк больше.",
+    ],
+)
+def test_arithmetic_conditions_and_a_bare_word_need_no_mark(text: str):
+    allowed = frozenset({25.0, 75.0})
+    assert not any(ASSUMPTION_MARK in v for v in _check(text, allowed=allowed))
+
+
+# --- «в плюсе» / «в минусе» ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text", ["Ставка на флопе в плюсе.", "Этот колл в минусе.", "Ставка окупается."]
+)
+def test_a_profit_conclusion_needs_a_decided_threshold(text: str):
+    """Вывод «в плюсе» — только по вызову `frequency_vs_threshold` с выводом выше
+    или ниже порога в разговоре; без него это мнение модели."""
+    assert any("порог" in v for v in _check(text))
+    assert _check(text, threshold_decided=True) == []
+
+
+def test_a_conditional_profit_phrase_is_always_allowed():
+    text = "Ставка окупается на одних фолдах, если соперник сбрасывает чаще 25%."
+    assert _check(text, allowed=frozenset({25.0})) == []
 
 
 # --- лучшая линия на флопе и тёрне ---------------------------------------------
@@ -165,8 +223,11 @@ def test_a_decimal_point_does_not_split_a_sentence():
     "text",
     [
         "На флопе лучше было чекнуть.",
-        "На тёрне вам стоило поставить.",
         "На терне правильно было бы сдаться.",
+        "На тёрне правильно было сдаться.",
+        "Лучшая линия на флопе — чек.",
+        "На тёрне правильная линия — пуш.",
+        "По GTO на флопе здесь чек.",
     ],
 )
 def test_the_best_line_on_flop_or_turn_is_refused(text: str):
@@ -174,7 +235,14 @@ def test_the_best_line_on_flop_or_turn_is_refused(text: str):
 
 
 @pytest.mark.parametrize(
-    "text", ["Это ничего не стоило на флопе.", "На ривере лучше было коллировать."]
+    "text",
+    [
+        "Это ничего не стоило на флопе.",
+        "На ривере лучше было коллировать.",
+        # «Стоило» — слово вопроса игрока («стоило ставить?»), а не вердикт.
+        "Стоило ли ставить на флопе, расчёт не судит.",
+        "На тёрне вам стоило поставить.",
+    ],
 )
 def test_what_is_not_a_best_line_verdict_on_flop_or_turn_passes(text: str):
     assert not any("лучшая линия" in v for v in _check(text))
@@ -196,6 +264,18 @@ def test_a_bare_label_without_its_kind_does_not_count():
 
 def test_a_word_that_merely_contains_a_term_is_not_the_term():
     assert _check("Сетка вечера и пробег.") == []
+
+
+@pytest.mark.parametrize(
+    "text", ["Без пары и без флеш-дро.", "Нет флеш-дро.",
+             "Это не флеш-дро.", "Ни пары, ни флеш-дро."]
+)
+def test_a_negated_term_is_not_the_term(text: str):
+    assert not any("флеш-дро" in v for v in _check(text))
+
+
+def test_a_term_negated_once_and_said_once_is_still_the_term():
+    assert any("флеш-дро" in v for v in _check("Не флеш-дро, а флеш-дро на тёрне."))
 
 
 # --- «лик» и «ошибка» -----------------------------------------------------------
@@ -326,3 +406,133 @@ def test_prose_registers_every_number_of_a_code_built_text():
     book = NumberBook()
     book.prose("Флоп: 6♠ J♦ Q♦ (банк 6.6): вы чек → CO бет 3.0, итог −2.6BB")
     assert {6.6, 3.0, -2.6} <= book.allowed
+
+
+def test_an_unjudged_hand_prints_no_service_count():
+    """«Судимых точек 0» модель пересказала игроку; без судимых точек сводка
+    говорит это словами и без числа."""
+    ctx = agent_context(
+        _result([_point(dp_index=0, ev_diff_bb=0.0, detail=_with_line())], ranked=[]),
+        _postflop_hand(),
+    )
+    assert "Судимых точек" not in ctx.text and "суммарная цена" not in ctx.text
+    assert "Решений с вердиктом в этой раздаче нет." in ctx.text
+    assert "Раздача TM99." in ctx.text
+
+
+_BACKDOOR_FLUSH = Backdoor(kind="flush", variants=None, approx=0.04)
+_OVERCARDS = Overcards(cards=["Ah", "Ks"], approx_by_river=0.12, approx_next=0.06)
+
+
+def test_the_context_carries_the_hero_draws_backdoors_and_overcards():
+    """Эквити героя из уже посчитанного разбора (`postflop_line`): дро с аутами и
+    шансом, бэкдоры, оверкарты — числа зарегистрированы."""
+    detail = _with_line(_TOP_PAIR, _FLUSH_DRAW)
+    line = PostflopLineDetail.model_validate(detail[POSTFLOP_LINE_DETAIL])
+    line = line.model_copy(update={"backdoors": [_BACKDOOR_FLUSH], "overcards": _OVERCARDS})
+    ctx = agent_context(
+        _result([_point(
+            dp_index=0, ev_diff_bb=-1.4,
+            detail={POSTFLOP_LINE_DETAIL: line.model_dump(mode="json")},
+        )]),
+        _postflop_hand(),
+    )
+    assert (
+        "Рука героя, префлоп: дро — флеш, 9 аутов, собрать на следующей улице 19.1%, "
+        "к риверу 35%; бэкдор — флеш ≈4%; оверкарты — A♥K♠, ≈12% к риверу, "
+        "если пара будет лучшей." in ctx.text
+    )
+    kw = {"allowed": ctx.allowed, "hero_class": ctx.hero_class, "board_ranks": ctx.board_ranks}
+    assert _check("У вас 9 аутов: 19.1% на тёрне, 35% к риверу, бэкдор ≈4%, оверкарты ≈12%.", **kw) == []
+
+
+def test_without_draws_the_context_prints_no_hero_equity_line():
+    ctx = agent_context(
+        _result([_point(dp_index=0, ev_diff_bb=-1.4, detail=_with_line())]), _postflop_hand()
+    )
+    assert "Рука героя" not in ctx.text
+
+
+# --- регрессия живого хода (синтетика той же формы) ------------------------------
+
+
+def _turn_shaped_allowed() -> frozenset[float]:
+    """Выходы трёх расчётов, как в ходе-образце: защита от ставки 2.5 в банк 5.0,
+    сдача поля в BB против порога от этой ставки, свой c-бет на баттоне. Плюс
+    размеры из сводки разбора."""
+    from harness.contracts import (
+        CalcName,
+        FrequencyResult,
+        FrequencyStat,
+        Measurement,
+        Subject,
+        ThresholdOutcome,
+        Window,
+    )
+    from harness.explanation.question import agent_digest
+    from tests.test_question_text import _defense, _threshold
+
+    defense = _defense().model_copy(update={
+        "pot_before": 500, "bet": 250, "pot_before_bb": 5.0, "bet_bb": 2.5,
+        "defend_frequency": 2 / 3, "fold_frequency": 1 / 3, "required_equity": 0.25,
+    })
+    threshold = _threshold(ThresholdOutcome.ABOVE, None).model_copy(update={
+        "subject": Subject.FIELD, "position": "BB", "threshold": 1 / 3,
+        "threshold_source": "bet_size", "reference": None,
+        "measurement": Measurement(numerator=30, denominator=50),
+    })
+    hero = FrequencyResult(
+        calc=CalcName.HERO_FREQUENCY, subject=Subject.HERO, stat=FrequencyStat.CBET_FLOP,
+        position="BTN", window=Window(), measurement=Measurement(numerator=5, denominator=7),
+    )
+    allowed: frozenset[float] = frozenset({5.0, 2.5})
+    for result in (defense, threshold, hero):
+        allowed |= agent_digest(result).allowed
+    return allowed
+
+
+_TURN_KW = {
+    "labels": frozenset({STAT_LABEL + "cbet_flop", STAT_LABEL + "fold_to_cbet"}),
+    "board_ranks": ("7", "7", "Q"),
+}
+
+# Отклонённый черновик хода-образца, синтетика: другие карты, борд и размеры.
+_REJECTED_DRAFT = (
+    "Ставка 2.5 в банк 5.0: чтобы она не приносила прибыль на одних фолдах, сопернику "
+    "достаточно сбрасывать 33.3% диапазона, а защищаться ему нужно 66.7%. Поле в BB "
+    "сбрасывало на с-бет 30 из 50 (60%) — это выше порога 33.3%, и выборка больше 20. "
+    "Но это поле целиком, а не конкретный BB (ника у нас нет), так что про его диапазон "
+    "это мало говорит. На борде 7-7-Q у вас A♠5♠ — без пары в руке и без флеш-дро; "
+    "с-бет здесь скорее ставка за фолд-эквити, а не за готовую руку (допущение). Свои "
+    "с-беты на баттоне вы делали 5 из 7 (71.4%) — выборка маленькая, выводов из неё не делаю."
+)
+
+_FIXED_ANSWER = (
+    "Для вашей ставки 2.5 в банк 5.0 она окупается на одних фолдах, если соперник "
+    "сбрасывает чаще 33.3%. Поле в BB сбрасывало на с-бет 30 из 50 (60%) — выше порога, "
+    "выборка достаточная, так что ставка в плюсе. Это поле, а не этот соперник. Свои "
+    "с-беты на баттоне — 5 из 7 (71.4%), выборка мала (меньше 20 возможностей)."
+)
+
+
+def test_the_rejected_draft_of_the_live_turn_now_passes():
+    """Все четыре отказа живого хода были ложными: «20» (теперь в выходе
+    расчёта), две фразы со словом «диапазон» без утверждения о составе и
+    «без флеш-дро»."""
+    assert _check(_REJECTED_DRAFT, allowed=_turn_shaped_allowed(), **_TURN_KW) == []
+
+
+def test_the_fixed_answer_passes_with_a_decided_threshold_only():
+    allowed = _turn_shaped_allowed()
+    assert _check(_FIXED_ANSWER, allowed=allowed, threshold_decided=True, **_TURN_KW) == []
+    assert any(
+        "frequency_vs_threshold" in v for v in _check(_FIXED_ANSWER, allowed=allowed, **_TURN_KW)
+    )
+
+
+def test_a_real_violation_in_the_live_turn_shape_is_still_caught():
+    draft = _REJECTED_DRAFT + " У него широкий диапазон, и выборка больше 30.5."
+    violations = _check(draft, allowed=_turn_shaped_allowed(), **_TURN_KW)
+    assert len(violations) == 2
+    assert any("30.5" in v for v in violations)
+    assert any(ASSUMPTION_MARK in v for v in violations)

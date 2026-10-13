@@ -24,6 +24,7 @@ from harness.agent.history import (
     player_text_numbers,
     seen_history,
     stats_in_history,
+    threshold_decided,
 )
 from harness.calcs.routing import CalcRun, tools_for
 from harness.contracts import CalcName, CalcResult, ModelOutput
@@ -110,6 +111,7 @@ def _violations(
         leaks_called=CalcName.LEAKS.value in calcs_in_history(messages),
         hero_class=context.hero_class if context else None,
         board_ranks=context.board_ranks if context else (),
+        threshold_decided=threshold_decided(messages),
     )
 
 

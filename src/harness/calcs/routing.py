@@ -69,6 +69,7 @@ from harness.contracts import (
 )
 from harness.explanation.question import (
     QuestionDraft,
+    agent_digest,
     check_answer,
     question_digest,
     question_prompt,
@@ -208,6 +209,12 @@ class CalcRun:
         return refusal
 
     @property
+    def for_agent(self) -> bool:
+        """Прогон агента: размеры сверяются (`sizes_from` задан). У агента и свои
+        выходы расчётов (`agent_digest`), у `/ask` — прежние (`question_digest`)."""
+        return self.sizes_from is not None
+
+    @property
     def result(self) -> CalcResult | None:
         """Первый расчёт хода; `None` — ни одного удачного вызова инструмента."""
         return self.results[0] if self.results else None
@@ -244,6 +251,7 @@ async def _perform(
     run_state: CalcRun,
     params: CalcParams,
     sizes_bb: tuple[float, float] | None = None,
+    opponent: str | None = None,
 ) -> str | ToolReturn:
     """Выполнить расчёт, если потолок не взят, и вернуть модели выжимку его выхода.
 
@@ -261,6 +269,11 @@ async def _perform(
     `sizes_bb` — банк и ставка агента в BB, как он их передал: журнал пишет их
     рядом с параметрами, а результат защиты несёт их для показа вместо сотых
     масштаба (`test_a_pot_from_the_hand_summary_is_computed_and_shown_in_bb`).
+
+    Агент видит свой выход (`agent_digest`, с ником `opponent` в уровне данных),
+    `/ask` — прежний (`test_the_agent_sees_its_own_output_and_ask_the_old_one`).
+    Вывод порога (`outcome`) лежит в метаданных: по нему проверка агента
+    разрешает «в плюсе» и «в минусе» (`threshold_decided`).
     """
     params_json = params.model_dump(mode="json")
     if sizes_bb is not None:
@@ -283,7 +296,11 @@ async def _perform(
         return f"Расчёт не выполнен: {exc}"
     if sizes_bb is not None and isinstance(result, DefenseResult):
         result = result.model_copy(update={"pot_before_bb": sizes_bb[0], "bet_bb": sizes_bb[1]})
-    digest = question_digest(result)
+    digest = (
+        agent_digest(result, opponent=opponent)
+        if run_state.for_agent
+        else question_digest(result)
+    )
     run_state.results.append(result)
     run_state.digests.append(digest)
     run_state.calls.append({
@@ -294,12 +311,14 @@ async def _perform(
         "duration_s": round(time.monotonic() - started, 3),
     })
     stat = getattr(result, "stat", None)
+    outcome = getattr(result, "outcome", None)
     return ToolReturn(
         return_value=digest.text,
         metadata={
             "calc": result.calc.value,
             "allowed": sorted(digest.allowed),
             "stat": stat.value if stat is not None else None,
+            "outcome": outcome.value if outcome is not None else None,
         },
     )
 
@@ -384,6 +403,7 @@ def tools_for(
                 position=position,
                 window=_window(window, session_id),
             ),
+            opponent=opponent,
         )
 
     async def coverage(
@@ -436,11 +456,12 @@ def tools_for(
         )
 
     async def defense_frequency_bb(pot_before_bb: float, bet_bb: float) -> str | ToolReturn:
-        """Требуемая частота защиты против ставки — арифметика, данных не требует.
+        """Арифметика ставки, данных не требует: при какой доле фолдов ставка
+        окупается для ставящего и сколько нужно защищаться защищающемуся.
 
         Args:
-            pot_before_bb: банк ДО ставки соперника — в BB, как в разборе.
-            bet_bb: размер ставки соперника — в BB, как в разборе.
+            pot_before_bb: банк ДО ставки — в BB, как в разборе.
+            bet_bb: размер ставки (вашей или соперника) — в BB, как в разборе.
         """
         sized = run_state.chips_for(CalcName.DEFENSE_FREQUENCY, pot_before_bb, bet_bb)
         if isinstance(sized, str):
@@ -490,6 +511,7 @@ def tools_for(
                 threshold=chosen,
             ),
             sizes_bb=sizes_bb,
+            opponent=opponent if subject is Subject.OPPONENT else None,
         )
 
     async def frequency_vs_threshold(
@@ -568,7 +590,7 @@ def tools_for(
         )
 
     # Агент (`sizes_from` задан) получает размеры в BB, `/ask` — в фишках.
-    in_bb = run_state.sizes_from is not None
+    in_bb = run_state.for_agent
     by_name: dict[CalcName, Any] = {
         CalcName.HERO_FREQUENCY: hero_frequency,
         CalcName.OPPONENT_FREQUENCY: opponent_frequency,
