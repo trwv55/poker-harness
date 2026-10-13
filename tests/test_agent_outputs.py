@@ -54,7 +54,7 @@ def test_the_ask_digest_is_unchanged_by_the_agent_one():
 def test_the_defense_output_names_the_side_of_each_number():
     text = agent_digest(_agent_defense()).text
     assert (
-        "Для ставящего: ставка окупается на одних фолдах, если соперник сбрасывает "
+        "Для ставящего: ставка окупается на одних фолдах, если защищающийся сбрасывает "
         "чаще 20%." in text
     )
     assert "Для защищающегося: защищаться 80%, эквити колла 16.7%." in text

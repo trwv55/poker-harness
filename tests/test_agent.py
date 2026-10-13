@@ -695,9 +695,10 @@ def test_ask_does_not_check_the_sizes():
     assert CalcRun().unsourced_sizes(CalcName.DEFENSE_FREQUENCY, 777, 333) is None
 
 
-async def test_the_agent_sees_its_own_output_and_ask_the_old_one(db_factory):
+async def test_the_agent_sees_its_own_output(db_factory):
     """Агенту — выход без имени расчёта в скобках, с уровнем данных и выборкой
-    словами; у `/ask` выход прежний (`question_digest`)."""
+    словами. Что у `/ask` выход прежний, держит
+    `test_agent_outputs.test_the_ask_digest_is_unchanged_by_the_agent_one`."""
     async with db_factory() as session:
         scope = await _seeded(session, tg_user_id=8141)
         script = _TurnScript([([_VPIP], _GOOD)])
@@ -736,3 +737,24 @@ async def test_a_decided_threshold_in_the_conversation_allows_a_profit_conclusio
     assert decided.results[0].outcome.value == "above"  # type: ignore[union-attr]
     assert decided.state == "prose", decided.violations
     assert later.state == "prose", later.violations
+
+
+# Порог от ставки 1 BB в банк 1 BB: сбрасывать достаточно 50%, а 2 из 2 у героя
+# интервал не отделяет от 50% — вывод «не определено».
+_UNDECIDED = (
+    "frequency_vs_threshold",
+    {"stat": "vpip", "threshold_source": "bet_size", "pot_before_bb": 1, "bet_bb": 1},
+)
+
+
+async def test_an_undecided_threshold_does_not_allow_a_profit_conclusion(db_factory):
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8143)
+        turn = await _turn(
+            db_factory, session,
+            _TurnScript([([_UNDECIDED], "Ставка в плюсе."), ([], "Ставка в плюсе.")]),
+            scope=scope, text="банк 1 BB, ставка 1 BB",
+        )
+    assert turn.results[0].outcome.value == "undecided"  # type: ignore[union-attr]
+    assert turn.state == "numbers"
+    assert any("frequency_vs_threshold" in v for v in turn.violations[0])

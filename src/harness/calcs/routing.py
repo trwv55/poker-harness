@@ -271,7 +271,8 @@ async def _perform(
     масштаба (`test_a_pot_from_the_hand_summary_is_computed_and_shown_in_bb`).
 
     Агент видит свой выход (`agent_digest`, с ником `opponent` в уровне данных),
-    `/ask` — прежний (`test_the_agent_sees_its_own_output_and_ask_the_old_one`).
+    `/ask` — прежний (`test_the_agent_sees_its_own_output`,
+    `test_the_ask_digest_is_unchanged_by_the_agent_one`).
     Вывод порога (`outcome`) лежит в метаданных: по нему проверка агента
     разрешает «в плюсе» и «в минусе» (`threshold_decided`).
     """
