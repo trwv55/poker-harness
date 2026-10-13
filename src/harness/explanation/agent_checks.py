@@ -32,16 +32,25 @@
 `test_a_habit_in_the_past_is_a_claim_not_a_fact_of_the_hand`); «вы» не освобождает
 придаточное, где подлежащее — соперник, с запятой или без
 (`test_a_clause_with_an_opponent_subject_is_checked_despite_you`). «Фолд», «сброс»,
-«защита» существительным — не действие, действие — только глагольные формы
-(`test_a_fold_or_defence_noun_is_not_an_opponent_action`); часть о прибыльности
+«защита» существительным — не действие только после предлога (на/по/от/при/без/
+для, через одно прилагательное) или в части о прибыльности ставки и никогда при
+«бы», будущем («будет», «сделает») или наречии повторяемости в предложении;
+иначе существительное — действие, как «рейз»
+(`test_a_fold_or_defence_noun_after_a_preposition_is_not_an_opponent_action`,
+`test_a_fold_or_defence_noun_outside_a_preposition_is_an_action`,
+`test_the_subjunctive_future_or_habit_cancels_the_noun_exemption`,
+`test_a_fold_noun_in_a_profit_clause_is_not_an_action`); часть о прибыльности
 ставки («он окупается против любой пары») — о ставке, рука в ней не утверждение
 о сопернике, а глагол соперника — прогноз
 (`test_a_hand_word_in_a_profit_clause_is_about_the_bet`,
 `test_an_opponent_verb_in_a_profit_clause_is_still_a_prediction`). В предложении о
 прибыльности форма «если <подлежащее> сбрасывает чаще/реже N%» с порогом из
-расчёта — арифметика порога через любые запятые
+расчёта — арифметика порога и через запятые, если между ними только вставки («по
+расчёту», «судя по выходу»); подлежащее-герой, глагол или другое придаточное
+между условием и действием опору разрывают
 (`test_threshold_math_after_a_profit_word_is_exempt_across_commas`,
-`test_live_threshold_math_about_the_bet_passes`).
+`test_live_threshold_math_about_the_bet_passes`,
+`test_a_hero_subject_or_another_clause_breaks_the_threshold_condition`).
 
 **«В плюсе», «в минусе», «окупается» — вывод только по порогу.** Голый вывод
 допустим, только когда в разговоре есть `frequency_vs_threshold` с выводом выше
@@ -170,11 +179,22 @@ _OPPONENT_SUBJECT_RE = re.compile(
     + r"|" + _POSITION,
     re.IGNORECASE,
 )
-# Фолд, сброс и защита существительным — не действие соперника («на одних фолдах»,
-# «порог по фолдам»); действие — только глагольные формы (раунд 5).
+# Фолд, сброс и защита существительным — не действие соперника только после
+# предлога («на одних фолдах», «порог по фолдам») или в части о прибыльности ставки,
+# и никогда при «бы», будущем или наречии повторяемости в предложении (раунды 5–6).
+# Иначе существительное — действие, как «рейз» («он сделает фолд»).
 _FOLD_NOUN_RE = re.compile(
     r"(?:фолд|сброс)(?:а|у|ом|е|ы|ов|ам|ами|ах)?|защит(?:а|ы|е|у|ой|ам|ами|ах)?",
     re.IGNORECASE,
+)
+# Предлог прямо перед существительным или через одно прилагательное.
+_ADJECTIVE = r"[а-яё]+(?:ых|их|ым|им|ыми|ими|ой|ей|ом|ем|ую|юю|ая|яя|ое|ее|ые|ие|ий|ый)"
+_PREPOSITION_BEFORE_RE = re.compile(
+    _W + r"(?:на|по|от|при|без|для)\s+(?:" + _ADJECTIVE + r"\s+)?$", re.IGNORECASE
+)
+# Будущее время — узко, по формам из решения: «будет…», «сделает…».
+_FUTURE_RE = re.compile(
+    _W + r"(?:буд(?:у|ешь|ет|ем|ете|ут)|сдела(?:ю|ешь|ет|ем|ете|ют))" + _WE, re.IGNORECASE
 )
 # Части придаточного: время глагола освобождает существительное («рейз») только в
 # своей части («вы поставили и он сделает рейз» — прогноз).
@@ -192,8 +212,14 @@ _CLAUSE_SPLIT_RE = re.compile(r"[,;:—–()]")
 # эквити»); «при такой ставке» — предлог, не условие.
 _PRI_SHARE = (
     r"при\s+\d+(?:[.,]\d+)?\s*%\s+(?:его\s+)?(?:фолд|сброс|защит|эквити|диапазон|рендж)"
+    r"[а-яё]*"
 )
 _CONDITION_RE = re.compile(_W + r"(?:(?:если|когда)" + _WE + r"|" + _PRI_SHARE + r")", re.IGNORECASE)
+# Вставка между запятыми, которую условие пропускает («по расчёту», «судя по
+# выходу»); остальное между запятыми — другое придаточное.
+_INSERT_RE = re.compile(
+    r"\s*(?:по|судя|как|согласно|видимо|похоже|вероятно|кажется)" + _WE, re.IGNORECASE
+)
 _MODAL_RE = re.compile(
     _W + r"(?:достаточно|нужно|надо|должн[а-яё]*|требуется|необходимо|можно)" + _WE,
     re.IGNORECASE,
@@ -253,6 +279,27 @@ def _word_at(text: str, position: int) -> str:
     return match.group(0) if match else ""
 
 
+def _verb_like(word: str) -> bool:
+    return bool(_VERB_END_RE.search(word) or _PAST_END_RE.search(word))
+
+
+def _condition_holds(segment: str) -> bool:
+    """Между словом условия и действием только подлежащее защищающегося и вставки:
+    подлежащее-герой («если вы поставите»), глагол или другое придаточное разрывают
+    опору (`test_a_hero_subject_or_another_clause_breaks_the_threshold_condition`)."""
+    if _HERO_SUBJECT_RE.search(segment) or re.search(r"[;:—–()]", segment):
+        return False
+    if any(_verb_like(word) for word in _WORD_RE.findall(segment)):
+        return False
+    pieces = segment.split(",")
+    if len(pieces) == 1:
+        return True
+    first, *middle, last = pieces
+    if not all(_INSERT_RE.match(piece) for piece in middle):
+        return False
+    return not (_WORD_RE.search(first) and _WORD_RE.search(last))
+
+
 def _backed(
     match: re.Match[str],
     text: str,
@@ -262,8 +309,10 @@ def _backed(
     """Действие держится на расчёте: измеренной частотой — всегда; порогом или долей
     защиты — только как арифметика порога (условие или модальное слово с
     инфинитивом в том же придаточном; голое «при» — не условие,
-    `test_a_bare_preposition_pri_is_not_a_condition`). В предложении о прибыльности
-    с «чаще/реже» перед долей условие ищется во всём предложении до действия
+    `test_a_bare_preposition_pri_is_not_a_condition`). Между условием и действием —
+    только подлежащее защищающегося (`_condition_holds`). В предложении о
+    прибыльности с «чаще/реже» перед долей условие ищется во всём предложении до
+    действия, через запятые — только вставки
     (`test_threshold_math_after_a_profit_word_is_exempt_across_commas`,
     `test_across_commas_only_the_more_or_less_than_threshold_form_is_exempt`)."""
     if _BET_WORD_RE.search(match.group("window")) or _HAND_RE.search(match.group("window")):
@@ -281,14 +330,17 @@ def _backed(
         return False
     clause = text[_clause_start(text, match.start()) : match.end()]
     # «X окупается…, если <подлежащее> сбрасывает чаще N%» — условие ищется во всём
-    # предложении до действия, как бы его ни делили запятые; без слова
+    # предложении до действия, через запятые со вставками («по расчёту»); без слова
     # прибыльности или без «чаще/реже» перед долей — только в своём придаточном
-    # (раунд 5).
+    # (раунды 5–6).
     across = bool(_PROFIT_RE.search(text)) and bool(_MORE_LESS_RE.search(match.group("window")))
     head_start = 0 if across else _clause_start(text, match.start())
     head = text[head_start : match.start()]
+    conditions = list(_CONDITION_RE.finditer(head))
+    if conditions and _condition_holds(head[conditions[-1].end() :]):
+        return True
     infinitive = bool(_INFINITIVE_END_RE.search(_word_at(text, match.start())))
-    return bool(_CONDITION_RE.search(head)) or (infinitive and bool(_MODAL_RE.search(clause)))
+    return infinitive and bool(_MODAL_RE.search(clause))
 
 
 def _strip_backed(
@@ -311,7 +363,7 @@ def _strip_backed(
     )
 
 
-def _opponent_clause(clause: str, hypothetical: bool) -> bool:
+def _opponent_clause(clause: str, hypothetical: bool, noun_locked: bool) -> bool:
     """Придаточное утверждает, что соперник держит или сделает: слово о нём и рука
     или действие в форме прогноза. Придаточное с «вы» без соперника подлежащим — о
     герое (`test_a_clause_with_an_opponent_subject_is_checked_despite_you`). Глагол
@@ -322,8 +374,11 @@ def _opponent_clause(clause: str, hypothetical: bool) -> bool:
     `hypothetical` («бы» или наречие повторяемости в предложении) прошедшее время
     ничего не освобождает (`test_the_subjunctive_is_a_prediction_not_a_fact_of_the_hand`,
     `test_a_habit_in_the_past_is_a_claim_not_a_fact_of_the_hand`). «Фолд», «сброс»,
-    «защита» существительным — не действие
-    (`test_a_fold_or_defence_noun_is_not_an_opponent_action`); рука в части о
+    «защита» существительным — не действие только после предлога или в части о
+    прибыльности и не при `noun_locked` («бы», будущее, наречие повторяемости;
+    `test_a_fold_or_defence_noun_after_a_preposition_is_not_an_opponent_action`,
+    `test_a_fold_or_defence_noun_outside_a_preposition_is_an_action`,
+    `test_the_subjunctive_future_or_habit_cancels_the_noun_exemption`); рука в части о
     прибыльности ставки — не утверждение о сопернике
     (`test_a_hand_word_in_a_profit_clause_is_about_the_bet`)."""
     if not _OPPONENT_RE.search(clause):
@@ -345,7 +400,11 @@ def _opponent_clause(clause: str, hypothetical: bool) -> bool:
             while start > 0 and part[start - 1].isalpha():
                 start -= 1
             word = _word_at(part, start)
-            if _FOLD_NOUN_RE.fullmatch(word):
+            if (
+                _FOLD_NOUN_RE.fullmatch(word)
+                and not noun_locked
+                and (_PREPOSITION_BEFORE_RE.search(part[:start]) or _PROFIT_RE.search(part))
+            ):
                 continue
             if _PAST_END_RE.search(word) and not hypothetical:
                 continue
@@ -367,8 +426,10 @@ def _opponent_claim(
     if _RANGE_WORD_RE.search(_HERO_HOLDS_RE.sub(" ", rest)):
         return True
     hypothetical = bool(_HYPOTHETICAL_RE.search(rest))
+    noun_locked = hypothetical or bool(_FUTURE_RE.search(rest))
     return any(
-        _opponent_clause(clause, hypothetical) for clause in _CLAUSE_SPLIT_RE.split(rest)
+        _opponent_clause(clause, hypothetical, noun_locked)
+        for clause in _CLAUSE_SPLIT_RE.split(rest)
     )
 
 
