@@ -39,6 +39,7 @@ __all__ = [
     "calcs_in_history",
     "dump_history",
     "estimate_tokens",
+    "frequency_numbers",
     "load_history",
     "player_numbers",
     "player_text_numbers",
@@ -217,6 +218,12 @@ def stats_in_history(messages: Sequence[ModelMessage]) -> frozenset[str]:
     """Частоты (`FrequencyStat.value`) из выходов расчётов — без префикса
     `stat:`; метку с пространством имён собирает вызывающий."""
     return frozenset(str(meta["stat"]) for meta in _metadata(messages) if meta.get("stat"))
+
+
+def frequency_numbers(messages: Sequence[ModelMessage]) -> frozenset[float]:
+    """Измеренные частоты из выходов расчётов (доля, числитель, знаменатель) — без
+    порогов и долей защиты (`test_the_measured_frequency_is_kept_apart_from_other_calc_numbers`)."""
+    return frozenset(float(n) for meta in _metadata(messages) for n in meta.get("frequency", []))
 
 
 def threshold_decided(messages: Sequence[ModelMessage]) -> bool:

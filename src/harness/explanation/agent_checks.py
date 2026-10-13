@@ -12,21 +12,27 @@
 — слово о нём плюс слово из короткого списка рук и действий
 (`test_a_claim_about_what_the_opponent_holds_or_does_needs_the_mark`). Списки не
 полны и не будут: другие формулировки о сопернике ловит судья (спека №2,
-принцип владельца 2026-10-11). Метки не требуют действие, за которым стоит доля
-или «N из M», выданные расчётом в разговоре (`calc_numbers`; не доля банка, не
-«поставите N%», без руки между ними —
+принцип владельца 2026-10-11). Метки не требуют: действие, за которым стоит
+измеренная частота из расчёта в разговоре (`frequency_numbers`), или порог и доля
+защиты из расчёта (`calc_numbers`), но только как арифметика порога — в придаточном
+с «если/когда/при» или с «достаточно/нужно/должен» и инфинитивом (не доля банка,
+не «поставите N%», без руки между ними —
 `test_calc_backed_statements_and_meta_speech_need_no_mark`,
 `test_a_bet_size_or_a_hand_in_the_window_backs_nothing`,
-`test_a_number_not_from_a_calculation_backs_nothing`), и узкая метаречь («про его
-диапазон это мало говорит»).
+`test_a_number_not_from_a_calculation_backs_nothing`,
+`test_only_a_measured_frequency_backs_an_opponent_action`); узкая метаречь («про
+его диапазон это мало говорит»); пересказ руки — глагол прошедшего времени и
+придаточное с «вы», «вы держите» о своей руке
+(`test_hand_narration_is_not_an_opponent_claim`).
 
 **«В плюсе», «в минусе», «окупается» — вывод только по порогу.** Голый вывод
 допустим, только когда в разговоре есть `frequency_vs_threshold` с выводом выше
 или ниже порога (`test_a_profit_conclusion_needs_a_decided_threshold`). Арифметика
-допустима всегда: в условном придаточном («если/при/от/когда/чтобы/чаще/реже», без
-запятой до числа) стоит доля, выданная расчётом, и это не доля банка
+допустима всегда: в одном из придаточных условие («если/при/от/когда/чтобы») и доля,
+выданная расчётом (не доля банка), а свободного придаточного-вывода рядом нет
 (`test_profit_arithmetic_with_a_calc_share_is_allowed`,
-`test_a_bare_profit_conclusion_with_some_share_still_needs_a_threshold`).
+`test_a_bare_profit_conclusion_with_some_share_still_needs_a_threshold`,
+`test_a_threshold_in_the_main_clause_is_not_a_condition`).
 
 **Отрицание термина — не термин.** «Без флеш-дро», «нет флеш-дро», «не
 флеш-дро» метки не требуют (`test_a_negated_term_is_not_the_term`).
@@ -92,13 +98,13 @@ _BOARD_JOIN = r"(?:[-–]|(?<=[TJQKA])|(?=[TJQKA]))"
 _BOARD_RE = re.compile(_EDGE_L + _RANK + r"(?:" + _BOARD_JOIN + _RANK + r"){2,4}" + _EDGE_R)
 # Точка внутри числа («6.6») предложение не кончает.
 _SENTENCE_RE = re.compile(r"(?:[^.!?\n]|\.(?=\d))+[.!?]?")
-# Утверждение о сопернике (решение владельца 2026-10-13, контроллер, правка 1):
-# предложение, которое (а) говорит о сопернике и (б) говорит о том, что он держит
-# или сделает, несёт «(допущение)». Ложный отказ здесь дешевле ложного «прошло»:
-# судьи в проде нет. До поиска (а) и (б) из предложения вырезается то, что
-# держится на расчёте: действие, привязанное к доле или к «N из M» («сбрасывать
-# 33.3% диапазона», «сбрасывало на с-бет 30 из 50»), и метаречь («про его
-# диапазон это мало говорит»).
+# Допущение (решения владельца 2026-10-11 и 2026-10-13, правки контроллера по
+# ревью). Механика узкая, остальное — судья (спека №2): метку требует предложение
+# со словом диапазона и придаточное с явным утверждением о сопернике (слово о нём
+# плюс рука или действие из короткого списка). До поиска вырезается то, что
+# держится на расчёте (`_strip_backed`), и метаречь («про его диапазон это мало
+# говорит»). Пересказ руки — не утверждение: глагол прошедшего времени, придаточное
+# с «вы» (`_opponent_clause`).
 _W = r"(?<![а-яёa-z])"
 _WE = r"(?![а-яё])"
 _POSITION = r"(?<![A-Za-z\d.])(?<![\d.]\s)(?:BB|SB|BTN|CO|HJ|LJ|MP|UTG(?:\+\d)?)(?![A-Za-z])"
@@ -121,18 +127,39 @@ _HAND = (
     r"(?![\w])"
 )
 _HAND_RE = re.compile(_HAND, re.IGNORECASE)
-_HOLDING_RE = re.compile(_ACTION + r"|" + _HAND, re.IGNORECASE)
-# Опора на расчёт (правка 2 контроллера): действие, за которым через пять слов или
-# меньше стоит доля или «N из M», и это число выдал расчёт в разговоре
-# (`calc_numbers`, не числа сводки и не слова игрока). Не опора: доля банка
-# («33.3% банка»), окно со ставкой героя глаголом («если вы поставите 25%») и окно
-# с рукой или диапазоном («с любой парой в 60% раз») — `_strip_backed`.
+# Формы глагола: прошедшее время — факт руки; не прошедшее (настоящее, будущее,
+# инфинитив) — прогноз. Остальное в списке действий — существительные («рейз»,
+# «коллом», «фолдах»).
+_PAST_END = r"(?:[аяиыеуоё]л|[аяиыеуо]л[аио]|[аяиыеу]л(?:ся|ась|ось|ись)|ш[её]л)"
+_PAST_WORD_RE = re.compile(r"[а-яё]{2,}" + _PAST_END + _WE, re.IGNORECASE)
+_PAST_END_RE = re.compile(_PAST_END + r"$", re.IGNORECASE)
+_VERB_END_RE = re.compile(
+    r"(?:ть|ться|ти|[еиё]т|[уюая]т|[еиё]тся|[уюая]тся|[еиё]шь|[еи]м|[еи]те|ст)$", re.IGNORECASE
+)
+_INFINITIVE_END_RE = re.compile(r"(?:ть|ться|ти)$", re.IGNORECASE)
+_WORD_RE = re.compile(r"[а-яё-]+", re.IGNORECASE)
+_HERO_SUBJECT_RE = re.compile(_W + r"(?:вы|у\s+вас)" + _WE, re.IGNORECASE)
+_HERO_HOLDS_RE = re.compile(_W + r"вы\s+(?:[^\s,.;:!?]+\s+)?держ[а-яё]*", re.IGNORECASE)
+_CLAUSE_SPLIT_RE = re.compile(r"[,;:—–()]")
+_CONDITION_RE = re.compile(_W + r"(?:если|когда|при)" + _WE, re.IGNORECASE)
+_MODAL_RE = re.compile(
+    _W + r"(?:достаточно|нужно|надо|должн[а-яё]*|требуется|необходимо|можно)" + _WE,
+    re.IGNORECASE,
+)
+# Опора на расчёт (правки контроллера, раунды 2–3): действие, за которым через пять
+# слов или меньше стоит доля или «N из M». Опора — измеренная частота из расчёта
+# (`frequency_numbers`: доля и «N из M» частоты или измеренной величины
+# порога); порог или доля защиты (`calc_numbers`) опорой служат только арифметике
+# порога — в придаточном с «если/когда/при» или с «достаточно/нужно/должен» и
+# инфинитивом. Не опора: доля банка («33.3% банка»), окно со ставкой героя глаголом
+# («если вы поставите 25%») и окно с рукой или диапазоном («с любой парой в 60% раз»).
 _NUMBER = r"\d+(?:[.,]\d+)?"
 _CALC_NUMBER = r"(?P<pct>" + _NUMBER + r")\s*%|(?P<num>\d+)\s+из\s+(?P<den>\d+)"
 _TAIL = r"(?P<tail>\s+(?:его\s+)?(?:диапазон|рендж|фолд|эквити|случа|раз)[а-яё]*)?"
 _BACKED_RE = re.compile(
     r"(?:" + _ACTION + r")[^\s.,;:!?]*(?P<window>(?:[\s,]+[^\s.;:!?]+){0,5}?)[\s,]+(?:"
-    + _CALC_NUMBER + r")" + _TAIL,
+    + _CALC_NUMBER + r")" + _TAIL + r"(?:\s*\((?:" + _CALC_NUMBER.replace("?P<", "?P<p_")
+    + r")\))?",
     re.IGNORECASE,
 )
 _SHARE_OF_RANGE_RE = re.compile(
@@ -153,22 +180,57 @@ _META_RANGE_RE = re.compile(
 )
 
 
-def _from_calc(text: str, calc_numbers: frozenset[float]) -> bool:
-    return round(float(text.replace(",", ".")), 1) in {round(n, 1) for n in calc_numbers}
+def _in(text: str, numbers: frozenset[float]) -> bool:
+    return round(float(text.replace(",", ".")), 1) in {round(n, 1) for n in numbers}
 
 
-def _backed_number(match: re.Match[str], text: str, calc_numbers: frozenset[float]) -> bool:
-    """Число совпадения — выход расчёта, и не доля банка."""
+def _numbers_of(match: re.Match[str]) -> list[str]:
     if match.group("pct") is not None:
-        if not match.group("tail") and _POT_AFTER_RE.match(text, match.end()):
-            return False
-        return _from_calc(match.group("pct"), calc_numbers)
-    return _from_calc(match.group("num"), calc_numbers) and _from_calc(
-        match.group("den"), calc_numbers
-    )
+        return [match.group("pct")]
+    return [match.group("num"), match.group("den")]
 
 
-def _strip_backed(sentence: str, calc_numbers: frozenset[float]) -> str:
+def _clause_start(text: str, position: int) -> int:
+    starts = [m.end() for m in _CLAUSE_SPLIT_RE.finditer(text, 0, position)]
+    return starts[-1] if starts else 0
+
+
+def _word_at(text: str, position: int) -> str:
+    match = _WORD_RE.match(text, position)
+    return match.group(0) if match else ""
+
+
+def _backed(
+    match: re.Match[str],
+    text: str,
+    calc_numbers: frozenset[float],
+    frequency_numbers: frozenset[float],
+) -> bool:
+    """Действие держится на расчёте: измеренной частотой — всегда; порогом или долей
+    защиты — только как арифметика порога (условие или модальное слово с
+    инфинитивом в том же придаточном)."""
+    if _BET_WORD_RE.search(match.group("window")) or _HAND_RE.search(match.group("window")):
+        return False
+    if (
+        match.group("pct") is not None
+        and not match.group("tail")
+        and _POT_AFTER_RE.match(text, text.index("%", match.end("pct")) + 1)
+    ):
+        return False
+    numbers = _numbers_of(match)
+    if all(_in(n, frequency_numbers) for n in numbers):
+        return True
+    if not all(_in(n, calc_numbers) for n in numbers):
+        return False
+    clause = text[_clause_start(text, match.start()) : match.end()]
+    head = text[_clause_start(text, match.start()) : match.start()]
+    infinitive = bool(_INFINITIVE_END_RE.search(_word_at(text, match.start())))
+    return bool(_CONDITION_RE.search(head)) or (infinitive and bool(_MODAL_RE.search(clause)))
+
+
+def _strip_backed(
+    sentence: str, calc_numbers: frozenset[float], frequency_numbers: frozenset[float]
+) -> str:
     """Предложение без того, что держится на расчёте, и без метаречи."""
     rest = _META_RANGE_RE.sub(" ", sentence)
     changed = True
@@ -176,33 +238,52 @@ def _strip_backed(sentence: str, calc_numbers: frozenset[float]) -> str:
         changed = False
         for anchor in _ACTION_RE.finditer(rest):
             match = _BACKED_RE.match(rest, anchor.start())
-            if match is None:
-                continue
-            window = match.group("window")
-            if (
-                _BET_WORD_RE.search(window)
-                or _HAND_RE.search(window)
-                or not _backed_number(match, rest, calc_numbers)
-            ):
+            if match is None or not _backed(match, rest, calc_numbers, frequency_numbers):
                 continue
             rest = rest[: match.start()] + " " + rest[match.end():]
             changed = True
             break
     return _SHARE_OF_RANGE_RE.sub(
-        lambda m: " " if _from_calc(m.group("pct"), calc_numbers) else m.group(0), rest
+        lambda m: " " if _in(m.group("pct"), calc_numbers) else m.group(0), rest
     )
 
 
-def _opponent_claim(sentence: str, calc_numbers: frozenset[float]) -> bool:
-    """Предложение требует «(допущение)»: в нём, кроме опоры на расчёт и метаречи,
-    осталось слово диапазона («диапазон», «рендж», «держ…») — правило по умолчанию,
-    — или явное утверждение о сопернике: слово о нём и о том, что он держит или
-    сделает (`test_a_claim_about_what_the_opponent_holds_or_does_needs_the_mark`,
-    `test_a_range_word_needs_the_mark_by_default`). Остальное — судья (спека №2)."""
-    rest = _strip_backed(sentence, calc_numbers)
-    if _RANGE_WORD_RE.search(rest):
+def _opponent_clause(clause: str) -> bool:
+    """Придаточное утверждает, что соперник держит или сделает: слово о нём и рука
+    или действие в форме прогноза. Придаточное с «вы» — о герое; глагол прошедшего
+    времени — факт руки; существительное («рейз», «коллом») рядом с глаголом
+    прошедшего времени — тоже (`test_hand_narration_is_not_an_opponent_claim`)."""
+    if _HERO_SUBJECT_RE.search(clause) or not _OPPONENT_RE.search(clause):
+        return False
+    if _HAND_RE.search(clause):
         return True
-    return bool(_OPPONENT_RE.search(rest) and _HOLDING_RE.search(rest))
+    narrated = bool(_PAST_WORD_RE.search(clause))
+    for action in _ACTION_RE.finditer(clause):
+        # Слово целиком — от начала совпадения назад до границы.
+        start = action.start()
+        while start > 0 and clause[start - 1].isalpha():
+            start -= 1
+        word = _word_at(clause, start)
+        if _PAST_END_RE.search(word):
+            continue
+        if _VERB_END_RE.search(word) or not narrated:
+            return True
+    return False
+
+
+def _opponent_claim(
+    sentence: str, calc_numbers: frozenset[float], frequency_numbers: frozenset[float]
+) -> bool:
+    """Предложение требует «(допущение)»: после опоры на расчёт и метаречи в нём
+    осталось слово диапазона («вы держите» — о герое и не в счёт;
+    `test_a_range_word_needs_the_mark_by_default`) или придаточное с явным
+    утверждением о сопернике
+    (`test_a_claim_about_what_the_opponent_holds_or_does_needs_the_mark`).
+    Остальное — судья (спека №2)."""
+    rest = _strip_backed(sentence, calc_numbers, frequency_numbers)
+    if _RANGE_WORD_RE.search(_HERO_HOLDS_RE.sub(" ", rest)):
+        return True
+    return any(_opponent_clause(clause) for clause in _CLAUSE_SPLIT_RE.split(rest))
 
 
 # Лучшая линия на флопе и тёрне (решение владельца 2026-10-13). «Стоило» убрано:
@@ -213,25 +294,45 @@ _BEST_LINE_RE = re.compile(
     r"|(?<![A-Za-z])GTO(?![A-Za-z])|(?<![А-Яа-яЁё])ГТО(?![А-Яа-яЁё])",
     re.IGNORECASE,
 )
-# Вывод о прибыльности: голый — только по решённому порогу в разговоре; с долей и
-# условием («окупается от 19.4% эквити», «при 24% фолдов») — арифметика (правка 4).
+# Вывод о прибыльности: голый — только по решённому порогу в разговоре.
 _PROFIT_RE = re.compile(_W + r"в\s+(?:плюсе|минусе)(?![а-яё])|окуп[а-яё]*", re.IGNORECASE)
-# Условие и в том же придаточном (без запятой и тире) доля, которую выдал расчёт.
-_ARITHMETIC_RE = re.compile(
-    _W + r"(?:если|при|от|когда|чтобы|чаще|реже)" + _WE
-    + r"[^.!?,;—–]*?(?P<pct>" + _NUMBER + r")\s*%",
-    re.IGNORECASE,
-)
+_PROFIT_CONDITION_RE = re.compile(_W + r"(?:если|при|от|когда|чтобы)" + _WE, re.IGNORECASE)
+_PCT_RE = re.compile(r"(?P<pct>" + _NUMBER + r")\s*%")
+
+
+def _calc_share_in(clause: str, calc_numbers: frozenset[float]) -> bool:
+    return any(
+        _in(m.group("pct"), calc_numbers) and not _POT_AFTER_RE.match(clause, m.end())
+        for m in _PCT_RE.finditer(clause)
+    )
 
 
 def _profit_arithmetic(sentence: str, calc_numbers: frozenset[float]) -> bool:
-    """«Окупается от 19.4% эквити»: в условии стоит доля из выхода расчёта, и это
-    не доля банка (`test_profit_arithmetic_with_a_calc_share_is_allowed`)."""
-    return any(
-        _from_calc(m.group("pct"), calc_numbers)
-        and not _POT_AFTER_RE.match(sentence, m.end())
-        for m in _ARITHMETIC_RE.finditer(sentence)
+    """«Окупается от 19.4% эквити» — арифметика, а не вывод, по придаточным: в
+    одном из них условие («если/при/от/когда/чтобы») и доля из выхода расчёта (не
+    доля банка), а свободных придаточных — без доли расчёта и не начатых условием —
+    нет («…, тут так и есть» — вывод;
+    `test_a_bare_profit_conclusion_with_some_share_still_needs_a_threshold`,
+    `test_profit_arithmetic_with_a_calc_share_is_allowed`)."""
+    clauses = [c for c in _CLAUSE_SPLIT_RE.split(sentence) if c.strip(" .!?")]
+    conditional = [
+        c for c in clauses
+        if _PROFIT_CONDITION_RE.search(c) and _calc_share_in(c, calc_numbers)
+    ]
+    purpose = [
+        c for c in clauses
+        if re.match(r"\s*чтобы" + _WE, c, re.IGNORECASE) and _PROFIT_RE.search(c)
+    ]
+    if not conditional and not (purpose and any(_calc_share_in(c, calc_numbers) for c in clauses)):
+        return False
+    return all(
+        _PROFIT_RE.search(c)
+        or _calc_share_in(c, calc_numbers)
+        or re.match(r"\s*(?:если|когда|при|чтобы)" + _WE, c, re.IGNORECASE)
+        for c in clauses
     )
+
+
 # Отрицание перед термином: «без флеш-дро», «нет …», «не …», «ни …».
 _NEGATION_BEFORE_RE = re.compile(_W + r"(?:без|нет|не|ни)\s+$", re.IGNORECASE)
 _FLOP_TURN_RE = re.compile(r"флоп|т[её]рн", re.IGNORECASE)
@@ -461,14 +562,16 @@ def check_agent_answer(
     board_ranks: Sequence[str] = (),
     threshold_decided: bool = False,
     calc_numbers: frozenset[float],
+    frequency_numbers: frozenset[float],
 ) -> list[str]:
     """Нарушения ответа словами; пустой список — ответ прошёл (спека §6).
 
     `threshold_decided` — в разговоре есть `frequency_vs_threshold` с выводом выше
     или ниже порога: только тогда голый вывод «в плюсе» / «в минусе» допустим.
     `calc_numbers` — числа из выходов расчётов разговора, без чисел сводки и слов
-    игрока: только они служат опорой для действия соперника и для арифметики
-    «окупается от N%».
+    игрока: опора арифметики порога и «окупается от N%». `frequency_numbers` —
+    из них измеренные частоты (доля и «N из M» частоты и измеренной величины
+    порога): только они служат опорой действию соперника вне арифметики порога.
     """
     text = answer.strip()
     if not text:
@@ -483,7 +586,10 @@ def check_agent_answer(
         violations.append(f"числа не из расчёта и не из разбора — {invented}")
     for sentence in _SENTENCE_RE.findall(text):
         quoted = sentence.strip()
-        if _opponent_claim(sentence, calc_numbers) and ASSUMPTION_MARK not in sentence:
+        if (
+            _opponent_claim(sentence, calc_numbers, frequency_numbers)
+            and ASSUMPTION_MARK not in sentence
+        ):
             violations.append(
                 f"утверждение о том, что соперник держит или сделает, без метки "
                 f"{ASSUMPTION_MARK} — «{quoted}»"

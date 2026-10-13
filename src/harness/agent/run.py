@@ -20,6 +20,7 @@ from harness.agent import prompt as _prompt
 from harness.agent.history import (
     allowed_from_history,
     calcs_in_history,
+    frequency_numbers,
     player_numbers,
     player_text_numbers,
     seen_history,
@@ -114,6 +115,7 @@ def _violations(
         board_ranks=context.board_ranks if context else (),
         threshold_decided=threshold_decided(messages),
         calc_numbers=calc_numbers,
+        frequency_numbers=frequency_numbers(messages),
     )
 
 

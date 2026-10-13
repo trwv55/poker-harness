@@ -758,3 +758,18 @@ async def test_an_undecided_threshold_does_not_allow_a_profit_conclusion(db_fact
     assert turn.results[0].outcome.value == "undecided"  # type: ignore[union-attr]
     assert turn.state == "numbers"
     assert any("frequency_vs_threshold" in v for v in turn.violations[0])
+
+
+async def test_the_measured_frequency_is_kept_apart_from_other_calc_numbers(db_factory):
+    """Метаданные ответа инструмента несут измеренную частоту отдельно: у защиты её
+    нет, у частоты героя — доля, числитель и знаменатель."""
+    from harness.agent.history import frequency_numbers
+
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8144)
+        script = _TurnScript([
+            ([_VPIP, ("defense_frequency", {"pot_before_bb": 7.7, "bet_bb": 3.3})], _GOOD),
+        ])
+        turn = await _turn(db_factory, session, script, scope=scope, text="банк 7.7 BB, ставка 3.3 BB")
+    assert frequency_numbers(turn.messages) == frozenset({2.0, 100.0})
+    assert 30.0 in allowed_from_history(turn.messages)  # доля защиты — расчёт, не частота

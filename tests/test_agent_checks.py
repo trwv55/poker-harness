@@ -44,6 +44,7 @@ def _check(answer: str, **kw) -> list[str]:
     kw.setdefault("labels", frozenset())
     kw.setdefault("leaks_called", False)
     kw.setdefault("calc_numbers", _NONE)
+    kw.setdefault("frequency_numbers", _NONE)
     return check_agent_answer(answer, **kw)
 
 
@@ -216,7 +217,7 @@ def test_a_claim_about_what_the_opponent_holds_or_does_needs_the_mark(text: str)
 @pytest.mark.parametrize(
     "text",
     [
-        # Арифметика порога — действие, привязанное к доле из расчёта.
+        # Арифметика порога — порог из расчёта в условии или с «нужно» и инфинитивом.
         "Сопернику достаточно сбрасывать 25% диапазона, а защищаться ему нужно 75%.",
         "Ставка окупается на одних фолдах, если защищающийся сбрасывает чаще 25%.",
         "Ставка окупается, если он сбрасывает чаще 25%.",
@@ -234,8 +235,10 @@ def test_a_claim_about_what_the_opponent_holds_or_does_needs_the_mark(text: str)
 )
 def test_calc_backed_statements_and_meta_speech_need_no_mark(text: str):
     allowed = frozenset({2.5, 5.0, 25.0, 30.0, 50.0, 60.0, 75.0})
+    measured = frozenset({30.0, 50.0, 60.0})
     assert not any(
-        ASSUMPTION_MARK in v for v in _check(text, allowed=allowed, calc_numbers=allowed)
+        ASSUMPTION_MARK in v
+        for v in _check(text, allowed=allowed, calc_numbers=allowed, frequency_numbers=measured)
     )
 
 
@@ -329,13 +332,69 @@ def test_profit_arithmetic_with_a_calc_share_is_allowed(text: str):
     ],
 )
 def test_a_bare_profit_conclusion_with_some_share_still_needs_a_threshold(text: str):
-    """Обходы повторного ревью: доля не из расчёта или вне условного придаточного."""
+    """Обходы повторных ревью: доля вне условного придаточного или свободное
+    придаточное-вывод («…, тут так и есть») — нарушение и при доле из расчёта."""
     numbers = frozenset({25.0})
     assert any("порог" in v for v in _check(text, allowed=numbers))
-    if "в минусе при любом" in text or "почти всё" in text:
-        assert any(
-            "порог" in v for v in _check(text, allowed=numbers, calc_numbers=numbers)
-        )
+    assert any("порог" in v for v in _check(text, allowed=numbers, calc_numbers=numbers))
+
+
+def test_a_threshold_in_the_main_clause_is_not_a_condition():
+    """«Чаще/реже» — не условие (раунд 3): порог защиты в главном придаточном не
+    снимает правило «в плюсе» и не служит опорой прогнозу."""
+    defense = frozenset({33.3, 66.7, 25.0, 5.0, 2.5})
+    kw = {"allowed": defense, "calc_numbers": defense}
+    violations = _check("Ставка в плюсе: он сбрасывает чаще 33.3%.", **kw)
+    assert any("порог" in v for v in violations)
+    assert any(ASSUMPTION_MARK in v for v in violations)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Он точно сбросит чаще 33.3%, так что ставка хорошая.", "Он будет защищаться 76% раз."],
+)
+def test_only_a_measured_frequency_backs_an_opponent_action(text: str):
+    """Порог и доля защиты из расчёта прогноз не освобождают (раунд 3)."""
+    defense = frozenset({33.3, 66.7, 76.0, 24.0})
+    assert any(
+        ASSUMPTION_MARK in v for v in _check(text, allowed=defense, calc_numbers=defense)
+    )
+
+
+def test_a_measured_frequency_of_the_field_backs_its_action():
+    numbers = frozenset({38.9, 21.0, 54.0})
+    text = "Поле сбрасывает на с-бет 38.9% (21 из 54)."
+    assert _check(
+        text, allowed=numbers, calc_numbers=numbers, frequency_numbers=numbers,
+        labels=frozenset({STAT_LABEL + "fold_to_cbet"}),
+    ) == []
+
+
+NARRATION = [
+    "На флопе он чекнул, вы поставили 2.5 BB.",
+    "У вас K-high без дро.",
+    "Он поставил 2 BB, вы сбросили.",
+    "BB заколлировал префлоп.",
+    "Вы открылись с баттона, BB заколлировал.",
+    "На тёрне соперник поставил 5 BB, и вы сфолдили.",
+    "Вы заколлировали его рейз на флопе.",
+    "Он сделал рейз до 8 BB, вы сбросили.",
+    "Префлоп вы рейзнули, он ответил коллом.",
+    "На ривере он пошёл олл-ин, вы заколлировали и проиграли.",
+    "SB сбросил, BB защитился.",
+    "Вы держите топ-пару на флопе.",
+    "У вас пара дам, у соперника оказался сет.",
+    "Он сбросил на ваш c-бет.",
+    "Вы поставили c-бет, он сфолдил.",
+]
+
+
+@pytest.mark.parametrize("text", NARRATION)
+def test_hand_narration_is_not_an_opponent_claim(text: str):
+    """Пересказ руки — факт, не прогноз (раунд 3, решение (а)): прошедшее время и
+    придаточное с «вы» метки не требуют; «вы держите» — о своей руке."""
+    sizes = frozenset({2.0, 2.5, 5.0, 8.0})
+    assert not any(ASSUMPTION_MARK in v for v in _check(text, allowed=sizes))
 
 
 # --- лучшая линия на флопе и тёрне ---------------------------------------------
@@ -616,6 +675,10 @@ def _turn_shaped_allowed() -> frozenset[float]:
     return calc
 
 
+# Измеренные частоты тех же расчётов: сдача поля 30 из 50 (60%), свой c-бет 5 из 7.
+_TURN_MEASURED = frozenset({30.0, 50.0, 60.0, 5.0, 7.0, 71.4})
+
+
 _TURN_KW = {
     "labels": frozenset({STAT_LABEL + "cbet_flop", STAT_LABEL + "fold_to_cbet"}),
     "board_ranks": ("7", "7", "Q"),
@@ -645,12 +708,12 @@ def test_the_rejected_draft_of_the_live_turn_now_passes():
     расчёта), две фразы со словом «диапазон» без утверждения о составе и
     «без флеш-дро»."""
     calc = _turn_shaped_allowed()
-    assert _check(_REJECTED_DRAFT, allowed=calc, calc_numbers=calc, **_TURN_KW) == []
+    assert _check(_REJECTED_DRAFT, allowed=calc, calc_numbers=calc, frequency_numbers=_TURN_MEASURED, **_TURN_KW) == []
 
 
 def test_the_fixed_answer_passes_with_a_decided_threshold_only():
     calc = _turn_shaped_allowed()
-    kw = {"allowed": calc, "calc_numbers": calc, **_TURN_KW}
+    kw = {"allowed": calc, "calc_numbers": calc, "frequency_numbers": _TURN_MEASURED, **_TURN_KW}
     assert _check(_FIXED_ANSWER, threshold_decided=True, **kw) == []
     assert any("frequency_vs_threshold" in v for v in _check(_FIXED_ANSWER, **kw))
 
@@ -658,7 +721,7 @@ def test_the_fixed_answer_passes_with_a_decided_threshold_only():
 def test_a_real_violation_in_the_live_turn_shape_is_still_caught():
     draft = _REJECTED_DRAFT + " У него широкий диапазон, и выборка больше 30.5."
     calc = _turn_shaped_allowed()
-    violations = _check(draft, allowed=calc, calc_numbers=calc, **_TURN_KW)
+    violations = _check(draft, allowed=calc, calc_numbers=calc, frequency_numbers=_TURN_MEASURED, **_TURN_KW)
     assert len(violations) == 2
     assert any("30.5" in v for v in violations)
     assert any(ASSUMPTION_MARK in v for v in violations)

@@ -313,6 +313,14 @@ async def _perform(
     })
     stat = getattr(result, "stat", None)
     outcome = getattr(result, "outcome", None)
+    # Измеренная частота (не порог и не доля защиты): опора действию соперника в
+    # проверке допущения агента (`agent_checks._backed`).
+    measurement = getattr(result, "measurement", None)
+    frequency: list[float] = []
+    if measurement is not None:
+        frequency = [float(measurement.numerator), float(measurement.denominator)]
+        if measurement.share is not None:
+            frequency.append(round(100.0 * measurement.share, 1))
     return ToolReturn(
         return_value=digest.text,
         metadata={
@@ -320,6 +328,7 @@ async def _perform(
             "allowed": sorted(digest.allowed),
             "stat": stat.value if stat is not None else None,
             "outcome": outcome.value if outcome is not None else None,
+            "frequency": frequency,
         },
     )
 
