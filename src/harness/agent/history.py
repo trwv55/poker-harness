@@ -25,6 +25,7 @@ from pydantic_ai.messages import (
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
+    TextPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -134,6 +135,20 @@ def _is_output_call(part: object) -> bool:
     return isinstance(part, ToolCallPart) and part.tool_name not in _CALC_TOOLS
 
 
+def _answer(message: ModelMessage) -> ToolCallPart | ModelResponse | None:
+    """Ответ модели, которым кончился прогон, в двух формах: вызов вывода или
+    ответ без единого вызова — простой текст, принятый фасадом наравне с
+    выводом (`test_a_final_answer_in_plain_text_is_shown_and_saved`). Текст
+    рядом с вызовами ответом не считается: библиотека тогда исполняет вызовы."""
+    if not isinstance(message, ModelResponse):
+        return None
+    calls = [part for part in message.parts if isinstance(part, ToolCallPart)]
+    if not calls:
+        return message if any(isinstance(part, TextPart) for part in message.parts) else None
+    outputs = [part for part in calls if _is_output_call(part)]
+    return outputs[-1] if outputs else None
+
+
 def seen_history(
     messages: Sequence[ModelMessage],
     *,
@@ -145,35 +160,46 @@ def seen_history(
     ответ модели на ход — тот, что ушёл игроку.
 
     `messages[:start]` — история вечера, уже прошедшая эту чистку, берётся как
-    есть. В сообщениях хода (`messages[start:]`):
+    есть. В сообщениях хода (`messages[start:]`) ответ модели — вызов вывода
+    или ответ простым текстом без вызовов (`_answer`), и:
 
-    * ответы модели сводятся к вызовам расчётов и последнему вызову вывода —
-      текст и рассуждения рядом с вызовами игрок не видел
+    * ответы модели сводятся к вызовам расчётов и последнему ответу — текст и
+      рассуждения рядом с вызовами игрок не видел
       (`test_text_next_to_a_rejected_draft_is_not_saved`,
-      `test_text_next_to_the_final_answer_is_not_saved`);
-    * прежние вызовы вывода — отвергнутые черновики — уходят вместе с ответами
-      на них, реплики в сообщении `rewrite_at` (просьба переписать — первое
-      сообщение второго прогона) тоже
-      (`test_the_saved_history_keeps_no_rejected_draft_and_no_rewrite_request`);
+      `test_text_next_to_the_final_answer_is_not_saved`); у ответа текстом
+      остаётся только текст (`test_a_final_answer_in_plain_text_is_shown_and_saved`);
+    * прежние ответы — отвергнутые черновики в любой из двух форм — уходят
+      вместе с ответами на вызов вывода, реплики в сообщении `rewrite_at`
+      (просьба переписать — первое сообщение второго прогона) тоже
+      (`test_the_saved_history_keeps_no_rejected_draft_and_no_rewrite_request`,
+      `test_a_rejected_text_draft_is_not_saved_and_the_text_rewrite_is`,
+      `test_a_text_draft_and_a_tool_rewrite_mix`);
     * `final_answer` — текст, который игрок получил вместо прозы (состояния
-      «числа» и «отказ»), подменяет ответ последнего вызова вывода; `None` —
-      проза прошла и остаётся как есть
-      (`test_a_refused_answer_is_saved_as_the_refusal_the_player_saw`).
+      «числа» и «отказ»), подменяет последний ответ; `None` — проза прошла и
+      остаётся как есть
+      (`test_a_refused_answer_is_saved_as_the_refusal_the_player_saw`,
+      `test_a_refused_text_answer_is_saved_as_the_refusal_the_player_saw`).
     """
     turn = list(messages[start:])
-    outputs = [
-        part
-        for message in turn
-        if isinstance(message, ModelResponse)
-        for part in message.parts
-        if _is_output_call(part)
-    ]
-    final = outputs[-1] if outputs else None
-    dropped = {part.tool_call_id for part in outputs if part is not final and isinstance(part, ToolCallPart)}
+    answers = [answer for message in turn if (answer := _answer(message)) is not None]
+    final = answers[-1] if answers else None
+    dropped = {
+        part.tool_call_id for part in answers if part is not final and isinstance(part, ToolCallPart)
+    }
 
     kept: list[ModelMessage] = list(messages[:start])
     for offset, message in enumerate(turn):
         if isinstance(message, ModelResponse):
+            if message is final:
+                text_parts: list[TextPart] = (
+                    [TextPart(final_answer)]
+                    if final_answer is not None
+                    else [part for part in message.parts if isinstance(part, TextPart)]
+                )
+                kept.append(dataclasses.replace(message, parts=text_parts))
+                continue
+            if any(message is answer for answer in answers):
+                continue
             parts: list[ToolCallPart] = []
             for part in message.parts:
                 if not isinstance(part, ToolCallPart) or part.tool_call_id in dropped:

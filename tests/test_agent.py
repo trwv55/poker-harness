@@ -7,15 +7,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from itertools import pairwise
 from typing import Any
 
+import pytest
 from pydantic_ai.messages import (
     ModelMessage,
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
     TextPart,
+    ThinkingPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -36,7 +39,7 @@ from harness.agent.run import MAX_CALCS_PER_TURN, REWRITE_HEAD, run_agent_turn
 from harness.analysis.frequency import defense_from_bet
 from harness.contracts import CalcName, DefenseResult
 from harness.explanation.agent_checks import agent_context
-from harness.platform.llm import LLM
+from harness.platform.llm import LLM, LLMSchemaError
 from harness.presentation.messages import agent_turn_msg
 from tests.conftest import requires_agent_prompt
 from tests.test_hand_replay import _postflop_hand
@@ -44,6 +47,7 @@ from tests.test_question_routing import _TEST_CFG, _seeded
 from tests.test_verdict_text import _point, _result
 
 _SYSTEM = "СИСТЕМНЫЙ-СИНТ"
+_THINKING = "РАССУЖДЕНИЕ-СИНТ"
 
 
 class _TurnScript:
@@ -55,12 +59,20 @@ class _TurnScript:
     """
 
     def __init__(
-        self, runs: list[tuple[list[tuple[str, dict[str, Any]]], str]], *, chatter: bool = False
+        self,
+        runs: list[tuple[list[tuple[str, dict[str, Any]]], str]],
+        *,
+        chatter: bool = False,
+        as_text: Collection[int] = (),
     ) -> None:
         """`chatter` — модель пишет текст рядом с вызовом вывода, как живые
-        провайдеры («Итак: …»); `FunctionModel` сам этого не делает."""
+        провайдеры («Итак: …»); `FunctionModel` сам этого не делает.
+        `as_text` — номера прогонов, в которых модель отвечает простым текстом,
+        а не вызовом вывода (живая модель с `tool_choice: auto` делает и так,
+        и так); такой ответ идёт с рассуждением рядом."""
         self.runs = runs
         self.chatter = chatter
+        self.as_text = frozenset(as_text)
         self.run = -1
         self.requests = 0
         self.instructions: list[str] = []
@@ -88,6 +100,9 @@ class _TurnScript:
         if step < len(calls):
             name, args = calls[step]
             return ModelResponse(parts=[ToolCallPart(tool_name=name, args=args)])
+        if self.run in self.as_text:
+            assert info.allow_text_output
+            return ModelResponse(parts=[ThinkingPart(_THINKING), TextPart(answer)])
         assert info.output_tools
         output = ToolCallPart(info.output_tools[0].name, {"answer": answer})
         if self.chatter:
@@ -773,3 +788,98 @@ async def test_the_measured_frequency_is_kept_apart_from_other_calc_numbers(db_f
         turn = await _turn(db_factory, session, script, scope=scope, text="банк 7.7 BB, ставка 3.3 BB")
     assert frequency_numbers(turn.messages) == frozenset({2.0, 100.0})
     assert 30.0 in allowed_from_history(turn.messages)  # доля защиты — расчёт, не частота
+
+
+# --- ответ простым текстом: модель с `tool_choice: auto` не всегда зовёт вывод ------
+
+
+async def test_a_final_answer_in_plain_text_is_shown_and_saved(db_factory):
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8140)
+        script = _TurnScript([([_VPIP], f"  {_GOOD}\n")], as_text={0})
+        turn = await _turn(db_factory, session, script, scope=scope)
+        assert turn.state == "prose" and turn.prose == _GOOD
+        assert [r.calc for r in turn.results] == [CalcName.HERO_FREQUENCY]
+        saved = load_history(dump_history(turn.saved_messages(None)))
+        stored = _stored_text(saved)
+        assert _GOOD in stored and _THINKING not in stored and _alternates(saved)
+        assert calcs_in_history(saved) == {"hero_frequency"}
+        nxt = await _turn(
+            db_factory, session, _TurnScript([([], "Те же 100.0% (2 из 2).")], as_text={0}),
+            scope=scope, history=saved,
+        )
+    assert nxt.state == "prose"
+    assert len(turns(nxt.saved_messages(None))) == 2
+
+
+async def test_a_plain_text_answer_goes_through_the_checks(db_factory):
+    """Текст проверяется так же, как вывод: выдуманное число — переписать."""
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8141)
+        script = _TurnScript(
+            [([_VPIP], "Вы входите в 43.0% раздач."), ([], "Вы входите в 44.0% раздач.")],
+            as_text={0, 1},
+        )
+        turn = await _turn(db_factory, session, script, scope=scope)
+    assert turn.state == "numbers" and len(turn.violations) == 2
+    assert turn.journal()["drafts"] == ["Вы входите в 43.0% раздач.", "Вы входите в 44.0% раздач."]
+    saved = turn.saved_messages("ПОКАЗАНО-СИНТ")
+    stored = _stored_text(saved)
+    assert "43.0" not in stored and "44.0" not in stored and REWRITE_HEAD not in stored
+    assert "ПОКАЗАНО-СИНТ" in stored and _alternates(saved)
+
+
+async def test_a_rejected_text_draft_is_not_saved_and_the_text_rewrite_is(db_factory):
+    bad = "Вы входите в 43.0% раздач."
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8142)
+        script = _TurnScript([([_VPIP], bad), ([], _GOOD)], as_text={0, 1})
+        turn = await _turn(db_factory, session, script, scope=scope)
+        assert turn.state == "prose" and turn.prose == _GOOD
+        saved = load_history(dump_history(turn.saved_messages(None)))
+        stored = _stored_text(saved)
+        assert "43.0" not in stored and REWRITE_HEAD not in stored and _THINKING not in stored
+        assert stored.count(_GOOD) == 1 and _alternates(saved)
+        nxt = await _turn(
+            db_factory, session, _TurnScript([([], "Те же 100.0% (2 из 2).")]),
+            scope=scope, history=saved,
+        )
+    assert nxt.state == "prose"
+
+
+async def test_a_text_draft_and_a_tool_rewrite_mix(db_factory):
+    """Черновик текстом отвергнут, переписано вызовом вывода — и наоборот."""
+    bad = "Вы входите в 43.0% раздач."
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8143)
+        for as_text in ({0}, {1}):
+            script = _TurnScript([([_VPIP], bad), ([], _GOOD)], as_text=as_text)
+            turn = await _turn(db_factory, session, script, scope=scope)
+            assert turn.state == "prose" and turn.prose == _GOOD, as_text
+            saved = load_history(dump_history(turn.saved_messages(None)))
+            stored = _stored_text(saved)
+            assert "43.0" not in stored and REWRITE_HEAD not in stored, as_text
+            assert stored.count(_GOOD) == 1 and _alternates(saved), as_text
+            nxt = await _turn(
+                db_factory, session, _TurnScript([([], "Те же 100.0% (2 из 2).")]),
+                scope=scope, history=saved,
+            )
+            assert nxt.state == "prose", as_text
+
+
+async def test_a_refused_text_answer_is_saved_as_the_refusal_the_player_saw(db_factory):
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8144)
+        script = _TurnScript([([], "На BB вы минусовой, это нормально.")], as_text={0})
+        turn = await _turn(db_factory, session, script, scope=scope)
+    assert turn.state == "refusal"
+    stored = _stored_text(turn.saved_messages("ОТКАЗ-СИНТ"))
+    assert "минусовой" not in stored and "ОТКАЗ-СИНТ" in stored
+
+
+async def test_a_blank_text_answer_is_a_schema_error(db_factory):
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8145)
+        script = _TurnScript([([_VPIP], " \n "), ([_VPIP], " \n ")], as_text={0, 1})
+        with pytest.raises(LLMSchemaError):
+            await _turn(db_factory, session, script, scope=scope)

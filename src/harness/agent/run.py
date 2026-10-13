@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel
+from pydantic_ai import ModelRetry
 from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -45,6 +46,17 @@ class AgentDraft(ModelOutput, BaseModel):
     """Что модели разрешено вернуть: слова. Подпись и числа собирает код."""
 
     answer: str
+
+    @classmethod
+    def from_text(cls, text: str) -> AgentDraft:
+        """Ответ простым текстом вместо вызова вывода: модель агента идёт с
+        `tool_choice: auto` и делает и так, и так
+        (`test_a_final_answer_in_plain_text_is_shown_and_saved`). Пустой текст —
+        не ответ, а ошибка схемы (`test_a_blank_text_answer_is_a_schema_error`)."""
+        answer = text.strip()
+        if not answer:
+            raise ModelRetry("пустой ответ")
+        return cls(answer=answer)
 
 
 @dataclass(frozen=True)
@@ -182,7 +194,8 @@ async def run_agent_turn(
 
     draft, meta = await llm(
         "agent", AgentDraft, prompt=text, tools=tools,
-        message_history=history, instructions=instructions, trace_id=trace_id,
+        message_history=history, instructions=instructions,
+        text_output=AgentDraft.from_text, trace_id=trace_id,
     )
     messages = meta.messages
     grounded = context is not None or bool(calcs_in_history(messages))
@@ -197,7 +210,8 @@ async def run_agent_turn(
         first_len = len(messages)
         draft, meta = await llm(
             "agent", AgentDraft, prompt=request, tools=tools,
-            message_history=messages, instructions=instructions, trace_id=trace_id,
+            message_history=messages, instructions=instructions,
+            text_output=AgentDraft.from_text, trace_id=trace_id,
         )
         messages = meta.messages
         rewrite_at = _rewrite_index(messages, first_len - 1, request)

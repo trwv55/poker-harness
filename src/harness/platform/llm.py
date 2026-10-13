@@ -32,14 +32,14 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Literal, TypeVar
 
 import anyio
 from pydantic import BaseModel
-from pydantic_ai import Agent, BinaryContent
+from pydantic_ai import Agent, BinaryContent, TextOutput, ToolOutput
 from pydantic_ai._genai_prices import fill_response_cost
 from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
 from pydantic_ai.messages import ModelMessage, ModelResponse
@@ -290,6 +290,7 @@ class LLM:
         tools: Sequence[Tool[None]] = (),
         message_history: Sequence[ModelMessage] = (),
         instructions: str | None = None,
+        text_output: Callable[[str], T] | None = None,
         trace_id: int,
     ) -> tuple[T, CallMeta]:
         """`trace_id` — обязательный параметр каждого вызова, а не конструктора:
@@ -335,6 +336,12 @@ class LLM:
 
         `message_history` уходит модели перед `prompt`, `instructions` — в
         инструкции этого прогона (`test_instructions_reach_the_model`).
+
+        `text_output` — ответ простым текстом тоже принимается, наравне с
+        вызовом вывода: функция строит из текста `schema`. Нужен агенту, чья
+        модель идёт без принудительного `tool_choice` и отвечает то так, то так
+        (`test_a_final_answer_in_plain_text_is_shown_and_saved`). Без него текст
+        вместо вывода — ошибка схемы (`test_retry_on_schema_error_then_fail`).
         """
         model: Model | str = (
             self._model_override if self._model_override is not None else self._resolve_model(purpose)
@@ -363,7 +370,11 @@ class LLM:
             )
             agent: Agent[None, T] = Agent(
                 metered,
-                output_type=schema,
+                output_type=(
+                    schema
+                    if text_output is None
+                    else [ToolOutput(schema), TextOutput(text_output)]
+                ),
                 retries=0,
                 tools=tools,
                 deps_type=type(None),
