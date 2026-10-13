@@ -31,7 +31,17 @@
 (`test_the_subjunctive_is_a_prediction_not_a_fact_of_the_hand`,
 `test_a_habit_in_the_past_is_a_claim_not_a_fact_of_the_hand`); «вы» не освобождает
 придаточное, где подлежащее — соперник, с запятой или без
-(`test_a_clause_with_an_opponent_subject_is_checked_despite_you`).
+(`test_a_clause_with_an_opponent_subject_is_checked_despite_you`). «Фолд», «сброс»,
+«защита» существительным — не действие, действие — только глагольные формы
+(`test_a_fold_or_defence_noun_is_not_an_opponent_action`); часть о прибыльности
+ставки («он окупается против любой пары») — о ставке, рука в ней не утверждение
+о сопернике, а глагол соперника — прогноз
+(`test_a_hand_word_in_a_profit_clause_is_about_the_bet`,
+`test_an_opponent_verb_in_a_profit_clause_is_still_a_prediction`). В предложении о
+прибыльности форма «если <подлежащее> сбрасывает чаще/реже N%» с порогом из
+расчёта — арифметика порога через любые запятые
+(`test_threshold_math_after_a_profit_word_is_exempt_across_commas`,
+`test_live_threshold_math_about_the_bet_passes`).
 
 **«В плюсе», «в минусе», «окупается» — вывод только по порогу.** Голый вывод
 допустим, только когда в разговоре есть `frequency_vs_threshold` с выводом выше
@@ -160,6 +170,12 @@ _OPPONENT_SUBJECT_RE = re.compile(
     + r"|" + _POSITION,
     re.IGNORECASE,
 )
+# Фолд, сброс и защита существительным — не действие соперника («на одних фолдах»,
+# «порог по фолдам»); действие — только глагольные формы (раунд 5).
+_FOLD_NOUN_RE = re.compile(
+    r"(?:фолд|сброс)(?:а|у|ом|е|ы|ов|ам|ами|ах)?|защит(?:а|ы|е|у|ой|ам|ами|ах)?",
+    re.IGNORECASE,
+)
 # Части придаточного: время глагола освобождает существительное («рейз») только в
 # своей части («вы поставили и он сделает рейз» — прогноз).
 _PART_SPLIT_RE = re.compile(r"\s(?:и|а|но)\s", re.IGNORECASE)
@@ -202,6 +218,7 @@ _SHARE_OF_RANGE_RE = re.compile(
     r"(?P<pct>" + _NUMBER + r")\s*%\s+(?:его\s+)?(?:диапазон|рендж|фолд)[а-яё]*", re.IGNORECASE
 )
 _POT_AFTER_RE = re.compile(r"\s*банк", re.IGNORECASE)
+_MORE_LESS_RE = re.compile(_W + r"(?:чаще|реже)" + _WE, re.IGNORECASE)
 # Ставка героя глаголом («если вы поставите 25%»); «продолженную ставку» — имя
 # стата, не ставка.
 _BET_WORD_RE = re.compile(r"постав|став(?:ит|ишь|лю|им|ят)", re.IGNORECASE)
@@ -245,7 +262,10 @@ def _backed(
     """Действие держится на расчёте: измеренной частотой — всегда; порогом или долей
     защиты — только как арифметика порога (условие или модальное слово с
     инфинитивом в том же придаточном; голое «при» — не условие,
-    `test_a_bare_preposition_pri_is_not_a_condition`)."""
+    `test_a_bare_preposition_pri_is_not_a_condition`). В предложении о прибыльности
+    с «чаще/реже» перед долей условие ищется во всём предложении до действия
+    (`test_threshold_math_after_a_profit_word_is_exempt_across_commas`,
+    `test_across_commas_only_the_more_or_less_than_threshold_form_is_exempt`)."""
     if _BET_WORD_RE.search(match.group("window")) or _HAND_RE.search(match.group("window")):
         return False
     if (
@@ -260,7 +280,13 @@ def _backed(
     if not all(_in(n, calc_numbers) for n in numbers):
         return False
     clause = text[_clause_start(text, match.start()) : match.end()]
-    head = text[_clause_start(text, match.start()) : match.start()]
+    # «X окупается…, если <подлежащее> сбрасывает чаще N%» — условие ищется во всём
+    # предложении до действия, как бы его ни делили запятые; без слова
+    # прибыльности или без «чаще/реже» перед долей — только в своём придаточном
+    # (раунд 5).
+    across = bool(_PROFIT_RE.search(text)) and bool(_MORE_LESS_RE.search(match.group("window")))
+    head_start = 0 if across else _clause_start(text, match.start())
+    head = text[head_start : match.start()]
     infinitive = bool(_INFINITIVE_END_RE.search(_word_at(text, match.start())))
     return bool(_CONDITION_RE.search(head)) or (infinitive and bool(_MODAL_RE.search(clause)))
 
@@ -295,14 +321,23 @@ def _opponent_clause(clause: str, hypothetical: bool) -> bool:
     `test_a_noun_action_after_and_is_not_covered_by_a_past_verb_before_it`); при
     `hypothetical` («бы» или наречие повторяемости в предложении) прошедшее время
     ничего не освобождает (`test_the_subjunctive_is_a_prediction_not_a_fact_of_the_hand`,
-    `test_a_habit_in_the_past_is_a_claim_not_a_fact_of_the_hand`)."""
+    `test_a_habit_in_the_past_is_a_claim_not_a_fact_of_the_hand`). «Фолд», «сброс»,
+    «защита» существительным — не действие
+    (`test_a_fold_or_defence_noun_is_not_an_opponent_action`); рука в части о
+    прибыльности ставки — не утверждение о сопернике
+    (`test_a_hand_word_in_a_profit_clause_is_about_the_bet`)."""
     if not _OPPONENT_RE.search(clause):
         return False
     if _HERO_SUBJECT_RE.search(clause) and not _OPPONENT_SUBJECT_RE.search(clause):
         return False
-    if _HAND_RE.search(clause):
+    parts = _PART_SPLIT_RE.split(clause)
+    # Часть о прибыльности ставки («он окупается против любой пары», «выше него она
+    # окупается») — о ставке, а не о сопернике: «он» там — ставка, и рука рядом не
+    # утверждение о нём (раунд 5). Глагол соперника в ней — по-прежнему прогноз.
+    claim = " ".join(part for part in parts if not _PROFIT_RE.search(part))
+    if _OPPONENT_RE.search(claim) and _HAND_RE.search(claim):
         return True
-    for part in _PART_SPLIT_RE.split(clause):
+    for part in parts:
         narrated = not hypothetical and bool(_PAST_WORD_RE.search(part))
         for action in _ACTION_RE.finditer(part):
             # Слово целиком — от начала совпадения назад до границы.
@@ -310,6 +345,8 @@ def _opponent_clause(clause: str, hypothetical: bool) -> bool:
             while start > 0 and part[start - 1].isalpha():
                 start -= 1
             word = _word_at(part, start)
+            if _FOLD_NOUN_RE.fullmatch(word):
+                continue
             if _PAST_END_RE.search(word) and not hypothetical:
                 continue
             if _VERB_END_RE.search(word) or not narrated:

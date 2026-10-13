@@ -534,6 +534,113 @@ def test_a_profit_conclusion_with_a_bare_pri_needs_a_threshold():
     assert any("порог" in v for v in _check(text, allowed=numbers, calc_numbers=numbers))
 
 
+# Живой ход на стенде (раунд 5): обе попытки отклонены за допущение, хотя это
+# арифметика порога. «Он» — c-бет, «него» — порог; 24 — порог из расчёта защиты.
+LIVE_THRESHOLD_MATH = [
+    "Он окупается на одних фолдах, если защищающийся сбрасывает чаще 24%.",
+    "Порог по фолдам у этой ставки 24%: выше него она окупается на одних фолдах.",
+]
+
+
+@pytest.mark.parametrize("text", LIVE_THRESHOLD_MATH)
+def test_live_threshold_math_about_the_bet_passes(text: str):
+    """Предложение о прибыльности ставки («окупается») — не утверждение о
+    сопернике, а «фолдах» — не действие: при решённом пороге в разговоре и пороге
+    24 из расчёта оно проходит целиком."""
+    calc = frozenset({24.0, 76.0, 19.4})
+    assert _check(text, allowed=calc, calc_numbers=calc, threshold_decided=True) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Ставка стоит на фолдах, а у него фолдов много.",
+        "Порог по фолдам у него низкий.",
+        "Его защита тут слабая.",
+        "На фолдах он теряет немного.",
+        "Сбросов у него хватает.",
+    ],
+)
+def test_a_fold_or_defence_noun_is_not_an_opponent_action(text: str):
+    """«Фолд», «сброс», «защита» существительным — не действие соперника; действием
+    считаются только глагольные формы (раунд 5). Что такие фразы говорят о
+    сопернике другими словами, ловит судья (спека №2)."""
+    assert not any(ASSUMPTION_MARK in v for v in _check(text))
+
+
+@pytest.mark.parametrize(
+    "text", ["Он фолдит здесь.", "Соперник сфолдит.", "Он защищается.", "BB сбросит."]
+)
+def test_a_fold_or_defence_verb_is_still_an_opponent_action(text: str):
+    assert any(ASSUMPTION_MARK in v for v in _check(text))
+
+
+def test_a_hand_word_in_a_profit_clause_is_about_the_bet():
+    """«Он» в придаточном о прибыльности — ставка: рука рядом не утверждение о
+    сопернике, придаточное судит правило «в плюсе» (раунд 5)."""
+    text = "Он окупается против любой пары."
+    assert _check(text, threshold_decided=True) == []
+    assert any("порог" in v for v in _check(text))
+
+
+def test_an_opponent_verb_in_a_profit_clause_is_still_a_prediction():
+    """Глагольная форма действия соперника — прогноз и в придаточном о прибыльности,
+    без запятой тоже."""
+    assert any(
+        ASSUMPTION_MARK in v
+        for v in _check("Ставка в плюсе он сбросит почти всё.", threshold_decided=True)
+    )
+
+
+def test_a_prediction_joined_to_a_profit_clause_by_and_is_still_checked():
+    """Освобождается только часть о прибыльности ставки: «и он сбросит почти всё»
+    в том же придаточном — прогноз."""
+    assert any(
+        ASSUMPTION_MARK in v
+        for v in _check("Ставка окупается и он сбросит почти всё.", threshold_decided=True)
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Ставка окупается, если, по расчёту, соперник сбрасывает чаще 24%.",
+        "Ставка окупается на одних фолдах, когда соперник, судя по выходу, сбрасывает чаще 24%.",
+    ],
+)
+def test_threshold_math_after_a_profit_word_is_exempt_across_commas(text: str):
+    """«X окупается…, если <подлежащее> сбрасывает чаще N%» с порогом из расчёта —
+    арифметика порога, как бы ни делили его запятые (раунд 5)."""
+    calc = frozenset({24.0, 76.0})
+    assert not any(
+        ASSUMPTION_MARK in v
+        for v in _check(text, allowed=calc, calc_numbers=calc, threshold_decided=True)
+    )
+
+
+def test_across_commas_only_the_more_or_less_than_threshold_form_is_exempt():
+    """Через запятые освобождается только форма «сбрасывает чаще/реже N%»:
+    «…, если вы поставите, он сбросит 24%» — прогноз с порогом."""
+    calc = frozenset({24.0})
+    text = "Ставка в плюсе, если вы поставите, он сбросит 24%."
+    assert any(
+        ASSUMPTION_MARK in v
+        for v in _check(text, allowed=calc, calc_numbers=calc, threshold_decided=True)
+    )
+
+
+def test_a_condition_without_a_profit_word_does_not_reach_across_commas():
+    """Без слова прибыльности условие из другого придаточного опорой не служит:
+    «Если вы поставите 2.5 BB, он сбросит 24%.» — прогноз с порогом."""
+    calc = frozenset({24.0, 2.5})
+    assert any(
+        ASSUMPTION_MARK in v
+        for v in _check(
+            "Если вы поставите 2.5 BB, он сбросит 24%.", allowed=calc, calc_numbers=calc
+        )
+    )
+
+
 # --- лучшая линия на флопе и тёрне ---------------------------------------------
 
 
