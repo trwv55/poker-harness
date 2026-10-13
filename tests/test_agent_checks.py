@@ -397,6 +397,143 @@ def test_hand_narration_is_not_an_opponent_claim(text: str):
     assert not any(ASSUMPTION_MARK in v for v in _check(text, allowed=sizes))
 
 
+# Обходы освобождений пересказа (повторное ревью 3, решения контроллера раунда 4).
+SUBJUNCTIVE = [
+    "Он бы сбросил на такую ставку.",
+    "Он явно сбросил бы на такую ставку.",
+    "Он сделал бы рейз на тёрне.",
+    "Скорее всего, он сфолдил бы любую слабую руку.",
+    "Он сбросил бы, если бы вы поставили 5 BB.",
+    "Он бы защитился почти всем.",
+    "Он мог бы сбросить на такую ставку.",
+    "Он не стал бы защищаться.",
+]
+
+HABITUAL = [
+    "Он всегда коллировал такие ставки.",
+    "Раньше этот соперник часто фолдил на с-бет.",
+    "BB обычно защищался против такой ставки.",
+    "Такие игроки на BB обычно сбрасывали на с-бет.",
+    "Поле всегда коллировало такие размеры.",
+]
+
+HERO_AND_OPPONENT = [
+    "Он сбросит и вы заберёте банк.",
+    "Если вы поставите он почти наверняка сбросит.",
+    "Он сбросит, и вы заберёте банк.",
+    "Если вы поставите, он почти наверняка сбросит.",
+    "Вы видели, что он держит пару.",
+    "Против вас он будет блефовать.",
+]
+
+
+@pytest.mark.parametrize("text", SUBJUNCTIVE)
+def test_the_subjunctive_is_a_prediction_not_a_fact_of_the_hand(text: str):
+    """«Бы» в предложении снимает освобождение по прошедшему времени: сослагательное
+    наклонение — прогноз (раунд 4, решение 1)."""
+    assert any(ASSUMPTION_MARK in v for v in _check(text, allowed=frozenset({5.0})))
+    marked = text.removesuffix(".") + f" {ASSUMPTION_MARK}."
+    assert _check(marked, allowed=frozenset({5.0})) == []
+
+
+@pytest.mark.parametrize("text", HABITUAL)
+def test_a_habit_in_the_past_is_a_claim_not_a_fact_of_the_hand(text: str):
+    """Наречие повторяемости («всегда», «обычно», «часто», «раньше»…) снимает
+    освобождение по прошедшему времени: это обобщение, а не ход руки (раунд 4,
+    решение 2)."""
+    assert any(ASSUMPTION_MARK in v for v in _check(text))
+
+
+@pytest.mark.parametrize(
+    "marker",
+    ["всегда", "обычно", "часто", "редко", "как правило", "раньше", "постоянно", "регулярно"],
+)
+def test_every_habit_marker_cancels_the_narration_exemption(marker: str):
+    assert any(ASSUMPTION_MARK in v for v in _check(f"Он {marker} сбрасывал на с-бет."))
+    assert not any(ASSUMPTION_MARK in v for v in _check("Он сбрасывал на с-бет."))
+
+
+def test_never_in_the_past_is_a_habit_too():
+    assert any(ASSUMPTION_MARK in v for v in _check("Он никогда не блефовал на ривере."))
+
+
+def test_a_purpose_clause_is_not_the_subjunctive():
+    """«Чтобы» содержит «бы», но это не частица: пересказ с «чтобы» остаётся
+    пересказом."""
+    text = "Он поставил 2 BB, чтобы вы сбросили."
+    assert not any(ASSUMPTION_MARK in v for v in _check(text, allowed=frozenset({2.0})))
+
+
+def test_any_measured_frequency_backs_an_opponent_action_whatever_its_subject():
+    """Принятая граница (раунд 4): частота не привязана к подлежащему — измеренная
+    частота поля служит опорой и фразе «он сбрасывает N%». Несовпадение ловит
+    судья (спека №2)."""
+    numbers = frozenset({38.9, 21.0, 54.0})
+    assert not any(
+        ASSUMPTION_MARK in v
+        for v in _check(
+            "Он сбрасывает 38.9%.", allowed=numbers, calc_numbers=numbers,
+            frequency_numbers=numbers,
+        )
+    )
+
+
+def test_a_measured_frequency_still_backs_a_habit_in_the_past():
+    """Обобщение, за которым стоит измеренная частота из расчёта, — данные, а не
+    допущение: опора вырезается раньше, чем смотрится время глагола."""
+    numbers = frozenset({30.0, 50.0})
+    text = "Поле обычно сбрасывало на продолженную ставку 30 из 50."
+    assert not any(
+        ASSUMPTION_MARK in v
+        for v in _check(text, allowed=numbers, calc_numbers=numbers, frequency_numbers=numbers)
+    )
+
+
+@pytest.mark.parametrize("text", HERO_AND_OPPONENT)
+def test_a_clause_with_an_opponent_subject_is_checked_despite_you(text: str):
+    """«Вы» освобождает только придаточное о герое: придаточное, где подлежащее —
+    соперник, проверяется, даже если в нём или рядом есть «вы», с запятой или без
+    (раунд 4, решение 3)."""
+    assert any(ASSUMPTION_MARK in v for v in _check(text))
+
+
+def test_a_hero_clause_joined_by_and_with_a_past_opponent_action_is_narration():
+    assert not any(ASSUMPTION_MARK in v for v in _check("Вы поставили и он сбросил."))
+
+
+def test_a_noun_action_after_and_is_not_covered_by_a_past_verb_before_it():
+    """Глагол прошедшего времени освобождает существительное («рейз») только в своей
+    части: «и он сделает рейз» — прогноз."""
+    assert any(ASSUMPTION_MARK in v for v in _check("Вы поставили и он сделает рейз."))
+
+
+@pytest.mark.parametrize("text", ["При такой ставке он сбросит 33.3%.", "Он сбросит 33.3% при такой ставке."])
+def test_a_bare_preposition_pri_is_not_a_condition(text: str):
+    """«При» — условие арифметики порога только перед долей со словом порога («при
+    24% фолдов»); «при такой ставке» порог опорой прогнозу не делает, а измеренная
+    частота делает (раунд 4, решение 4)."""
+    numbers = frozenset({33.3})
+    assert any(ASSUMPTION_MARK in v for v in _check(text, allowed=numbers, calc_numbers=numbers))
+    assert not any(
+        ASSUMPTION_MARK in v
+        for v in _check(text, allowed=numbers, calc_numbers=numbers, frequency_numbers=numbers)
+    )
+
+
+@pytest.mark.parametrize("text", ["Ставка окупается при 24% фолдов.", "Колл в плюсе при 19.4% эквити."])
+def test_pri_before_a_share_with_a_threshold_word_is_still_a_condition(text: str):
+    numbers = frozenset({24.0, 19.4})
+    assert not any("порог" in v for v in _check(text, allowed=numbers, calc_numbers=numbers))
+
+
+def test_a_profit_conclusion_with_a_bare_pri_needs_a_threshold():
+    """«При такой доске» — не условие, даже если доля из расчёта стоит в том же
+    придаточном."""
+    numbers = frozenset({25.0})
+    text = "Колл в плюсе при такой доске с 25% эквити."
+    assert any("порог" in v for v in _check(text, allowed=numbers, calc_numbers=numbers))
+
+
 # --- лучшая линия на флопе и тёрне ---------------------------------------------
 
 

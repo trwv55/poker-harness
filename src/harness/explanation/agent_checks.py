@@ -14,25 +14,35 @@
 полны и не будут: другие формулировки о сопернике ловит судья (спека №2,
 принцип владельца 2026-10-11). Метки не требуют: действие, за которым стоит
 измеренная частота из расчёта в разговоре (`frequency_numbers`), или порог и доля
-защиты из расчёта (`calc_numbers`), но только как арифметика порога — в придаточном
-с «если/когда/при» или с «достаточно/нужно/должен» и инфинитивом (не доля банка,
-не «поставите N%», без руки между ними —
-`test_calc_backed_statements_and_meta_speech_need_no_mark`,
+защиты из расчёта (`calc_numbers`), но только как арифметика порога: в придаточном
+с «если/когда», с «при» перед долей со словом порога («при 24% фолдов»; «при такой
+ставке» — не условие) или с «достаточно/нужно/должен» и инфинитивом; не доля банка,
+не «поставите N%», без руки между действием и долей
+(`test_calc_backed_statements_and_meta_speech_need_no_mark`,
 `test_a_bet_size_or_a_hand_in_the_window_backs_nothing`,
 `test_a_number_not_from_a_calculation_backs_nothing`,
-`test_only_a_measured_frequency_backs_an_opponent_action`); узкая метаречь («про
-его диапазон это мало говорит»); пересказ руки — глагол прошедшего времени и
-придаточное с «вы», «вы держите» о своей руке
-(`test_hand_narration_is_not_an_opponent_claim`).
+`test_only_a_measured_frequency_backs_an_opponent_action`,
+`test_a_bare_preposition_pri_is_not_a_condition`); узкая метаречь («про
+его диапазон это мало говорит»); пересказ руки — глагол прошедшего времени,
+придаточное с «вы» без соперника подлежащим, «вы держите» о своей руке
+(`test_hand_narration_is_not_an_opponent_claim`). Прошедшее время не освобождает,
+если в предложении «бы» или наречие повторяемости («всегда», «обычно», «часто»,
+«редко», «раньше», «никогда»…) — это прогноз или обобщение
+(`test_the_subjunctive_is_a_prediction_not_a_fact_of_the_hand`,
+`test_a_habit_in_the_past_is_a_claim_not_a_fact_of_the_hand`); «вы» не освобождает
+придаточное, где подлежащее — соперник, с запятой или без
+(`test_a_clause_with_an_opponent_subject_is_checked_despite_you`).
 
 **«В плюсе», «в минусе», «окупается» — вывод только по порогу.** Голый вывод
 допустим, только когда в разговоре есть `frequency_vs_threshold` с выводом выше
 или ниже порога (`test_a_profit_conclusion_needs_a_decided_threshold`). Арифметика
-допустима всегда: в одном из придаточных условие («если/при/от/когда/чтобы») и доля,
-выданная расчётом (не доля банка), а свободного придаточного-вывода рядом нет
+допустима всегда: в одном из придаточных условие («если/от/когда/чтобы» или «при»
+перед долей со словом порога) и доля, выданная расчётом (не доля банка), а
+свободного придаточного-вывода рядом нет
 (`test_profit_arithmetic_with_a_calc_share_is_allowed`,
 `test_a_bare_profit_conclusion_with_some_share_still_needs_a_threshold`,
-`test_a_threshold_in_the_main_clause_is_not_a_condition`).
+`test_a_threshold_in_the_main_clause_is_not_a_condition`,
+`test_a_profit_conclusion_with_a_bare_pri_needs_a_threshold`).
 
 **Отрицание термина — не термин.** «Без флеш-дро», «нет флеш-дро», «не
 флеш-дро» метки не требуют (`test_a_negated_term_is_not_the_term`).
@@ -103,8 +113,9 @@ _SENTENCE_RE = re.compile(r"(?:[^.!?\n]|\.(?=\d))+[.!?]?")
 # со словом диапазона и придаточное с явным утверждением о сопернике (слово о нём
 # плюс рука или действие из короткого списка). До поиска вырезается то, что
 # держится на расчёте (`_strip_backed`), и метаречь («про его диапазон это мало
-# говорит»). Пересказ руки — не утверждение: глагол прошедшего времени, придаточное
-# с «вы» (`_opponent_clause`).
+# говорит»). Пересказ руки — не утверждение: глагол прошедшего времени (без «бы» и
+# наречий повторяемости в предложении), придаточное с «вы» без соперника
+# подлежащим (`_opponent_clause`).
 _W = r"(?<![а-яёa-z])"
 _WE = r"(?![а-яё])"
 _POSITION = r"(?<![A-Za-z\d.])(?<![\d.]\s)(?:BB|SB|BTN|CO|HJ|LJ|MP|UTG(?:\+\d)?)(?![A-Za-z])"
@@ -139,9 +150,34 @@ _VERB_END_RE = re.compile(
 _INFINITIVE_END_RE = re.compile(r"(?:ть|ться|ти)$", re.IGNORECASE)
 _WORD_RE = re.compile(r"[а-яё-]+", re.IGNORECASE)
 _HERO_SUBJECT_RE = re.compile(_W + r"(?:вы|у\s+вас)" + _WE, re.IGNORECASE)
+# Соперник подлежащим (именительный падеж): придаточное с ним не освобождается «вы»
+# («Если вы поставите он сбросит»). «Его рейз» в придаточном о герое — не подлежащее.
+_OPPONENT_SUBJECT_RE = re.compile(
+    _W + r"(?:он|они)" + _WE
+    + r"|" + _W + r"(?:соперник|оппонент|противник|регуляр)(?:и|ы)?" + _WE
+    + r"|" + _W + r"поле" + _WE
+    + r"|так(?:ие|ой)\s+игрок"
+    + r"|" + _POSITION,
+    re.IGNORECASE,
+)
+# Части придаточного: время глагола освобождает существительное («рейз») только в
+# своей части («вы поставили и он сделает рейз» — прогноз).
+_PART_SPLIT_RE = re.compile(r"\s(?:и|а|но)\s", re.IGNORECASE)
+# Прошедшее время — не факт руки, если в предложении «бы» (сослагательное — прогноз;
+# «чтобы» не в счёт) или наречие повторяемости (обобщение, а не ход руки).
+_HYPOTHETICAL_RE = re.compile(
+    _W + r"(?:бы|всегда|обычно|часто|редко|раньше|постоянно|регулярно|никогда"
+    r"|как\s+правило)" + _WE,
+    re.IGNORECASE,
+)
 _HERO_HOLDS_RE = re.compile(_W + r"вы\s+(?:[^\s,.;:!?]+\s+)?держ[а-яё]*", re.IGNORECASE)
 _CLAUSE_SPLIT_RE = re.compile(r"[,;:—–()]")
-_CONDITION_RE = re.compile(_W + r"(?:если|когда|при)" + _WE, re.IGNORECASE)
+# «При» — условие только перед долей со словом порога («при 24% фолдов», «при 19.4%
+# эквити»); «при такой ставке» — предлог, не условие.
+_PRI_SHARE = (
+    r"при\s+\d+(?:[.,]\d+)?\s*%\s+(?:его\s+)?(?:фолд|сброс|защит|эквити|диапазон|рендж)"
+)
+_CONDITION_RE = re.compile(_W + r"(?:(?:если|когда)" + _WE + r"|" + _PRI_SHARE + r")", re.IGNORECASE)
 _MODAL_RE = re.compile(
     _W + r"(?:достаточно|нужно|надо|должн[а-яё]*|требуется|необходимо|можно)" + _WE,
     re.IGNORECASE,
@@ -150,8 +186,8 @@ _MODAL_RE = re.compile(
 # слов или меньше стоит доля или «N из M». Опора — измеренная частота из расчёта
 # (`frequency_numbers`: доля и «N из M» частоты или измеренной величины
 # порога); порог или доля защиты (`calc_numbers`) опорой служат только арифметике
-# порога — в придаточном с «если/когда/при» или с «достаточно/нужно/должен» и
-# инфинитивом. Не опора: доля банка («33.3% банка»), окно со ставкой героя глаголом
+# порога — в придаточном с «если/когда», «при N% фолдов/эквити» или с
+# «достаточно/нужно/должен» и инфинитивом. Не опора: доля банка («33.3% банка»), окно со ставкой героя глаголом
 # («если вы поставите 25%») и окно с рукой или диапазоном («с любой парой в 60% раз»).
 _NUMBER = r"\d+(?:[.,]\d+)?"
 _CALC_NUMBER = r"(?P<pct>" + _NUMBER + r")\s*%|(?P<num>\d+)\s+из\s+(?P<den>\d+)"
@@ -208,7 +244,8 @@ def _backed(
 ) -> bool:
     """Действие держится на расчёте: измеренной частотой — всегда; порогом или долей
     защиты — только как арифметика порога (условие или модальное слово с
-    инфинитивом в том же придаточном)."""
+    инфинитивом в том же придаточном; голое «при» — не условие,
+    `test_a_bare_preposition_pri_is_not_a_condition`)."""
     if _BET_WORD_RE.search(match.group("window")) or _HAND_RE.search(match.group("window")):
         return False
     if (
@@ -248,26 +285,35 @@ def _strip_backed(
     )
 
 
-def _opponent_clause(clause: str) -> bool:
+def _opponent_clause(clause: str, hypothetical: bool) -> bool:
     """Придаточное утверждает, что соперник держит или сделает: слово о нём и рука
-    или действие в форме прогноза. Придаточное с «вы» — о герое; глагол прошедшего
-    времени — факт руки; существительное («рейз», «коллом») рядом с глаголом
-    прошедшего времени — тоже (`test_hand_narration_is_not_an_opponent_claim`)."""
-    if _HERO_SUBJECT_RE.search(clause) or not _OPPONENT_RE.search(clause):
+    или действие в форме прогноза. Придаточное с «вы» без соперника подлежащим — о
+    герое (`test_a_clause_with_an_opponent_subject_is_checked_despite_you`). Глагол
+    прошедшего времени — факт руки, существительное («рейз», «коллом») в одной части
+    с ним (части делят «и», «а», «но») — тоже
+    (`test_hand_narration_is_not_an_opponent_claim`,
+    `test_a_noun_action_after_and_is_not_covered_by_a_past_verb_before_it`); при
+    `hypothetical` («бы» или наречие повторяемости в предложении) прошедшее время
+    ничего не освобождает (`test_the_subjunctive_is_a_prediction_not_a_fact_of_the_hand`,
+    `test_a_habit_in_the_past_is_a_claim_not_a_fact_of_the_hand`)."""
+    if not _OPPONENT_RE.search(clause):
+        return False
+    if _HERO_SUBJECT_RE.search(clause) and not _OPPONENT_SUBJECT_RE.search(clause):
         return False
     if _HAND_RE.search(clause):
         return True
-    narrated = bool(_PAST_WORD_RE.search(clause))
-    for action in _ACTION_RE.finditer(clause):
-        # Слово целиком — от начала совпадения назад до границы.
-        start = action.start()
-        while start > 0 and clause[start - 1].isalpha():
-            start -= 1
-        word = _word_at(clause, start)
-        if _PAST_END_RE.search(word):
-            continue
-        if _VERB_END_RE.search(word) or not narrated:
-            return True
+    for part in _PART_SPLIT_RE.split(clause):
+        narrated = not hypothetical and bool(_PAST_WORD_RE.search(part))
+        for action in _ACTION_RE.finditer(part):
+            # Слово целиком — от начала совпадения назад до границы.
+            start = action.start()
+            while start > 0 and part[start - 1].isalpha():
+                start -= 1
+            word = _word_at(part, start)
+            if _PAST_END_RE.search(word) and not hypothetical:
+                continue
+            if _VERB_END_RE.search(word) or not narrated:
+                return True
     return False
 
 
@@ -283,7 +329,10 @@ def _opponent_claim(
     rest = _strip_backed(sentence, calc_numbers, frequency_numbers)
     if _RANGE_WORD_RE.search(_HERO_HOLDS_RE.sub(" ", rest)):
         return True
-    return any(_opponent_clause(clause) for clause in _CLAUSE_SPLIT_RE.split(rest))
+    hypothetical = bool(_HYPOTHETICAL_RE.search(rest))
+    return any(
+        _opponent_clause(clause, hypothetical) for clause in _CLAUSE_SPLIT_RE.split(rest)
+    )
 
 
 # Лучшая линия на флопе и тёрне (решение владельца 2026-10-13). «Стоило» убрано:
@@ -296,7 +345,12 @@ _BEST_LINE_RE = re.compile(
 )
 # Вывод о прибыльности: голый — только по решённому порогу в разговоре.
 _PROFIT_RE = re.compile(_W + r"в\s+(?:плюсе|минусе)(?![а-яё])|окуп[а-яё]*", re.IGNORECASE)
-_PROFIT_CONDITION_RE = re.compile(_W + r"(?:если|при|от|когда|чтобы)" + _WE, re.IGNORECASE)
+_PROFIT_CONDITION_RE = re.compile(
+    _W + r"(?:(?:если|от|когда|чтобы)" + _WE + r"|" + _PRI_SHARE + r")", re.IGNORECASE
+)
+_CLAUSE_CONDITION_RE = re.compile(
+    r"\s*(?:(?:если|когда|чтобы)" + _WE + r"|" + _PRI_SHARE + r")", re.IGNORECASE
+)
 _PCT_RE = re.compile(r"(?P<pct>" + _NUMBER + r")\s*%")
 
 
@@ -309,11 +363,12 @@ def _calc_share_in(clause: str, calc_numbers: frozenset[float]) -> bool:
 
 def _profit_arithmetic(sentence: str, calc_numbers: frozenset[float]) -> bool:
     """«Окупается от 19.4% эквити» — арифметика, а не вывод, по придаточным: в
-    одном из них условие («если/при/от/когда/чтобы») и доля из выхода расчёта (не
-    доля банка), а свободных придаточных — без доли расчёта и не начатых условием —
-    нет («…, тут так и есть» — вывод;
+    одном из них условие («если/от/когда/чтобы», «при» только перед долей со словом
+    порога) и доля из выхода расчёта (не доля банка), а свободных придаточных — без
+    доли расчёта и не начатых условием — нет («…, тут так и есть» — вывод;
     `test_a_bare_profit_conclusion_with_some_share_still_needs_a_threshold`,
-    `test_profit_arithmetic_with_a_calc_share_is_allowed`)."""
+    `test_profit_arithmetic_with_a_calc_share_is_allowed`,
+    `test_a_profit_conclusion_with_a_bare_pri_needs_a_threshold`)."""
     clauses = [c for c in _CLAUSE_SPLIT_RE.split(sentence) if c.strip(" .!?")]
     conditional = [
         c for c in clauses
@@ -328,7 +383,7 @@ def _profit_arithmetic(sentence: str, calc_numbers: frozenset[float]) -> bool:
     return all(
         _PROFIT_RE.search(c)
         or _calc_share_in(c, calc_numbers)
-        or re.match(r"\s*(?:если|когда|при|чтобы)" + _WE, c, re.IGNORECASE)
+        or _CLAUSE_CONDITION_RE.match(c)
         for c in clauses
     )
 
