@@ -99,7 +99,8 @@ def _violations(
     context: AgentContext | None,
     said: frozenset[float],
 ) -> list[str]:
-    allowed = allowed_from_history(messages) | said
+    calc_numbers = allowed_from_history(messages)
+    allowed = calc_numbers | said
     labels = frozenset(STAT_LABEL + stat for stat in stats_in_history(messages))
     if context is not None:
         allowed |= context.allowed
@@ -112,6 +113,7 @@ def _violations(
         hero_class=context.hero_class if context else None,
         board_ranks=context.board_ranks if context else (),
         threshold_decided=threshold_decided(messages),
+        calc_numbers=calc_numbers,
     )
 
 
