@@ -2642,7 +2642,7 @@ def test_a_long_agent_answer_fits_one_message_by_cutting_the_prose():
 
     msg = agent_turn_msg("prose", "слово " * 2000, [_frequency()], from_context=False, job_id=7)
     assert len(msg.text) <= 4096
-    assert "Посчитано: ваша частота." in msg.text and "5 из 7" in msg.text
+    assert msg.text.endswith("Посчитано: ваша частота.")
 
 
 def test_a_huge_list_of_numbers_still_fits_one_message():
@@ -2663,3 +2663,28 @@ def test_a_calculation_called_twice_is_named_once_in_the_signature():
 
     msg = agent_turn_msg("prose", "Синт.", [_frequency(), _frequency()], from_context=False, job_id=7)
     assert "Посчитано: ваша частота." in msg.text
+
+
+def test_the_agent_prose_is_signed_by_names_only_without_numbers():
+    """Под прозой — только «Посчитано: <названия>»: выходы расчётов не
+    пересказываются (решение владельца 2026-10-13)."""
+    from harness.presentation import agent_turn_msg
+    from tests.test_question_text import _defense, _frequency
+
+    msg = agent_turn_msg(
+        "prose", "Синт.", [_frequency(), _defense(), _frequency()], from_context=False, job_id=7
+    )
+    assert msg.text == "Синт.\n\nПосчитано: ваша частота, требуемая частота защиты."
+
+
+def test_agent_numbers_print_whole_percents_without_a_trailing_zero():
+    """Числа без прозы: 50%, а не 50.0%; дробные — одним знаком. У `/ask` — как было."""
+    from harness.contracts import Measurement
+    from harness.presentation import agent_turn_msg, question_msg
+    from tests.test_question_text import _frequency
+
+    half = _frequency().model_copy(update={"measurement": Measurement(numerator=1, denominator=2)})
+    agent = agent_turn_msg("numbers", None, [half, _frequency()], from_context=False, job_id=7)
+    assert "50% (1 из 2)" in agent.text and "50.0%" not in agent.text
+    assert "71.4% (5 из 7)" in agent.text
+    assert "50.0% (1 из 2)" in question_msg(half, None).text

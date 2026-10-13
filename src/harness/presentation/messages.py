@@ -2803,7 +2803,14 @@ _OUTCOME_WORD: dict[ThresholdOutcome, str] = {
 _WINDOW_WORD = {True: "за этот вечер", False: "за всю историю разборов"}
 
 
-def _measured(measurement: Measurement) -> str:
+def _calc_pct(value: float, trim: bool) -> str:
+    """Доля в ответе на вопрос: одним знаком; `trim` — у агента целое без «.0»
+    (`test_agent_numbers_print_whole_percents_without_a_trailing_zero`)."""
+    text = f"{value:.1f}"
+    return (text.removesuffix(".0") if trim else text) + "%"
+
+
+def _measured(measurement: Measurement, trim: bool = False) -> str:
     """Величина со своим знаменателем — требование владельца, безусловное.
 
     Доля печатается только при ненулевом знаменателе: «0 из 0» — не ноль
@@ -2813,7 +2820,7 @@ def _measured(measurement: Measurement) -> str:
     share = measurement.share
     if share is None:
         return f"наблюдений нет ({counted})"
-    return f"{_fmt_pct(100.0 * share)} ({counted})"
+    return f"{_calc_pct(100.0 * share, trim)} ({counted})"
 
 
 def _window_word(window: Window) -> str:
@@ -2822,32 +2829,34 @@ def _window_word(window: Window) -> str:
 
 def _measured_line(
     stat: FrequencyStat, subject: Subject, position: str | None, measurement: Measurement,
-    window: Window,
+    window: Window, trim: bool = False,
 ) -> str:
     """Строка измеренной величины: что, у кого, где, сколько и из скольких."""
     where = f", позиция {position}" if position is not None else ""
     title = _STAT_WORD[stat]
     return (
         f"{title[0].upper()}{title[1:]} {_SUBJECT_WORD[subject]}{where}: "
-        f"{_measured(measurement)}, {_window_word(window)}."
+        f"{_measured(measurement, trim)}, {_window_word(window)}."
     )
 
 
-def _frequency_answer(result: FrequencyResult) -> list[str]:
+def _frequency_answer(result: FrequencyResult, trim: bool = False) -> list[str]:
     return [
         _measured_line(
-            result.stat, result.subject, result.position, result.measurement, result.window
+            result.stat, result.subject, result.position, result.measurement, result.window,
+            trim,
         )
     ]
 
 
-def _threshold_answer(result: ThresholdResult) -> list[str]:
+def _threshold_answer(result: ThresholdResult, trim: bool = False) -> list[str]:
     lines = [
         _measured_line(
-            result.stat, result.subject, result.position, result.measurement, result.window
+            result.stat, result.subject, result.position, result.measurement, result.window,
+            trim,
         )
     ]
-    threshold = f"Порог — {_fmt_pct(100.0 * result.threshold)}"
+    threshold = f"Порог — {_calc_pct(100.0 * result.threshold, trim)}"
     if result.reference is not None:
         reference = result.reference
         threshold += (
@@ -2897,7 +2906,7 @@ def _leaks_answer(result: LeaksResult) -> list[str]:
     return lines
 
 
-def _defense_answer(result: DefenseResult) -> list[str]:
+def _defense_answer(result: DefenseResult, trim: bool = False) -> list[str]:
     # Размеры агента — в BB, как он их передал; фишки масштаба игроку не показываются
     # (`test_a_pot_from_the_hand_summary_is_computed_and_shown_in_bb`).
     if result.pot_before_bb is not None and result.bet_bb is not None:
@@ -2907,10 +2916,10 @@ def _defense_answer(result: DefenseResult) -> list[str]:
     return [
         (
             f"Против ставки {bet} в банк {pot} "
-            f"защищаться нужно в {_fmt_pct(100.0 * result.defend_frequency)} случаев, "
-            f"сдаваться допустимо в {_fmt_pct(100.0 * result.fold_frequency)}."
+            f"защищаться нужно в {_calc_pct(100.0 * result.defend_frequency, trim)} случаев, "
+            f"сдаваться допустимо в {_calc_pct(100.0 * result.fold_frequency, trim)}."
         ),
-        f"Колл окупается от {_fmt_pct(100.0 * result.required_equity)} эквити.",
+        f"Колл окупается от {_calc_pct(100.0 * result.required_equity, trim)} эквити.",
         "Ваших раздач здесь нет вовсе: это арифметика от размера ставки.",
     ]
 
@@ -2937,17 +2946,17 @@ def question_msg(result: CalcResult, prose: str | None) -> Msg:
     return Msg(text="\n".join(lines))
 
 
-def _calc_answer(result: CalcResult) -> list[str]:
-    """Числа одного расчёта в виде, собранном кодом."""
+def _calc_answer(result: CalcResult, trim: bool = False) -> list[str]:
+    """Числа одного расчёта в виде, собранном кодом; `trim` — проценты агента без «.0»."""
     if isinstance(result, FrequencyResult):
-        return _frequency_answer(result)
+        return _frequency_answer(result, trim)
     if isinstance(result, ThresholdResult):
-        return _threshold_answer(result)
+        return _threshold_answer(result, trim)
     if isinstance(result, CoverageResult):
         return _coverage_answer(result)
     if isinstance(result, LeaksResult):
         return _leaks_answer(result)
-    return _defense_answer(result)
+    return _defense_answer(result, trim)
 
 
 def agent_turn_msg(
@@ -2962,12 +2971,15 @@ def agent_turn_msg(
     """Ответ агента — одно из трёх состояний (спека агента, §7).
 
     Подпись «Посчитано: …» собирает код по `CalcResult.calc` всех расчётов
-    хода, модель в ней не участвует. Без расчётов в ходе подпись называет те
+    хода, модель в ней не участвует. Под прозой — только подпись с названиями,
+    без чисел расчётов (`test_the_agent_prose_is_signed_by_names_only_without_numbers`);
+    числа печатаются в состоянии «числа без прозы», проценты — без «.0»
+    (`test_agent_numbers_print_whole_percents_without_a_trailing_zero`). Без расчётов в ходе подпись называет те
     источники, что есть: разбор раздачи (`from_context`) и/или расчёты выше в
     этом разговоре (`from_history`); без обоих прозу подписать нечем — это
     отказ, а не ответ (`test_an_answer_with_a_hand_and_earlier_calculations_names_both`,
-    `test_a_prose_answer_without_any_source_is_not_signed`). В тесноте режется проза, а если и числа не
-    влезают — они, с маркером; подпись не режется никогда
+    `test_a_prose_answer_without_any_source_is_not_signed`). В тесноте режется проза (под ней
+    только подпись), а в состоянии «числа» — числа, с маркером; подпись не режется никогда
     (`test_a_long_agent_answer_fits_one_message_by_cutting_the_prose`,
     `test_a_huge_list_of_numbers_still_fits_one_message`).
 
@@ -3001,15 +3013,16 @@ def agent_turn_msg(
         if not sources:
             raise ValueError("ответ без расчёта, разбора и расчётов вечера — это отказ")
         signature = "Посчитано: " + ", ".join(sources) + "."
-    numbers = [line for result in results for line in _calc_answer(result) if line]
+    if state == "prose" and prose and prose.strip():
+        budget = _TELEGRAM_TEXT_LIMIT - len(signature) - 2
+        return Msg(
+            text=_fitted(prose.strip(), budget) + "\n\n" + signature,
+            buttons=[[agent_miss_button(job_id)]],
+        )
+    numbers = [line for result in results for line in _calc_answer(result, trim=True) if line]
     numbers_text = _fitted("\n".join(numbers), _TELEGRAM_TEXT_LIMIT - len(signature) - 1)
     tail = "\n".join([signature, numbers_text] if numbers_text else [signature])
-    head = ""
-    if state == "prose" and prose and prose.strip():
-        budget = _TELEGRAM_TEXT_LIMIT - len(tail) - 2
-        if budget > len(_MARKER):
-            head = _fitted(prose.strip(), budget) + "\n\n"
-    return Msg(text=head + tail, buttons=[[agent_miss_button(job_id)]])
+    return Msg(text=tail, buttons=[[agent_miss_button(job_id)]])
 
 
 _AGENT_NUMBERS_UNCHECKED = "Ответ не прошёл проверку чисел, и показать мне нечего."
