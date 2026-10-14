@@ -91,6 +91,7 @@ from harness.contracts import (
     DrawKind,
     EnrichedHand,
     PostflopLineDetail,
+    Purpose,
     Street,
     class_of,
     postflop_line_detail,
@@ -550,6 +551,19 @@ _DRAW_WORD: dict[DrawKind, str] = {
 }
 _BACKDOOR_WORD = {"flush": "флеш", "straight": "стрит"}
 
+# Слова назначения — те же, что в разборе (`presentation.messages._PURPOSE_WORD`);
+# копия, потому что `explanation` не импортирует `presentation`
+# (`test_the_purpose_words_are_the_words_of_the_hand_breakdown`).
+_PURPOSE_WORD: dict[Purpose, str] = {
+    Purpose.VALUE: "вэлью",
+    Purpose.MEDIUM_HAND: "ставка со средней рукой",
+    Purpose.SEMIBLUFF: "полублеф",
+    Purpose.BLUFF: "блеф",
+    Purpose.CALL_STRONG: "колл с сильной рукой",
+    Purpose.BLUFF_CATCH: "ловля блефа",
+    Purpose.CALL_WITH_DRAW: "колл с дро",
+}
+
 
 def _outs_word(count: int) -> str:
     if count % 10 == 1 and count % 100 != 11:
@@ -595,21 +609,60 @@ def _hero_equity_line(line: PostflopLineDetail, street: Street, book: NumberBook
     return f"Рука героя, {_STREET_NAME[street]}: {'; '.join(parts)}."
 
 
+def _purpose_line(
+    line: PostflopLineDetail, street: Street, book: NumberBook, thresholds: NumberBook
+) -> str | None:
+    """Назначение и порог фолдов героя в точке — из ядра (`postflop_line`, §4.5–§4.6).
+    Числа порога пишутся в обе книги: они числа сводки и опора арифметики порога
+    (`AgentContext.threshold_numbers`;
+    `test_the_context_names_the_purpose_and_the_fold_threshold_of_a_hero_bet`)."""
+    played = line.line
+    if played is None or played.purpose is None:
+        return None
+    text = f"Назначение, {_STREET_NAME[street]}: {_PURPOSE_WORD[played.purpose]}"
+    fold = line.fold_threshold
+
+    def pct(share: float) -> str:
+        thresholds.pct(100.0 * share, trim=True)
+        return book.pct(100.0 * share, trim=True)
+
+    if fold is not None:
+        if fold.semibluff_free:
+            text += (
+                f"; порог фолдов как у чистого блефа {pct(fold.bluff)}%, "
+                "с учётом аутов ставка окупается и без фолдов"
+            )
+        elif fold.semibluff is not None:
+            text += (
+                f"; порог фолдов как у чистого блефа {pct(fold.bluff)}%, "
+                f"с учётом аутов {pct(fold.semibluff)}%"
+            )
+        else:
+            text += f"; ставка окупается, если соперник сбрасывает чаще {pct(fold.bluff)}%"
+    return text + "."
+
+
 @dataclass(frozen=True, slots=True)
 class AgentContext:
     """Сводка последнего разбора для агента: текст, разрешённые числа, метки
-    классификатора, класс руки героя и ранги борда (для вырезания карт)."""
+    классификатора, класс руки героя и ранги борда (для вырезания карт).
+    `threshold_numbers` — числа порога фолдов из ядра, напечатанные в сводке:
+    опора арифметики порога
+    (`test_a_threshold_from_the_summary_backs_profit_arithmetic`)."""
 
     text: str
     allowed: frozenset[float]
     labels: frozenset[str]
     hero_class: str | None
     board_ranks: tuple[str, ...]
+    threshold_numbers: frozenset[float] = frozenset()
 
 
 def agent_context(result: AnalysisResult, enriched: EnrichedHand) -> AgentContext:
     """Сводка разбора: ход руки (реплей, код), судимые точки (выжимка вердикта),
-    метки классификатора всех точек и дро, бэкдоры, оверкарты героя из них.
+    метки классификатора всех точек и дро, бэкдоры, оверкарты героя из них,
+    назначение ставки героя и порог фолдов
+    (`test_the_context_names_the_purpose_and_the_fold_threshold_of_a_hero_bet`).
     Разрешены числа реплея без обозначений
     карт: ранг карты героя или борда числом не становится
     (`test_a_card_rank_of_the_hand_is_not_an_allowed_number`). Идентификаторы в
@@ -638,6 +691,8 @@ def agent_context(result: AnalysisResult, enriched: EnrichedHand) -> AgentContex
     labels: set[str] = set()
     label_lines: list[str] = []
     equity_lines: list[str] = []
+    thresholds = NumberBook()
+    purpose_lines: list[str] = []
     for point in result.points:
         line = postflop_line_detail(point)
         if line is None:
@@ -656,11 +711,16 @@ def agent_context(result: AnalysisResult, enriched: EnrichedHand) -> AgentContex
         equity = _hero_equity_line(line, point.street, book)
         if equity is not None:
             equity_lines.append(equity)
+        purpose = _purpose_line(line, point.street, book, thresholds)
+        if purpose is not None:
+            purpose_lines.append(purpose)
     # Две точки одной улицы с одной рукой дали бы одну строку дважды.
     equity_text = "\n".join(dict.fromkeys(equity_lines))
     text = "\n\n".join(
         part
-        for part in (replay, verdict_text, "\n".join(label_lines), equity_text)
+        for part in (
+            replay, verdict_text, "\n".join(label_lines), "\n".join(purpose_lines), equity_text
+        )
         if part
     )
     return AgentContext(
@@ -669,6 +729,7 @@ def agent_context(result: AnalysisResult, enriched: EnrichedHand) -> AgentContex
         labels=frozenset(labels),
         hero_class=hero_class,
         board_ranks=board,
+        threshold_numbers=thresholds.allowed,
     )
 
 
@@ -721,8 +782,9 @@ def check_agent_answer(
 
     `threshold_decided` — в разговоре есть `frequency_vs_threshold` с выводом выше
     или ниже порога: только тогда голый вывод «в плюсе» / «в минусе» допустим.
-    `calc_numbers` — числа из выходов расчётов разговора, без чисел сводки и слов
-    игрока: опора арифметики порога и «окупается от N%». `frequency_numbers` —
+    `calc_numbers` — числа из выходов расчётов разговора и числа порога сводки
+    (`threshold_numbers` — их добавляет вызывающий), без прочих чисел сводки и
+    слов игрока: опора арифметики порога и «окупается от N%». `frequency_numbers` —
     из них измеренные частоты (доля и «N из M» частоты и измеренной величины
     порога): только они служат опорой действию соперника вне арифметики порога.
     """

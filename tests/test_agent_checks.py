@@ -16,11 +16,14 @@ from harness.contracts import (
     Combination,
     Draw,
     DrawKind,
+    FoldThreshold,
     HandCategory,
     HandStrength,
     Line,
     Overcards,
     PostflopLineDetail,
+    Purpose,
+    SizeTag,
     Street,
     StrengthClass,
 )
@@ -947,6 +950,70 @@ def test_without_draws_the_context_prints_no_hero_equity_line():
         _result([_point(dp_index=0, ev_diff_bb=-1.4, detail=_with_line())]), _postflop_hand()
     )
     assert "Рука героя" not in ctx.text
+
+
+def _bet_line(threshold: FoldThreshold | None, purpose: Purpose) -> dict[str, object]:
+    detail = PostflopLineDetail(
+        hand=None, draw=None, draw_missed=False, backdoors=[], overcards=None,
+        line=Line(
+            action=ActionTag.CBET, barrel=None, size_pct=0.32, size_tag=SizeTag.BLOCK,
+            purpose=purpose,
+        ),
+        fold_threshold=threshold, draw_call=None, showdown=None,
+    )
+    return {POSTFLOP_LINE_DETAIL: detail.model_dump(mode="json")}
+
+
+def _ctx(detail: dict[str, object]):
+    return agent_context(
+        _result([_point(dp_index=0, ev_diff_bb=-1.4, detail=detail)]), _postflop_hand()
+    )
+
+
+def test_the_context_names_the_purpose_and_the_fold_threshold_of_a_hero_bet():
+    ctx = _ctx(_bet_line(FoldThreshold(bluff=0.24, semibluff=None, semibluff_free=False), Purpose.BLUFF))
+    assert "Назначение, префлоп: блеф; ставка окупается, если соперник сбрасывает чаще 24%." in ctx.text
+    assert 24.0 in ctx.allowed and ctx.threshold_numbers == frozenset({24.0})
+
+
+def test_a_semibluff_names_both_thresholds_or_that_it_pays_without_folds():
+    both = _ctx(_bet_line(FoldThreshold(bluff=0.24, semibluff=0.091, semibluff_free=False), Purpose.SEMIBLUFF))
+    assert (
+        "Назначение, префлоп: полублеф; порог фолдов как у чистого блефа 24%, "
+        "с учётом аутов 9.1%." in both.text
+    )
+    assert both.threshold_numbers == frozenset({24.0, 9.1})
+    free = _ctx(_bet_line(FoldThreshold(bluff=0.24, semibluff=0.0, semibluff_free=True), Purpose.SEMIBLUFF))
+    assert "с учётом аутов ставка окупается и без фолдов." in free.text
+
+
+def test_a_value_bet_names_its_purpose_without_a_threshold():
+    ctx = _ctx(_bet_line(None, Purpose.VALUE))
+    assert "Назначение, префлоп: вэлью." in ctx.text
+    assert ctx.threshold_numbers == frozenset()
+
+
+def test_the_purpose_words_are_the_words_of_the_hand_breakdown():
+    """Копия словаря разбора (`explanation` не импортирует `presentation`)."""
+    from harness.explanation.agent_checks import _PURPOSE_WORD as SUMMARY
+    from harness.presentation.messages import _PURPOSE_WORD as BREAKDOWN
+
+    assert SUMMARY == BREAKDOWN
+
+
+def test_a_threshold_from_the_summary_backs_profit_arithmetic():
+    """Порог в сводке — из ядра, не догадка: «окупается, если сбрасывает чаще 24%»
+    с ним — арифметика порога (спека 2026-10-14, §7). Без `threshold_numbers` та
+    же фраза — голый вывод без расчёта."""
+    from harness.agent.run import _violations
+
+    ctx = _ctx(_bet_line(FoldThreshold(bluff=0.24, semibluff=None, semibluff_free=False), Purpose.BLUFF))
+    answer = "Ставка окупается, если соперник сбрасывает чаще 24%."
+    assert _violations(answer, [], ctx, frozenset()) == []
+    assert any(
+        "в плюсе" in v
+        for v in _check(answer, allowed=ctx.allowed, calc_numbers=frozenset(), labels=ctx.labels)
+    )
 
 
 # --- регрессия живого хода (синтетика той же формы) ------------------------------

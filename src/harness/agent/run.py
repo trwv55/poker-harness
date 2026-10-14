@@ -118,6 +118,7 @@ def _violations(
     if context is not None:
         allowed |= context.allowed
         labels |= context.labels
+        calc_numbers |= context.threshold_numbers
     return check_agent_answer(
         answer,
         allowed=allowed,
