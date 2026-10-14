@@ -906,6 +906,21 @@ class AnalysesRepo:
         # (`test_an_analysis_is_never_answered_by_another_one_of_the_same_hand`).
         return record if record is not None and record.id == analysis_id else None
 
+    async def enriched_hand(self, analysis_id: int, player_id: int) -> EnrichedHand | None:
+        """Рука разбора — только если разбор этого игрока; чужой или пропавший — `None`
+        (`test_another_players_analysis_is_not_read`)."""
+        record = await self.get(analysis_id)
+        if record is None:
+            return None
+        owner = await self.db.scalar(
+            select(SessionRow.player_id)
+            .join(Hand, Hand.session_id == SessionRow.id)
+            .where(Hand.id == record.hand_id)
+        )
+        if owner != player_id:
+            return None
+        return (await HandsRepo(self.db).get(record.hand_id)).enriched
+
 
 class TournamentsRepo:
     """`tournaments`: HH-вход и сводка скана (задача 18, встык с `hh_scan`).
@@ -1120,6 +1135,13 @@ class CalcCacheRepo:
         )
         rows = (await self.db.execute(stmt)).all()
         return {key[len(prefix) :]: float(value) for key, value in rows}
+
+    async def get(self, prefix: str, key: str) -> float | None:
+        """Одно значение по полному ключу `prefix + key`; нет строки — `None`."""
+        value = await self.db.scalar(
+            select(CalcCache.value).where(CalcCache.key == f"{prefix}{key}")
+        )
+        return None if value is None else float(value)
 
     async def upsert_many(self, prefix: str, entries: Mapping[str, float]) -> None:
         """Записать пачку значений, разбивая её на куски по `_UPSERT_CHUNK` строк.

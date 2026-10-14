@@ -122,10 +122,12 @@ from harness.contracts.calcs import (
     CalcResult,
     CoverageResult,
     DefenseResult,
+    EquityVsRangeResult,
     FrequencyResult,
     FrequencyStat,
     LeaksResult,
     Measurement,
+    OpponentRangeResult,
     Subject,
     ThresholdOutcome,
     ThresholdResult,
@@ -2775,6 +2777,8 @@ _CALC_WORD: dict[CalcName, str] = {
     CalcName.LEAKS: "типы расхождений",
     CalcName.DEFENSE_FREQUENCY: "требуемая частота защиты",
     CalcName.FREQUENCY_VS_THRESHOLD: "частота против порога",
+    CalcName.OPPONENT_RANGE: "диапазон соперника по чарту",
+    CalcName.EQUITY_VS_RANGE: "эквити против суженного диапазона",
 }
 
 _STAT_WORD: dict[FrequencyStat, str] = {
@@ -2924,6 +2928,37 @@ def _defense_answer(result: DefenseResult, trim: bool = False) -> list[str]:
     ]
 
 
+def _opponent_range_answer(result: OpponentRangeResult, trim: bool = False) -> list[str]:
+    chart = (
+        "чарту опена"
+        if result.chart == "open"
+        else f"чарту защиты {result.chart_position} против {result.vs_chart_position}"
+    )
+    table = (
+        "" if result.chart_seats == result.table_seats
+        else f"; мест за столом: {result.table_seats}"
+    )
+    return [
+        (
+            f"Диапазон {result.opponent_position} по {chart} ({result.chart_seats}-max, "
+            f"{_bb_number(result.chart_depth_bb)}BB{table}): "
+            f"{_calc_pct(100.0 * result.hands_share, trim)} рук, "
+            f"{round(result.live_combos)} комбо."
+        )
+    ]
+
+
+def _equity_answer(result: EquityVsRangeResult, trim: bool = False) -> list[str]:
+    return [
+        (
+            f"Эквити против диапазона {result.opponent_position}, суженного по линии "
+            f"(допущение): {_calc_pct(100.0 * result.equity, trim)} — "
+            f"{round(result.live_combos)} комбо, "
+            f"{_calc_pct(100.0 * result.share_of_start, trim)} стартового."
+        )
+    ]
+
+
 def question_msg(result: CalcResult, prose: str | None) -> Msg:
     """Ответ на вопрос: слова модели (если они прошли проверку) и числа расчёта.
 
@@ -2956,6 +2991,10 @@ def _calc_answer(result: CalcResult, trim: bool = False) -> list[str]:
         return _coverage_answer(result)
     if isinstance(result, LeaksResult):
         return _leaks_answer(result)
+    if isinstance(result, OpponentRangeResult):
+        return _opponent_range_answer(result, trim)
+    if isinstance(result, EquityVsRangeResult):
+        return _equity_answer(result, trim)
     return _defense_answer(result, trim)
 
 
@@ -2993,7 +3032,7 @@ def agent_turn_msg(
         return agent_refusal_msg()
     if state == "numbers" and not results:
         return Msg(
-            text=_AGENT_NUMBERS_UNCHECKED + "\n\n" + _WHAT_CAN_BE_COUNTED,
+            text=_AGENT_NUMBERS_UNCHECKED + "\n\n" + _AGENT_CAN_BE_COUNTED,
             buttons=[[agent_miss_button(job_id)]],
         )
     if results:
@@ -3030,7 +3069,7 @@ _AGENT_NUMBERS_UNCHECKED = "Ответ не прошёл проверку чис
 
 def agent_refusal_msg() -> Msg:
     """Ни расчёта, ни разбора — текста модели ни строки, и список того, что есть."""
-    return Msg(text="На это у меня нет ни расчёта, ни разбора.\n\n" + _WHAT_CAN_BE_COUNTED)
+    return Msg(text="На это у меня нет ни расчёта, ни разбора.\n\n" + _AGENT_CAN_BE_COUNTED)
 
 
 def agent_miss_saved_msg() -> Msg:
@@ -3073,16 +3112,37 @@ def question_too_long_msg(limit: int) -> Msg:
     return Msg(text=f"Вопрос длиннее {limit} символов — сократите его.")
 
 
-# Список того, что продукт умеет считать. Один на отказ и на подсказку команды:
-# два списка разошлись бы, и один из них начал бы обещать несуществующее.
-_WHAT_CAN_BE_COUNTED = (
-    "Посчитать могу:\n"
-    "• ваши частоты — вход в банк, повышение, ре-рейз, продолженная ставка, "
-    "бареллы, сдача на продолженную ставку, доход до вскрытия;\n"
-    "• те же частоты у поля или у названного оппонента;\n"
-    "• вашу частоту против порога — по размеру ставки или по полю;\n"
-    "• покрытие разбора и цену расхождений;\n"
-    "• типы повторяющихся расхождений;\n"
-    "• требуемую частоту защиты против ставки.\n\n"
-    "Можно сузить вопрос позицией и вечером."
+# Список того, что продукт умеет считать. У `/ask` — один на отказ и на подсказку
+# команды; у агента — тот же список плюс расчёты по разобранной руке, которых у
+# `/ask` нет (`test_the_agent_list_names_the_range_calculations_and_ask_does_not`).
+# Пункты общие, а не скопированы: два списка разошлись бы, и один из них начал бы
+# обещать несуществующее.
+_COUNTED_ITEMS: tuple[str, ...] = (
+    (
+        "ваши частоты — вход в банк, повышение, ре-рейз, продолженная ставка, "
+        "бареллы, сдача на продолженную ставку, доход до вскрытия"
+    ),
+    "те же частоты у поля или у названного оппонента",
+    "вашу частоту против порога — по размеру ставки или по полю",
+    "покрытие разбора и цену расхождений",
+    "типы повторяющихся расхождений",
+    "требуемую частоту защиты против ставки",
 )
+_AGENT_ONLY_ITEMS: tuple[str, ...] = (
+    (
+        "в разобранной руке — стартовый диапазон соперника по чарту и эквити вашей руки "
+        "против него, суженного по линии (допущение)"
+    ),
+)
+
+
+def _can_be_counted(items: Sequence[str]) -> str:
+    return (
+        "Посчитать могу:\n"
+        + ";\n".join(f"• {item}" for item in items)
+        + ".\n\nМожно сузить вопрос позицией и вечером."
+    )
+
+
+_WHAT_CAN_BE_COUNTED = _can_be_counted(_COUNTED_ITEMS)
+_AGENT_CAN_BE_COUNTED = _can_be_counted(_COUNTED_ITEMS + _AGENT_ONLY_ITEMS)

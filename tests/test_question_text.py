@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from harness.contracts import (
+    AGENT_ONLY_CALCS,
     CalcName,
     CalcResult,
     CoverageResult,
@@ -129,7 +130,7 @@ def test_the_digest_registers_every_number_it_prints(result: CalcResult):
     Дисциплина автора выжимки, которую реестр гарантировать не может: обычная
     f-строка ему не подотчётна. Вычитаем разрешённые из чисел готового текста и
     требуем пустоты — тот же тест, что у выжимок разбора и турнира, на всех
-    шести расчётах разом.
+    расчётах `/ask` разом.
     """
     digest = question_digest(result)
     assert set(numbers_in(digest.text)) - digest.allowed == set()
@@ -142,8 +143,9 @@ def test_the_digest_names_the_calculation_it_came_from(result: CalcResult):
 
 
 def test_every_calculation_name_has_a_digest():
-    """У каждого имени словаря есть выжимка — непокрытого имени в наборе нет."""
-    assert {result.calc for result in ALL_RESULTS} == set(CalcName)
+    """У каждого имени `/ask` есть выжимка — непокрытого имени в наборе нет; у
+    расчётов агента выжимки `/ask` нет (`test_ask_has_no_digest_for_agent_only_calculations`)."""
+    assert {result.calc for result in ALL_RESULTS} == set(CalcName) - AGENT_ONLY_CALCS
 
 
 def test_a_measurement_without_observations_gets_no_share():

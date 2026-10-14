@@ -2688,3 +2688,26 @@ def test_agent_numbers_print_whole_percents_without_a_trailing_zero():
     assert "50% (1 из 2)" in agent.text and "50.0%" not in agent.text
     assert "71.4% (5 из 7)" in agent.text
     assert "50.0% (1 из 2)" in question_msg(half, None).text
+
+
+def test_agent_numbers_print_the_chart_range_and_the_assumed_equity():
+    from harness.presentation import agent_turn_msg
+    from tests.test_agent_outputs import equity_result, range_result
+
+    msg = agent_turn_msg("numbers", None, [range_result(), equity_result()], from_context=True, job_id=7)
+    assert "Посчитано: диапазон соперника по чарту, эквити против суженного диапазона." in msg.text
+    assert (
+        "Диапазон BB по чарту защиты BB против BTN (8-max, 25.0BB; мест за столом: 6): "
+        "1.9% рук, 22 комбо." in msg.text
+    )
+    assert (
+        "Эквити против диапазона BB, суженного по линии (допущение): 31.4% — 7 комбо, "
+        "31.8% стартового." in msg.text
+    )
+
+
+def test_the_agent_list_names_the_range_calculations_and_ask_does_not():
+    from harness.presentation import agent_refusal_msg, question_refusal_msg
+
+    assert "стартовый диапазон соперника по чарту" in agent_refusal_msg().text
+    assert "диапазон" not in question_refusal_msg().text

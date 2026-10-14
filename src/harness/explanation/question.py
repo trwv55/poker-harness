@@ -27,11 +27,14 @@ from harness.contracts import (
     CalcResult,
     CoverageResult,
     DefenseResult,
+    EquityVsRangeResult,
     FrequencyResult,
     FrequencyStat,
     LeaksResult,
     Measurement,
     ModelOutput,
+    OpponentRangeResult,
+    Street,
     Subject,
     ThresholdOutcome,
     ThresholdResult,
@@ -64,6 +67,8 @@ _CALC_BRIEF: dict[CalcName, str] = {
     CalcName.LEAKS: "типы расхождений с ценой",
     CalcName.DEFENSE_FREQUENCY: "требуемая частота защиты от размера ставки",
     CalcName.FREQUENCY_VS_THRESHOLD: "частота против порога",
+    CalcName.OPPONENT_RANGE: "стартовый диапазон соперника по чарту",
+    CalcName.EQUITY_VS_RANGE: "эквити против диапазона, суженного агентом",
 }
 
 # Подписи величин повторяют то, что считает `analysis/player_stats.py`: у
@@ -252,8 +257,9 @@ def question_digest(result: CalcResult) -> Digest:
 
     Числа печатаются только через `NumberBook`, и они же становятся
     разрешёнными в ответе — одной записью, как в `verdict_digest`. Что мимо
-    книги не напечатано ни одно число ни у одного из шести расчётов, держит
-    `test_the_digest_registers_every_number_it_prints`.
+    книги не напечатано ни одно число ни у одного из расчётов `/ask`, держит
+    `test_the_digest_registers_every_number_it_prints`. У расчётов агента
+    выжимки `/ask` нет — отказ (`test_ask_has_no_digest_for_agent_only_calculations`).
     """
     book = NumberBook()
     lines = [f"Расчёт: {_CALC_BRIEF[result.calc]} ({result.calc.value})."]
@@ -265,6 +271,9 @@ def question_digest(result: CalcResult) -> Digest:
         lines += _leaks_lines(result, book)
     elif isinstance(result, DefenseResult):
         lines += _defense_lines(result, book)
+    elif isinstance(result, (OpponentRangeResult, EquityVsRangeResult)):
+        # Ошибка в значении имени расчёта, а не в типе вызова: `ValueError`.
+        raise ValueError(f"{result.calc.value} — расчёт агента, у /ask его нет")  # noqa: TRY004
     else:
         lines += _threshold_lines(result, book)
     return Digest(text="\n".join(lines), allowed=book.allowed)
@@ -363,6 +372,92 @@ def _agent_defense_lines(result: DefenseResult, book: NumberBook) -> list[str]:
     ]
 
 
+_STREET_WORD: dict[Street, str] = {
+    Street.PREFLOP: "префлоп", Street.FLOP: "флоп", Street.TURN: "тёрн", Street.RIVER: "ривер",
+}
+
+_LINE_BRIEF: dict[str, str] = {
+    "open_raise": "опен рейзом",
+    "open_allin": "опен олл-ином",
+    "limp": "лимп",
+    "call": "колл против опена {opener}",
+    "check": "чек после лимпа {opener}",
+    "three_bet": "3-бет против опена {opener}",
+    "allin": "олл-ин против опена {opener}",
+}
+
+# Карманная пара словами: «99» в тексте сверка чисел считала бы числом, а модель,
+# пересказавшая «99», — выдумкой (решение контроллера R2, 2026-10-15).
+_PAIR_WORD: dict[str, str] = {
+    "A": "тузов", "K": "королей", "Q": "дам", "J": "валетов", "T": "десяток",
+    "9": "девяток", "8": "восьмёрок", "7": "семёрок", "6": "шестёрок", "5": "пятёрок",
+    "4": "четвёрок", "3": "троек", "2": "двоек",
+}
+
+
+def _depth_text(value: float, book: NumberBook) -> str:
+    return book.count(int(value)) if float(value).is_integer() else book.bb(value)
+
+
+def _range_text(text: str, book: NumberBook) -> str:
+    """Диапазон по классам (`to_notation`): пара — словами («пара девяток»), класс с
+    буквой — как есть; доля чарта — процентом в скобках при классе, и только она
+    регистрируется. Цифры классов с буквой сверка вырезает (`strip_card_tokens`)
+    (`test_pocket_pairs_are_printed_in_words_and_are_not_numbers`,
+    `test_the_range_outputs_register_every_number_that_stays_a_number`)."""
+    parts: list[str] = []
+    for token in text.split(", "):
+        cls, _, weight = token.partition(":")
+        word = f"пара {_PAIR_WORD[cls[0]]}" if len(cls) == 2 and cls[0] == cls[1] else cls
+        if weight:
+            word += f" ({book.pct(100.0 * float(weight), trim=True)}%)"
+        parts.append(word)
+    return ", ".join(parts)
+
+
+def _agent_range_lines(result: OpponentRangeResult, book: NumberBook) -> list[str]:
+    chart = (
+        f"чарт опена {result.chart_position}"
+        if result.chart == "open"
+        else f"чарт защиты {result.chart_position} против {result.vs_chart_position}"
+    )
+    source = (
+        f"{chart}, {book.count(result.chart_seats)}-max, "
+        f"{_depth_text(result.chart_depth_bb, book)} BB"
+    )
+    if result.chart_seats != result.table_seats:
+        source += (
+            f"; за столом мест — {book.count(result.table_seats)}: чарт "
+            f"{book.count(result.chart_seats)}-max по позиции от конца (правило, не допущение)"
+        )
+    line = _LINE_BRIEF[result.line].format(opener=result.opener_position)
+    return [
+        f"Соперник: {result.opponent_position}, линия до флопа — {line}.",
+        f"Источник: {source}.",
+        f"Стартовый диапазон: {_range_text(result.range_text, book)}.",
+        (
+            f"Доля рук: {book.pct(100.0 * result.hands_share, trim=True)}%; комбо без ваших "
+            f"карт и борда ({_STREET_WORD[result.street]}): "
+            f"{book.count(round(result.live_combos))}."
+        ),
+    ]
+
+
+def _agent_equity_lines(result: EquityVsRangeResult, book: NumberBook) -> list[str]:
+    return [
+        f"Соперник: {result.opponent_position}, улица: {_STREET_WORD[result.street]}.",
+        (
+            f"Диапазон, суженный агентом: {_range_text(result.range_text, book)}. "
+            "Диапазон сужен агентом — это допущение."
+        ),
+        (
+            f"Комбо: {book.count(round(result.live_combos))} — "
+            f"{book.pct(100.0 * result.share_of_start, trim=True)}% стартового диапазона."
+        ),
+        f"Эквити вашей руки при вскрытии: {book.pct(100.0 * result.equity, trim=True)}%.",
+    ]
+
+
 def agent_digest(result: CalcResult, *, opponent: str | None = None) -> Digest:
     """Выход расчёта, который видит модель агента; у `/ask` — `question_digest`.
 
@@ -383,6 +478,10 @@ def agent_digest(result: CalcResult, *, opponent: str | None = None) -> Digest:
         lines += _leaks_lines(result, book, trim=True)
     elif isinstance(result, DefenseResult):
         lines += _agent_defense_lines(result, book)
+    elif isinstance(result, OpponentRangeResult):
+        lines += _agent_range_lines(result, book)
+    elif isinstance(result, EquityVsRangeResult):
+        lines += _agent_equity_lines(result, book)
     else:
         lines += _agent_threshold_lines(result, opponent, book)
         lines.append(_window_line(result.window, book))

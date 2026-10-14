@@ -22,7 +22,9 @@
 вердикта: постфлопного эталона в проекте нет. Вердикт даёт
 `ThresholdResult`, и порог у него приходит либо арифметикой от размера ставки
 (`BetSizeThreshold`), либо измерением поля (`FieldThreshold`) — третьего
-источника в наборе нет.
+источника в наборе нет. Стартовый диапазон соперника (`OpponentRangeResult`) берётся
+из чарта — эталона владельца; эквити против суженного диапазона
+(`EquityVsRangeResult`) — допущение агента, оценкой не является.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from harness.contracts.history import LeakStat
 from harness.contracts.raw import Street
 
 __all__ = [
+    "AGENT_ONLY_CALCS",
     "POSITIONS",
     "BetSizeThreshold",
     "CalcName",
@@ -47,6 +50,8 @@ __all__ = [
     "CoverageResult",
     "DefenseParams",
     "DefenseResult",
+    "EquityVsRangeParams",
+    "EquityVsRangeResult",
     "FieldThreshold",
     "FrequencyResult",
     "FrequencyStat",
@@ -55,6 +60,8 @@ __all__ = [
     "LeaksResult",
     "Measurement",
     "OpponentFrequencyParams",
+    "OpponentRangeParams",
+    "OpponentRangeResult",
     "PointFilter",
     "RangeLine",
     "Subject",
@@ -92,6 +99,15 @@ class CalcName(StrEnum):
     LEAKS = "leaks"
     DEFENSE_FREQUENCY = "defense_frequency"
     FREQUENCY_VS_THRESHOLD = "frequency_vs_threshold"
+    OPPONENT_RANGE = "opponent_range"
+    EQUITY_VS_RANGE = "equity_vs_range"
+
+
+# Расчёты только агента: им нужна рука разбора вечера и улица точки решения, у
+# `/ask` нет ни того, ни другого (спека 2026-10-14, §6; `/ask` без изменений).
+AGENT_ONLY_CALCS: frozenset[CalcName] = frozenset(
+    {CalcName.OPPONENT_RANGE, CalcName.EQUITY_VS_RANGE}
+)
 
 
 class FrequencyStat(StrEnum):
@@ -312,6 +328,45 @@ class ThresholdResult(BaseModel):
     observations_needed: int | None = None
 
 
+class OpponentRangeResult(BaseModel):
+    """Стартовый диапазон соперника по чарту — зона `strict`: диапазон не угадан, а
+    взят из эталона владельца по линии, которую код прочёл в руке.
+
+    `hands_share` — `Range.fraction_of_hands` (от 1326 комбо); `live_combos` —
+    взвешенные комбо без карт героя и борда улицы `street`. `chart_seats` и
+    `table_seats` расходятся на столе 4–7 мест (8-max по позиции от конца — правило).
+    """
+
+    calc: CalcName
+    opponent_position: str
+    street: Street
+    line: RangeLine
+    opener_position: str
+    chart: Literal["open", "defend"]
+    chart_seats: int
+    table_seats: int
+    chart_position: str
+    vs_chart_position: str | None = None
+    chart_depth_bb: float
+    range_text: str
+    hands_share: float
+    live_combos: float
+
+
+class EquityVsRangeResult(BaseModel):
+    """Эквити героя при вскрытии против диапазона, суженного агентом, — зона
+    `assuming`: сужение — допущение агента, классы — подмножество стартового с
+    долями чарта. `share_of_start` — доля живых комбо суженного от стартового."""
+
+    calc: CalcName
+    opponent_position: str
+    street: Street
+    range_text: str
+    live_combos: float
+    share_of_start: float
+    equity: float
+
+
 class HeroFrequencyParams(BaseModel):
     calc: Literal[CalcName.HERO_FREQUENCY] = CalcName.HERO_FREQUENCY
     stat: FrequencyStat
@@ -388,16 +443,43 @@ class ThresholdParams(BaseModel):
     threshold: Annotated[BetSizeThreshold | FieldThreshold, Field(discriminator="source")]
 
 
+class OpponentRangeParams(BaseModel):
+    """`analysis_id` подставляет код (указатель разбора вечера), не модель."""
+
+    calc: Literal[CalcName.OPPONENT_RANGE] = CalcName.OPPONENT_RANGE
+    analysis_id: int
+    opponent_position: str
+    street: Street
+
+
+class EquityVsRangeParams(BaseModel):
+    """`hands` — классы без весов; `analysis_id` — от кода, как у `OpponentRangeParams`."""
+
+    calc: Literal[CalcName.EQUITY_VS_RANGE] = CalcName.EQUITY_VS_RANGE
+    analysis_id: int
+    opponent_position: str
+    street: Street
+    hands: str
+
+
 CalcParams = Annotated[
     HeroFrequencyParams
     | OpponentFrequencyParams
     | CoverageParams
     | LeaksParams
     | DefenseParams
-    | ThresholdParams,
+    | ThresholdParams
+    | OpponentRangeParams
+    | EquityVsRangeParams,
     Field(discriminator="calc"),
 ]
 
 CalcResult = (
-    FrequencyResult | CoverageResult | LeaksResult | DefenseResult | ThresholdResult
+    FrequencyResult
+    | CoverageResult
+    | LeaksResult
+    | DefenseResult
+    | ThresholdResult
+    | OpponentRangeResult
+    | EquityVsRangeResult
 )

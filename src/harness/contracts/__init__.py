@@ -38,6 +38,7 @@ from harness.contracts.analysis import (
     turn_flop_call_detail,
 )
 from harness.contracts.calcs import (
+    AGENT_ONLY_CALCS,
     POSITIONS,
     BetSizeThreshold,
     CalcName,
@@ -47,6 +48,8 @@ from harness.contracts.calcs import (
     CoverageResult,
     DefenseParams,
     DefenseResult,
+    EquityVsRangeParams,
+    EquityVsRangeResult,
     FieldThreshold,
     FrequencyResult,
     FrequencyStat,
@@ -55,6 +58,8 @@ from harness.contracts.calcs import (
     LeaksResult,
     Measurement,
     OpponentFrequencyParams,
+    OpponentRangeParams,
+    OpponentRangeResult,
     PointFilter,
     RangeLine,
     Subject,
@@ -159,6 +164,7 @@ from harness.contracts.vision import (
 )
 
 __all__ = [
+    "AGENT_ONLY_CALCS",
     "JUDGED_SPOTS",
     "LEAK_RULES",
     "MAX_NOTE_COLORS",
@@ -200,6 +206,8 @@ __all__ = [
     "DrawKind",
     "EngineReport",
     "EnrichedHand",
+    "EquityVsRangeParams",
+    "EquityVsRangeResult",
     "EvInterval",
     "EvSplit",
     "FieldThreshold",
@@ -225,6 +233,8 @@ __all__ = [
     "NoteRecord",
     "OpenThreshold",
     "OpponentFrequencyParams",
+    "OpponentRangeParams",
+    "OpponentRangeResult",
     "OpponentRecord",
     "Overcards",
     "PlayerState",

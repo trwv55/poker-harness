@@ -17,21 +17,28 @@ from typing import Any, cast
 
 import pytest
 
+import harness.calcs as calcs_module
+from harness.analysis import analyze_hand
+from harness.analysis.charts import lookup, parse_range, to_notation
 from harness.analysis.frequency import wilson_interval
+from harness.analysis.tools.equity import equity_vs_range
 from harness.calcs import run
 from harness.contracts import (
     ActionKind,
     AnalysisResult,
     BetSizeThreshold,
+    CalcName,
     CanonicalAction,
     CoverageParams,
     DecisionPoint,
     DefenseParams,
+    EquityVsRangeParams,
     FieldThreshold,
     FrequencyStat,
     HeroFrequencyParams,
     LeaksParams,
     OpponentFrequencyParams,
+    OpponentRangeParams,
     PointFilter,
     PointVerdict,
     SpotKind,
@@ -45,13 +52,16 @@ from harness.contracts import (
 )
 from harness.memory.repos import (
     AnalysesRepo,
+    CalcCacheRepo,
     HandsRepo,
     OpponentsRepo,
     PlayersRepo,
     SessionsRepo,
 )
 from harness.normalizer import normalize
+from tests.test_opponent_range import BTN_OPENS_BB_CALLS, _raw, defend_file
 from tests.test_player_stats import _call, _fold, _raise_to, _raw_hand
+from tests.test_postflop_line import _played_out
 
 
 async def _player_with_session(db, tg_user_id: int) -> tuple[int, int]:
@@ -563,3 +573,98 @@ def test_the_bot_does_not_load_the_dictionary():
         [sys.executable, "-c", code], capture_output=True, text=True, check=True
     )
     assert result.stdout.strip() == "[]", f"бот загрузил словарь: {result.stdout}"
+
+
+# --- диапазон соперника и эквити против суженного (только агент) -------------------
+
+
+async def stored_analysis(db, *, session_id: int, actions=None) -> int:
+    """Синтетическая рука вечера с разбором: BTN открывает, BB коллирует, флоп."""
+    raw = _raw(actions or BTN_OPENS_BB_CALLS)
+    en = _played_out(raw)
+    hand_id = await HandsRepo(db).save_raw(session_id=session_id, raw=raw)
+    await HandsRepo(db).save_canonical(hand_id, en.hand)
+    await HandsRepo(db).save_enriched(hand_id, en)
+    return await AnalysesRepo(db).save(
+        hand_id=hand_id, result=analyze_hand(en), decision_points=en.report.decision_points
+    )
+
+
+async def test_the_opponent_range_comes_from_the_chart_of_the_analysed_hand(
+    db, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    player_id, session_id = await _player_with_session(db, tg_user_id=9201)
+    analysis_id = await stored_analysis(db, session_id=session_id)
+    result = await run(db, player_id, OpponentRangeParams(
+        analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP,
+    ))
+    assert (result.calc, result.line, result.chart, result.vs_chart_position) == (
+        CalcName.OPPONENT_RANGE, "call", "defend", "BTN",
+    )
+    assert (result.chart_seats, result.table_seats) == (8, 6)
+
+
+async def test_another_players_analysis_is_not_read(db, tmp_path, monkeypatch):
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    _owner, owner_session = await _player_with_session(db, tg_user_id=9202)
+    stranger, _ = await _player_with_session(db, tg_user_id=9203)
+    analysis_id = await stored_analysis(db, session_id=owner_session)
+    with pytest.raises(ValueError, match="разбора этой руки нет"):
+        await run(db, stranger, OpponentRangeParams(
+            analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP,
+        ))
+
+
+async def test_equity_is_deterministic_and_cached(db, tmp_path, monkeypatch):
+    """Тот же вход — то же число, равное прямому расчёту с тем же сидом; второй раз
+    — из `calc_cache`."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 2_000)
+    player_id, session_id = await _player_with_session(db, tg_user_id=9204)
+    analysis_id = await stored_analysis(db, session_id=session_id)
+    params = EquityVsRangeParams(
+        analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP,
+        hands="QQ, 77, 22, AQs",
+    )
+    first = await run(db, player_id, params)
+    prefix, key = calcs_module.equity_cache_prefix(), "KdTc|Qc7d2s|" + to_notation(
+        parse_range("QQ, 77, 22, AQs")
+    )
+    assert await CalcCacheRepo(db).get(prefix, key) == first.equity
+    assert first.equity == equity_vs_range(
+        ("Kd", "Tc"), parse_range("QQ, 77, 22, AQs"), ["Qc", "7d", "2s"], iterations=2_000,
+        seed=42,
+    )
+    assert (await run(db, player_id, params)).equity == first.equity
+    assert first.live_combos == 12.0
+
+
+async def test_a_cached_equity_is_returned_without_counting_again(db, tmp_path, monkeypatch):
+    """Строка кэша с тем же ключом отдаётся как есть: Монте-Карло не зовётся."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    player_id, session_id = await _player_with_session(db, tg_user_id=9206)
+    analysis_id = await stored_analysis(db, session_id=session_id)
+    key = "KdTc|Qc7d2s|" + to_notation(parse_range("QQ, AQs"))
+    await CalcCacheRepo(db).upsert_many(calcs_module.equity_cache_prefix(), {key: 0.25})
+
+    def must_not_run(*_args: object, **_kw: object) -> float:
+        raise AssertionError("эквити посчитано заново при строке в кэше")
+
+    monkeypatch.setattr(calcs_module, "equity_vs_range", must_not_run)
+    result = await run(db, player_id, EquityVsRangeParams(
+        analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP, hands="QQ, AQs",
+    ))
+    assert result.equity == 0.25
+
+
+async def test_a_narrowing_outside_the_start_is_refused_by_the_calculation(
+    db, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    player_id, session_id = await _player_with_session(db, tg_user_id=9205)
+    analysis_id = await stored_analysis(db, session_id=session_id)
+    with pytest.raises(ValueError, match="нет в стартовом диапазоне: AKo"):
+        await run(db, player_id, EquityVsRangeParams(
+            analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP, hands="AKo",
+        ))

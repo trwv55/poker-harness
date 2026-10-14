@@ -29,7 +29,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from sqlalchemy import text as sql_text
 
 from harness.calcs.routing import CalcRun, answer_question, tools_for
-from harness.contracts import CalcName, FrequencyResult
+from harness.contracts import AGENT_ONLY_CALCS, CalcName, FrequencyResult
 from harness.explanation.question import QuestionDraft
 from harness.memory.models import Job, Trace
 from harness.memory.repos import PlayersRepo, SessionsRepo
@@ -119,14 +119,17 @@ async def _ask(db_factory, session, script: _Script, *, scope, question="воп�
     )
 
 
-def test_the_tool_set_covers_every_calculation_name_exactly_once():
-    """Набор инструментов и набор имён словаря — один список, а не две копии.
+def test_the_ask_tool_set_covers_every_ask_calculation_exactly_once():
+    """Набор инструментов `/ask` и набор имён словаря без расчётов агента
+    (`AGENT_ONLY_CALCS`) — один список, а не две копии.
 
     Разойтись они могли бы молча: лишний инструмент считал бы то, чего в
     словаре нет, а забытый делал бы имя недостижимым для вопроса.
     """
     tools = tools_for(None, 1, 1, CalcRun())  # type: ignore[arg-type] — база здесь не трогается
-    assert sorted(tool.name for tool in tools) == sorted(name.value for name in CalcName)
+    assert sorted(tool.name for tool in tools) == sorted(
+        n.value for n in set(CalcName) - AGENT_ONLY_CALCS
+    )
 
 
 @requires_prompts
@@ -304,7 +307,7 @@ async def test_a_tool_call_round_trip_logs_a_row_per_request(db_factory):
     assert run_state.result is not None
 
 
-@pytest.mark.parametrize("name", [name.value for name in CalcName])
+@pytest.mark.parametrize("name", sorted(n.value for n in set(CalcName) - AGENT_ONLY_CALCS))
 def test_every_tool_describes_its_parameters(name: str):
     """У каждого инструмента есть описание и схема параметров.
 

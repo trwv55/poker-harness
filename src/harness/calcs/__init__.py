@@ -25,23 +25,34 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, cast, overload
 
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from harness.analysis.charts import to_notation
 from harness.analysis.frequency import (
     compare_to_reference,
     compare_to_threshold,
     defense_from_bet,
     threshold_from_bet,
 )
+from harness.analysis.opponent_range import (
+    board_at,
+    equity_spot,
+    hero_cards,
+    live_combos,
+    range_spot,
+    start_range,
+)
 from harness.analysis.player_stats import (
     measurement_of,
     player_stats_of_seats,
     seat_position,
 )
+from harness.analysis.tools.equity import equity_vs_range
 from harness.contracts import (
     POSITIONS,
     CalcName,
@@ -52,6 +63,8 @@ from harness.contracts import (
     CoverageResult,
     DefenseParams,
     DefenseResult,
+    EquityVsRangeParams,
+    EquityVsRangeResult,
     FrequencyResult,
     FrequencyStat,
     HeroFrequencyParams,
@@ -59,15 +72,30 @@ from harness.contracts import (
     LeaksResult,
     Measurement,
     OpponentFrequencyParams,
+    OpponentRangeParams,
+    OpponentRangeResult,
     PointFilter,
     Subject,
     ThresholdParams,
     ThresholdResult,
     Window,
 )
-from harness.memory.repos import HandsRepo, LeaksRepo, OpponentsRepo
+from harness.memory.repos import (
+    AnalysesRepo,
+    CalcCacheRepo,
+    HandsRepo,
+    LeaksRepo,
+    OpponentsRepo,
+)
 
-__all__ = ["REGISTRY", "run", "seats_of"]
+__all__ = [
+    "AGENT_EQUITY_ITERATIONS",
+    "AGENT_EQUITY_SEED",
+    "REGISTRY",
+    "equity_cache_prefix",
+    "run",
+    "seats_of",
+]
 
 _Runner = Callable[[AsyncSession, int, Any], Awaitable[CalcResult]]
 
@@ -281,6 +309,82 @@ async def _threshold(
     )
 
 
+# Потолок итераций Монте-Карло у эквити агента: ход агента ждут до 30 с, а расчёт
+# идёт в процессе воркера. Значение — по замеру на стенде (план 2026-10-14, Task 5,
+# Step 6). Сид — тот же, что умолчание `equity_vs_range`: один вход — одно число.
+AGENT_EQUITY_ITERATIONS = 50_000
+AGENT_EQUITY_SEED = 42
+
+
+def equity_cache_prefix() -> str:
+    """Пространство ключей `calc_cache` эквити агента: смена итераций или сида не
+    отдаёт число, посчитанное на старых (тот же приём, что у `CalcCacheRepo`)."""
+    return f"eqr:v1:{AGENT_EQUITY_ITERATIONS}:{AGENT_EQUITY_SEED}:"
+
+
+async def _analysed_hand(db: AsyncSession, player_id: int, analysis_id: int) -> CanonicalHand:
+    enriched = await AnalysesRepo(db).enriched_hand(analysis_id, player_id)
+    if enriched is None:
+        raise ValueError("разбора этой руки нет — диапазон соперника считать не по чему")
+    return enriched.hand
+
+
+async def _opponent_range(
+    db: AsyncSession, player_id: int, params: OpponentRangeParams
+) -> OpponentRangeResult:
+    """Стартовый диапазон по чарту в руке разбора; отказы ядра — `ValueError` словами."""
+    _check_position(params.opponent_position)
+    hand = await _analysed_hand(db, player_id, params.analysis_id)
+    start = start_range(range_spot(hand, params.opponent_position))
+    dead = [*hero_cards(hand), *board_at(hand, params.street)]
+    return OpponentRangeResult(
+        calc=params.calc,
+        opponent_position=params.opponent_position,
+        street=params.street,
+        line=start.spot.line,
+        opener_position=start.spot.opener_position,
+        chart=start.chart,
+        chart_seats=start.chart_seats,
+        table_seats=start.spot.seats,
+        chart_position=start.chart_position,
+        vs_chart_position=start.vs_chart_position,
+        chart_depth_bb=start.chart_depth_bb,
+        range_text=to_notation(start.range),
+        hands_share=start.range.fraction_of_hands(),
+        live_combos=live_combos(start.range, dead),
+    )
+
+
+async def _equity_vs_range(
+    db: AsyncSession, player_id: int, params: EquityVsRangeParams
+) -> EquityVsRangeResult:
+    """Эквити против суженного: Монте-Карло под потолком итераций, с фиксированным
+    сидом (`test_equity_is_deterministic_and_cached`) и `calc_cache`: строка кэша
+    отдаётся без пересчёта (`test_a_cached_equity_is_returned_without_counting_again`).
+    Счёт — в потоке, чтобы не держать цикл событий воркера."""
+    _check_position(params.opponent_position)
+    hand = await _analysed_hand(db, player_id, params.analysis_id)
+    spot = equity_spot(hand, params.opponent_position, params.street, params.hands)
+    cache = CalcCacheRepo(db)
+    prefix = equity_cache_prefix()
+    equity = await cache.get(prefix, spot.cache_key)
+    if equity is None:
+        equity = await asyncio.to_thread(
+            equity_vs_range, spot.hero, spot.narrowed, spot.board,
+            iterations=AGENT_EQUITY_ITERATIONS, seed=AGENT_EQUITY_SEED,
+        )
+        await cache.upsert_many(prefix, {spot.cache_key: equity})
+    return EquityVsRangeResult(
+        calc=params.calc,
+        opponent_position=params.opponent_position,
+        street=params.street,
+        range_text=to_notation(spot.narrowed),
+        live_combos=spot.live_combos,
+        share_of_start=spot.share_of_start,
+        equity=equity,
+    )
+
+
 # Реестр словаря: имя → (тип параметров, исполнитель). Одно место, где набор
 # перечислен: диспетчер берёт исполнителя отсюда же, поэтому имя, забытое в
 # реестре, не вызывается вовсе, а не вызывается вторым списком.
@@ -291,6 +395,8 @@ REGISTRY: dict[CalcName, tuple[type[BaseModel], _Runner]] = {
     CalcName.LEAKS: (LeaksParams, _leaks),
     CalcName.DEFENSE_FREQUENCY: (DefenseParams, _defense),
     CalcName.FREQUENCY_VS_THRESHOLD: (ThresholdParams, _threshold),
+    CalcName.OPPONENT_RANGE: (OpponentRangeParams, _opponent_range),
+    CalcName.EQUITY_VS_RANGE: (EquityVsRangeParams, _equity_vs_range),
 }
 
 
@@ -314,6 +420,14 @@ async def run(db: AsyncSession, player_id: int, params: DefenseParams) -> Defens
 async def run(
     db: AsyncSession, player_id: int, params: ThresholdParams
 ) -> ThresholdResult: ...
+@overload
+async def run(
+    db: AsyncSession, player_id: int, params: OpponentRangeParams
+) -> OpponentRangeResult: ...
+@overload
+async def run(
+    db: AsyncSession, player_id: int, params: EquityVsRangeParams
+) -> EquityVsRangeResult: ...
 
 
 async def run(db: AsyncSession, player_id: int, params: CalcParams) -> CalcResult:
@@ -321,7 +435,7 @@ async def run(db: AsyncSession, player_id: int, params: CalcParams) -> CalcResul
 
     Перегрузки выше — то же соответствие «имя → форма результата», что в
     `REGISTRY`, на языке типов: вызывающий, попросивший покрытие, получает
-    `CoverageResult`, а не объединение всех шести.
+    `CoverageResult`, а не объединение всех восьми.
 
     Расчёт выбирается полем `params.calc`, а не типом аргумента: тот же ключ
     подписывает результат, поэтому ответ на не тот вопрос виден по подписи
