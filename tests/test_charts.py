@@ -19,10 +19,13 @@ from harness.analysis.charts import (
     ChartKey,
     ChartMissing,
     ChartPlaceholder,
+    DefendKey,
     DepthNotCharted,
     NotationError,
     chart_keys,
+    defend_strategy,
     load_chart_book,
+    load_defend_book,
     open_range,
     open_strategy,
     parse_range,
@@ -355,3 +358,100 @@ def test_not_json_at_all_is_rejected(tmp_path: Path):
     path.write_text("{это не json", encoding="utf-8")
     with pytest.raises(ChartFileError):
         load_chart_book(path)
+
+
+# --- чарты защиты ---------------------------------------------------------------
+#
+# Схема — опен-чарта с двумя отличиями (спека 2026-10-14, §4): ключ несёт
+# `vs_position`, действия — `call`, `raise` (3-бет), `allin`, сверка — `defend_pct`.
+# Синтетика: 22+ (78) + A2s-AQs (44) + K9o+ (48) = 170 комбо колла, AKs наполовину
+# 3-бетом (2) — 172 комбо = 12.97%.
+
+
+def _defend(**over: object) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "seats": 8,
+        "position": "BB",
+        "vs_position": "BTN",
+        "depth_bb": 25,
+        "ante_type": "per_player",
+        "source": "тестовый источник",
+        "revised_at": "2026-10-14",
+        "call": "22+, A2s-AQs, K9o+",
+        "raise": "AKs:0.5",
+    }
+    entry.update(over)
+    return entry
+
+
+def _write_defend(tmp_path: Path, entries: list[dict[str, object]], **file_fields: object) -> Path:
+    payload: dict[str, object] = {"schema_version": 3, "entries": entries}
+    payload.update(file_fields)
+    path = tmp_path / "defend.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def test_a_defence_entry_gives_three_actions_and_folds_the_rest(tmp_path: Path):
+    path = _write_defend(tmp_path, [_defend(defend_pct="13.0%")])
+    strategy = defend_strategy(8, "BB", "BTN", 25.0, "per_player", path=path)
+    assert strategy.call_range.weight("A5s") == 1.0
+    assert strategy.raise_range.weight("AKs") == 0.5
+    assert strategy.allin_range.weights == {}
+    assert strategy.fold_weight("AKs") == pytest.approx(0.5)
+    assert strategy.fold_weight("72o") == 1.0
+
+
+def test_the_defence_takes_the_nearest_depth_like_the_open(tmp_path: Path):
+    """Одно правило на опен и защиту: ближайшая глубина, при равенстве — меньшая."""
+    path = _write_defend(tmp_path, [_defend(depth_bb=20), _defend(depth_bb=30, call="22+")])
+    book = load_defend_book(path)
+    assert book.nearest(8, "BB", "BTN", 25.0, "per_player").depth_bb == 20.0
+    assert book.nearest(8, "BB", "BTN", 26.0, "per_player").depth_bb == 30.0
+    with pytest.raises(DepthNotCharted):
+        book.nearest(8, "BB", "BTN", 12.0, "per_player")
+
+
+def test_a_missing_defence_file_means_no_charts(tmp_path: Path):
+    """Чарт защиты владелец кладёт позже: без файла лукап отказывает, а не падает."""
+    absent = tmp_path / "нет-такого.json"
+    assert load_defend_book(absent).all_keys() == []
+    with pytest.raises(ChartMissing):
+        defend_strategy(8, "BB", "BTN", 25.0, "per_player", path=absent)
+
+
+def test_no_neighbour_defence_is_substituted(tmp_path: Path):
+    path = _write_defend(tmp_path, [_defend()])
+    with pytest.raises(ChartMissing):
+        defend_strategy(8, "BB", "CO", 25.0, "per_player", path=path)
+    with pytest.raises(ChartMissing):
+        defend_strategy(8, "SB", "BTN", 25.0, "per_player", path=path)
+    with pytest.raises(ChartMissing):
+        defend_strategy(8, "BB", "BTN", 25.0, "bb_ante", path=path)
+
+
+def test_a_defence_placeholder_is_refused(tmp_path: Path):
+    path = _write_defend(tmp_path, [_defend(status="example")])
+    assert DefendKey(8, "BB", "BTN", 25.0, "per_player") in load_defend_book(path).all_keys()
+    with pytest.raises(ChartPlaceholder):
+        defend_strategy(8, "BB", "BTN", 25.0, "per_player", path=path)
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        pytest.param([_defend(seats=4, vs_position="LJ")], id="открывшего нет за таким столом"),
+        pytest.param([_defend(vs_position="BB")], id="защищающийся и открывший — одно место"),
+        pytest.param([_defend(call="", **{"raise": ""})], id="защиты нет"),
+        pytest.param([_defend(call="AKs", **{"raise": "AKs:0.5"})], id="доли руки больше 1"),
+        pytest.param([_defend(defend_pct="15%")], id="defend_pct расходится с диапазонами"),
+        pytest.param([_defend(limp="AA")], id="поле опен-чарта в чарте защиты"),
+        pytest.param([_defend(depth_bb=10)], id="глубина ниже 15bb"),
+        pytest.param([_defend(source=" ")], id="пустой source"),
+        pytest.param([_defend(), _defend()], id="ключ дважды"),
+        pytest.param([], id="ни одной записи"),
+    ],
+)
+def test_a_malformed_defence_file_is_rejected(tmp_path: Path, entries: list[dict[str, object]]):
+    with pytest.raises(ChartFileError):
+        load_defend_book(_write_defend(tmp_path, entries))
