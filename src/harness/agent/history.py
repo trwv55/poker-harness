@@ -37,7 +37,9 @@ from harness.explanation.faithfulness import numbers_in
 
 __all__ = [
     "allowed_from_history",
+    "assumed_numbers_in",
     "calcs_in_history",
+    "chart_numbers_in",
     "dump_history",
     "estimate_tokens",
     "frequency_numbers",
@@ -131,7 +133,7 @@ def trim_history(messages: Sequence[ModelMessage], max_tokens: int) -> list[Mode
 
 def _is_output_call(part: object) -> bool:
     """Вызов вывода (`final_result`), а не расчёта: инструменты агента — ровно
-    имена `CalcName` (`test_the_tool_set_covers_every_calculation_name_exactly_once`)."""
+    имена `CalcName` (`test_the_agent_tool_set_covers_every_calculation_name_exactly_once`)."""
     return isinstance(part, ToolCallPart) and part.tool_name not in _CALC_TOOLS
 
 
@@ -250,6 +252,19 @@ def frequency_numbers(messages: Sequence[ModelMessage]) -> frozenset[float]:
     """Измеренные частоты из выходов расчётов (доля, числитель, знаменатель) — без
     порогов и долей защиты (`test_the_measured_frequency_is_kept_apart_from_other_calc_numbers`)."""
     return frozenset(float(n) for meta in _metadata(messages) for n in meta.get("frequency", []))
+
+
+def chart_numbers_in(messages: Sequence[ModelMessage]) -> frozenset[float]:
+    """Числа выхода `opponent_range`: доля рук в процентах и комбо
+    (`test_the_agent_reads_the_range_by_the_chart_and_counts_equity_against_its_narrowing`)."""
+    return frozenset(float(n) for meta in _metadata(messages) for n in meta.get("chart", []))
+
+
+def assumed_numbers_in(messages: Sequence[ModelMessage]) -> frozenset[float]:
+    """Числа выхода `equity_vs_range`: эквити и доля от стартового в процентах —
+    числа расчёта, но не измеренная частота
+    (`test_equity_numbers_are_calculation_numbers_and_never_a_measured_frequency`)."""
+    return frozenset(float(n) for meta in _metadata(messages) for n in meta.get("assumed", []))
 
 
 def threshold_decided(messages: Sequence[ModelMessage]) -> bool:

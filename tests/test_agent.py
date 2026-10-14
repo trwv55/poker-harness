@@ -26,23 +26,38 @@ from pydantic_ai.messages import (
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from sqlalchemy import text as sql_text
 
+import harness.calcs as calcs_module
 from harness.agent.history import (
     allowed_from_history,
+    assumed_numbers_in,
     calcs_in_history,
+    chart_numbers_in,
     dump_history,
+    frequency_numbers,
     load_history,
     trim_history,
     turns,
 )
 from harness.agent.prompt import instructions_for, load_system_prompt
 from harness.agent.run import MAX_CALCS_PER_TURN, REWRITE_HEAD, run_agent_turn
+from harness.analysis.charts import lookup
 from harness.analysis.frequency import defense_from_bet
-from harness.contracts import CalcName, DefenseResult
+from harness.calcs.routing import CalcRun, tools_for
+from harness.contracts import (
+    AGENT_ONLY_CALCS,
+    CalcName,
+    DefenseResult,
+    EquityVsRangeResult,
+    OpponentRangeResult,
+)
 from harness.explanation.agent_checks import agent_context
+from harness.memory.repos import SessionsRepo
 from harness.platform.llm import LLM, LLMSchemaError
 from harness.presentation.messages import agent_turn_msg
 from tests.conftest import requires_agent_prompt
+from tests.test_calcs import stored_analysis
 from tests.test_hand_replay import _postflop_hand
+from tests.test_opponent_range import defend_file
 from tests.test_question_routing import _TEST_CFG, _seeded
 from tests.test_verdict_text import _point, _result
 
@@ -115,13 +130,15 @@ _GOOD = "Вы входите в банк в 100.0% раздач (2 из 2)."
 
 
 async def _turn(
-    db_factory, session, script, *, scope, text="вопрос", history=(), context=None, system=_SYSTEM
+    db_factory, session, script, *, scope, text="вопрос", history=(), context=None,
+    system=_SYSTEM, analysis_id=None,
 ):
     player_id, session_id, trace_id = scope
     llm = LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script))
     return await run_agent_turn(
         session, llm, player_id=player_id, session_id=session_id, text=text,
         trace_id=trace_id, history=history, context=context, system_prompt=system,
+        analysis_id=analysis_id,
     )
 
 
@@ -883,3 +900,91 @@ async def test_a_blank_text_answer_is_a_schema_error(db_factory):
         script = _TurnScript([([_VPIP], " \n "), ([_VPIP], " \n ")], as_text={0, 1})
         with pytest.raises(LLMSchemaError):
             await _turn(db_factory, session, script, scope=scope)
+
+
+# --- диапазон соперника по чарту и эквити против суженного (только агент) ----------
+
+_RANGE_CALL = ("opponent_range", {"opponent_position": "BB", "street": "flop"})
+_EQUITY_CALL = (
+    "equity_vs_range", {"opponent_position": "BB", "street": "flop", "hands": "QQ, 77, 22, AQs"},
+)
+
+
+async def _evening_with_hand(session, tg_user_id: int):
+    scope = await _seeded(session, tg_user_id=tg_user_id)
+    analysis_id = await stored_analysis(session, session_id=scope[1])
+    await SessionsRepo(session).set_last_analysis(scope[1], analysis_id)
+    await session.commit()
+    return scope, analysis_id
+
+
+def test_the_agent_tool_set_covers_every_calculation_name_exactly_once():
+    tools = tools_for(None, 1, 1, CalcRun(max_calcs=8, sizes_from=frozenset()))  # type: ignore[arg-type]
+    assert sorted(tool.name for tool in tools) == sorted(name.value for name in CalcName)
+
+
+def test_ask_does_not_get_the_agent_only_calculations():
+    tools = tools_for(None, 1, 1, CalcRun())  # type: ignore[arg-type]
+    assert not {tool.name for tool in tools} & {name.value for name in AGENT_ONLY_CALCS}
+
+
+async def test_the_agent_reads_the_range_by_the_chart_and_counts_equity_against_its_narrowing(
+    db_factory, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 2_000)
+    async with db_factory() as session:
+        scope, analysis_id = await _evening_with_hand(session, tg_user_id=8301)
+        script = _TurnScript([([_RANGE_CALL, _EQUITY_CALL], "Ответ без чисел (допущение).")])
+        turn = await _turn(db_factory, session, script, scope=scope, analysis_id=analysis_id)
+    assert [r.calc for r in turn.results] == [CalcName.OPPONENT_RANGE, CalcName.EQUITY_VS_RANGE]
+    assert [c["zone"] for c in turn.calls] == ["strict", "assuming"]
+    range_result, equity_result = turn.results
+    assert isinstance(range_result, OpponentRangeResult)
+    assert isinstance(equity_result, EquityVsRangeResult)
+    assert chart_numbers_in(turn.messages) == frozenset(
+        {round(100.0 * range_result.hands_share, 1), float(round(range_result.live_combos))}
+    )
+    assumed = frozenset(
+        {round(100.0 * equity_result.equity, 1), round(100.0 * equity_result.share_of_start, 1)}
+    )
+    assert assumed_numbers_in(turn.messages) == assumed
+
+
+async def test_equity_numbers_are_calculation_numbers_and_never_a_measured_frequency(
+    db_factory, tmp_path, monkeypatch
+):
+    """Эквити и доля от стартового — числа расчёта (`allowed`), но не измеренная
+    частота: частота — опора действию соперника, а сужение агента ею не бывает."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 2_000)
+    async with db_factory() as session:
+        scope, analysis_id = await _evening_with_hand(session, tg_user_id=8304)
+        script = _TurnScript([([_RANGE_CALL, _EQUITY_CALL], "Ответ без чисел (допущение).")])
+        turn = await _turn(db_factory, session, script, scope=scope, analysis_id=analysis_id)
+    assumed = assumed_numbers_in(turn.messages)
+    assert assumed and assumed <= allowed_from_history(turn.messages)
+    assert chart_numbers_in(turn.messages) <= allowed_from_history(turn.messages)
+    assert frequency_numbers(turn.messages) == frozenset()
+
+
+async def test_without_a_hand_analysis_the_range_tool_says_so(db_factory):
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8302)
+        script = _TurnScript([([_RANGE_CALL], _GOOD)])
+        turn = await _turn(db_factory, session, script, scope=scope)
+    assert turn.results == ()
+    assert any("Разбора руки в этом вечере нет" in text for text in script.returns)
+
+
+async def test_a_refused_narrowing_reaches_the_model_and_spends_no_calculation(
+    db_factory, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    async with db_factory() as session:
+        scope, analysis_id = await _evening_with_hand(session, tg_user_id=8303)
+        bad = ("equity_vs_range", {"opponent_position": "BB", "street": "flop", "hands": "AKo"})
+        script = _TurnScript([([bad], "Ответ без чисел (допущение).")])
+        turn = await _turn(db_factory, session, script, scope=scope, analysis_id=analysis_id)
+    assert turn.results == ()
+    assert "нет в стартовом диапазоне" in turn.calls[0]["error"]

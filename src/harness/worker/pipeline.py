@@ -1353,6 +1353,9 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
                     trace_id=trace.trace_id,
                     history=history,
                     context=context,
+                    # Сводки нет — руки тоже нет: указатель на разбор без руки
+                    # инструментам диапазона не нужен.
+                    analysis_id=state.last_analysis_id if context is not None else None,
                 )
         finally:
             typing.cancel()

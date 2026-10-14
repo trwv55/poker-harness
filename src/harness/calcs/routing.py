@@ -1,6 +1,8 @@
 """Маршрутизация вопроса игрока к расчёту: модель выбирает имя, считает код.
 
-Шесть расчётов словаря подключены модели инструментами. Модель не пишет SQL и
+Расчёты словаря подключены модели инструментами: у `/ask` — шесть, у агента —
+все имена `CalcName` (диапазон соперника и эквити против него — только агенту,
+`AGENT_ONLY_CALCS`). Модель не пишет SQL и
 не считает: она называет инструмент и подставляет параметры, инструмент зовёт
 `calcs.run` и возвращает выжимку его выхода, модель излагает эту выжимку
 словами. Всё, что в ответе окажется сверх выхода инструмента, отбраковывается
@@ -53,11 +55,15 @@ from harness.contracts import (
     CoverageParams,
     DefenseParams,
     DefenseResult,
+    EquityVsRangeParams,
+    EquityVsRangeResult,
     FieldThreshold,
     FrequencyStat,
     HeroFrequencyParams,
     LeaksParams,
     OpponentFrequencyParams,
+    OpponentRangeParams,
+    OpponentRangeResult,
     PointFilter,
     SpotKind,
     Street,
@@ -163,11 +169,21 @@ class CalcRun:
     суммы в BB, и целые фишки из неё не взять. Внутрь расчёта они идут целыми
     сотыми долями BB (`_BB_SCALE`); выход зависит только от отношения ставки к
     банку (`test_sizes_in_bb_give_the_same_result_as_chips_of_the_same_ratio`).
+
+    `analysis_id` — указатель разбора руки вечера, его подставляет код, не
+    модель. Без него `opponent_range` и `equity_vs_range` не считают и отвечают
+    модели отказом (`test_without_a_hand_analysis_the_range_tool_says_so`).
     """
 
-    def __init__(self, max_calcs: int = 1, sizes_from: frozenset[float] | None = None) -> None:
+    def __init__(
+        self,
+        max_calcs: int = 1,
+        sizes_from: frozenset[float] | None = None,
+        analysis_id: int | None = None,
+    ) -> None:
         self.max_calcs = max_calcs
         self.sizes_from = sizes_from
+        self.analysis_id = analysis_id
         self.results: list[CalcResult] = []
         self.digests: list[Digest] = []
         self.calls: list[dict[str, Any]] = []
@@ -240,9 +256,14 @@ _BB_SCALE = 100
 
 _CALC_CAP = "Потолок расчётов на один ответ — {cap}: ответьте по тому, что уже посчитано."
 
-# Зона доверия по инструменту (CLAUDE.md): все шесть расчётов — измерения и
-# арифметика, ни один не опирается на угаданный диапазон.
-_TOOL_ZONE: dict[CalcName, Zone] = {name: Zone.STRICT for name in CalcName}
+# Зона доверия по инструменту (CLAUDE.md): измерения, арифметика и диапазон по
+# чарту не опираются на угаданный диапазон; эквити против диапазона, суженного
+# агентом, — опирается (спека 2026-10-14, §6.2).
+_TOOL_ZONE: dict[CalcName, Zone] = {
+    name: Zone.ASSUMING if name is CalcName.EQUITY_VS_RANGE else Zone.STRICT for name in CalcName
+}
+
+_NO_HAND = "Разбора руки в этом вечере нет — диапазон соперника считать не по чему."
 
 
 async def _perform(
@@ -275,6 +296,10 @@ async def _perform(
     `test_the_ask_digest_is_unchanged_by_the_agent_one`).
     Вывод порога (`outcome`) лежит в метаданных: по нему проверка агента
     разрешает «в плюсе» и «в минусе» (`threshold_decided`).
+    Числа `opponent_range` лежат в `chart`, `equity_vs_range` — в `assumed`, и
+    ни те, ни другие не попадают в `frequency`
+    (`test_the_agent_reads_the_range_by_the_chart_and_counts_equity_against_its_narrowing`,
+    `test_equity_numbers_are_calculation_numbers_and_never_a_measured_frequency`).
     """
     params_json = params.model_dump(mode="json")
     if sizes_bb is not None:
@@ -321,6 +346,12 @@ async def _perform(
         frequency = [float(measurement.numerator), float(measurement.denominator)]
         if measurement.share is not None:
             frequency.append(round(100.0 * measurement.share, 1))
+    chart: list[float] = []
+    assumed: list[float] = []
+    if isinstance(result, OpponentRangeResult):
+        chart = [round(100.0 * result.hands_share, 1), float(round(result.live_combos))]
+    elif isinstance(result, EquityVsRangeResult):
+        assumed = [round(100.0 * result.equity, 1), round(100.0 * result.share_of_start, 1)]
     return ToolReturn(
         return_value=digest.text,
         metadata={
@@ -329,6 +360,8 @@ async def _perform(
             "stat": stat.value if stat is not None else None,
             "outcome": outcome.value if outcome is not None else None,
             "frequency": frequency,
+            "chart": chart,
+            "assumed": assumed,
         },
     )
 
@@ -359,12 +392,15 @@ def _unknown_opponent(nick: str) -> str:
 def tools_for(
     db: AsyncSession, player_id: int, session_id: int, run_state: CalcRun
 ) -> list[Tool[None]]:
-    """Шесть инструментов — по одному на имя из `CalcName`, и ни одного сверх.
+    """Инструменты по именам словаря `CalcName`, и ни одного сверх.
 
-    Имена инструментов совпадают с именами словаря
-    (`test_the_tool_set_covers_every_calculation_name_exactly_once`): набор,
-    из которого выбирает модель, и набор, который умеет считать код, — один и
-    тот же список, а не две копии, способные разойтись.
+    Агент (`sizes_from` задан) получает по одному инструменту на каждое имя
+    (`test_the_agent_tool_set_covers_every_calculation_name_exactly_once`),
+    `/ask` — все, кроме `AGENT_ONLY_CALCS`
+    (`test_the_ask_tool_set_covers_every_ask_calculation_exactly_once`,
+    `test_ask_does_not_get_the_agent_only_calculations`): набор, из которого
+    выбирает модель, и набор, который умеет считать код, — один и тот же
+    список, а не две копии, способные разойтись.
     """
 
     async def hero_frequency(
@@ -599,6 +635,51 @@ def tools_for(
             sizes_bb=(pot_before_bb, bet_bb),
         )
 
+    async def opponent_range(opponent_position: str, street: Street) -> str | ToolReturn:
+        """Стартовый диапазон соперника по чарту в последней разобранной руке.
+
+        Линию соперника до флопа, глубину, число мест и анте код берёт из руки сам.
+
+        Args:
+            opponent_position: позиция соперника за столом, как в сводке разбора, например BB.
+            street: улица точки решения — по ней из комбо убираются карты борда.
+        """
+        if run_state.analysis_id is None:
+            return _NO_HAND
+        return await _perform(
+            db, player_id, run_state,
+            OpponentRangeParams(
+                analysis_id=run_state.analysis_id,
+                opponent_position=opponent_position,
+                street=street,
+            ),
+        )
+
+    async def equity_vs_range(
+        opponent_position: str, street: Street, hands: str
+    ) -> str | ToolReturn:
+        """Эквити вашей руки при вскрытии против диапазона соперника, суженного вами.
+
+        Классы — только из стартового диапазона `opponent_range` этого соперника и
+        без весов: доли берутся из чарта. Сужение — допущение.
+
+        Args:
+            opponent_position: позиция соперника за столом, как в сводке разбора.
+            street: улица точки решения; борд и ваши карты берутся из руки.
+            hands: классы рук через запятую, например «AA, KQs, 88-66, A5s-A2s».
+        """
+        if run_state.analysis_id is None:
+            return _NO_HAND
+        return await _perform(
+            db, player_id, run_state,
+            EquityVsRangeParams(
+                analysis_id=run_state.analysis_id,
+                opponent_position=opponent_position,
+                street=street,
+                hands=hands,
+            ),
+        )
+
     # Агент (`sizes_from` задан) получает размеры в BB, `/ask` — в фишках.
     in_bb = run_state.for_agent
     by_name: dict[CalcName, Any] = {
@@ -611,6 +692,10 @@ def tools_for(
             frequency_vs_threshold_bb if in_bb else frequency_vs_threshold
         ),
     }
+    # Диапазон и эквити — только агенту: им нужна рука разбора вечера (`AGENT_ONLY_CALCS`).
+    if in_bb:
+        by_name[CalcName.OPPONENT_RANGE] = opponent_range
+        by_name[CalcName.EQUITY_VS_RANGE] = equity_vs_range
     return [
         Tool(function, name=name.value, max_retries=_TOOL_RETRIES)
         for name, function in by_name.items()

@@ -168,6 +168,7 @@ async def run_agent_turn(
     history: Sequence[ModelMessage],
     context: AgentContext | None,
     system_prompt: str | None = None,
+    analysis_id: int | None = None,
 ) -> AgentTurn:
     """Ход: вызов модели, проверки, не более одной попытки переписать.
 
@@ -175,7 +176,9 @@ async def run_agent_turn(
     включая этот ход
     (`test_an_answer_without_a_call_and_without_a_context_is_refused`). Числа
     без прозы — проза не прошла проверку дважды
-    (`test_one_rewrite_then_numbers_without_prose`).
+    (`test_one_rewrite_then_numbers_without_prose`). `analysis_id` — указатель
+    разбора руки вечера для `opponent_range` и `equity_vs_range`; без него они
+    отвечают отказом (`test_without_a_hand_analysis_the_range_tool_says_so`).
     """
     system = system_prompt if system_prompt is not None else _prompt.load_system_prompt()
     instructions = _prompt.instructions_for(system, context)
@@ -191,7 +194,9 @@ async def run_agent_turn(
     sizes_from = said | allowed_from_history(history)
     if context is not None:
         sizes_from |= context.allowed
-    run_state = CalcRun(max_calcs=MAX_CALCS_PER_TURN, sizes_from=sizes_from)
+    run_state = CalcRun(
+        max_calcs=MAX_CALCS_PER_TURN, sizes_from=sizes_from, analysis_id=analysis_id
+    )
     tools = tools_for(db, player_id, session_id, run_state)
 
     draft, meta = await llm(

@@ -307,14 +307,16 @@ async def test_a_tool_call_round_trip_logs_a_row_per_request(db_factory):
     assert run_state.result is not None
 
 
-@pytest.mark.parametrize("name", sorted(n.value for n in set(CalcName) - AGENT_ONLY_CALCS))
+@pytest.mark.parametrize("name", sorted(n.value for n in CalcName))
 def test_every_tool_describes_its_parameters(name: str):
     """У каждого инструмента есть описание и схема параметров.
 
     Без описания модель выбирает по одному имени; схема при этом собирается из
     сигнатуры, и пустая означала бы инструмент, который нечем параметризовать.
+    Набор агента полный, поэтому инструменты берутся из него.
     """
-    tools = {tool.name: tool for tool in tools_for(None, 1, 1, CalcRun())}  # type: ignore[arg-type]
+    run_state = CalcRun(max_calcs=8, sizes_from=frozenset())
+    tools = {tool.name: tool for tool in tools_for(None, 1, 1, run_state)}  # type: ignore[arg-type]
     assert tools[name].description
 
 
