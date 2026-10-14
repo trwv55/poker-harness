@@ -56,6 +56,7 @@ __all__ = [
     "Measurement",
     "OpponentFrequencyParams",
     "PointFilter",
+    "RangeLine",
     "Subject",
     "ThresholdOutcome",
     "ThresholdParams",
@@ -74,6 +75,12 @@ __all__ = [
 POSITIONS: frozenset[str] = frozenset(
     {"BTN", "SB", "BB", "UTG", "UTG+1", "UTG+2", "LJ", "HJ", "CO"}
 )
+
+# Линия соперника до флопа, которую покрывают чарты (спека 2026-10-14, §6.1): опен
+# рейзом или олл-ином и лимп SB — опен-чарт; колл, 3-бет, олл-ин BB против одного опена
+# рейзом и чек BB после лимпа SB — чарт защиты. Остальное — отказ
+# (`analysis.opponent_range.range_spot`).
+RangeLine = Literal["open_raise", "open_allin", "limp", "call", "check", "three_bet", "allin"]
 
 
 class CalcName(StrEnum):
