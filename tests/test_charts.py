@@ -13,8 +13,10 @@ from pathlib import Path
 
 import pytest
 
+from harness.analysis import open_chart
 from harness.analysis.charts import (
     DEFAULT_CHART_PATH,
+    DEFAULT_DEFEND_PATH,
     ChartFileError,
     ChartKey,
     ChartMissing,
@@ -327,7 +329,7 @@ def test_absent_file_is_a_clear_error(tmp_path: Path):
             [_entry(**{"raise": "AA, AJo:0.6"}, allin="AJo:0.5")], {}, id="доли руки больше 1"
         ),
         pytest.param(
-            [_entry(**{"raise": "AJo:0.5"}, allin="AJo:0.3", limp="AJo:0.21")],
+            [_entry(**{"raise": "AJo:0.5"}, allin="AJo:0.3", limp="AJo:0.22")],
             {},
             id="доли руки больше 1 вместе с лимпом",
         ),
@@ -353,6 +355,29 @@ def test_malformed_file_is_rejected(
         load_chart_book(path)
 
 
+@pytest.mark.parametrize(
+    ("shares", "loads"),
+    [(("AJo:0.5", "AJo:0.3", "AJo:0.21"), True), (("AJo:0.5", "AJo:0.3", "AJo:0.22"), False)],
+)
+def test_shares_rounded_to_hundredths_may_sum_to_one_point_zero_one(
+    tmp_path: Path, shares: tuple[str, str, str], loads: bool
+):
+    """Солвер округляет каждую долю до сотых: сумма руки 1.01 — округление, 1.02 —
+    ошибка. Доли не перенормируются: каждое действие держит свою долю как записана."""
+    raise_, allin, limp = shares
+    path = _write(tmp_path, [_entry(**{"raise": raise_}, allin=allin, limp=limp)])
+    if not loads:
+        with pytest.raises(ChartFileError):
+            load_chart_book(path)
+        return
+    strategy = open_strategy(8, "CO", 20.0, "per_player", path=path)
+    assert (
+        strategy.raise_range.weight("AJo"),
+        strategy.allin_range.weight("AJo"),
+        strategy.limp_range.weight("AJo"),
+    ) == (0.5, 0.3, 0.21)
+
+
 def test_not_json_at_all_is_rejected(tmp_path: Path):
     path = tmp_path / "charts.json"
     path.write_text("{это не json", encoding="utf-8")
@@ -362,10 +387,12 @@ def test_not_json_at_all_is_rejected(tmp_path: Path):
 
 # --- чарты защиты ---------------------------------------------------------------
 #
-# Схема — опен-чарта с двумя отличиями (спека 2026-10-14, §4): ключ несёт
-# `vs_position`, действия — `call`, `raise` (3-бет), `allin`, сверка — `defend_pct`.
-# Синтетика: 22+ (78) + A2s-AQs (44) + K9o+ (48) = 170 комбо колла, AKs наполовину
-# 3-бетом (2) — 172 комбо = 12.97%.
+# Формат — владельца (спека 2026-10-14, §4): ключ несёт `vs_position` и `vs_action`
+# (`raise` по умолчанию, `limp` — только против SB); против рейза действия `call`,
+# `raise` (3-бет), `allin`, против лимпа — `check`, `raise` (изоляция), `allin`.
+# Сверки `*_pct` — у каждого действия и `fold_pct`.
+# Синтетика: колл 22+ (78) + A2s-AQs (44) + K9o+ (48) = 170 комбо = 12.82%, AKs
+# наполовину 3-бетом (2) = 0.15%, фолд — остальные 1154 = 87.03%.
 
 
 def _defend(**over: object) -> dict[str, object]:
@@ -381,7 +408,21 @@ def _defend(**over: object) -> dict[str, object]:
         "raise": "AKs:0.5",
     }
     entry.update(over)
-    return entry
+    return {key: value for key, value in entry.items() if value is not None}
+
+
+def _limp(**over: object) -> dict[str, object]:
+    """Синтетика против лимпа SB: чек 22+ (78) = 5.88%, изоляция AKs (4) = 0.30%;
+    рук вне действий сколько угодно — форма их не судит."""
+    entry: dict[str, object] = {
+        "vs_position": "SB",
+        "vs_action": "limp",
+        "call": None,
+        "check": "22+",
+        "raise": "AKs",
+    }
+    entry.update(over)
+    return _defend(**entry)
 
 
 def _write_defend(tmp_path: Path, entries: list[dict[str, object]], **file_fields: object) -> Path:
@@ -393,11 +434,15 @@ def _write_defend(tmp_path: Path, entries: list[dict[str, object]], **file_field
 
 
 def test_a_defence_entry_gives_three_actions_and_folds_the_rest(tmp_path: Path):
-    path = _write_defend(tmp_path, [_defend(defend_pct="13.0%")])
+    path = _write_defend(
+        tmp_path,
+        [_defend(call_pct="12.8%", raise_pct="0.2%", allin_pct="0%", fold_pct="87.0%")],
+    )
     strategy = defend_strategy(8, "BB", "BTN", 25.0, "per_player", path=path)
     assert strategy.call_range.weight("A5s") == 1.0
     assert strategy.raise_range.weight("AKs") == 0.5
     assert strategy.allin_range.weights == {}
+    assert strategy.check_range.weights == {}
     assert strategy.fold_weight("AKs") == pytest.approx(0.5)
     assert strategy.fold_weight("72o") == 1.0
 
@@ -413,7 +458,7 @@ def test_the_defence_takes_the_nearest_depth_like_the_open(tmp_path: Path):
 
 
 def test_a_missing_defence_file_means_no_charts(tmp_path: Path):
-    """Чарт защиты владелец кладёт позже: без файла лукап отказывает, а не падает."""
+    """Без файла лукап отказывает, а не падает."""
     absent = tmp_path / "нет-такого.json"
     assert load_defend_book(absent).all_keys() == []
     with pytest.raises(ChartMissing):
@@ -421,20 +466,59 @@ def test_a_missing_defence_file_means_no_charts(tmp_path: Path):
 
 
 def test_no_neighbour_defence_is_substituted(tmp_path: Path):
-    path = _write_defend(tmp_path, [_defend()])
+    path = _write_defend(tmp_path, [_defend(), _defend(vs_position="SB")])
     with pytest.raises(ChartMissing):
         defend_strategy(8, "BB", "CO", 25.0, "per_player", path=path)
     with pytest.raises(ChartMissing):
         defend_strategy(8, "SB", "BTN", 25.0, "per_player", path=path)
     with pytest.raises(ChartMissing):
         defend_strategy(8, "BB", "BTN", 25.0, "bb_ante", path=path)
+    with pytest.raises(ChartMissing):
+        defend_strategy(8, "BB", "SB", 25.0, "per_player", vs_action="limp", path=path)
 
 
 def test_a_defence_placeholder_is_refused(tmp_path: Path):
     path = _write_defend(tmp_path, [_defend(status="example")])
-    assert DefendKey(8, "BB", "BTN", 25.0, "per_player") in load_defend_book(path).all_keys()
+    assert DefendKey(8, "BB", "BTN", "raise", 25.0, "per_player") in load_defend_book(path).all_keys()
     with pytest.raises(ChartPlaceholder):
         defend_strategy(8, "BB", "BTN", 25.0, "per_player", path=path)
+
+
+def test_the_owner_spelling_utg1_is_read_as_utg_plus_one(tmp_path: Path):
+    path = _write_defend(tmp_path, [_defend(vs_position="UTG1")])
+    assert load_defend_book(path).all_keys() == [
+        DefendKey(8, "BB", "UTG+1", "raise", 25.0, "per_player")
+    ]
+    strategy = defend_strategy(8, "BB", "UTG+1", 25.0, "per_player", path=path)
+    assert strategy.call_range.weight("A5s") == 1.0
+
+
+def test_vs_action_is_raise_unless_named(tmp_path: Path):
+    path = _write_defend(tmp_path, [_defend(vs_position="SB")])
+    assert load_defend_book(path).all_keys() == [
+        DefendKey(8, "BB", "SB", "raise", 25.0, "per_player")
+    ]
+
+
+def test_the_raise_and_the_limp_of_the_sb_are_two_keys(tmp_path: Path):
+    path = _write_defend(
+        tmp_path,
+        [
+            _defend(vs_position="SB", vs_action="raise"),
+            _limp(check_pct="5.9%", raise_pct="0.3%", allin_pct="0%", raise_size_bb=3),
+        ],
+    )
+    against_raise = defend_strategy(8, "BB", "SB", 25.0, "per_player", path=path)
+    against_limp = defend_strategy(8, "BB", "SB", 25.0, "per_player", vs_action="limp", path=path)
+    assert against_raise.call_range.weight("A5s") == 1.0
+    assert against_raise.check_range.weights == {}
+    assert against_limp.check_range.weight("22") == 1.0
+    assert against_limp.call_range.weights == {}
+    assert against_limp.raise_range.weight("AKs") == 1.0
+    assert against_limp.fold_weight("22") == 0.0
+    book = load_defend_book(path)
+    limp_key = book.nearest(8, "BB", "SB", 25.0, "per_player", vs_action="limp")
+    assert book.entry(limp_key).raise_size_bb == 3
 
 
 @pytest.mark.parametrize(
@@ -444,14 +528,97 @@ def test_a_defence_placeholder_is_refused(tmp_path: Path):
         pytest.param([_defend(vs_position="BB")], id="защищающийся и открывший — одно место"),
         pytest.param([_defend(call="", **{"raise": ""})], id="защиты нет"),
         pytest.param([_defend(call="AKs", **{"raise": "AKs:0.5"})], id="доли руки больше 1"),
-        pytest.param([_defend(defend_pct="15%")], id="defend_pct расходится с диапазонами"),
+        pytest.param([_defend(call_pct="13.0%")], id="call_pct расходится с диапазоном"),
+        pytest.param([_defend(raise_pct="0.3%")], id="raise_pct расходится с диапазоном"),
+        pytest.param([_defend(allin_pct="0.2%")], id="allin_pct расходится с диапазоном"),
+        pytest.param([_defend(fold_pct="86.9%")], id="fold_pct расходится с диапазонами"),
+        pytest.param([_limp(check_pct="6.0%")], id="check_pct расходится с диапазоном"),
+        pytest.param([_defend(raise_pct="без процента")], id="сверка без процента"),
+        pytest.param([_defend(check="AA")], id="чек против рейза"),
+        pytest.param([_defend(check_pct="0%")], id="сверка чека против рейза"),
+        pytest.param([_limp(call="AA")], id="колл против лимпа"),
+        pytest.param([_limp(call_pct="0%")], id="сверка колла против лимпа"),
+        pytest.param([_limp(fold_pct="5%")], id="фолд против лимпа"),
+        pytest.param([_limp(vs_position="BTN")], id="лимп не от SB"),
+        pytest.param([_defend(vs_action="call")], id="неизвестное vs_action"),
+        pytest.param([_defend(defend_pct="13.0%")], id="поле defend_pct из схемы Task 1"),
         pytest.param([_defend(limp="AA")], id="поле опен-чарта в чарте защиты"),
         pytest.param([_defend(depth_bb=10)], id="глубина ниже 15bb"),
         pytest.param([_defend(source=" ")], id="пустой source"),
+        pytest.param([_defend(revised_at=None)], id="нет revised_at"),
         pytest.param([_defend(), _defend()], id="ключ дважды"),
+        pytest.param([_defend(vs_position="UTG1"), _defend(vs_position="UTG+1")], id="UTG1 и UTG+1 — один ключ"),
         pytest.param([], id="ни одной записи"),
     ],
 )
 def test_a_malformed_defence_file_is_rejected(tmp_path: Path, entries: list[dict[str, object]]):
     with pytest.raises(ChartFileError):
         load_defend_book(_write_defend(tmp_path, entries))
+
+
+@pytest.mark.parametrize(("raise_share", "loads"), [("0.51", True), ("0.52", False)])
+def test_defence_shares_follow_the_same_rounding_rule(
+    tmp_path: Path, raise_share: str, loads: bool
+):
+    """Тот же допуск, что у опенов: K9o 0.5 чеком и 0.51 изоляцией (1.01) грузится
+    как записано, 0.52 (1.02) — отказ."""
+    entry = _limp(check="22+, K9o:0.5", **{"raise": f"AKs, K9o:{raise_share}"})
+    path = _write_defend(tmp_path, [entry])
+    if not loads:
+        with pytest.raises(ChartFileError):
+            load_defend_book(path)
+        return
+    strategy = defend_strategy(8, "BB", "SB", 25.0, "per_player", vs_action="limp", path=path)
+    assert (strategy.check_range.weight("K9o"), strategy.raise_range.weight("K9o")) == (0.5, 0.51)
+    assert strategy.fold_weight("K9o") == 0.0
+
+
+def test_a_limp_entry_may_declare_zero_fold(tmp_path: Path):
+    """Против лимпа фолда нет: `fold_pct` отсутствует или «0%» — и «0%» сверяется
+    с диапазонами, как любая сверка. Синтетика: всё, кроме AKs, — чек (1322 комбо)."""
+    every_class_but_aks = ", ".join(cls for cls in all_classes() if cls != "AKs")
+    full = _limp(check=every_class_but_aks, check_pct="99.7%", raise_pct="0.3%")
+    load_defend_book(_write_defend(tmp_path, [{**full, "fold_pct": "0%"}]))
+    with pytest.raises(ChartFileError):
+        load_defend_book(_write_defend(tmp_path, [_limp(fold_pct="0%")]))
+
+
+# --- чарт защиты владельца в репозитории ----------------------------------------
+
+_OWNER_OPENERS = ("UTG", "UTG+1", "LJ", "HJ", "CO", "BTN")
+
+
+def test_the_defence_file_in_the_repo_loads_with_every_check():
+    """Восемь записей владельца: BB против шести опенов рейзом и против SB дважды;
+    загрузка — значит, все сверки `*_pct` и сумма долей прошли."""
+    book = load_defend_book(DEFAULT_DEFEND_PATH)
+    keys = {(k.vs_position, k.vs_action) for k in book.all_keys()}
+    assert keys == {*((opener, "raise") for opener in _OWNER_OPENERS), ("SB", "raise"), ("SB", "limp")}
+    assert {(k.seats, k.position, k.depth_bb, k.ante_type) for k in book.all_keys()} == {
+        (8, "BB", 25.0, "per_player")
+    }
+
+
+def test_the_repo_defence_against_the_button():
+    strategy = defend_strategy(8, "BB", "BTN", 25.0, "per_player")
+    assert strategy.call_range.weight("A9s") == 1.0
+    assert strategy.raise_range.weight("AA") == 1.0
+    assert strategy.allin_range.weight("TT") == 1.0
+    assert strategy.check_range.weights == {}
+
+
+def test_the_repo_defence_against_the_sb_differs_by_its_action():
+    against_raise = defend_strategy(8, "BB", "SB", 25.0, "per_player")
+    against_limp = defend_strategy(8, "BB", "SB", 25.0, "per_player", vs_action="limp")
+    assert against_raise.call_range.weight("AA") == 1.0
+    assert against_raise.check_range.weights == {}
+    assert against_limp.check_range.weight("K8s") == 1.0
+    assert against_limp.raise_range.weight("AA") == 1.0
+    assert against_limp.call_range.weights == {}
+
+
+def test_a_seven_handed_defence_reads_the_eight_max_entry_from_the_repo():
+    seats, position, vs_position = open_chart.defend_table(7, "BB", "BTN")
+    assert defend_strategy(seats, position, vs_position, 25.0, "per_player") == defend_strategy(
+        8, "BB", "BTN", 25.0, "per_player"
+    )

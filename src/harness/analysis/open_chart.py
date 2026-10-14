@@ -139,7 +139,15 @@ def defend_table(seats: int, position: str, vs_position: str) -> tuple[int, str,
     """Раскладка чарта защиты, позиция защищающегося и позиция открывшего в нём —
     то же правило неполного стола, что у опена (`chart_table`), к обоим местам
     (`test_the_defence_maps_the_opener_by_the_same_rule`,
-    `test_three_and_nine_handed_defences_keep_their_own_table`)."""
+    `test_three_and_nine_handed_defences_keep_their_own_table`). Позиции нет в
+    раскладке стола на `seats` мест — `ChartMissing`, как у лукапа, а не запись 8-max
+    с тем же именем (`test_a_seat_missing_at_the_table_has_no_defence_chart`)."""
+    layout = POSITIONS_BY_COUNT.get(seats)
+    if layout is None or position not in layout or vs_position not in layout:
+        raise ChartMissing(
+            f"нет чарта защиты {position} против {vs_position}: за столом на {seats} "
+            f"мест таких позиций нет ({layout})"
+        )
     chart_seats, chart_position = chart_table(seats, position)
     _, chart_vs = chart_table(seats, vs_position)
     return chart_seats, chart_position, chart_vs

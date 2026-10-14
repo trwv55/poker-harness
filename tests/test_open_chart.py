@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from harness.analysis import analyze_hand, open_chart
-from harness.analysis.charts import load_chart_book
+from harness.analysis.charts import ChartMissing, load_chart_book
 from harness.analysis.classifier import classify, table_state
 from harness.contracts import (
     ActionKind,
@@ -528,6 +528,17 @@ def test_three_and_nine_handed_defences_keep_their_own_table():
     """Меньше 4 и больше 8 мест — только своя запись (§5): позиции не сдвигаются."""
     assert open_chart.defend_table(3, "BB", "BTN") == (3, "BB", "BTN")
     assert open_chart.defend_table(9, "BB", "UTG+2") == (9, "BB", "UTG+2")
+
+
+@pytest.mark.parametrize(
+    ("seats", "position", "opener"),
+    [(6, "BB", "LJ"), (7, "BB", "LJ"), (7, "BB", "XX"), (5, "XX", "UTG"), (10, "BB", "UTG")],
+)
+def test_a_seat_missing_at_the_table_has_no_defence_chart(seats, position, opener):
+    """Позиции нет в раскладке стола на N мест — `ChartMissing`, как у лукапа, а не
+    запись 8-max с тем же именем."""
+    with pytest.raises(ChartMissing):
+        open_chart.defend_table(seats, position, opener)
 
 
 def _same_hand_on_eight_max(hero8: str, cards: tuple[str, str], eff_bb: float, action: str):
