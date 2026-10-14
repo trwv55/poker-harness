@@ -27,6 +27,8 @@ from harness.contracts import Post, PostKind, Provenance, Range, RawHand, SeatIn
 from tests.test_postflop_line import F, P, R, T, _bet, _call, _check, _fold, _played_out, _raise
 
 _SB, _BB = 50, 100
+# 30bb у всех по умолчанию: ближайший чарт защиты (25bb) не дальше допуска глубины.
+_STACK = 3_000
 # Кнопка — Hero: P5 — SB, P6 — BB, P1 — UTG, P2 — HJ, P3 — CO.
 _SIX = ("P1", "P2", "P3", "Hero", "P5", "P6")
 _BOARD = {F: ["Qc", "7d", "2s"], T: ["5h"], R: ["9s"]}
@@ -59,7 +61,7 @@ def _raw(
         table_name="syn",
         max_seats=len(labels),
         button_seat=at + 1,
-        seats=[SeatInfo(seat=n, label=label, stack=stacks.get(label, 10_000))
+        seats=[SeatInfo(seat=n, label=label, stack=stacks.get(label, _STACK))
                for n, label in enumerate(labels, 1)],
         posts=[
             Post(label=small, kind=PostKind.SMALL_BLIND, amount=_SB),
@@ -100,7 +102,7 @@ def defend_file(tmp_path: Path, **over: object) -> Path:
 def test_the_bb_call_against_a_button_open_takes_the_defence_call_range(tmp_path: Path):
     spot = range_spot(_hand(BTN_OPENS_BB_CALLS), "BB")
     assert (spot.label, spot.line, spot.opener_position, spot.seats) == ("P6", "call", "BTN", 6)
-    assert spot.depth_bb == 100.0
+    assert spot.depth_bb == 30.0
     start = start_range(spot, defend_path=defend_file(tmp_path))
     assert start.range == parse_range(_DEFEND_CALL)
     assert (start.chart, start.chart_seats, start.chart_position, start.vs_chart_position) == (
@@ -127,9 +129,9 @@ def test_the_opener_range_is_the_raise_range_of_the_open_chart():
         _call(P, "Hero", 150),
     ]
     spot = range_spot(_hand(actions, button="P2"), "BTN")
-    assert (spot.label, spot.line, spot.depth_bb) == ("P2", "open_raise", 100.0)
+    assert (spot.label, spot.line, spot.depth_bb) == ("P2", "open_raise", 30.0)
     start = start_range(spot)
-    assert start.range == open_strategy(8, "BTN", 100.0, "per_player").raise_range
+    assert start.range == open_strategy(8, "BTN", 30.0, "per_player").raise_range
     assert (start.chart, start.chart_seats, start.chart_position) == ("open", 8, "BTN")
 
 
@@ -139,7 +141,9 @@ def test_the_opener_depth_is_capped_by_the_deepest_player_left_behind():
         _fold(P, "P5"), _fold(P, "P6"), _fold(P, "P1"), _raise(P, "P2", 250), _fold(P, "P3"),
         _call(P, "Hero", 150),
     ]
-    hand = _hand(actions, button="P2", stacks={"P3": 2_500, "Hero": 3_000})
+    hand = _hand(actions, button="P2", stacks={
+        "P5": 10_000, "P6": 10_000, "P1": 10_000, "P2": 10_000, "P3": 2_500, "Hero": 3_000,
+    })
     assert range_spot(hand, "BTN").depth_bb == 30.0
 
 
@@ -274,6 +278,76 @@ def test_multiway_equity_is_refused():
         equity_spot(_hand(actions, button="P2"), "BTN", Street.FLOP, "AA")
 
 
+
+def test_preflop_equity_counts_the_players_at_the_hero_decision(tmp_path: Path):
+    """BTN открывает, BB 3-бетит, SB сбросил раньше: на ответе героя банк хедз-ап."""
+    actions = [
+        _fold(P, "P1"), _fold(P, "P2"), _fold(P, "P3"), _raise(P, "Hero", 250), _fold(P, "P5"),
+        _raise(P, "P6", 800), _call(P, "Hero", 550),
+    ]
+    spot = equity_spot(
+        _hand(actions), "BB", Street.PREFLOP, "AKs", defend_path=defend_file(tmp_path)
+    )
+    assert spot.board == []
+    assert spot.live_combos == 3.0  # AKs без Kd
+
+
+def test_a_third_player_folding_before_the_hero_decision_leaves_a_heads_up_flop():
+    """CO открывает, герой на BTN и SB коллируют; на флопе SB сбросил на ставку героя
+    до того, как герой отвечает на рейз CO."""
+    actions = [
+        _fold(P, "P1"), _fold(P, "P2"), _raise(P, "P3", 250), _call(P, "Hero", 250),
+        _call(P, "P5", 200), _fold(P, "P6"),
+        _check(F, "P5"), _check(F, "P3"), _bet(F, "Hero", 300), _fold(F, "P5"),
+        _raise(F, "P3", 900), _call(F, "Hero", 600),
+    ]
+    spot = equity_spot(_hand(actions), "CO", Street.FLOP, "AA")
+    assert spot.start.spot.line == "open_raise"
+
+
+def test_three_players_at_the_hero_preflop_decision_are_multiway():
+    actions = [
+        _fold(P, "P5"), _fold(P, "P6"), _fold(P, "P1"), _raise(P, "P2", 250), _call(P, "P3", 200),
+        _call(P, "Hero", 150),
+    ]
+    with pytest.raises(RangeRefused, match="мультивей"):
+        equity_spot(_hand(actions, button="P2"), "BTN", Street.PREFLOP, "AA")
+
+
+# --- допуск глубины чарта защиты ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("bb_stack", "refused"),
+    [
+        pytest.param(3_490, False, id="34.9bb — чарт 25bb"),
+        pytest.param(3_500, False, id="35bb — ровно 10bb, ещё чарт"),
+        pytest.param(3_540, True, id="35.4bb — дальше 10bb"),
+    ],
+)
+def test_a_defence_chart_further_than_ten_bb_away_is_refused(
+    tmp_path: Path, bb_stack: int, refused: bool
+):
+    hand = _hand(BTN_OPENS_BB_CALLS, stacks={"P6": bb_stack, "Hero": 10_000})
+    spot = range_spot(hand, "BB")
+    if refused:
+        with pytest.raises(RangeRefused, match="чарта защиты для такой глубины нет: ближайший 25 BB"):
+            start_range(spot, defend_path=defend_file(tmp_path))
+    else:
+        assert start_range(spot, defend_path=defend_file(tmp_path)).chart_depth_bb == 25.0
+
+
+def test_the_open_chart_keeps_the_nearest_depth_without_a_limit():
+    """Опен-чарт допуска не получил: 100bb судится самым глубоким чартом."""
+    actions = [
+        _fold(P, "P5"), _fold(P, "P6"), _fold(P, "P1"), _raise(P, "P2", 250), _fold(P, "P3"),
+        _call(P, "Hero", 150),
+    ]
+    hand = _hand(actions, button="P2", stacks=dict.fromkeys(_SIX, 10_000))
+    start = start_range(range_spot(hand, "BTN"))
+    assert start.spot.depth_bb == 100.0
+    assert start.chart_depth_bb == 60.0
+
 # --- лимп SB и чек BB (решение владельца 2026-10-14, §6.1) ---------------------------
 
 # Кнопка — P2: P3 — SB, Hero — BB, P5 — UTG, P6 — HJ, P1 — CO.
@@ -303,9 +377,9 @@ def limp_file(tmp_path: Path) -> Path:
 
 def test_the_sb_limp_takes_the_limp_range_of_the_open_chart():
     spot = range_spot(_hand(_SB_LIMPS_HERO_CHECKS, button="P2"), "SB")
-    assert (spot.label, spot.line, spot.opener_position, spot.depth_bb) == ("P3", "limp", "SB", 100.0)
+    assert (spot.label, spot.line, spot.opener_position, spot.depth_bb) == ("P3", "limp", "SB", 30.0)
     start = start_range(spot)
-    assert start.range == open_strategy(8, "SB", 100.0, "per_player").limp_range
+    assert start.range == open_strategy(8, "SB", 30.0, "per_player").limp_range
     assert (start.chart, start.chart_position, start.vs_chart_position) == ("open", "SB", None)
 
 

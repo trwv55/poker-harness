@@ -15,7 +15,11 @@
 
 **Глубина** — в мерах чарта, стек до анте: у открывшего (и у лимпившего SB) — его
 стек, но не больше самого глубокого из не сбросивших до его хода; у BB — меньший из
-стеков BB и открывшего.
+стеков BB и открывшего. Чарт — ближайшей снятой глубины; у чарта защиты — не дальше
+`DEFEND_DEPTH_TOLERANCE_BB`, иначе отказ.
+
+**Хедз-ап — на точке решения героя** (`live_at`): мультивей — отказ, префлоп считается
+наравне с улицами после флопа.
 
 **Сужение — подмножество, целыми классами** (`narrow`): класс вне стартового или с
 долей 0 — отказ; оставленные классы сохраняют долю чарта, модель весов не задаёт.
@@ -55,6 +59,7 @@ from harness.contracts import (
 )
 
 __all__ = [
+    "DEFEND_DEPTH_TOLERANCE_BB",
     "EquitySpot",
     "RangeRefused",
     "RangeSpot",
@@ -71,6 +76,14 @@ __all__ = [
 
 _STREETS: list[Street] = list(Street)
 _HEADS_UP = 2
+
+# Чарт защиты берётся ближайшей глубины, но не дальше этого от глубины соперника
+# (включительно): снят пока один, 25bb, и BB на 100bb не должен молча получать
+# диапазон 25bb. Решение оркестратора 2026-10-15, владельцу на подтверждение; у
+# опен-чарта допуска нет — его глубины сняты от 15 до 60bb
+# (`test_a_defence_chart_further_than_ten_bb_away_is_refused`,
+# `test_the_open_chart_keeps_the_nearest_depth_without_a_limit`).
+DEFEND_DEPTH_TOLERANCE_BB = 10.0
 _OPEN_LINES: tuple[RangeLine, ...] = ("open_raise", "open_allin", "limp")
 
 
@@ -150,11 +163,13 @@ def range_spot(hand: CanonicalHand, position: str) -> RangeSpot:
         limper = preflop[entered_at[0]].label
         if raise_at:
             raise RangeRefused(
-                "после лимпа SB был рейз — изоляции и ответа на неё в чартах этого среза нет"
+                "после лимпа SB был рейз или олл-ин — изоляция BB и ответ SB на неё в этом "
+                "срезе не поддерживаются, поддержана только линия «лимп SB, чек BB»"
             )
         if opponent.label == limper:
             return spot("limp", limper, first_in_depth(entered_at[0]))
-        # Без рейза после лимпа SB в банке остаётся только BB: его ход — чек.
+        if position != "BB":
+            raise RangeRefused("после лимпа SB в чартах есть только линии SB и BB")
         return spot("check", limper, min(stack[opponent.label], stack[limper]))
     if not raise_at:
         raise RangeRefused("до флопа никто не повышал — для лимп-банка чартов нет")
@@ -174,7 +189,8 @@ def range_spot(hand: CanonicalHand, position: str) -> RangeSpot:
         raise RangeRefused("чарты колла и 3-бета есть только для BB")
     if opening.is_all_in:
         raise RangeRefused(
-            "опен был олл-ином — чарт защиты снят против опена рейзом, ответа на олл-ин в нём нет"
+            "опен был олл-ином — колл и 3-бет против опена олл-ином не поддерживаются: "
+            "чарт защиты снят против опена рейзом"
         )
     own_at = [i for i, a in enumerate(preflop) if a.label == opponent.label]
     if not own_at:
@@ -239,6 +255,11 @@ def _charted(spot: RangeSpot, open_path: Path | None, defend_path: Path | None) 
         chart_seats, chart_position, chart_vs, spot.depth_bb, spot.ante_type,
         "limp" if spot.line == "check" else "raise",
     )
+    if abs(defence_key.depth_bb - spot.depth_bb) > DEFEND_DEPTH_TOLERANCE_BB:
+        raise RangeRefused(
+            f"чарта защиты для такой глубины нет: ближайший {defence_key.depth_bb:g} BB, "
+            f"а у соперника {spot.depth_bb:.1f} BB"
+        )
     defence = defence_book.get(defence_key)
     rng = {
         "call": defence.call_range,
@@ -265,12 +286,18 @@ def board_at(hand: CanonicalHand, street: Street) -> list[str]:
 
 
 def live_at(hand: CanonicalHand, street: Street) -> list[str]:
-    """Места, не сбросившие карты до начала улицы."""
-    folded = {
-        a.label
-        for a in hand.actions
-        if a.kind is ActionKind.FOLD and _STREETS.index(a.street) < _STREETS.index(street)
-    }
+    """Места в раздаче на точке решения героя — его последнем ходе на улице: сбросившие
+    раньше, в том числе на этой же улице, выбыли
+    (`test_preflop_equity_counts_the_players_at_the_hero_decision`,
+    `test_a_third_player_folding_before_the_hero_decision_leaves_a_heads_up_flop`).
+    Хода у героя на улице нет — отказ."""
+    turns = [
+        i for i, a in enumerate(hand.actions)
+        if a.street is street and a.label == hand.hero_label
+    ]
+    if not turns:
+        raise RangeRefused("у героя на этой улице нет хода — точки решения нет")
+    folded = {a.label for a in hand.actions[: turns[-1]] if a.kind is ActionKind.FOLD}
     return [p.label for p in hand.players if p.label not in folded]
 
 
@@ -321,10 +348,11 @@ def equity_spot(
     board = board_at(hand, street)
     live = live_at(hand, street)
     if start.spot.label not in live:
-        raise RangeRefused("соперник сбросил карты до этой улицы")
+        raise RangeRefused("соперник сбросил карты до точки решения героя")
     if len(live) > _HEADS_UP:
         raise RangeRefused(
-            "на этой улице в банке больше двух игроков — мультивей в этом срезе не считается"
+            "на точке решения героя в банке больше двух игроков — мультивей в этом срезе "
+            "не считается"
         )
     narrowed = narrow(start.range, hands)
     dead = [*cards, *board]
