@@ -2160,6 +2160,61 @@ async def test_an_agent_job_answers_journals_and_keeps_the_evening_history(
     assert turn["calls"][0]["zone"] == "strict" and turn["rewrite"] is False
 
 
+async def _agent_range_turn(db_factory, queue, deps, *, with_analysis: bool):
+    """Задача `agent`, в которой модель зовёт `opponent_range`; вечер с разбором
+    синтетической руки (указатель `last_analysis_id` выставлен) или без него.
+    Возвращает запись хода из журнала и то, что инструмент вернул модели."""
+    from pydantic_ai.models.function import FunctionModel
+
+    from tests.test_agent import _RANGE_CALL, _TurnScript
+    from tests.test_calcs import stored_analysis
+
+    player_id, session_id = await _make_scope(db_factory)
+    if with_analysis:
+        async with db_factory() as session:
+            analysis_id = await stored_analysis(session, session_id=session_id)
+            await SessionsRepo(session).set_last_analysis(session_id, analysis_id)
+            await session.commit()
+    jid = await queue.enqueue(type="agent", player_id=player_id, session_id=session_id,
+                              payload={"text": "какой диапазон у BB"})
+    job = await queue.claim("w1")
+    assert job is not None
+    script = _TurnScript([([_RANGE_CALL], "Ответ без чисел.")])
+    await run_job(job, replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script))))
+    assert (await job_status(db_factory, jid)) == "done"
+    async with db_factory() as session:
+        spans = (await session.execute(
+            text("select spans from traces where job_id = :j"), {"j": jid}
+        )).scalar_one()
+    return next(s for s in spans if s["name"] == "agent_turn"), script.returns
+
+
+async def test_the_agent_job_hands_the_evening_analysis_to_the_range_tool(
+    db_factory, queue, deps, fake_sender, monkeypatch, tmp_path
+):
+    """Воркер передаёт ходу агента указатель разбора вечера: `opponent_range`
+    считается по чарту (зона `strict`), а не отвечает отказом «разбора нет»."""
+    from harness.analysis.charts import lookup
+    from tests.test_opponent_range import defend_file
+
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    turn, returns = await _agent_range_turn(db_factory, queue, deps, with_analysis=True)
+    call = turn["calls"][0]
+    assert call["calc"] == "opponent_range" and call["zone"] == "strict"
+    assert "Источник: чарт защиты BB против BTN" in call["output"]
+    assert not any("Разбора руки в этом вечере нет" in r for r in returns)
+
+
+async def test_the_agent_job_without_an_evening_analysis_gets_the_range_refusal(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    turn, returns = await _agent_range_turn(db_factory, queue, deps, with_analysis=False)
+    assert not [c for c in turn["calls"] if c.get("zone")]
+    assert any("Разбора руки в этом вечере нет" in r for r in returns)
+
+
 async def test_an_agent_job_stores_only_the_final_answer_and_no_progress_message(
     db_factory, queue, deps, fake_sender, monkeypatch
 ):
