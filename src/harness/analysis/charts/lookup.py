@@ -24,8 +24,10 @@
 записи с такими `(seats, position, ante_type)` — `ChartMissing`; вызывающая сторона
 обязана отказаться от вердикта, а не получить «похожий» диапазон. Стол на 4–7 мест
 лукап тоже не переносит сам: вызывающая сторона явно спрашивает 8-max ключ позиции с
-тем же числом игроков позади (`open_chart.chart_table`, решение владельца 2026-10-10,
-`test_the_chart_table_counts_the_players_behind`).
+тем же числом игроков позади (`chart_table` у опена, `defend_table` у защиты — оба в
+`open_chart`, решение владельца 2026-10-10,
+`test_the_chart_table_counts_the_players_behind`,
+`test_the_defence_maps_the_opener_by_the_same_rule`).
 
 Чартов ниже 15bb нет: там эталон вычисляется равновесием (`analysis.tools.pushfold`).
 Лукап судит стек от `MIN_LOOKUP_DEPTH_BB` (13bb, решение владельца 2026-10-03:

@@ -498,6 +498,38 @@ def test_the_chart_table_counts_the_players_behind(seats, position, chart):
     assert open_chart.chart_table(seats, position) == chart
 
 
+@pytest.mark.parametrize(
+    ("seats", "position", "chart"),
+    [
+        (7, "UTG", "UTG+1"), (7, "UTG+1", "LJ"), (7, "HJ", "HJ"), (7, "CO", "CO"),
+        (7, "BTN", "BTN"), (7, "SB", "SB"), (7, "BB", "BB"),
+        (6, "UTG", "LJ"), (6, "HJ", "HJ"), (6, "CO", "CO"), (6, "BTN", "BTN"),
+        (6, "SB", "SB"), (6, "BB", "BB"),
+        (5, "UTG", "HJ"), (5, "CO", "CO"), (5, "BTN", "BTN"), (5, "SB", "SB"), (5, "BB", "BB"),
+        (4, "UTG", "CO"), (4, "BTN", "BTN"), (4, "SB", "SB"), (4, "BB", "BB"),
+    ],
+)
+def test_the_short_table_rule_covers_the_whole_table_of_the_spec(seats, position, chart):
+    """Таблица §5 спеки 2026-10-14 строка в строку: стол на 4–7 мест — 8-max и
+    позиция с тем же числом игроков позади до BB."""
+    assert open_chart.chart_table(seats, position) == (8, chart)
+
+
+@pytest.mark.parametrize(
+    ("seats", "opener", "chart_opener"),
+    [(7, "UTG", "UTG+1"), (6, "UTG", "LJ"), (5, "UTG", "HJ"), (4, "UTG", "CO"),
+     (6, "BTN", "BTN"), (8, "LJ", "LJ")],
+)
+def test_the_defence_maps_the_opener_by_the_same_rule(seats, opener, chart_opener):
+    assert open_chart.defend_table(seats, "BB", opener) == (8, "BB", chart_opener)
+
+
+def test_three_and_nine_handed_defences_keep_their_own_table():
+    """Меньше 4 и больше 8 мест — только своя запись (§5): позиции не сдвигаются."""
+    assert open_chart.defend_table(3, "BB", "BTN") == (3, "BB", "BTN")
+    assert open_chart.defend_table(9, "BB", "UTG+2") == (9, "BB", "UTG+2")
+
+
 def _same_hand_on_eight_max(hero8: str, cards: tuple[str, str], eff_bb: float, action: str):
     return _point(_hand(hero8, cards, eff_bb, action))
 

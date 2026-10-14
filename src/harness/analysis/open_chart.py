@@ -22,7 +22,8 @@
 игроков позади до BB (на 7 местах BTN — BTN, UTG — UTG+1). Зона та же, `strict`;
 в `detail` точка несёт `chart_seats` и `chart_position` — каким чартом судили.
 Стол на 8 мест судится своим чартом, как прежде; на 9 и на 3 местах и в хедз-апе
-чарта нет — точка без вердикта с причиной.
+чарта нет — точка без вердикта с причиной. То же правило — у чарта защиты
+(`defend_table`).
 """
 
 from __future__ import annotations
@@ -120,7 +121,8 @@ def chart_table(seats: int, position: str) -> tuple[int, str]:
     (`test_a_seven_handed_button_is_judged_by_the_eight_max_button`,
     `test_a_seven_handed_utg_is_judged_by_the_eight_max_utg1`,
     `test_a_six_handed_table_is_judged_by_position_from_the_end`,
-    `test_a_four_handed_table_is_judged_by_position_from_the_end`); остальные — как
+    `test_a_four_handed_table_is_judged_by_position_from_the_end`,
+    `test_the_short_table_rule_covers_the_whole_table_of_the_spec`); остальные — как
     есть (`test_the_chart_table_counts_the_players_behind`).
     """
     if not MIN_SHIFTED_SEATS <= seats < CHART_SEATS or seats not in POSITIONS_BY_COUNT:
@@ -131,6 +133,16 @@ def chart_table(seats: int, position: str) -> tuple[int, str]:
     behind = len(order) - 1 - order.index(position)
     chart_order = _preflop_order(CHART_SEATS)
     return CHART_SEATS, chart_order[len(chart_order) - 1 - behind]
+
+
+def defend_table(seats: int, position: str, vs_position: str) -> tuple[int, str, str]:
+    """Раскладка чарта защиты, позиция защищающегося и позиция открывшего в нём —
+    то же правило неполного стола, что у опена (`chart_table`), к обоим местам
+    (`test_the_defence_maps_the_opener_by_the_same_rule`,
+    `test_three_and_nine_handed_defences_keep_their_own_table`)."""
+    chart_seats, chart_position = chart_table(seats, position)
+    _, chart_vs = chart_table(seats, vs_position)
+    return chart_seats, chart_position, chart_vs
 
 
 def _preflop_order(seats: int) -> list[str]:
