@@ -127,6 +127,7 @@ def _violations(
         hero_class=context.hero_class if context else None,
         board_ranks=context.board_ranks if context else (),
         threshold_decided=threshold_decided(messages),
+        profit_without_folds=context.profit_without_folds if context else False,
         calc_numbers=calc_numbers,
         frequency_numbers=frequency_numbers(messages),
     )

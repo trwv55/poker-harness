@@ -1016,6 +1016,45 @@ def test_a_threshold_from_the_summary_backs_profit_arithmetic():
     )
 
 
+_FREE = FoldThreshold(bluff=0.24, semibluff=0.0, semibluff_free=True)
+
+
+def test_a_semibluff_that_pays_without_folds_may_be_retold_from_the_summary():
+    """Признак ядра `semibluff_free` — факт сводки: «окупается без фолдов» модель
+    может пересказать, если он в контексте; без него — голый вывод."""
+    from harness.agent.run import _violations
+
+    free = _ctx(_bet_line(_FREE, Purpose.SEMIBLUFF))
+    assert free.profit_without_folds
+    for answer in (
+        "С учётом аутов ставка окупается и без фолдов.",
+        "Ставка окупается без фолдов.",
+        "Полублеф в плюсе и без фолдов.",
+    ):
+        assert _violations(answer, [], free, frozenset()) == [], answer
+        assert _check(answer, profit_without_folds=True) == [], answer
+
+    paid = _ctx(_bet_line(
+        FoldThreshold(bluff=0.24, semibluff=0.091, semibluff_free=False), Purpose.SEMIBLUFF
+    ))
+    assert not paid.profit_without_folds
+    answer = "С учётом аутов ставка окупается и без фолдов."
+    assert any("в плюсе" in v for v in _violations(answer, [], paid, frozenset()))
+    assert any("в плюсе" in v for v in _check(answer))
+
+
+def test_the_without_folds_flag_frees_only_that_conclusion():
+    """Флаг освобождает только «окупается / в плюсе (и) без фолдов»: другой вывод,
+    отрицание и «в минусе» в том же предложении остаются выводами."""
+    for answer in (
+        "Ставка окупается.",
+        "Ставка не окупается без фолдов.",
+        "Ставка в минусе без фолдов.",
+        "Ставка окупается и без фолдов, а на ривере в минусе.",
+    ):
+        assert any("в плюсе" in v for v in _check(answer, profit_without_folds=True)), answer
+
+
 # --- регрессия живого хода (синтетика той же формы) ------------------------------
 
 

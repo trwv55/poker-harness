@@ -54,7 +54,9 @@
 
 **«В плюсе», «в минусе», «окупается» — вывод только по порогу.** Голый вывод
 допустим, только когда в разговоре есть `frequency_vs_threshold` с выводом выше
-или ниже порога (`test_a_profit_conclusion_needs_a_decided_threshold`). Арифметика
+или ниже порога (`test_a_profit_conclusion_needs_a_decided_threshold`), и вывод
+«окупается / в плюсе (и) без фолдов», когда ядро дало его в сводке
+(`test_a_semibluff_that_pays_without_folds_may_be_retold_from_the_summary`). Арифметика
 допустима всегда: в одном из придаточных условие («если/от/когда/чтобы» или «при»
 перед долей со словом порога) и доля, выданная расчётом (не доля банка), а
 свободного придаточного-вывода рядом нет
@@ -451,6 +453,18 @@ _CLAUSE_CONDITION_RE = re.compile(
     r"\s*(?:(?:если|когда|чтобы)" + _WE + r"|" + _PRI_SHARE + r")", re.IGNORECASE
 )
 _PCT_RE = re.compile(r"(?P<pct>" + _NUMBER + r")\s*%")
+# «Окупается / в плюсе (и) без фолдов» — признак ядра `semibluff_free`, без «не» перед.
+_WITHOUT_FOLDS_RE = re.compile(
+    r"(?<!не\s)" + _W + r"(?:окуп[а-яё]*|в\s+плюсе" + _WE + r")\s+(?:и\s+)?без\s+фолд[а-яё]*",
+    re.IGNORECASE,
+)
+
+
+def _profit_without_folds(sentence: str) -> bool:
+    """Каждый вывод о прибыльности в предложении — «окупается / в плюсе (и) без
+    фолдов» (`test_the_without_folds_flag_frees_only_that_conclusion`)."""
+    free = [m.start() for m in _WITHOUT_FOLDS_RE.finditer(sentence)]
+    return bool(free) and all(m.start() in free for m in _PROFIT_RE.finditer(sentence))
 
 
 def _calc_share_in(clause: str, calc_numbers: frozenset[float]) -> bool:
@@ -648,7 +662,10 @@ class AgentContext:
     классификатора, класс руки героя и ранги борда (для вырезания карт).
     `threshold_numbers` — числа порога фолдов из ядра, напечатанные в сводке:
     опора арифметики порога
-    (`test_a_threshold_from_the_summary_backs_profit_arithmetic`)."""
+    (`test_a_threshold_from_the_summary_backs_profit_arithmetic`).
+    `profit_without_folds` — хоть у одной точки ядро дало `semibluff_free`: вывод
+    «окупается без фолдов» — факт сводки
+    (`test_a_semibluff_that_pays_without_folds_may_be_retold_from_the_summary`)."""
 
     text: str
     allowed: frozenset[float]
@@ -656,6 +673,7 @@ class AgentContext:
     hero_class: str | None
     board_ranks: tuple[str, ...]
     threshold_numbers: frozenset[float] = frozenset()
+    profit_without_folds: bool = False
 
 
 def agent_context(result: AnalysisResult, enriched: EnrichedHand) -> AgentContext:
@@ -693,6 +711,7 @@ def agent_context(result: AnalysisResult, enriched: EnrichedHand) -> AgentContex
     equity_lines: list[str] = []
     thresholds = NumberBook()
     purpose_lines: list[str] = []
+    without_folds = False
     for point in result.points:
         line = postflop_line_detail(point)
         if line is None:
@@ -712,6 +731,7 @@ def agent_context(result: AnalysisResult, enriched: EnrichedHand) -> AgentContex
         if equity is not None:
             equity_lines.append(equity)
         purpose = _purpose_line(line, point.street, book, thresholds)
+        without_folds |= line.fold_threshold is not None and line.fold_threshold.semibluff_free
         if purpose is not None:
             purpose_lines.append(purpose)
     # Две точки одной улицы с одной рукой дали бы одну строку дважды.
@@ -730,6 +750,7 @@ def agent_context(result: AnalysisResult, enriched: EnrichedHand) -> AgentContex
         hero_class=hero_class,
         board_ranks=board,
         threshold_numbers=thresholds.allowed,
+        profit_without_folds=without_folds,
     )
 
 
@@ -775,6 +796,7 @@ def check_agent_answer(
     hero_class: str | None = None,
     board_ranks: Sequence[str] = (),
     threshold_decided: bool = False,
+    profit_without_folds: bool = False,
     calc_numbers: frozenset[float],
     frequency_numbers: frozenset[float],
 ) -> list[str]:
@@ -782,6 +804,8 @@ def check_agent_answer(
 
     `threshold_decided` — в разговоре есть `frequency_vs_threshold` с выводом выше
     или ниже порога: только тогда голый вывод «в плюсе» / «в минусе» допустим.
+    `profit_without_folds` — `AgentContext.profit_without_folds`: тогда допустим и
+    вывод «окупается / в плюсе (и) без фолдов», если других выводов в предложении нет.
     `calc_numbers` — числа из выходов расчётов разговора и числа порога сводки
     (`threshold_numbers` — их добавляет вызывающий), без прочих чисел сводки и
     слов игрока: опора арифметики порога и «окупается от N%». `frequency_numbers` —
@@ -815,6 +839,7 @@ def check_agent_answer(
             _PROFIT_RE.search(sentence)
             and not _profit_arithmetic(sentence, calc_numbers)
             and not threshold_decided
+            and not (profit_without_folds and _profit_without_folds(sentence))
         ):
             violations.append(
                 "«в плюсе», «в минусе» или «окупается» выводом без расчёта "
