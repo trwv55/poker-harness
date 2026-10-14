@@ -20,7 +20,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from harness.agent import prompt as _prompt
 from harness.agent.history import (
     allowed_from_history,
+    assumed_numbers_in,
     calcs_in_history,
+    chart_numbers_in,
     frequency_numbers,
     player_numbers,
     player_text_numbers,
@@ -130,6 +132,8 @@ def _violations(
         profit_without_folds=context.profit_without_folds if context else False,
         calc_numbers=calc_numbers,
         frequency_numbers=frequency_numbers(messages),
+        chart_numbers=chart_numbers_in(messages),
+        assumed_numbers=assumed_numbers_in(messages),
     )
 
 

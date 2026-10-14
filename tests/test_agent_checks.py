@@ -1172,3 +1172,84 @@ def test_on_the_turn_the_hero_equity_line_has_no_river_odds():
         "Рука героя, тёрн: дро — флеш, 9 аутов, собрать на следующей улице 19.1%; "
         "оверкарты — A♥K♠, ≈6% на следующей улице, если пара будет лучшей." in ctx.text
     )
+
+
+# --- диапазон по чарту и эквити против суженного (спека среза диапазона, §6, §8) ---
+
+_CHART = frozenset({38.2, 410.0})
+
+
+def test_a_chart_range_sentence_needs_no_mark():
+    """Стартовый диапазон по чарту — зона `strict`: пересказ со словом «чарт» и
+    числом выхода `opponent_range` метки не требует; без «чарт» или без числа его
+    выхода слово диапазона требует её, как раньше."""
+    kw = {"allowed": _CHART, "calc_numbers": _CHART, "chart_numbers": _CHART}
+    assert _check("Стартовый диапазон BB по чарту — 38.2% рук, 410 комбо.", **kw) == []
+    assert any(ASSUMPTION_MARK in v for v in _check("Стартовый диапазон BB — 38.2% рук.", **kw))
+    plain = {"allowed": _CHART, "calc_numbers": _CHART}
+    assert any(
+        ASSUMPTION_MARK in v
+        for v in _check("Стартовый диапазон BB по чарту — 38.2% рук, 410 комбо.", **plain)
+    )
+
+
+def test_a_chart_fact_does_not_cover_a_prediction_in_the_same_sentence():
+    kw = {"allowed": _CHART, "calc_numbers": _CHART, "chart_numbers": _CHART}
+    assert any(
+        ASSUMPTION_MARK in v
+        for v in _check("По чарту у BB 38.2% рук, и он сбросит всё без пары.", **kw)
+    )
+
+
+def test_an_equity_against_a_narrowed_range_needs_the_mark():
+    """Эквити против суженного — допущение даже без слова «диапазон»."""
+    eq = frozenset({31.4, 31.8})
+    kw = {"allowed": eq, "calc_numbers": eq, "assumed_numbers": eq}
+    assert any("суженного" in v for v in _check("Против этих рук у вас 31.4%.", **kw))
+    assert _check("Против этих рук у вас 31.4% (допущение).", **kw) == []
+    assert _check(
+        "Если BB держит только пары и дамы (допущение), эквити 31.4%.", **kw
+    ) == []
+
+
+def test_the_prompt_range_paragraph_passes_with_its_numbers_and_marks():
+    """Третий абзац ответа о прибыльности (спека §8): стартовый диапазон по чарту —
+    факт, сужение и эквити против суженного — с меткой; эквити без метки — нарушение."""
+    chart = frozenset({38.2, 410.0})
+    eq = frozenset({22.0})
+    kw = {
+        "allowed": chart | eq,
+        "calc_numbers": chart | eq,
+        "chart_numbers": chart,
+        "assumed_numbers": eq,
+        "board_ranks": ("8", "8", "J"),
+    }
+    paragraph = (
+        "По чарту защиты BB против BTN стартовый диапазон — 38.2% рук, 410 комбо. "
+        "После колла на 8-8-J у BB остаются восьмёрки, валеты, карманные пары и "
+        "стрит-дро (допущение). Против этого диапазона у вас 22% (допущение)."
+    )
+    assert _check(paragraph, **kw) == []
+    violations = _check("Против этого диапазона у вас 22%.", **kw)
+    assert any("суженного" in v for v in violations)
+    assert any(
+        ASSUMPTION_MARK in v
+        for v in _check("По чарту защиты у BB 38.2% рук, и он сбросит всё без пары.", **kw)
+    )
+
+
+def test_the_turn_checks_read_chart_and_assumed_numbers_from_history():
+    from pydantic_ai.messages import ModelRequest, ToolReturnPart
+
+    from harness.agent.run import _violations
+
+    messages = [ModelRequest(parts=[
+        ToolReturnPart(tool_name="opponent_range", content="…", tool_call_id="c1", metadata={
+            "calc": "opponent_range", "allowed": [38.2, 410.0], "chart": [38.2, 410.0],
+        }),
+        ToolReturnPart(tool_name="equity_vs_range", content="…", tool_call_id="c2", metadata={
+            "calc": "equity_vs_range", "allowed": [31.4], "assumed": [31.4],
+        }),
+    ])]
+    assert _violations("Стартовый диапазон BB по чарту — 38.2% рук.", messages, None, frozenset()) == []
+    assert _violations("У вас 31.4%.", messages, None, frozenset()) != []

@@ -4,8 +4,17 @@
 бы с первой на первой же правке. Модуль чистый — ни pydantic-ai, ни базы:
 разрешённые числа, метки и признак вызова `leaks` приходят аргументами.
 
-**Допущение — с меткой: механика узкая, остальное — судья.** В v1 диапазоны не
-считает ни один расчёт (они — спека №3). Код ловит два вида предложений без
+**Допущение — с меткой: механика узкая, остальное — судья.** Стартовый диапазон
+по чарту считает `opponent_range` (факт), эквити против суженного —
+`equity_vs_range` (допущение). Предложение со словом «чарт» и числом выхода
+`opponent_range` пересказывает чарт: слово диапазона и «чарт защиты» в нём метки не
+требуют (`test_a_chart_range_sentence_needs_no_mark`,
+`test_the_prompt_range_paragraph_passes_with_its_numbers_and_marks`), утверждение о
+сопернике рядом — требует
+(`test_a_chart_fact_does_not_cover_a_prediction_in_the_same_sentence`). Доля из
+выхода `equity_vs_range` без «(допущение)» в том же предложении — нарушение, даже
+без слова диапазона (`test_an_equity_against_a_narrowed_range_needs_the_mark`).
+Кроме этого, код ловит два вида предложений без
 «(допущение)», даже с «если» и с разрешёнными числами: со словом диапазона
 («диапазон», «рендж», «держ…» — метка по умолчанию,
 `test_a_range_word_needs_the_mark_by_default`) и с явным утверждением о сопернике
@@ -99,7 +108,7 @@ from harness.contracts import (
     postflop_line_detail,
 )
 from harness.explanation.digest import NumberBook
-from harness.explanation.faithfulness import error_words_in, unsupported_numbers
+from harness.explanation.faithfulness import error_words_in, numbers_in, unsupported_numbers
 from harness.explanation.hand_replay import cards_text, hand_replay
 from harness.explanation.verdict_text import verdict_digest
 
@@ -255,6 +264,10 @@ _MORE_LESS_RE = re.compile(_W + r"(?:чаще|реже)" + _WE, re.IGNORECASE)
 # стата, не ставка.
 _BET_WORD_RE = re.compile(r"постав|став(?:ит|ишь|лю|им|ят)", re.IGNORECASE)
 _RANGE_WORD_RE = re.compile(r"диапазон|рендж|держ", re.IGNORECASE)
+_CHART_WORD_RE = re.compile(r"чарт", re.IGNORECASE)
+# «Чарт защиты» — имя чарта, а не действие соперника
+# (`test_the_prompt_range_paragraph_passes_with_its_numbers_and_marks`).
+_CHART_NAME_RE = re.compile(r"чарт[а-яё]*\s+защит[а-яё]*", re.IGNORECASE)
 _META_RANGE_RE = re.compile(
     r"(?:про|о|об)\s+(?:его\s+|их\s+)?(?:диапазон|рендж)[а-яё]*(?:\s+[^\s.,;:!?]+){0,2}?"
     r"\s+(?:мало|ничего\s+не|почти\s+ничего\s+не)\s+говорит"
@@ -419,16 +432,46 @@ def _opponent_clause(clause: str, hypothetical: bool, noun_locked: bool) -> bool
     return False
 
 
+def _chart_backed(sentence: str, chart_numbers: frozenset[float]) -> bool:
+    """Пересказ стартового диапазона из `opponent_range`: слово «чарт» и число
+    выхода этого расчёта (`test_a_chart_range_sentence_needs_no_mark`)."""
+    if not chart_numbers or not _CHART_WORD_RE.search(sentence):
+        return False
+    chart = {round(n, 1) for n in chart_numbers}
+    return any(round(n, 1) in chart for n in numbers_in(sentence))
+
+
+def _assumed_share_in(sentence: str, assumed_numbers: frozenset[float]) -> bool:
+    """Доля из выхода `equity_vs_range` в предложении
+    (`test_an_equity_against_a_narrowed_range_needs_the_mark`)."""
+    return any(_in(m.group("pct"), assumed_numbers) for m in _PCT_RE.finditer(sentence))
+
+
 def _opponent_claim(
-    sentence: str, calc_numbers: frozenset[float], frequency_numbers: frozenset[float]
+    sentence: str,
+    calc_numbers: frozenset[float],
+    frequency_numbers: frozenset[float],
+    chart_numbers: frozenset[float] = frozenset(),
 ) -> bool:
     """Предложение требует «(допущение)»: после опоры на расчёт и метаречи в нём
     осталось слово диапазона («вы держите» — о герое и не в счёт;
     `test_a_range_word_needs_the_mark_by_default`) или придаточное с явным
     утверждением о сопернике
     (`test_a_claim_about_what_the_opponent_holds_or_does_needs_the_mark`).
+    Слово диапазона не в счёт, если в предложении «чарт» и число выхода
+    `opponent_range` (`chart_numbers`): это пересказ стартового диапазона по чарту
+    (`test_a_chart_range_sentence_needs_no_mark`), и «чарт защиты» в нём — имя
+    чарта, а не действие
+    (`test_the_prompt_range_paragraph_passes_with_its_numbers_and_marks`); утверждение о сопернике в том же
+    предложении метку по-прежнему требует
+    (`test_a_chart_fact_does_not_cover_a_prediction_in_the_same_sentence`).
     Остальное — судья (спека №2)."""
     rest = _strip_backed(sentence, calc_numbers, frequency_numbers)
+    if _chart_backed(sentence, chart_numbers):
+        # Слово диапазона — о чарте, а не догадка; прогноз о сопернике в том же
+        # предложении проверяется дальше как обычно
+        # (`test_a_chart_fact_does_not_cover_a_prediction_in_the_same_sentence`).
+        rest = _RANGE_WORD_RE.sub(" ", _CHART_NAME_RE.sub(" ", rest))
     if _RANGE_WORD_RE.search(_HERO_HOLDS_RE.sub(" ", rest)):
         return True
     hypothetical = bool(_HYPOTHETICAL_RE.search(rest))
@@ -803,6 +846,8 @@ def check_agent_answer(
     profit_without_folds: bool = False,
     calc_numbers: frozenset[float],
     frequency_numbers: frozenset[float],
+    chart_numbers: frozenset[float] = frozenset(),
+    assumed_numbers: frozenset[float] = frozenset(),
 ) -> list[str]:
     """Нарушения ответа словами; пустой список — ответ прошёл (спека §6).
 
@@ -815,6 +860,12 @@ def check_agent_answer(
     слов игрока: опора арифметики порога и «окупается от N%». `frequency_numbers` —
     из них измеренные частоты (доля и «N из M» частоты и измеренной величины
     порога): только они служат опорой действию соперника вне арифметики порога.
+    `chart_numbers` — числа выхода `opponent_range` (доля рук, комбо): предложение
+    с «чарт» и таким числом пересказывает стартовый диапазон, слово диапазона в нём
+    метки не требует (`test_a_chart_range_sentence_needs_no_mark`).
+    `assumed_numbers` — числа выхода `equity_vs_range`: доля из них в предложении без
+    «(допущение)» — нарушение, даже без слова диапазона
+    (`test_an_equity_against_a_narrowed_range_needs_the_mark`).
     """
     text = answer.strip()
     if not text:
@@ -830,12 +881,20 @@ def check_agent_answer(
     for sentence in _SENTENCE_RE.findall(text):
         quoted = sentence.strip()
         if (
-            _opponent_claim(sentence, calc_numbers, frequency_numbers)
+            _opponent_claim(sentence, calc_numbers, frequency_numbers, chart_numbers)
             and ASSUMPTION_MARK not in sentence
         ):
             violations.append(
                 f"утверждение о том, что соперник держит или сделает, без метки "
                 f"{ASSUMPTION_MARK} — «{quoted}»"
+            )
+        if (
+            ASSUMPTION_MARK not in sentence
+            and assumed_numbers
+            and _assumed_share_in(sentence, assumed_numbers)
+        ):
+            violations.append(
+                f"эквити против суженного диапазона без метки {ASSUMPTION_MARK} — «{quoted}»"
             )
         if _BEST_LINE_RE.search(sentence) and _FLOP_TURN_RE.search(sentence):
             violations.append(f"лучшая линия на флопе или тёрне — «{quoted}»")
