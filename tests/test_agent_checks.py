@@ -75,6 +75,19 @@ def test_real_numbers_stay_numbers(text: str):
     assert numbers_in(strip_card_tokens(text, hero_class="99", board_ranks=("Q", "J", "6"))) != []
 
 
+@pytest.mark.parametrize("text", ["BB против UTG+1", "чарт опена UTG+2", "позиция UTG1"])
+def test_a_position_name_with_a_digit_is_not_a_number(text: str):
+    """Позиция — имя, а не число (решение контроллера R12): «UTG+1» проходит сверку
+    при пустом наборе разрешённых."""
+    assert numbers_in(strip_card_tokens(text)) == []
+    assert _check(f"Чарт защиты: {text}.") == []
+
+
+@pytest.mark.parametrize("text", ["Он поставил 1 BB.", "Ставка +1 BB.", "Это 1 из 5 раз."])
+def test_a_digit_outside_a_position_name_stays_a_number(text: str):
+    assert any("числа" in v for v in _check(text))
+
+
 def test_a_bare_digit_pair_is_always_a_number():
     """Чисто цифровую пару (`22`…`99`) от суммы шаблоном не отличить (тех-спека
     §5.7). Решение: она число всегда, даже если герой держит эту пару — иначе

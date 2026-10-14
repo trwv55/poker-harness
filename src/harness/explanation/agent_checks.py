@@ -124,6 +124,9 @@ _EDGE_R = r"(?![\w%]|[.,]\d)"
 _SUITED_CARD_RE = re.compile(_RANK + r"[♠♥♦♣]️?")
 _CLASS_RE = re.compile(_EDGE_L + r"([2-9TJQKA])([2-9TJQKA])([so])?" + _EDGE_R)
 _DIGITS_ONLY_RE = re.compile(r"\d+")
+# Позиция с цифрой — имя, а не число (решение контроллера R12): «UTG+1», «UTG+2» и
+# написание «UTG1». Только целым словом: «+1 BB» и «1 из 5» остаются числами.
+_POSITION_RE = re.compile(r"(?<!\w)UTG\+?[12]" + _EDGE_R)
 # Без разделителя ранги борда слипаются, только если рядом буква («KQ7»): три
 # цифры подряд («258») — сумма, а не борд 2-5-8.
 _BOARD_JOIN = r"(?:[-–]|(?<=[TJQKA])|(?=[TJQKA]))"
@@ -760,11 +763,12 @@ def strip_card_tokens(
     """Текст без обозначений карт — то, что идёт в сверку чисел.
 
     Вырезается только однозначное: карта с мастью, класс с буквой (`A5s`,
-    `T9o`, `KQ`, `98s`), ранги борда через дефис. Две цифры без буквы и масти
+    `T9o`, `KQ`, `98s`), ранги борда через дефис, имя позиции с цифрой (`UTG+1`,
+    `UTG1`; `test_a_position_name_with_a_digit_is_not_a_number`). Две цифры без буквы и масти
     (`22`) остаются числом всегда. `hero_class` сохранён ради интерфейса
     (`AgentContext.hero_class`, `check_agent_answer`) и на вырезание не влияет.
     """
-    text = _SUITED_CARD_RE.sub(" ", text)
+    text = _POSITION_RE.sub(" ", _SUITED_CARD_RE.sub(" ", text))
     board = Counter(board_ranks)
 
     def board_sub(match: re.Match[str]) -> str:

@@ -211,6 +211,22 @@ def test_the_sb_limp_check_line_names_the_limper():
     assert "Соперник: BB, линия до флопа — чек после лимпа SB." in text
 
 
+def test_a_position_with_a_digit_passes_the_number_check():
+    """Открывший UTG+1, соперник UTG+2: цифры имён позиций не регистрируются и
+    сверкой не считаются (R12)."""
+    result = range_result(
+        opponent_position="UTG+2", chart="open", chart_position="UTG+2",
+        vs_chart_position=None, opener_position="UTG+1", line="open_raise",
+    )
+    digest = agent_digest(result)
+    assert "UTG+2" in digest.text
+    assert not {1.0, 2.0} & digest.allowed
+    assert unsupported_numbers(strip_card_tokens(digest.text), digest.allowed) == []
+    defend = agent_digest(range_result(vs_chart_position="UTG+1", opener_position="UTG+1"))
+    assert "чарт защиты BB против UTG+1" in defend.text
+    assert unsupported_numbers(strip_card_tokens(defend.text), defend.allowed) == []
+
+
 def test_an_eight_max_range_says_nothing_about_another_table():
     assert "за столом мест" not in agent_digest(range_result(table_seats=8)).text
 

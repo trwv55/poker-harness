@@ -658,6 +658,27 @@ async def test_a_cached_equity_is_returned_without_counting_again(db, tmp_path, 
     assert result.equity == 0.25
 
 
+@pytest.mark.parametrize(
+    ("name", "value"), [("AGENT_EQUITY_ITERATIONS", 1_000), ("AGENT_EQUITY_SEED", 7)]
+)
+async def test_another_iteration_count_or_seed_misses_the_cache(
+    db, tmp_path, monkeypatch, name: str, value: int
+):
+    """Число, посчитанное на других итерациях или с другим сидом, не отдаётся:
+    они входят в префикс ключа `calc_cache`."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    player_id, session_id = await _player_with_session(db, tg_user_id=9207)
+    analysis_id = await stored_analysis(db, session_id=session_id)
+    key = "KdTc|Qc7d2s|" + to_notation(parse_range("QQ, AQs"))
+    await CalcCacheRepo(db).upsert_many(calcs_module.equity_cache_prefix(), {key: 0.25})
+    monkeypatch.setattr(calcs_module, name, value)
+    monkeypatch.setattr(calcs_module, "equity_vs_range", lambda *_a, **_kw: 0.5)
+    result = await run(db, player_id, EquityVsRangeParams(
+        analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP, hands="QQ, AQs",
+    ))
+    assert result.equity == 0.5
+
+
 async def test_a_narrowing_outside_the_start_is_refused_by_the_calculation(
     db, tmp_path, monkeypatch
 ):
