@@ -32,7 +32,7 @@
 
 Репозиторий **публичный**. Не коммитить и не пушить:
 
-- `evals/vision/`, `evals/e2e/` — размеченный eval-датасет (это ров продукта)
+- `evals/vision/`, `evals/e2e/`, `evals/agent/` — размеченный eval-датасет (это ров продукта)
 - промпты моделей — vision (`src/harness/parsers/prompts/`) и изложения (`src/harness/explanation/prompts/`) — копируются за вечер
 - `.claude/screens/` — скриншоты столов
 - `fixtures/hh/*.txt` — реальные hand history игрока
