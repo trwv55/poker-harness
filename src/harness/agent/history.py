@@ -71,36 +71,43 @@ def _without_thinking(messages: Sequence[ModelMessage]) -> list[ModelMessage]:
     расчётов на него тоже
     (`test_a_stored_row_with_thinking_loads_without_it`).
 
-    Запросы, оставшиеся подряд из-за такого ответа, склеиваются здесь, как их склеила бы
-    библиотека при запуске: иначе длина переданной
-    истории не совпала бы с местом, где в `all_messages()` начинается ход, и
-    `seen_history` сохранил бы начало хода нечищеным. По той же причине уходит
-    целиком последний ход, если ответ из одного рассуждения стоял в самом конце
-    (`test_dropped_thinking_only_answers_do_not_shift_the_start_of_the_turn`)."""
+    Если такой ответ — последний ответ хода, ход игроку ничего не дал и уходит
+    целиком (`turns`), с вызовами и выходами расчётов: иначе запросы, оставшиеся
+    подряд, склеила бы библиотека, длина переданной истории не совпала бы с местом,
+    где в `all_messages()` начинается ход, а выход расчёта, склеенный с репликой
+    следующего хода, после обрезки встал бы в начало истории
+    (`test_dropped_thinking_only_answers_do_not_shift_the_start_of_the_turn`,
+    `test_a_turn_ending_in_a_thinking_only_answer_leaves_no_orphan_tool_return`).
+    Запросы, оставшиеся подряд внутри хода, склеиваются, как их склеила бы
+    библиотека."""
     kept: list[ModelMessage] = []
-    dropped = False
-    for message in messages:
-        if isinstance(message, ModelResponse):
-            parts = [part for part in message.parts if not isinstance(part, ThinkingPart)]
-            dropped = not parts
-            if dropped:
+    for turn in turns(list(messages)):
+        cleaned: list[ModelMessage] = []
+        dropped = False
+        answered = True
+        for message in turn:
+            if isinstance(message, ModelResponse):
+                parts = [part for part in message.parts if not isinstance(part, ThinkingPart)]
+                answered = bool(parts)
+                dropped = not parts
+                if dropped:
+                    continue
+                if len(parts) != len(message.parts):
+                    message = dataclasses.replace(message, parts=parts)
+            elif dropped and cleaned and isinstance(previous := cleaned[-1], ModelRequest):
+                merged = sorted(
+                    [*previous.parts, *message.parts],
+                    key=lambda part: not isinstance(part, ToolReturnPart | RetryPromptPart),
+                )
+                cleaned[-1] = dataclasses.replace(
+                    message, parts=merged, instructions=previous.instructions or message.instructions
+                )
+                dropped = False
                 continue
-            if len(parts) != len(message.parts):
-                message = dataclasses.replace(message, parts=parts)
-        elif dropped and kept and isinstance(previous := kept[-1], ModelRequest):
-            merged = sorted(
-                [*previous.parts, *message.parts],
-                key=lambda part: not isinstance(part, ToolReturnPart | RetryPromptPart),
-            )
-            kept[-1] = dataclasses.replace(
-                message, parts=merged, instructions=previous.instructions or message.instructions
-            )
-            continue
-        kept.append(message)
-    if dropped:
-        # История кончилась ответом из одного рассуждения: ход остался без ответа,
-        # и его реплику библиотека склеила бы с новой. Ход уходит целиком (`turns`).
-        kept = [m for turn in turns(kept)[:-1] for m in turn]
+            dropped = False
+            cleaned.append(message)
+        if answered:
+            kept.extend(cleaned)
     return kept
 
 

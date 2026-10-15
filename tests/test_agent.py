@@ -1261,10 +1261,10 @@ def _strictly_alternates(messages) -> bool:
 
 
 async def test_dropped_thinking_only_answers_do_not_shift_the_start_of_the_turn(db_factory):
-    """Два ответа из одного рассуждения посреди строки и один в конце: запросы,
-    оставшиеся подряд, склеены, а последний ход, оставшийся без ответа, ушёл целиком
-    (иначе библиотека склеила бы его реплику с новой) — длина истории та же, что у
-    библиотеки, начало хода не съезжает, и отвергнутый черновик хода не сохраняется."""
+    """Два ответа из одного рассуждения посреди строки и один в конце: ходы, оставшиеся
+    без ответа, ушли целиком (иначе библиотека склеила бы их реплики со следующими) —
+    длина истории та же, что у библиотеки, начало хода не съезжает, и отвергнутый
+    черновик хода не сохраняется."""
     old = [
         ModelRequest(parts=[UserPromptPart("первый вопрос")]),
         ModelResponse(parts=[ToolCallPart("hero_frequency", {"stat": "vpip"}, tool_call_id="c1")]),
@@ -1303,3 +1303,43 @@ async def test_dropped_thinking_only_answers_do_not_shift_the_start_of_the_turn(
     stored = _stored_text(saved)
     assert "43.0" not in stored and REWRITE_HEAD not in stored and "Те же 100.0%" in stored
     assert _strictly_alternates(saved)
+
+
+async def test_a_turn_ending_in_a_thinking_only_answer_leaves_no_orphan_tool_return(db_factory):
+    """Ход с вызовом расчёта, кончившийся ответом из одного рассуждения, игроку ничего
+    не дал и уходит целиком: выход его расчёта не склеивается с репликой следующего
+    хода, и ни одна обрезка не оставляет выход расчёта в начале истории."""
+    old = [
+        ModelRequest(parts=[UserPromptPart("первый вопрос")]),
+        ModelResponse(parts=[ToolCallPart("hero_frequency", {"stat": "vpip"}, tool_call_id="c1")]),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    "hero_frequency",
+                    "выход-синт",
+                    tool_call_id="c1",
+                    metadata={"calc": "hero_frequency", "allowed": [100.0, 2.0]},
+                )
+            ]
+        ),
+        ModelResponse(parts=[ThinkingPart(_THINKING)]),
+        ModelRequest(parts=[UserPromptPart("второй вопрос")]),
+        ModelResponse(parts=[TextPart("Второй ответ.")]),
+    ]
+    loaded = load_history(ModelMessagesTypeAdapter.dump_python(old, mode="json"))
+    assert _strictly_alternates(loaded)
+    assert not any(isinstance(p, ToolReturnPart | ToolCallPart) for m in loaded for p in m.parts)
+    assert [len(t) for t in turns(loaded)] == [2]
+    for budget in range(0, 2000, 25):
+        trimmed = trim_history(loaded, budget)
+        if trimmed:
+            head = trimmed[0]
+            assert isinstance(head, ModelRequest)
+            assert not any(isinstance(p, ToolReturnPart) for p in head.parts)
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8183)
+        script = _TurnScript([([], "Те же 100.0% (2 из 2).")], as_text={0})
+        turn = await _turn(db_factory, session, script, scope=scope, history=loaded)
+    # Расчёт ушёл вместе с ходом: опоры нет, ход — отказ, но начало хода не съезжает.
+    assert turn.state == "refusal" and turn.history_len == len(loaded)
+    assert _stored_text([turn.messages[turn.history_len]]) == "вопрос"
