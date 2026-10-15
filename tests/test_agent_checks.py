@@ -1208,6 +1208,27 @@ def test_a_chart_word_with_a_number_not_from_the_chart_needs_the_mark():
     assert any(
         ASSUMPTION_MARK in v for v in _check("Диапазон BB по чарту — 12.5% рук.", **kw)
     )
+    assert any(
+        ASSUMPTION_MARK in v for v in _check("Диапазон BB по чарту 12.5% рук.", **kw)
+    )
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "Его реальный диапазон уже чарта — 38.2% рук.",
+        "Его диапазон уже чарта в 38.2% рук.",
+        "Диапазон BB шире чарта — 38.2% рук.",
+        "Диапазон BB по чарту сужен до 38.2% рук.",
+        "Диапазон BB урезан против чарта — 38.2% рук.",
+        "Его диапазон меньше чарта в 38.2% рук.",
+        "Реальный диапазон BB против чарта — 38.2% рук.",
+    ],
+)
+def test_a_narrowing_word_in_the_chart_clause_needs_the_mark(sentence):
+    """Сравнение с чартом или сужение — утверждение о сужении, а не пересказ чарта."""
+    kw = {"allowed": _CHART, "calc_numbers": _CHART, "chart_numbers": _CHART}
+    assert any(ASSUMPTION_MARK in v for v in _check(sentence, **kw))
 
 
 @pytest.mark.parametrize(

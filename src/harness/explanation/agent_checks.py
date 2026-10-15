@@ -13,6 +13,9 @@
 `test_the_prompt_range_paragraph_passes_with_its_numbers_and_marks`); число не из
 этого выхода пересказом не делает
 (`test_a_chart_word_with_a_number_not_from_the_chart_needs_the_mark`). Другие
+Слово сравнения или сужения («уже», «шире», «сужен», «урезан», «меньше чарта»,
+«реальный диапазон») в этом придаточном исключение снимает
+(`test_a_narrowing_word_in_the_chart_clause_needs_the_mark`). Другие
 придаточные того же предложения проверяются как обычно: слово диапазона, «держит»
 и утверждение о сопернике там требуют метки
 (`test_a_chart_fact_does_not_cover_a_prediction_in_the_same_sentence`,
@@ -277,6 +280,14 @@ _CHART_NAME_RE = re.compile(r"чарт[а-яё]*\s+защит[а-яё]*", re.IGN
 # том, что соперник держит, и остаётся (раунд ревью 1).
 _RANGE_NOUN_RE = re.compile(r"диапазон|рендж", re.IGNORECASE)
 _CLAUSE_PIECES_RE = re.compile(r"([,;:—–()])")
+# Сравнение или сужение в придаточном с «чарт» — утверждение о сужении, а не
+# пересказ чарта (решение контроллера, R28; «уже» и в смысле «уже сейчас» — принятый
+# ложный отказ).
+_NARROWING_RE = re.compile(
+    _W + r"(?:уже|шире)" + _WE + r"|сужен|урезан|меньше\s+чарт"
+    r"|реальн[а-яё]*\s+(?:диапазон|рендж)",
+    re.IGNORECASE,
+)
 _LEADING_NUMBER_RE = re.compile(r"\s*(" + r"\d+(?:[.,]\d+)?" + r")")
 _META_RANGE_RE = re.compile(
     r"(?:про|о|об)\s+(?:его\s+|их\s+)?(?:диапазон|рендж)[а-яё]*(?:\s+[^\s.,;:!?]+){0,2}?"
@@ -449,7 +460,10 @@ def _chart_clauses(rest: str, chart_numbers: frozenset[float]) -> str:
     BB по чарту — 38.2% рук»; `test_a_chart_range_sentence_needs_no_mark`,
     `test_the_prompt_range_paragraph_passes_with_its_numbers_and_marks`). Число не из
     этого выхода пересказом не делает
-    (`test_a_chart_word_with_a_number_not_from_the_chart_needs_the_mark`); остальные
+    (`test_a_chart_word_with_a_number_not_from_the_chart_needs_the_mark`), слово
+    сравнения или сужения («уже», «шире», «сужен», «урезан», «меньше чарта»,
+    «реальный диапазон») в придаточном — тоже
+    (`test_a_narrowing_word_in_the_chart_clause_needs_the_mark`); остальные
     придаточные проверяются как обычно
     (`test_the_chart_exemption_covers_only_the_clause_that_retells_the_chart`)."""
     if not chart_numbers or not _CHART_WORD_RE.search(rest):
@@ -458,7 +472,7 @@ def _chart_clauses(rest: str, chart_numbers: frozenset[float]) -> str:
     # Чётные — придаточные, нечётные — разделители между ними.
     for i in range(0, len(pieces), 2):
         clause = pieces[i]
-        if not _CHART_WORD_RE.search(clause):
+        if not _CHART_WORD_RE.search(clause) or _NARROWING_RE.search(clause):
             continue
         backed = any(_in(str(n), chart_numbers) for n in numbers_in(clause))
         if not backed and i + 2 < len(pieces) and pieces[i + 1] in "—–:":
