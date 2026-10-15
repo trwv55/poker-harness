@@ -3006,8 +3006,21 @@ def agent_turn_msg(
     from_context: bool,
     from_history: bool = False,
     job_id: int,
+    assumption: str | None = None,
 ) -> Msg:
     """Ответ агента — одно из трёх состояний (спека агента, §7).
+
+    `assumption` — прошедший проверку блок «Оценка модели» (чтение диапазона
+    соперника, решение владельца 2026-10-15): под прозой отдельным абзацем с
+    жирным заголовком «Оценка модели», подпись — после всего; сообщение тогда в
+    `parse_mode=HTML`, текст экранирован
+    (`test_the_model_assessment_block_follows_the_prose_under_a_bold_header`). Без
+    блока проза — простой текст, как раньше
+    (`test_without_a_block_the_agent_prose_stays_plain_text`); без прозы блока нет
+    (`test_the_block_is_not_shown_without_prose`). В тесноте сначала режется блок,
+    потом проза; не влезает и заголовок — блок уходит целиком
+    (`test_a_long_block_is_cut_before_the_prose_and_the_signature_stays`,
+    `test_a_huge_prose_drops_the_block_and_cuts_the_prose`).
 
     Подпись «Посчитано: …» собирает код по `CalcResult.calc` всех расчётов
     хода, модель в ней не участвует. Под прозой — только подпись с названиями,
@@ -3054,6 +3067,22 @@ def agent_turn_msg(
         signature = "Посчитано: " + ", ".join(sources) + "."
     if state == "prose" and prose and prose.strip():
         budget = _TELEGRAM_TEXT_LIMIT - len(signature) - 2
+        block = assumption.strip() if assumption else ""
+        head = prose.strip() + "\n\n" + _ASSESSMENT_HEAD + "\n"
+        # Бюджет Телеграма — по видимому тексту, без тегов и экранирования.
+        room = budget - len(head)
+        if block and room > len(_MARKER):
+            return Msg(
+                text=(
+                    _html_escape(prose.strip())
+                    + f"\n\n<b>{_ASSESSMENT_HEAD}</b>\n"
+                    + _html_escape(_fitted(block, room))
+                    + "\n\n"
+                    + _html_escape(signature)
+                ),
+                buttons=[[agent_miss_button(job_id)]],
+                parse_mode="HTML",
+            )
         return Msg(
             text=_fitted(prose.strip(), budget) + "\n\n" + signature,
             buttons=[[agent_miss_button(job_id)]],
@@ -3064,6 +3093,7 @@ def agent_turn_msg(
     return Msg(text=tail, buttons=[[agent_miss_button(job_id)]])
 
 
+_ASSESSMENT_HEAD = "Оценка модели"
 _AGENT_NUMBERS_UNCHECKED = "Ответ не прошёл проверку чисел, и показать мне нечего."
 
 

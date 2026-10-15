@@ -2711,3 +2711,74 @@ def test_the_agent_list_names_the_range_calculations_and_ask_does_not():
 
     assert "стартовый диапазон соперника по чарту" in agent_refusal_msg().text
     assert "диапазон" not in question_refusal_msg().text
+
+
+# --- Task 12: блок «Оценка модели» под прозой агента (решение владельца 2026-10-15) --
+
+
+def _visible(text: str) -> str:
+    """Текст, как его покажет Телеграм при `parse_mode=HTML`: без тегов, с символами."""
+    import html
+    import re
+
+    return html.unescape(re.sub(r"</?b>", "", text))
+
+
+def test_the_model_assessment_block_follows_the_prose_under_a_bold_header():
+    from harness.presentation import agent_turn_msg
+    from tests.test_question_text import _frequency
+
+    msg = agent_turn_msg(
+        "prose", "Проза-синт.", [_frequency()], from_context=False, job_id=7,
+        assumption="BB держит пары <и> дро & сбросит слабое.",
+    )
+    assert msg.parse_mode == "HTML"
+    assert msg.text == (
+        "Проза-синт.\n\n<b>Оценка модели</b>\nBB держит пары &lt;и&gt; дро &amp; сбросит слабое."
+        "\n\nПосчитано: ваша частота."
+    )
+
+
+def test_without_a_block_the_agent_prose_stays_plain_text():
+    from harness.presentation import agent_turn_msg
+    from tests.test_question_text import _frequency
+
+    msg = agent_turn_msg("prose", "Проза <синт>.", [_frequency()], from_context=False, job_id=7)
+    assert msg.parse_mode is None and msg.text == "Проза <синт>.\n\nПосчитано: ваша частота."
+
+
+def test_the_block_is_not_shown_without_prose():
+    from harness.presentation import agent_turn_msg
+    from tests.test_question_text import _frequency
+
+    msg = agent_turn_msg(
+        "numbers", None, [_frequency()], from_context=False, job_id=7, assumption="Блок-синт."
+    )
+    assert "Оценка модели" not in msg.text and "Блок-синт" not in msg.text
+
+
+def test_a_long_block_is_cut_before_the_prose_and_the_signature_stays():
+    from harness.presentation import agent_turn_msg
+    from tests.test_question_text import _frequency
+
+    msg = agent_turn_msg(
+        "prose", "Проза-синт.", [_frequency()], from_context=False, job_id=7,
+        assumption="слово & " * 1000,
+    )
+    shown = _visible(msg.text)
+    assert len(shown) <= 4096
+    assert shown.startswith("Проза-синт.\n\nОценка модели\nслово & ")
+    assert "показано не целиком" in shown and shown.endswith("Посчитано: ваша частота.")
+
+
+def test_a_huge_prose_drops_the_block_and_cuts_the_prose():
+    from harness.presentation import agent_turn_msg
+    from tests.test_question_text import _frequency
+
+    msg = agent_turn_msg(
+        "prose", "слово " * 2000, [_frequency()], from_context=False, job_id=7,
+        assumption="Блок-синт.",
+    )
+    shown = _visible(msg.text)
+    assert len(shown) <= 4096 and "Блок-синт" not in shown
+    assert shown.endswith("Посчитано: ваша частота.")

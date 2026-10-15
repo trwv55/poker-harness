@@ -39,7 +39,7 @@ from harness.agent.history import (
     turns,
 )
 from harness.agent.prompt import instructions_for, load_system_prompt
-from harness.agent.run import MAX_CALCS_PER_TURN, REWRITE_HEAD, run_agent_turn
+from harness.agent.run import MAX_CALCS_PER_TURN, REWRITE_HEAD, AgentDraft, run_agent_turn
 from harness.analysis.charts import lookup
 from harness.analysis.frequency import defense_from_bet
 from harness.calcs.routing import CalcRun, tools_for
@@ -79,6 +79,7 @@ class _TurnScript:
         *,
         chatter: bool = False,
         as_text: Collection[int] = (),
+        assumptions: dict[int, str] | None = None,
     ) -> None:
         """`chatter` — модель пишет текст рядом с вызовом вывода, как живые
         провайдеры («Итак: …»); `FunctionModel` сам этого не делает.
@@ -88,6 +89,8 @@ class _TurnScript:
         self.runs = runs
         self.chatter = chatter
         self.as_text = frozenset(as_text)
+        # Номер прогона → блок «Оценка модели» вторым полем вывода.
+        self.assumptions = assumptions or {}
         self.run = -1
         self.requests = 0
         self.instructions: list[str] = []
@@ -119,7 +122,10 @@ class _TurnScript:
             assert info.allow_text_output
             return ModelResponse(parts=[ThinkingPart(_THINKING), TextPart(answer)])
         assert info.output_tools
-        output = ToolCallPart(info.output_tools[0].name, {"answer": answer})
+        args: dict[str, Any] = {"answer": answer}
+        if self.run in self.assumptions:
+            args["assumption"] = self.assumptions[self.run]
+        output = ToolCallPart(info.output_tools[0].name, args)
         if self.chatter:
             return ModelResponse(parts=[TextPart(f"Итак: {answer}"), output])
         return ModelResponse(parts=[output])
@@ -988,3 +994,102 @@ async def test_a_refused_narrowing_reaches_the_model_and_spends_no_calculation(
         turn = await _turn(db_factory, session, script, scope=scope, analysis_id=analysis_id)
     assert turn.results == ()
     assert "нет в стартовом диапазоне" in turn.calls[0]["error"]
+
+
+# --- Task 12: блок «Оценка модели» (решение владельца 2026-10-15) -----------------
+
+_BLOCK = "BB держит пары и сбросит слабое на тёрне; против такого диапазона ставка в плюсе."
+_BAD_BLOCK = "BB держит пары, эквити против них 55%."
+
+
+def test_text_with_the_separator_splits_into_answer_and_block():
+    draft = AgentDraft.from_text(f"  {_GOOD}\n\nоценка МОДЕЛИ:\n{_BLOCK}\n")
+    assert draft.answer == _GOOD and draft.assumption == _BLOCK
+    same_line = AgentDraft.from_text(f"{_GOOD}\nОценка модели: {_BLOCK}")
+    assert same_line.answer == _GOOD and same_line.assumption == _BLOCK
+
+
+def test_text_without_the_separator_at_a_line_start_is_all_answer():
+    inline = f"{_GOOD} Оценка модели: дальше."
+    assert AgentDraft.from_text(inline) == AgentDraft(answer=inline)
+    assert AgentDraft.from_text(_GOOD).assumption is None
+    empty = AgentDraft.from_text(f"{_GOOD}\nОценка модели:\n  ")
+    assert empty.answer == _GOOD and empty.assumption is None
+
+
+async def test_a_block_with_claims_about_the_opponent_passes_by_the_output_call(db_factory):
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8160)
+        script = _TurnScript([([_VPIP], _GOOD)], assumptions={0: _BLOCK})
+        turn = await _turn(db_factory, session, script, scope=scope)
+    assert turn.state == "prose" and turn.prose == _GOOD and turn.assumption == _BLOCK
+    assert turn.violations == ((),)
+    journal = turn.journal()
+    assert journal["assumption"] == _BLOCK and journal["assumption_dropped"] is False
+    stored = _stored_text(load_history(dump_history(turn.saved_messages(None))))
+    assert _GOOD in stored and _BLOCK in stored
+
+
+async def test_a_block_by_text_with_the_separator_passes_and_is_saved(db_factory):
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8161)
+        script = _TurnScript([([_VPIP], f"{_GOOD}\nОценка модели:\n{_BLOCK}")], as_text={0})
+        turn = await _turn(db_factory, session, script, scope=scope)
+    assert turn.state == "prose" and turn.prose == _GOOD and turn.assumption == _BLOCK
+    stored = _stored_text(load_history(dump_history(turn.saved_messages(None))))
+    assert _BLOCK in stored and _THINKING not in stored
+
+
+@pytest.mark.parametrize("as_text", [frozenset(), frozenset({0, 1})])
+async def test_a_block_that_fails_twice_is_dropped_and_the_answer_is_shown(db_factory, as_text):
+    """Не прошёл только блок — игрок получает прозу без блока; журнал говорит, что
+    блок выброшен, история хранит показанное, без блока."""
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8162 + len(as_text))
+        if as_text:
+            runs: list[tuple[list[tuple[str, dict[str, Any]]], str]] = [
+                ([_VPIP], f"{_GOOD}\nОценка модели:\n{_BAD_BLOCK}")
+            ] * 2
+            script = _TurnScript(runs, as_text=as_text)
+        else:
+            script = _TurnScript(
+                [([_VPIP], _GOOD), ([], _GOOD)], assumptions={0: _BAD_BLOCK, 1: _BAD_BLOCK}
+            )
+        turn = await _turn(db_factory, session, script, scope=scope)
+        assert turn.state == "prose" and turn.prose == _GOOD and turn.assumption is None
+        assert len(turn.violations) == 2
+        assert all(v.startswith("блок «Оценка модели»") for v in turn.violations[0])
+        journal = turn.journal()
+        assert journal["assumption"] is None and journal["assumption_dropped"] is True
+        assert len(journal["drafts"]) == 2 and all(_BAD_BLOCK in d for d in journal["drafts"])
+        saved = load_history(dump_history(turn.saved_messages(None)))
+        stored = _stored_text(saved)
+        assert _GOOD in stored and "эквити против них" not in stored
+        assert "Оценка модели" not in stored
+        assert REWRITE_HEAD not in stored and _alternates(saved)
+        nxt = await _turn(
+            db_factory, session, _TurnScript([([], "Те же 100.0% (2 из 2).")]),
+            scope=scope, history=saved,
+        )
+    assert nxt.state == "prose"
+
+
+async def test_a_block_fixed_by_the_rewrite_is_shown(db_factory):
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8165)
+        script = _TurnScript(
+            [([_VPIP], _GOOD), ([], _GOOD)], assumptions={0: _BAD_BLOCK, 1: _BLOCK}
+        )
+        turn = await _turn(db_factory, session, script, scope=scope)
+    assert turn.state == "prose" and turn.assumption == _BLOCK
+    assert turn.journal()["assumption_dropped"] is False
+
+
+async def test_a_failed_answer_with_a_good_block_is_numbers_without_prose(db_factory):
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8166)
+        bad = "Вы входите в 43.0% раздач."
+        script = _TurnScript([([_VPIP], bad), ([], bad)], assumptions={0: _BLOCK, 1: _BLOCK})
+        turn = await _turn(db_factory, session, script, scope=scope)
+    assert turn.state == "numbers" and turn.prose is None and turn.assumption is None
+    assert turn.journal()["assumption"] is None

@@ -8,11 +8,12 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pydantic_ai import ModelRetry
 from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,7 +33,12 @@ from harness.agent.history import (
 )
 from harness.calcs.routing import CalcRun, tools_for
 from harness.contracts import CalcName, CalcResult, ModelOutput
-from harness.explanation.agent_checks import STAT_LABEL, AgentContext, check_agent_answer
+from harness.explanation.agent_checks import (
+    STAT_LABEL,
+    AgentContext,
+    check_agent_answer,
+    check_agent_assumption,
+)
 from harness.platform.llm import LLM
 
 __all__ = ["MAX_CALCS_PER_TURN", "REWRITE_HEAD", "AgentDraft", "AgentTurn", "run_agent_turn"]
@@ -44,21 +50,56 @@ MAX_CALCS_PER_TURN = 8
 REWRITE_HEAD = "Ответ не прошёл проверку:"
 
 
-class AgentDraft(ModelOutput, BaseModel):
-    """Что модели разрешено вернуть: слова. Подпись и числа собирает код."""
+# Разделитель блока «Оценка модели» в ответе простым текстом: в начале строки,
+# регистр не важен.
+_ASSUMPTION_SEPARATOR_RE = re.compile(r"^[ \t]*оценка модели:", re.IGNORECASE | re.MULTILINE)
 
-    answer: str
+
+class AgentDraft(ModelOutput, BaseModel):
+    """Что модели разрешено вернуть: слова. Подпись и числа собирает код.
+
+    `assumption` — блок «Оценка модели», чтение диапазона соперника (решение
+    владельца 2026-10-15): код проверяет в нём только числа и словарные запреты
+    (`check_agent_assumption`), смысл — нет."""
+
+    answer: str = Field(
+        description=(
+            "Ответ игроку: всё, кроме чтения диапазона соперника. Сюда — то, что "
+            "посчитано и что сказано в разборе раздачи."
+        )
+    )
+    assumption: str | None = Field(
+        default=None,
+        description=(
+            "Чтение диапазона соперника: стартовый диапазон по чарту, его сужение по "
+            "линии, эквити против суженного из расчёта. Игрок увидит это под "
+            "заголовком «Оценка модели». Нет такого чтения — не заполнять."
+        ),
+    )
 
     @classmethod
     def from_text(cls, text: str) -> AgentDraft:
         """Ответ простым текстом вместо вызова вывода: модель агента идёт с
         `tool_choice: auto` и делает и так, и так
         (`test_a_final_answer_in_plain_text_is_shown_and_saved`). Пустой текст —
-        не ответ, а ошибка схемы (`test_a_blank_text_answer_is_a_schema_error`)."""
-        answer = text.strip()
+        не ответ, а ошибка схемы (`test_a_blank_text_answer_is_a_schema_error`).
+        Строка, начатая с «Оценка модели:» (регистр не важен), отделяет блок: всё
+        после неё — `assumption`, до — `answer`; без такой строки всё — `answer`
+        (`test_text_with_the_separator_splits_into_answer_and_block`,
+        `test_text_without_the_separator_at_a_line_start_is_all_answer`)."""
+        separator = _ASSUMPTION_SEPARATOR_RE.search(text)
+        head = text if separator is None else text[: separator.start()]
+        tail = None if separator is None else text[separator.end() :].strip()
+        answer = head.strip()
         if not answer:
             raise ModelRetry("пустой ответ")
-        return cls(answer=answer)
+        return cls(answer=answer, assumption=tail or None)
+
+    def as_text(self) -> str:
+        """Черновик одной строкой для журнала: ответ и блок за разделителем."""
+        if not self.assumption:
+            return self.answer
+        return f"{self.answer}\n\nОценка модели:\n{self.assumption}"
 
 
 @dataclass(frozen=True)
@@ -83,9 +124,18 @@ class AgentTurn:
     # по ним `saved_messages` чистит ход, не читая текст реплик.
     history_len: int = 0
     rewrite_at: int | None = None
+    # Блок «Оценка модели», который игрок увидит; `assumption_dropped` — блок был в
+    # последнем черновике, а игрок его не увидит
+    # (`test_a_block_that_fails_twice_is_dropped_and_the_answer_is_shown`).
+    assumption: str | None = None
+    assumption_dropped: bool = False
 
     def saved_messages(self, final_answer: str | None) -> list[ModelMessage]:
-        """Что сохранить в историю вечера (`history.seen_history`)."""
+        """Что сохранить в историю вечера (`history.seen_history`). Проза прошла,
+        а блок выброшен — сохраняется проза без блока, как её увидел игрок
+        (`test_a_block_that_fails_twice_is_dropped_and_the_answer_is_shown`)."""
+        if final_answer is None and self.assumption_dropped:
+            final_answer = self.prose
         return seen_history(
             self.messages,
             start=self.history_len,
@@ -105,6 +155,8 @@ class AgentTurn:
             "from_context": self.from_context,
             "from_history": self.from_history,
             "drafts": list(self.drafts),
+            "assumption": self.assumption,
+            "assumption_dropped": self.assumption_dropped,
         }
 
 
@@ -114,6 +166,18 @@ def _violations(
     context: AgentContext | None,
     said: frozenset[float],
 ) -> list[str]:
+    """Нарушения одного ответа, без блока «Оценка модели»."""
+    return _draft_violations(AgentDraft(answer=answer), messages, context, said)[0]
+
+
+def _draft_violations(
+    draft: AgentDraft,
+    messages: Sequence[ModelMessage],
+    context: AgentContext | None,
+    said: frozenset[float],
+) -> tuple[list[str], list[str]]:
+    """Нарушения ответа и блока «Оценка модели» — порознь: при повторном провале
+    одного блока игрок получает прозу без него. Разрешённые числа у них одни."""
     calc_numbers = allowed_from_history(messages)
     allowed = calc_numbers | said
     labels = frozenset(STAT_LABEL + stat for stat in stats_in_history(messages))
@@ -121,11 +185,23 @@ def _violations(
         allowed |= context.allowed
         labels |= context.labels
         calc_numbers |= context.threshold_numbers
+    leaks_called = CalcName.LEAKS.value in calcs_in_history(messages)
+    block = (
+        check_agent_assumption(
+            draft.assumption,
+            allowed=allowed,
+            leaks_called=leaks_called,
+            hero_class=context.hero_class if context else None,
+            board_ranks=context.board_ranks if context else (),
+        )
+        if draft.assumption
+        else []
+    )
     return check_agent_answer(
-        answer,
+        draft.answer,
         allowed=allowed,
         labels=labels,
-        leaks_called=CalcName.LEAKS.value in calcs_in_history(messages),
+        leaks_called=leaks_called,
         hero_class=context.hero_class if context else None,
         board_ranks=context.board_ranks if context else (),
         threshold_decided=threshold_decided(messages),
@@ -134,7 +210,7 @@ def _violations(
         frequency_numbers=frequency_numbers(messages),
         chart_numbers=chart_numbers_in(messages),
         assumed_numbers=assumed_numbers_in(messages),
-    )
+    ), block
 
 
 def _rewrite_index(messages: Sequence[ModelMessage], since: int, request: str) -> int:
@@ -180,7 +256,10 @@ async def run_agent_turn(
     включая этот ход
     (`test_an_answer_without_a_call_and_without_a_context_is_refused`). Числа
     без прозы — проза не прошла проверку дважды
-    (`test_one_rewrite_then_numbers_without_prose`). `analysis_id` — указатель
+    (`test_one_rewrite_then_numbers_without_prose`). Нарушения блока «Оценка
+    модели» идут в тот же список и в ту же одну попытку переписать; не прошёл
+    дважды только блок — проза без блока
+    (`test_a_block_that_fails_twice_is_dropped_and_the_answer_is_shown`). `analysis_id` — указатель
     разбора руки вечера для `opponent_range` и `equity_vs_range`; без него они
     отвечают отказом (`test_without_a_hand_analysis_the_range_tool_says_so`).
     """
@@ -210,10 +289,11 @@ async def run_agent_turn(
     )
     messages = meta.messages
     grounded = context is not None or bool(calcs_in_history(messages))
-    found = _violations(draft.answer, messages, context, said)
+    answer_found, block_found = _draft_violations(draft, messages, context, said)
+    found = answer_found + block_found
     violations: list[tuple[str, ...]] = [tuple(found)]
     prose: str | None = draft.answer.strip() if not found else None
-    drafts: list[str] = [draft.answer] if found or not grounded else []
+    drafts: list[str] = [draft.as_text()] if found or not grounded else []
 
     rewrite_at: int | None = None
     if grounded and found:
@@ -226,11 +306,12 @@ async def run_agent_turn(
         )
         messages = meta.messages
         rewrite_at = _rewrite_index(messages, first_len - 1, request)
-        second = _violations(draft.answer, messages, context, said)
+        answer_found, block_found = _draft_violations(draft, messages, context, said)
+        second = answer_found + block_found
         violations.append(tuple(second))
-        prose = draft.answer.strip() if not second else None
+        prose = draft.answer.strip() if not answer_found else None
         if second:
-            drafts.append(draft.answer)
+            drafts.append(draft.as_text())
 
     state: Literal["prose", "numbers", "refusal"]
     if not grounded:
@@ -239,6 +320,10 @@ async def run_agent_turn(
         state = "prose"
     else:
         state = "numbers"
+    # Блок показывается, только если прошёл сам и прошла проза; не прошёл только
+    # блок — проза идёт без него (решение владельца 2026-10-15).
+    block_text = draft.assumption.strip() if draft.assumption else None
+    assumption = block_text if state == "prose" and not block_found else None
     return AgentTurn(
         state=state,
         prose=prose,
@@ -251,4 +336,6 @@ async def run_agent_turn(
         drafts=tuple(drafts),
         history_len=len(history),
         rewrite_at=rewrite_at,
+        assumption=assumption,
+        assumption_dropped=grounded and block_text is not None and assumption is None,
     )

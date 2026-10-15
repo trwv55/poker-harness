@@ -2617,3 +2617,52 @@ async def test_an_hh_scan_sends_the_summary_and_nothing_else(
         assert row is not None
         assert "report_message_id" not in row.payload
         assert "story_message_id" not in row.payload
+
+
+async def test_the_model_assessment_block_reaches_the_player_journal_and_history(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    """Task 12: прошедший блок «Оценка модели» — под прозой с заголовком, в журнале
+    полем `assumption`, в истории вечера; выброшенный — нигде, кроме черновиков."""
+    from pydantic_ai.messages import ModelMessagesTypeAdapter
+    from pydantic_ai.models.function import FunctionModel
+
+    from tests.test_agent import _BAD_BLOCK, _BLOCK, _GOOD, _VPIP, _TurnScript
+
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    player_id, session_id = await _make_scope(db_factory)
+    await _seed_two_hands(db_factory, session_id)
+    script = _TurnScript(
+        [([_VPIP], _GOOD), ([_VPIP], _GOOD), ([], _GOOD), ([], "Синт-ответ 100.0%.")],
+        assumptions={0: _BLOCK, 1: _BAD_BLOCK, 2: _BAD_BLOCK},
+    )
+    seen_by_model: list[str] = []
+
+    def model(messages, info):
+        seen_by_model.append(ModelMessagesTypeAdapter.dump_json(messages).decode())
+        return script(messages, info)
+
+    llm_deps = replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(model)))
+    jobs = []
+    for question in ("первый", "второй", "третий"):
+        jobs.append(await queue.enqueue(type="agent", player_id=player_id, session_id=session_id,
+                                        payload={"text": question}))
+        job = await queue.claim("w1")
+        assert job is not None
+        await run_job(job, llm_deps)
+
+    first, second = fake_sender.sent[0], fake_sender.sent[1]
+    assert first.parse_mode == "HTML"
+    assert first.text.startswith(f"{_GOOD}\n\n<b>Оценка модели</b>\n{_BLOCK}\n\nПосчитано:")
+    assert second.parse_mode is None and "Оценка модели" not in second.text
+    spans = []
+    async with db_factory() as session:
+        for jid in jobs[:2]:
+            rows = (await session.execute(
+                text("select spans from traces where job_id = :j"), {"j": jid}
+            )).scalar_one()
+            spans.append(next(s for s in rows if s["name"] == "agent_turn"))
+    assert spans[0]["assumption"] == _BLOCK and spans[0]["assumption_dropped"] is False
+    assert spans[1]["assumption"] is None and spans[1]["assumption_dropped"] is True
+    last_request = seen_by_model[-1]
+    assert _BLOCK in last_request and "эквити против них" not in last_request

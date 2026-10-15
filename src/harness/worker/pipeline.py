@@ -1370,6 +1370,7 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
             from_context=turn.from_context,
             from_history=turn.from_history,
             job_id=job.id,
+            assumption=turn.assumption,
         )
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
         await session.commit()
