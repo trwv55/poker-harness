@@ -1354,6 +1354,64 @@ async def test_a_turn_ending_in_a_thinking_only_answer_leaves_no_orphan_tool_ret
     assert _stored_text([turn.messages[turn.history_len]]) == "вопрос"
 
 
+def _output_turn(question: str, answer: str, call_id: str) -> list[ModelMessage]:
+    """Ход, отвеченный вызовом вывода, в форме прежнего кода: выход вывода —
+    отдельным запросом после вызова."""
+    return [
+        ModelRequest(parts=[UserPromptPart(question)]),
+        ModelResponse(parts=[ToolCallPart("final_result", {"answer": answer}, tool_call_id=call_id)]),
+        ModelRequest(parts=[ToolReturnPart("final_result", "Final result processed.",
+                                           tool_call_id=call_id)]),
+    ]
+
+
+async def test_after_an_output_answer_a_dropped_thinking_only_turn_keeps_the_output_return(
+    db_factory,
+):
+    """Ход ответил вызовом вывода, следующий кончился одним рассуждением и уходит
+    целиком; выход вывода, склеенный с его репликой, остаётся — без него вызов
+    вывода висел бы без ответа, и библиотека отвергала бы каждый следующий ход."""
+    first = _output_turn("первый вопрос", "Первый ответ.", "f1")
+    output_return = first[2]
+    assert isinstance(output_return, ModelRequest)
+    row = [
+        *first[:2],
+        ModelRequest(parts=[*output_return.parts, UserPromptPart("второй вопрос")]),
+        ModelResponse(parts=[ThinkingPart(_THINKING)]),
+    ]
+    loaded = load_history(ModelMessagesTypeAdapter.dump_python(row, mode="json"))
+    assert "второй вопрос" not in _stored_text(loaded)
+    assert [p.tool_call_id for m in loaded for p in m.parts if isinstance(p, ToolReturnPart)] == ["f1"]
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8190)
+        script = _TurnScript([([_VPIP], _GOOD)])
+        turn = await _turn(db_factory, session, script, scope=scope, history=loaded)
+    assert turn.state == "prose" and turn.history_len == len(loaded)
+    saved = load_history(dump_history(turn.saved_messages(None)))
+    assert _strictly_alternates(saved) and _GOOD in _stored_text(saved)
+
+
+async def test_an_old_row_with_separate_output_returns_loads_merged(db_factory):
+    """Строка прежней формы: выход вывода — отдельным запросом перед репликой
+    следующего хода. Загружается склеенной, как склеит библиотека, и следующий ход
+    начинается там, где кончается загруженная история."""
+    row = [
+        *_output_turn("первый вопрос", "Первый ответ.", "f1"),
+        *_output_turn("второй вопрос", "Второй ответ.", "f2"),
+    ]
+    loaded = load_history(ModelMessagesTypeAdapter.dump_python(row, mode="json"))
+    assert _strictly_alternates(loaded[:-1]) and len(loaded) == 5
+    assert len(turns(loaded)) == 2
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8191)
+        script = _TurnScript([([_VPIP], _GOOD)])
+        turn = await _turn(db_factory, session, script, scope=scope, history=loaded)
+    assert turn.state == "prose" and turn.history_len == len(loaded)
+    assert _stored_text([turn.messages[turn.history_len]]) == "вопрос"
+    saved = load_history(dump_history(turn.saved_messages(None)))
+    assert len(turns(saved)) == 3 and _GOOD in _stored_text(saved)
+
+
 async def test_the_start_of_the_turn_holds_from_the_third_turn_with_output_answers(db_factory):
     """Ответ вызовом вывода оставляет в конце хода запрос с его выходом; в истории
     из двух таких ходов он стоит перед репликой следующего, и библиотека склеила
@@ -1444,7 +1502,7 @@ async def test_a_turn_without_a_hand_and_back_gets_boundaries(db_factory):
 def test_the_boundary_has_no_numbers_and_is_not_the_players_text():
     assert not re.search(r"\d", NEW_HAND_MARK) and not re.search(r"\d", NO_HAND_MARK)
     request = ModelRequest(
-        parts=[UserPromptPart([TextContent("— 77 —", metadata={"hand_boundary": True}), "до 12"])]
+        parts=[UserPromptPart([TextContent("— 77 —"), "до 12"])]
     )
     assert player_numbers([request]) == frozenset({12.0})
 
@@ -1496,5 +1554,5 @@ async def test_an_old_row_without_hand_tags_loads_and_gets_no_boundary(db_factor
     loaded = load_history(ModelMessagesTypeAdapter.dump_python(old, mode="json"))
     async with db_factory() as session:
         scope = await _seeded(session, tg_user_id=8188)
-        marks, _ = await _evening(db_factory, session, scope, [None, 3, 4], history=loaded)
-    assert marks == [[], [NEW_HAND_MARK], [NEW_HAND_MARK]]
+        marks, _ = await _evening(db_factory, session, scope, [3, 3, None, 4], history=loaded)
+    assert marks == [[], [], [NO_HAND_MARK], [NEW_HAND_MARK]]

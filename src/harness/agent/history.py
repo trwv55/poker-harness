@@ -80,8 +80,7 @@ _CALC_TOOLS = frozenset(name.value for name in CalcName)
 # Ключ метаданных запроса с репликой игрока: указатель разбора её хода (`None` —
 # ход без разбора).
 HAND_KEY = "analysis_id"
-# Ключ метаданных отметки-границы; текст отметки — без чисел.
-_BOUNDARY_KEY = "hand_boundary"
+# Тексты отметки-границы — без чисел.
 NEW_HAND_MARK = (
     "— Дальше разговор о другой руке. Ответы выше относились к прошлым рукам вечера; "
     "не пересматривай их. —"
@@ -93,7 +92,16 @@ NO_HAND_MARK = (
 
 
 def _is_tool_result(part: object) -> bool:
+    """Ключ порядка в склеенном запросе — тот же, что у библиотеки."""
     return isinstance(part, ToolReturnPart | RetryPromptPart)
+
+
+def _answers_a_call(part: object) -> bool:
+    """Ответ на вызов инструмента — по тому же правилу, что `_is_tool_result_part`
+    библиотеки: `RetryPromptPart` без имени инструмента ответом не считается."""
+    return isinstance(part, ToolReturnPart) or (
+        isinstance(part, RetryPromptPart) and part.tool_name is not None
+    )
 
 
 def merged_requests(messages: Sequence[ModelMessage]) -> list[ModelMessage]:
@@ -152,7 +160,7 @@ def _without_thinking(messages: Sequence[ModelMessage]) -> list[ModelMessage]:
             continue
         head = turn[0]
         if isinstance(head, ModelRequest) and (
-            results := [part for part in head.parts if _is_tool_result(part)]
+            results := [part for part in head.parts if _answers_a_call(part)]
         ):
             kept.append(ModelRequest(parts=results))
     return merged_requests(kept)
@@ -217,16 +225,17 @@ def hand_boundary(
         if not isinstance(tags, dict) or HAND_KEY not in tags or tags[HAND_KEY] == analysis_id:
             return None
         text = NEW_HAND_MARK if analysis_id is not None else NO_HAND_MARK
-        return TextContent(text, metadata={_BOUNDARY_KEY: True})
+        return TextContent(text)
     return None
 
 
 def turns(messages: list[ModelMessage]) -> list[list[ModelMessage]]:
     """Ходы: каждый начинается запросом с репликой игрока.
 
-    Реплика игрока — отдельный запрос (pydantic-ai, как установлен), поэтому
-    ответ на последний вызов хода — в том числе на вывод `final_result` —
-    остаётся в своём ходе и уходит вместе с ним при обрезке.
+    Выходы расчётов остаются в своём ходе: за ними внутри хода всегда идёт ответ
+    модели. Выход вывода (`final_result`) в истории склеен с репликой следующего
+    хода (`merged_requests`) и считается частью того хода
+    (`test_an_old_row_with_separate_output_returns_loads_merged`).
     """
     result: list[list[ModelMessage]] = []
     for message in messages:
@@ -240,10 +249,12 @@ def turns(messages: list[ModelMessage]) -> list[list[ModelMessage]]:
 def trim_history(messages: Sequence[ModelMessage], max_tokens: int) -> list[ModelMessage]:
     """Самые старые ходы — прочь целиком, пока история не влезет в потолок.
 
-    Ход режется только целиком (`turns`), поэтому вызов инструмента не
-    отрывается от своего ответа, и оставшаяся история начинается репликой
-    игрока (`test_trimming_leaves_no_orphan_tool_return`). Возвращается без
-    инструкций — так, как будет храниться.
+    Ход режется только целиком (`turns`), поэтому вызов расчёта не отрывается
+    от своего выхода, и оставшаяся история начинается репликой игрока
+    (`test_trimming_leaves_no_orphan_tool_return`). Выход вывода, склеенный с этой
+    репликой, после ушедшего хода остался бы без вызова — он снимается
+    (`test_the_start_of_the_turn_holds_from_the_third_turn_with_output_answers`).
+    Возвращается без инструкций — так, как будет храниться.
     """
     kept = turns(_bare(messages))
     while kept and estimate_tokens([m for turn in kept for m in turn]) > max_tokens:
@@ -252,7 +263,7 @@ def trim_history(messages: Sequence[ModelMessage], max_tokens: int) -> list[Mode
     # Выходы прошлого хода, склеенные с репликой (`merged_requests`), без своего вызова
     # провайдер отвергает: в начале истории их не бывает.
     if result and isinstance(head := result[0], ModelRequest):
-        parts = [part for part in head.parts if not _is_tool_result(part)]
+        parts = [part for part in head.parts if not _answers_a_call(part)]
         if len(parts) != len(head.parts):
             result[0] = dataclasses.replace(head, parts=parts)
     return result
