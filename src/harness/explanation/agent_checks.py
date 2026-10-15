@@ -132,6 +132,7 @@ from harness.explanation.verdict_text import verdict_digest
 
 __all__ = [
     "ACTION_LABEL",
+    "ASSUMPTION_BLOCK",
     "ASSUMPTION_MARK",
     "DRAW_LABEL",
     "HAND_LABEL",
@@ -140,6 +141,7 @@ __all__ = [
     "AgentContext",
     "agent_context",
     "check_agent_answer",
+    "check_agent_assumption",
     "strip_card_tokens",
 ]
 
@@ -1039,3 +1041,54 @@ def check_agent_answer(
     if errors:
         violations.append(f"решение названо ошибкой — {errors}")
     return violations
+
+
+# Блок «Оценка модели» (решение владельца 2026-10-15): лучшая линия запрещена на любой
+# улице — блок о диапазоне соперника, не о линии героя.
+_ASSUMPTION_BEST_LINE_RE = re.compile(
+    r"(?:лучш|правильн)[а-яё]*\s+лини|лучше\s+было|было\s+лучше|правильн[а-яё]*\s+было"
+    r"|(?<![A-Za-z])GTO(?![A-Za-z])|(?<![А-Яа-яЁё])ГТО(?![А-Яа-яЁё])",
+    re.IGNORECASE,
+)
+ASSUMPTION_BLOCK = "блок «Оценка модели»"
+
+
+def check_agent_assumption(
+    assumption: str,
+    *,
+    allowed: frozenset[float],
+    leaks_called: bool,
+    hero_class: str | None = None,
+    board_ranks: Sequence[str] = (),
+) -> list[str]:
+    """Нарушения блока «Оценка модели» — чтения диапазона соперника; пустой список —
+    блок прошёл (решение владельца 2026-10-15).
+
+    Блок — оценка модели, смысл в нём код не проверяет: метка «(допущение)»,
+    утверждения о сопернике, слово диапазона, «в плюсе / в минусе», эквити без метки
+    и термины к нему не применяются
+    (`test_the_model_assessment_block_passes_claims_about_the_opponent_without_a_mark`).
+    Проверяется только надёжное: числа — из того же `allowed`, что у ответа, после
+    вырезки карт и позиций (`strip_card_tokens`;
+    `test_an_invented_number_in_the_block_is_a_violation`,
+    `test_card_and_position_tokens_in_the_block_are_not_numbers`); «лик» без расчёта
+    `leaks`, лучшая или правильная линия, «лучше было», «правильно было», GTO и слова
+    ошибки (`test_word_bans_hold_in_the_block`). Каждое нарушение начинается с
+    «блок «Оценка модели»» (`test_the_block_violations_name_the_block`).
+    """
+    text = assumption.strip()
+    found: list[str] = []
+    invented = unsupported_numbers(
+        strip_card_tokens(text, hero_class=hero_class, board_ranks=board_ranks), allowed
+    )
+    if invented:
+        found.append(f"числа не из расчёта и не из разбора — {invented}")
+    for sentence in _SENTENCE_RE.findall(text):
+        if _ASSUMPTION_BEST_LINE_RE.search(sentence):
+            found.append(f"лучшая линия — «{sentence.strip()}»")
+    if _LEAK_RE.search(text) and not leaks_called:
+        found.append("слово «лик» без расчёта leaks")
+    errors = error_words_in(text)
+    if errors:
+        found.append(f"решение названо ошибкой — {errors}")
+    return [f"{ASSUMPTION_BLOCK}: {v}" for v in found]

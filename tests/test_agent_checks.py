@@ -32,6 +32,7 @@ from harness.explanation.agent_checks import (
     STAT_LABEL,
     agent_context,
     check_agent_answer,
+    check_agent_assumption,
     strip_card_tokens,
 )
 from harness.explanation.digest import NumberBook
@@ -1353,3 +1354,60 @@ def test_a_prediction_in_the_main_clause_after_a_condition_is_still_a_violation(
     """Прогноз или рука соперника в главной части (или рука в условии) — по-прежнему
     нарушение."""
     assert any(ASSUMPTION_MARK in v for v in _check(text))
+
+
+# --- Task 12: блок «Оценка модели» — только числа и словарные запреты --------------
+
+
+def _check_block(text: str, **kw) -> list[str]:
+    kw.setdefault("allowed", _NONE)
+    kw.setdefault("leaks_called", False)
+    return check_agent_assumption(text, **kw)
+
+
+def test_the_model_assessment_block_passes_claims_about_the_opponent_without_a_mark():
+    """Чтение диапазона — оценка модели: утверждения о сопернике, слово диапазона,
+    «в плюсе», эквити и термины в блоке метки не требуют."""
+    allowed = frozenset({38.2, 41.5})
+    text = (
+        "BB по чарту защищает 38.2% рук. После колла на флопе он держит пары и дро, "
+        "сбросит слабое на тёрне. Против такого диапазона эквити 41.5%, контбет в плюсе."
+    )
+    assert _check_block(text, allowed=allowed) == []
+    assert _check(text, allowed=allowed, calc_numbers=allowed) != []
+
+
+def test_an_invented_number_in_the_block_is_a_violation():
+    violations = _check_block("Эквити против его диапазона около 55%.", allowed=frozenset({41.5}))
+    assert any("числа" in v for v in violations)
+
+
+def test_card_and_position_tokens_in_the_block_are_not_numbers():
+    assert _check_block("UTG+1 держит A5s, K9o и J♥ — T9 на K-7-2.", board_ranks=("K", "7", "2")) == []
+    assert _check_block("UTG+1 держит пары до 99.") != []  # голая пара цифр — число
+
+
+@pytest.mark.parametrize(
+    ("text", "word"),
+    [
+        ("Это его лик — он слишком часто коллирует.", "лик"),
+        ("По GTO он защищает шире.", "лучшая линия"),
+        ("Лучшая линия — чек.", "лучшая линия"),
+        ("Правильная линия — бет.", "лучшая линия"),
+        ("Лучше было проверить.", "лучшая линия"),
+        ("Правильно было сбросить.", "лучшая линия"),
+        ("Колл был ошибкой.", "ошибк"),
+    ],
+)
+def test_word_bans_hold_in_the_block(text: str, word: str):
+    assert any(word in v for v in _check_block(text))
+
+
+def test_the_word_leak_in_the_block_is_allowed_after_the_leaks_calculation():
+    assert _check_block("Это похоже на лик соперника.", leaks_called=True) == []
+
+
+def test_the_block_violations_name_the_block():
+    """Нарушения блока отличимы от нарушений ответа в общем списке на переписывание."""
+    violations = _check_block("Эквити 55%.")
+    assert violations and all(v.startswith("блок «Оценка модели»") for v in violations)
