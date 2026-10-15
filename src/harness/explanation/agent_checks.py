@@ -73,9 +73,10 @@
 числа в нём; без доли расчёта — нет
 (`test_threshold_math_with_the_threshold_earlier_in_the_sentence_passes`,
 `test_threshold_math_without_a_calculation_number_is_still_a_violation`). Условие
-«когда/если <соперник> <действие>» перед частью о руке или шансах героя («Когда BB
-коллирует, рука не пустая») — не утверждение; рука соперника в условии или прогноз
-в главной части — по-прежнему да
+«когда/если <соперник> <действие>» перед частью о шансах героя, где герой назван явно
+(«Когда BB коллирует, ваша рука не пустая») — не утверждение; рука соперника в условии,
+голая «рука», исход или сила («рука проиграет», «рука позади») и прогноз в главной части
+— по-прежнему да
 (`test_a_condition_on_the_opponent_with_a_conclusion_about_the_hero_hand_passes`,
 `test_a_prediction_in_the_main_clause_after_a_condition_is_still_a_violation`).
 
@@ -570,13 +571,19 @@ def _opponent_claim(
 
 
 # Условие на действие соперника перед выводом о руке героя (решение владельца
-# 2026-10-15): «Когда BB коллирует, рука не пустая.» Узко: придаточное начинается с
-# «когда/если», в нём соперник и действие без руки; следующая часть — о руке или
-# шансах героя, без соперника, действия и руки словом.
+# 2026-10-15): «Когда BB коллирует, ваша рука не пустая.» Узко: придаточное начинается
+# с «когда/если», в нём соперник и действие без руки; следующая часть — о шансах героя,
+# без соперника, действия и руки словом. Герой назван явно («ваша рука», «у вас»,
+# «ваши шансы»), сказано о шансах, аутах или эквити, а не об исходе и силе: голая
+# «рука», «рука проиграет», «рука позади», «рука сильная» остаются прогнозом
+# (решение контроллера по ревью Task 12).
 _CONDITION_START_RE = re.compile(r"\s*(?:когда|если)" + _WE, re.IGNORECASE)
-_HERO_HAND_RE = re.compile(
-    _W + r"(?:рук[аиуеой]*|ваш[а-яё]*|у\s+вас|шанс[а-яё]*|эквити|аут[а-яё]*)" + _WE,
-    re.IGNORECASE,
+_HERO_OWNER_RE = re.compile(_W + r"(?:ваш[а-яё]*|у\s+вас)" + _WE, re.IGNORECASE)
+_HERO_CHANCES_RE = re.compile(
+    _W + r"(?:не\s+пуст[а-яё]*|шанс[а-яё]*|эквити|аут[а-яё]*)" + _WE, re.IGNORECASE
+)
+_OUTCOME_RE = re.compile(
+    r"проигр|выигр|позади|впереди|сильн|слаб|бь[её]т|побь|лучше|хуже", re.IGNORECASE
 )
 
 
@@ -594,7 +601,9 @@ def _about_hero_hand(clause: str) -> bool:
     (`test_a_condition_on_the_opponent_with_a_conclusion_about_the_hero_hand_passes`,
     `test_a_prediction_in_the_main_clause_after_a_condition_is_still_a_violation`)."""
     return (
-        bool(_HERO_HAND_RE.search(clause))
+        bool(_HERO_OWNER_RE.search(clause))
+        and bool(_HERO_CHANCES_RE.search(clause))
+        and not _OUTCOME_RE.search(clause)
         and not _OPPONENT_RE.search(clause)
         and not _ACTION_RE.search(clause)
         and not _HAND_RE.search(clause)
@@ -1043,13 +1052,6 @@ def check_agent_answer(
     return violations
 
 
-# Блок «Оценка модели» (решение владельца 2026-10-15): лучшая линия запрещена на любой
-# улице — блок о диапазоне соперника, не о линии героя.
-_ASSUMPTION_BEST_LINE_RE = re.compile(
-    r"(?:лучш|правильн)[а-яё]*\s+лини|лучше\s+было|было\s+лучше|правильн[а-яё]*\s+было"
-    r"|(?<![A-Za-z])GTO(?![A-Za-z])|(?<![А-Яа-яЁё])ГТО(?![А-Яа-яЁё])",
-    re.IGNORECASE,
-)
 ASSUMPTION_BLOCK = "блок «Оценка модели»"
 
 
@@ -1065,15 +1067,16 @@ def check_agent_assumption(
     блок прошёл (решение владельца 2026-10-15).
 
     Блок — оценка модели, смысл в нём код не проверяет: метка «(допущение)»,
-    утверждения о сопернике, слово диапазона, «в плюсе / в минусе», эквити без метки
-    и термины к нему не применяются
+    утверждения о сопернике, слово диапазона, эквити без метки и термины к нему не
+    применяются
     (`test_the_model_assessment_block_passes_claims_about_the_opponent_without_a_mark`).
     Проверяется только надёжное: числа — из того же `allowed`, что у ответа, после
     вырезки карт и позиций (`strip_card_tokens`;
     `test_an_invented_number_in_the_block_is_a_violation`,
     `test_card_and_position_tokens_in_the_block_are_not_numbers`); «лик» без расчёта
-    `leaks`, лучшая или правильная линия, «лучше было», «правильно было», GTO и слова
-    ошибки (`test_word_bans_hold_in_the_block`). Каждое нарушение начинается с
+    `leaks`, лучшая линия теми же оборотами, что у ответа, но на любой улице
+    («следовало», «надо было», GTO…), вывод о прибыльности («в плюсе», «в минусе»,
+    «окупается») и слова ошибки (`test_word_bans_hold_in_the_block`). Каждое нарушение начинается с
     «блок «Оценка модели»» (`test_the_block_violations_name_the_block`).
     """
     text = assumption.strip()
@@ -1084,8 +1087,16 @@ def check_agent_assumption(
     if invented:
         found.append(f"числа не из расчёта и не из разбора — {invented}")
     for sentence in _SENTENCE_RE.findall(text):
-        if _ASSUMPTION_BEST_LINE_RE.search(sentence):
+        # Лучшая линия — `_BEST_LINE_RE` целиком и на любой улице: блок о диапазоне
+        # соперника, не о линии героя (решение контроллера по ревью Task 12).
+        if _BEST_LINE_RE.search(sentence):
             found.append(f"лучшая линия — «{sentence.strip()}»")
+        # Вердикт о прибыльности — в ответе, где он сверяется с порогом.
+        if _PROFIT_RE.search(sentence):
+            found.append(
+                "вывод о прибыльности («в плюсе», «в минусе», «окупается») — его место в "
+                f"ответе, где он сверяется с порогом — «{sentence.strip()}»"
+            )
     if _LEAK_RE.search(text) and not leaks_called:
         found.append("слово «лик» без расчёта leaks")
     errors = error_words_in(text)

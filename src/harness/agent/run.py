@@ -51,8 +51,11 @@ REWRITE_HEAD = "Ответ не прошёл проверку:"
 
 
 # Разделитель блока «Оценка модели» в ответе простым текстом: в начале строки,
-# регистр не важен.
-_ASSUMPTION_SEPARATOR_RE = re.compile(r"^[ \t]*оценка модели:", re.IGNORECASE | re.MULTILINE)
+# регистр не важен; разметка markdown вокруг («**…:**», «> », «## ») не мешает
+# (`test_a_markdown_separator_also_splits_the_text`).
+_ASSUMPTION_SEPARATOR_RE = re.compile(
+    r"^[ \t\u00a0*_#>]*оценка модели[*_]*:[*_]*", re.IGNORECASE | re.MULTILINE
+)
 
 
 class AgentDraft(ModelOutput, BaseModel):

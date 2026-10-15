@@ -176,9 +176,10 @@ def seen_history(
       (`test_the_saved_history_keeps_no_rejected_draft_and_no_rewrite_request`,
       `test_a_rejected_text_draft_is_not_saved_and_the_text_rewrite_is`,
       `test_a_text_draft_and_a_tool_rewrite_mix`);
-    * `final_answer` — текст, который игрок получил вместо прозы (состояния
-      «числа» и «отказ»), подменяет последний ответ; `None` — проза прошла и
-      остаётся как есть
+    * `final_answer` — текст, который игрок получил вместо ответа модели
+      (состояния «числа» и «отказ»; проза без выброшенного блока «Оценка модели»
+      — `AgentTurn.saved_messages`), подменяет последний ответ; `None` — ответ
+      прошёл и остаётся как есть
       (`test_a_refused_answer_is_saved_as_the_refusal_the_player_saw`,
       `test_a_refused_text_answer_is_saved_as_the_refusal_the_player_saw`).
     """

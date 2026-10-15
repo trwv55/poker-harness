@@ -998,7 +998,7 @@ async def test_a_refused_narrowing_reaches_the_model_and_spends_no_calculation(
 
 # --- Task 12: блок «Оценка модели» (решение владельца 2026-10-15) -----------------
 
-_BLOCK = "BB держит пары и сбросит слабое на тёрне; против такого диапазона ставка в плюсе."
+_BLOCK = "BB держит пары и сбросит слабое на тёрне; против такого диапазона у вас 100.0% раздач."
 _BAD_BLOCK = "BB держит пары, эквити против них 55%."
 
 
@@ -1007,6 +1007,14 @@ def test_text_with_the_separator_splits_into_answer_and_block():
     assert draft.answer == _GOOD and draft.assumption == _BLOCK
     same_line = AgentDraft.from_text(f"{_GOOD}\nОценка модели: {_BLOCK}")
     assert same_line.answer == _GOOD and same_line.assumption == _BLOCK
+
+
+@pytest.mark.parametrize(
+    "separator", ["**Оценка модели:**", "**Оценка модели**:", "> Оценка модели:", "## Оценка модели:"]
+)
+def test_a_markdown_separator_also_splits_the_text(separator: str):
+    draft = AgentDraft.from_text(f"{_GOOD}\n{separator}\n{_BLOCK}")
+    assert draft.answer == _GOOD and draft.assumption == _BLOCK
 
 
 def test_text_without_the_separator_at_a_line_start_is_all_answer():
