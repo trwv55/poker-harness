@@ -37,6 +37,7 @@ fixtures/hh/
 # eval-датасет и промпты: ров продукта, см. docs/publishing-policy.md
 evals/vision/
 evals/e2e/
+evals/agent/
 src/harness/parsers/prompts/
 src/harness/explanation/prompts/
 src/harness/agent/prompts/
