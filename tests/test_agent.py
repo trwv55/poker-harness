@@ -1250,3 +1250,56 @@ async def test_a_stored_row_with_thinking_loads_without_it(db_factory):
         script = _TurnScript([([], "Те же 100.0% (2 из 2).")], as_text={0})
         turn = await _turn(db_factory, session, script, scope=scope, history=loaded)
     assert turn.state == "prose" and not script.thinking_seen
+
+
+def _strictly_alternates(messages) -> bool:
+    """Запрос, ответ, запрос, … — двух запросов подряд нет: внутри такой истории
+    библиотеке склеивать нечего, и её длина — та, с которой начинается ход."""
+    return all(
+        isinstance(m, ModelRequest if i % 2 == 0 else ModelResponse) for i, m in enumerate(messages)
+    )
+
+
+async def test_dropped_thinking_only_answers_do_not_shift_the_start_of_the_turn(db_factory):
+    """Два ответа из одного рассуждения посреди строки и один в конце: запросы,
+    оставшиеся подряд, склеены, а последний ход, оставшийся без ответа, ушёл целиком
+    (иначе библиотека склеила бы его реплику с новой) — длина истории та же, что у
+    библиотеки, начало хода не съезжает, и отвергнутый черновик хода не сохраняется."""
+    old = [
+        ModelRequest(parts=[UserPromptPart("первый вопрос")]),
+        ModelResponse(parts=[ToolCallPart("hero_frequency", {"stat": "vpip"}, tool_call_id="c1")]),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    "hero_frequency",
+                    "выход-синт",
+                    tool_call_id="c1",
+                    metadata={"calc": "hero_frequency", "allowed": [100.0, 2.0]},
+                )
+            ]
+        ),
+        ModelResponse(parts=[ThinkingPart(_THINKING), TextPart("Первый ответ.")]),
+        ModelRequest(parts=[UserPromptPart("второй вопрос")]),
+        ModelResponse(parts=[ThinkingPart(_THINKING)]),
+        ModelRequest(parts=[UserPromptPart("третий вопрос")]),
+        ModelResponse(parts=[ThinkingPart(_THINKING)]),
+        ModelRequest(parts=[UserPromptPart("четвёртый вопрос")]),
+        ModelResponse(parts=[ThinkingPart(_THINKING), TextPart("Четвёртый ответ.")]),
+        ModelRequest(parts=[UserPromptPart("пятый вопрос")]),
+        ModelResponse(parts=[ThinkingPart(_THINKING)]),
+    ]
+    loaded = load_history(ModelMessagesTypeAdapter.dump_python(old, mode="json"))
+    assert not _has_thinking(loaded) and _strictly_alternates(loaded) and len(loaded) == 6
+    assert "пятый вопрос" not in _stored_text(loaded)
+    bad = "Вы входите в 43.0% раздач."
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8182)
+        script = _TurnScript([([], bad), ([], "Те же 100.0% (2 из 2).")], as_text={0, 1})
+        turn = await _turn(db_factory, session, script, scope=scope, history=loaded)
+        assert turn.state == "prose" and turn.history_len == len(loaded)
+        start = turn.messages[turn.history_len]
+        assert isinstance(start, ModelRequest) and _stored_text([start]) == "вопрос"
+        saved = turn.saved_messages(None)
+    stored = _stored_text(saved)
+    assert "43.0" not in stored and REWRITE_HEAD not in stored and "Те же 100.0%" in stored
+    assert _strictly_alternates(saved)

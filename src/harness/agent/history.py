@@ -25,6 +25,7 @@ from pydantic_ai.messages import (
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
+    RetryPromptPart,
     TextPart,
     ThinkingPart,
     ToolCallPart,
@@ -68,16 +69,38 @@ def _without_thinking(messages: Sequence[ModelMessage]) -> list[ModelMessage]:
     рассуждения из истории провайдер отвергает (400). Ответ, в котором кроме
     рассуждения ничего не было, уходит целиком: вызовов в нём нет, выходов
     расчётов на него тоже
-    (`test_a_stored_row_with_thinking_loads_without_it`)."""
+    (`test_a_stored_row_with_thinking_loads_without_it`).
+
+    Запросы, оставшиеся подряд из-за такого ответа, склеиваются здесь, как их склеила бы
+    библиотека при запуске: иначе длина переданной
+    истории не совпала бы с местом, где в `all_messages()` начинается ход, и
+    `seen_history` сохранил бы начало хода нечищеным. По той же причине уходит
+    целиком последний ход, если ответ из одного рассуждения стоял в самом конце
+    (`test_dropped_thinking_only_answers_do_not_shift_the_start_of_the_turn`)."""
     kept: list[ModelMessage] = []
+    dropped = False
     for message in messages:
         if isinstance(message, ModelResponse):
             parts = [part for part in message.parts if not isinstance(part, ThinkingPart)]
-            if not parts:
+            dropped = not parts
+            if dropped:
                 continue
             if len(parts) != len(message.parts):
                 message = dataclasses.replace(message, parts=parts)
+        elif dropped and kept and isinstance(previous := kept[-1], ModelRequest):
+            merged = sorted(
+                [*previous.parts, *message.parts],
+                key=lambda part: not isinstance(part, ToolReturnPart | RetryPromptPart),
+            )
+            kept[-1] = dataclasses.replace(
+                message, parts=merged, instructions=previous.instructions or message.instructions
+            )
+            continue
         kept.append(message)
+    if dropped:
+        # История кончилась ответом из одного рассуждения: ход остался без ответа,
+        # и его реплику библиотека склеила бы с новой. Ход уходит целиком (`turns`).
+        kept = [m for turn in turns(kept)[:-1] for m in turn]
     return kept
 
 
