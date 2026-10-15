@@ -26,6 +26,7 @@ from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
     TextPart,
+    ThinkingPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -61,8 +62,29 @@ _BYTES_PER_TOKEN = 3
 _CALC_TOOLS = frozenset(name.value for name in CalcName)
 
 
+def _without_thinking(messages: Sequence[ModelMessage]) -> list[ModelMessage]:
+    """Сообщения без рассуждений модели. Подпись рассуждения привязана к системному
+    промпту и инструментам, а инструкции агента меняются от хода к ходу — повтор
+    рассуждения из истории провайдер отвергает (400). Ответ, в котором кроме
+    рассуждения ничего не было, уходит целиком: вызовов в нём нет, выходов
+    расчётов на него тоже
+    (`test_a_stored_row_with_thinking_loads_without_it`)."""
+    kept: list[ModelMessage] = []
+    for message in messages:
+        if isinstance(message, ModelResponse):
+            parts = [part for part in message.parts if not isinstance(part, ThinkingPart)]
+            if not parts:
+                continue
+            if len(parts) != len(message.parts):
+                message = dataclasses.replace(message, parts=parts)
+        kept.append(message)
+    return kept
+
+
 def load_history(raw: list[dict[str, Any]] | None) -> list[ModelMessage]:
-    return ModelMessagesTypeAdapter.validate_python(raw) if raw else []
+    """История вечера из строки — без рассуждений (`_without_thinking`): строки,
+    сохранённые прежним кодом, могли их содержать."""
+    return _without_thinking(ModelMessagesTypeAdapter.validate_python(raw)) if raw else []
 
 
 def _bare(messages: Sequence[ModelMessage]) -> list[ModelMessage]:
@@ -162,7 +184,9 @@ def seen_history(
     ответ модели на ход — тот, что ушёл игроку.
 
     `messages[:start]` — история вечера, уже прошедшая эту чистку, берётся как
-    есть. В сообщениях хода (`messages[start:]`) ответ модели — вызов вывода
+    есть, кроме рассуждений: их в сохранённой истории нет ни в одном ответе
+    (`_without_thinking`,
+    `test_no_thinking_is_saved_on_any_path_and_the_next_turn_gets_none`). В сообщениях хода (`messages[start:]`) ответ модели — вызов вывода
     или ответ простым текстом без вызовов (`_answer`), и:
 
     * ответы модели сводятся к вызовам расчётов и последнему ответу — текст и
@@ -222,7 +246,7 @@ def seen_history(
         ]
         if request_parts:
             kept.append(dataclasses.replace(message, parts=request_parts))
-    return kept
+    return _without_thinking(kept)
 
 
 def _metadata(messages: Sequence[ModelMessage]) -> list[dict[str, Any]]:

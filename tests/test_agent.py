@@ -80,12 +80,15 @@ class _TurnScript:
         chatter: bool = False,
         as_text: Collection[int] = (),
         assumptions: dict[int, str] | None = None,
+        think: bool = False,
     ) -> None:
         """`chatter` — модель пишет текст рядом с вызовом вывода, как живые
         провайдеры («Итак: …»); `FunctionModel` сам этого не делает.
         `as_text` — номера прогонов, в которых модель отвечает простым текстом,
         а не вызовом вывода (живая модель с `tool_choice: auto` делает и так,
-        и так); такой ответ идёт с рассуждением рядом."""
+        и так); такой ответ идёт с рассуждением рядом. `think` — рассуждение
+        в каждом ответе модели, и в вызовах тоже, как у живой модели с thinking.
+        `thinking_seen` — модели пришло рассуждение из истории."""
         self.runs = runs
         self.chatter = chatter
         self.as_text = frozenset(as_text)
@@ -95,8 +98,19 @@ class _TurnScript:
         self.requests = 0
         self.instructions: list[str] = []
         self.returns: list[str] = []
+        self.think = think
+        self.thinking_seen = False
 
     def __call__(self, messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        self.thinking_seen |= any(
+            isinstance(part, ThinkingPart) for message in messages for part in message.parts
+        )
+        response = self._respond(messages, info)
+        if self.think and not any(isinstance(p, ThinkingPart) for p in response.parts):
+            response = ModelResponse(parts=[ThinkingPart(_THINKING), *response.parts])
+        return response
+
+    def _respond(self, messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         self.requests += 1
         self.instructions.append(info.instructions or "")
         self.returns = [
@@ -1175,3 +1189,64 @@ async def test_a_failed_answer_with_a_good_block_is_numbers_without_prose(db_fac
         turn = await _turn(db_factory, session, script, scope=scope)
     assert turn.state == "numbers" and turn.prose is None and turn.assumption is None
     assert turn.journal()["assumption"] is None
+
+
+# --- рассуждения в истории: подпись привязана к системному промпту и инструментам -----
+
+
+def _has_thinking(messages) -> bool:
+    return any(isinstance(part, ThinkingPart) for message in messages for part in message.parts)
+
+
+async def test_no_thinking_is_saved_on_any_path_and_the_next_turn_gets_none(db_factory):
+    """Рассуждение в каждом ответе: у вызова расчёта, у отвергнутого черновика текстом,
+    у переписанного вывода — и в истории вечера, пришедшей со старой строки."""
+    stale = [
+        ModelRequest(parts=[UserPromptPart("прошлый вопрос")]),
+        ModelResponse(parts=[ThinkingPart(_THINKING), TextPart("Прошлый ответ.")]),
+    ]
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8180)
+        script = _TurnScript(
+            [([_VPIP], "Вы входите в 43.0% раздач."), ([], _GOOD)], as_text={0}, think=True
+        )
+        turn = await _turn(db_factory, session, script, scope=scope, history=stale)
+        assert turn.state == "prose"
+        saved = load_history(dump_history(turn.saved_messages(None)))
+        assert not _has_thinking(turn.saved_messages(None)) and _alternates(saved)
+        assert _GOOD in _stored_text(saved) and "Прошлый ответ." in _stored_text(saved)
+        nxt_script = _TurnScript([([], "Те же 100.0% (2 из 2).")], as_text={0}, think=True)
+        nxt = await _turn(db_factory, session, nxt_script, scope=scope, history=saved)
+    assert nxt.state == "prose" and not nxt_script.thinking_seen
+    assert not _has_thinking(nxt.saved_messages(None))
+
+
+async def test_a_stored_row_with_thinking_loads_without_it(db_factory):
+    """Строка, сохранённая старым кодом: рассуждение рядом с вызовом и с текстом и
+    ответ из одного рассуждения — без рассуждений, пустой ответ уходит целиком."""
+    call = ToolCallPart("hero_frequency", {"stat": "vpip"}, tool_call_id="c1")
+    old = [
+        ModelRequest(parts=[UserPromptPart("первый вопрос")]),
+        ModelResponse(parts=[ThinkingPart(_THINKING, signature="подпись-синт"), call]),
+        ModelRequest(parts=[ToolReturnPart(
+            "hero_frequency", "выход-синт", tool_call_id="c1",
+            metadata={"calc": "hero_frequency", "allowed": [100.0, 2.0]},
+        )]),
+        ModelResponse(parts=[ThinkingPart(_THINKING), TextPart("Первый ответ.")]),
+        ModelRequest(parts=[UserPromptPart("второй вопрос")]),
+        ModelResponse(parts=[ThinkingPart(_THINKING)]),
+        ModelRequest(parts=[UserPromptPart("третий вопрос")]),
+        ModelResponse(parts=[ThinkingPart(_THINKING), TextPart("Третий ответ.")]),
+    ]
+    raw = ModelMessagesTypeAdapter.dump_python(old, mode="json")
+    loaded = load_history(raw)
+    assert not _has_thinking(loaded) and _alternates(loaded)
+    assert all(message.parts for message in loaded)
+    assert [p.tool_call_id for m in loaded for p in m.parts if isinstance(p, ToolCallPart)] == ["c1"]
+    assert [p.tool_call_id for m in loaded for p in m.parts if isinstance(p, ToolReturnPart)] == ["c1"]
+    assert sum(isinstance(m, ModelResponse) for m in loaded) == 3
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8181)
+        script = _TurnScript([([], "Те же 100.0% (2 из 2).")], as_text={0})
+        turn = await _turn(db_factory, session, script, scope=scope, history=loaded)
+    assert turn.state == "prose" and not script.thinking_seen
