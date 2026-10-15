@@ -290,7 +290,8 @@ def live_at(hand: CanonicalHand, street: Street) -> list[str]:
     раньше, в том числе на этой же улице, выбыли
     (`test_preflop_equity_counts_the_players_at_the_hero_decision`,
     `test_a_third_player_folding_before_the_hero_decision_leaves_a_heads_up_flop`).
-    Хода у героя на улице нет — отказ."""
+    Хода у героя на улице нет — отказ
+    (`test_no_hero_turn_on_the_street_is_no_decision_point`)."""
     turns = [
         i for i, a in enumerate(hand.actions)
         if a.street is street and a.label == hand.hero_label

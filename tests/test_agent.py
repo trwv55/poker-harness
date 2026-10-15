@@ -411,7 +411,34 @@ async def test_a_long_system_prompt_does_not_eat_the_history_budget(db_factory):
 
 
 def _stored_text(messages) -> str:
-    return ModelMessagesTypeAdapter.dump_json(list(messages)).decode()
+    """Тексты частей сохранённых сообщений — реплики, вызовы с аргументами, выходы
+    расчётов, рассуждения. Без меток времени: в JSON всего сообщения «43.0» находилось
+    в секундах метки, и проверки «числа нет» падали через раз."""
+    chunks: list[str] = []
+    for message in messages:
+        for part in message.parts:
+            if isinstance(part, ToolCallPart):
+                chunks.append(part.args_as_json_str())
+            elif isinstance(part, ToolReturnPart):
+                chunks.append(part.model_response_str())
+            elif isinstance(part, UserPromptPart):
+                content = part.content
+                chunks.append(content if isinstance(content, str) else " ".join(map(str, content)))
+            elif isinstance(part, TextPart | ThinkingPart):
+                chunks.append(part.content)
+            else:
+                chunks.append(str(getattr(part, "content", "")))
+    return "\n".join(chunks)
+
+
+def test_the_stored_text_ignores_timestamps():
+    """Флейк из финального ревью: метка времени с секундами 43.0… не число ответа."""
+    from datetime import UTC, datetime
+
+    stamp = datetime(2026, 1, 1, 0, 0, 43, 5, tzinfo=UTC)
+    message = ModelResponse(parts=[TextPart(_GOOD)], timestamp=stamp)
+    assert "43.0" in ModelMessagesTypeAdapter.dump_json([message]).decode()
+    assert "43.0" not in _stored_text([message]) and _GOOD in _stored_text([message])
 
 
 async def test_the_saved_history_keeps_no_rejected_draft_and_no_rewrite_request(db_factory):
@@ -1091,6 +1118,53 @@ async def test_a_block_fixed_by_the_rewrite_is_shown(db_factory):
         turn = await _turn(db_factory, session, script, scope=scope)
     assert turn.state == "prose" and turn.assumption == _BLOCK
     assert turn.journal()["assumption_dropped"] is False
+
+
+@pytest.mark.parametrize("second_block", [None, _BLOCK], ids=["no-block", "good-block"])
+async def test_a_failed_rewrite_keeps_the_first_answer_without_the_block(db_factory, second_block):
+    """Решение контроллера по финальному ревью: в первом черновике прошёл ответ, не
+    прошёл только блок, а переписанный ответ не прошёл — игрок получает ответ первого
+    черновика без блока, а не числа без прозы; история — показанное."""
+    bad = "Вы входите в 43.0% раздач."
+    assumptions = {0: _BAD_BLOCK} | ({1: second_block} if second_block else {})
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8167 + (second_block is not None))
+        script = _TurnScript([([_VPIP], _GOOD), ([], bad)], assumptions=assumptions)
+        turn = await _turn(db_factory, session, script, scope=scope)
+        assert turn.state == "prose" and turn.prose == _GOOD and turn.assumption is None
+        assert len(turn.violations) == 2 and turn.violations[1]
+        journal = turn.journal()
+        assert journal["answer"] == _GOOD
+        assert journal["assumption"] is None and journal["assumption_dropped"] is True
+        assert len(journal["drafts"]) == 2
+        saved = load_history(dump_history(turn.saved_messages(None)))
+        stored = _stored_text(saved)
+        assert stored.count(_GOOD) == 1 and "43.0" not in stored
+        assert "эквити против них" not in stored and "Оценка модели" not in stored
+        assert "сбросит слабое" not in stored
+        assert REWRITE_HEAD not in stored and _alternates(saved)
+        nxt = await _turn(
+            db_factory, session, _TurnScript([([], "Те же 100.0% (2 из 2).")]),
+            scope=scope, history=saved,
+        )
+    assert nxt.state == "prose"
+
+
+_OTHER_GOOD = "Раздач, где вы входите в банк, 100.0% (2 из 2)."
+
+
+async def test_a_rewrite_that_passes_fully_replaces_the_first_answer(db_factory):
+    """Переписанный черновик прошёл целиком — показывается он, с блоком."""
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8169)
+        script = _TurnScript(
+            [([_VPIP], _GOOD), ([], _OTHER_GOOD)], assumptions={0: _BAD_BLOCK, 1: _BLOCK}
+        )
+        turn = await _turn(db_factory, session, script, scope=scope)
+    assert turn.state == "prose" and turn.prose == _OTHER_GOOD and turn.assumption == _BLOCK
+    assert turn.journal()["assumption_dropped"] is False
+    stored = _stored_text(load_history(dump_history(turn.saved_messages(None))))
+    assert _OTHER_GOOD in stored and _BLOCK in stored and _GOOD not in stored
 
 
 async def test_a_failed_answer_with_a_good_block_is_numbers_without_prose(db_factory):

@@ -18,6 +18,7 @@ from harness.analysis.opponent_range import (
     RangeRefused,
     board_at,
     equity_spot,
+    live_at,
     live_combos,
     narrow,
     range_spot,
@@ -303,6 +304,19 @@ def test_a_third_player_folding_before_the_hero_decision_leaves_a_heads_up_flop(
     ]
     spot = equity_spot(_hand(actions), "CO", Street.FLOP, "AA")
     assert spot.start.spot.line == "open_raise"
+
+
+def test_no_hero_turn_on_the_street_is_no_decision_point():
+    """Герой пошёл олл-ин на префлопе: на флопе хода у него нет — точки решения нет,
+    отказ словами, а не места с префлопа."""
+    actions = [
+        _fold(P, "P1"), _fold(P, "P2"), _fold(P, "P3"), _raise(P, "Hero", _STACK),
+        _fold(P, "P5"), _call(P, "P6", _STACK - 100),
+    ]
+    hand = _hand(actions)
+    assert "Hero" in live_at(hand, Street.PREFLOP)
+    with pytest.raises(RangeRefused, match="точки решения нет"):
+        live_at(hand, Street.FLOP)
 
 
 def test_three_players_at_the_hero_preflop_decision_are_multiway():

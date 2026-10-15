@@ -12,7 +12,7 @@
 (`test_a_chart_range_sentence_needs_no_mark`,
 `test_the_prompt_range_paragraph_passes_with_its_numbers_and_marks`); число не из
 этого выхода пересказом не делает
-(`test_a_chart_word_with_a_number_not_from_the_chart_needs_the_mark`). Другие
+(`test_a_chart_word_with_a_number_not_from_the_chart_needs_the_mark`).
 Слово сравнения или сужения («уже», «шире», «сужен», «урезан», «меньше чарта»,
 «реальный диапазон») в этом придаточном исключение снимает
 (`test_a_narrowing_word_in_the_chart_clause_needs_the_mark`). Другие
@@ -618,6 +618,20 @@ _BEST_LINE_RE = re.compile(
     r"|(?<![A-Za-z])GTO(?![A-Za-z])|(?<![А-Яа-яЁё])ГТО(?![А-Яа-яЁё])",
     re.IGNORECASE,
 )
+# Словарь блока «Оценка модели» сверх оборотов ответа (решение контроллера по
+# финальному ревью): синонимы вывода о прибыльности и вердикта линии. Только для
+# блока — в ответе вывод о прибыльности сверяется с порогом (`_PROFIT_RE`).
+_BLOCK_PROFIT_RE = re.compile(
+    r"выгодн[а-яё]*|прибыльн[а-яё]*|убыточн[а-яё]*"
+    r"|(?<![A-Za-z0-9])[+\-−–]\s?EV(?![A-Za-z])|в\s+плюс\s+по\s+EV(?![A-Za-z])",
+    re.IGNORECASE,
+)
+_BLOCK_LINE_RE = re.compile(
+    _W + r"лучше\s+(?:чек|став|постав|колл|сброс|сбрасыв|фолд)[а-яё]*"
+    r"|" + _W + r"было\s+(?:не)?(?:верн|правильн)[а-яё]*"
+    r"|" + _W + r"(?:не)?(?:верн|правильн)[а-яё]*\s+решени[а-яё]*",
+    re.IGNORECASE,
+)
 # Вывод о прибыльности: голый — только по решённому порогу в разговоре.
 _PROFIT_RE = re.compile(_W + r"в\s+(?:плюсе|минусе)(?![а-яё])|окуп[а-яё]*", re.IGNORECASE)
 _PROFIT_CONDITION_RE = re.compile(
@@ -1076,8 +1090,14 @@ def check_agent_assumption(
     `test_card_and_position_tokens_in_the_block_are_not_numbers`); «лик» без расчёта
     `leaks`, лучшая линия теми же оборотами, что у ответа, но на любой улице
     («следовало», «надо было», GTO…), вывод о прибыльности («в плюсе», «в минусе»,
-    «окупается») и слова ошибки (`test_word_bans_hold_in_the_block`). Каждое нарушение начинается с
-    «блок «Оценка модели»» (`test_the_block_violations_name_the_block`).
+    «окупается») и слова ошибки (`test_word_bans_hold_in_the_block`); сверх оборотов
+    ответа — «выгодн-», «прибыльн-», «убыточн-», «+EV», «-EV», «в плюс по EV», «лучше»
+    с глаголом линии («чекать», «ставить», «коллировать», «сбросить», «фолдить»),
+    «было верно / правильно», «верное / правильное решение»
+    (`test_profit_and_line_verdict_synonyms_are_banned_in_the_block`). Словарь не полон:
+    другие формулировки вердикта и число словами («тридцати процентов») проходят — их
+    ловит судья (`test_a_number_written_in_words_is_a_known_gap_of_the_block`). Каждое
+    нарушение начинается с «блок «Оценка модели»» (`test_the_block_violations_name_the_block`).
     """
     text = assumption.strip()
     found: list[str] = []
@@ -1089,13 +1109,13 @@ def check_agent_assumption(
     for sentence in _SENTENCE_RE.findall(text):
         # Лучшая линия — `_BEST_LINE_RE` целиком и на любой улице: блок о диапазоне
         # соперника, не о линии героя (решение контроллера по ревью Task 12).
-        if _BEST_LINE_RE.search(sentence):
+        if _BEST_LINE_RE.search(sentence) or _BLOCK_LINE_RE.search(sentence):
             found.append(f"лучшая линия — «{sentence.strip()}»")
         # Вердикт о прибыльности — в ответе, где он сверяется с порогом.
-        if _PROFIT_RE.search(sentence):
+        if _PROFIT_RE.search(sentence) or _BLOCK_PROFIT_RE.search(sentence):
             found.append(
-                "вывод о прибыльности («в плюсе», «в минусе», «окупается») — его место в "
-                f"ответе, где он сверяется с порогом — «{sentence.strip()}»"
+                "вывод о прибыльности («в плюсе», «окупается», «выгодно», «+EV»…) — его "
+                f"место в ответе, где он сверяется с порогом — «{sentence.strip()}»"
             )
     if _LEAK_RE.search(text) and not leaks_called:
         found.append("слово «лик» без расчёта leaks")

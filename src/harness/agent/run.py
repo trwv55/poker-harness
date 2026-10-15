@@ -128,8 +128,9 @@ class AgentTurn:
     history_len: int = 0
     rewrite_at: int | None = None
     # Блок «Оценка модели», который игрок увидит; `assumption_dropped` — блок был в
-    # последнем черновике, а игрок его не увидит
-    # (`test_a_block_that_fails_twice_is_dropped_and_the_answer_is_shown`).
+    # последнем черновике (или в первом, чей ответ показан), а игрок его не увидит
+    # (`test_a_block_that_fails_twice_is_dropped_and_the_answer_is_shown`,
+    # `test_a_failed_rewrite_keeps_the_first_answer_without_the_block`).
     assumption: str | None = None
     assumption_dropped: bool = False
 
@@ -262,7 +263,12 @@ async def run_agent_turn(
     (`test_one_rewrite_then_numbers_without_prose`). Нарушения блока «Оценка
     модели» идут в тот же список и в ту же одну попытку переписать; не прошёл
     дважды только блок — проза без блока
-    (`test_a_block_that_fails_twice_is_dropped_and_the_answer_is_shown`). `analysis_id` — указатель
+    (`test_a_block_that_fails_twice_is_dropped_and_the_answer_is_shown`). В первом
+    черновике прошёл ответ и не прошёл только блок, а переписанный ответ не прошёл —
+    игрок получает ответ первого черновика без блока
+    (`test_a_failed_rewrite_keeps_the_first_answer_without_the_block`); переписанный
+    прошёл целиком — показывается он
+    (`test_a_rewrite_that_passes_fully_replaces_the_first_answer`). `analysis_id` — указатель
     разбора руки вечера для `opponent_range` и `equity_vs_range`; без него они
     отвечают отказом (`test_without_a_hand_analysis_the_range_tool_says_so`).
     """
@@ -296,6 +302,10 @@ async def run_agent_turn(
     found = answer_found + block_found
     violations: list[tuple[str, ...]] = [tuple(found)]
     prose: str | None = draft.answer.strip() if not found else None
+    # Ответ первого черновика, прошедший проверку, — запасной, если переписанный
+    # ответ не пройдёт, а в первом провалился только блок.
+    first_answer = draft.answer.strip() if not answer_found else None
+    fell_back = False
     drafts: list[str] = [draft.as_text()] if found or not grounded else []
 
     rewrite_at: int | None = None
@@ -312,7 +322,8 @@ async def run_agent_turn(
         answer_found, block_found = _draft_violations(draft, messages, context, said)
         second = answer_found + block_found
         violations.append(tuple(second))
-        prose = draft.answer.strip() if not answer_found else None
+        prose = draft.answer.strip() if not answer_found else first_answer
+        fell_back = bool(answer_found) and first_answer is not None
         if second:
             drafts.append(draft.as_text())
 
@@ -324,9 +335,10 @@ async def run_agent_turn(
     else:
         state = "numbers"
     # Блок показывается, только если прошёл сам и прошла проза; не прошёл только
-    # блок — проза идёт без него (решение владельца 2026-10-15).
+    # блок — проза идёт без него (решение владельца 2026-10-15). Проза взята из
+    # первого черновика — его блок не прошёл, а блок второго к ней не относится.
     block_text = draft.assumption.strip() if draft.assumption else None
-    assumption = block_text if state == "prose" and not block_found else None
+    assumption = block_text if state == "prose" and not block_found and not fell_back else None
     return AgentTurn(
         state=state,
         prose=prose,
@@ -340,5 +352,6 @@ async def run_agent_turn(
         history_len=len(history),
         rewrite_at=rewrite_at,
         assumption=assumption,
-        assumption_dropped=grounded and block_text is not None and assumption is None,
+        assumption_dropped=fell_back
+        or (grounded and block_text is not None and assumption is None),
     )
