@@ -1201,6 +1201,33 @@ def test_a_chart_fact_does_not_cover_a_prediction_in_the_same_sentence():
     )
 
 
+def test_a_chart_word_with_a_number_not_from_the_chart_needs_the_mark():
+    """Слово «чарт» и число не из выхода `opponent_range` — не пересказ чарта."""
+    other = _CHART | {12.5}
+    kw = {"allowed": other, "calc_numbers": other, "chart_numbers": _CHART}
+    assert any(
+        ASSUMPTION_MARK in v for v in _check("Диапазон BB по чарту — 12.5% рук.", **kw)
+    )
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "По чарту у BB 38.2% рук, он держит только сильные руки.",
+        "По чарту у BB 38.2% рук, но здесь его диапазон намного уже.",
+        "По чарту у BB 38.2% рук, а реальный рендж сужен до топа.",
+        "По чарту у BB 38.2% рук — его диапазон намного уже.",
+        "По чарту у BB 38.2% рук и он держит только сильные руки.",
+        "По чарту всё иначе, но его диапазон здесь 38.2% рук.",
+    ],
+)
+def test_the_chart_exemption_covers_only_the_clause_that_retells_the_chart(sentence):
+    """Исключение «чарт» — только для придаточного-пересказа; «держит» и слово
+    диапазона в другом придаточном требуют метки."""
+    kw = {"allowed": _CHART, "calc_numbers": _CHART, "chart_numbers": _CHART}
+    assert any(ASSUMPTION_MARK in v for v in _check(sentence, **kw))
+
+
 def test_an_equity_against_a_narrowed_range_needs_the_mark():
     """Эквити против суженного — допущение даже без слова «диапазон»."""
     eq = frozenset({31.4, 31.8})

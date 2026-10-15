@@ -6,12 +6,17 @@
 
 **Допущение — с меткой: механика узкая, остальное — судья.** Стартовый диапазон
 по чарту считает `opponent_range` (факт), эквити против суженного —
-`equity_vs_range` (допущение). Предложение со словом «чарт» и числом выхода
-`opponent_range` пересказывает чарт: слово диапазона и «чарт защиты» в нём метки не
-требуют (`test_a_chart_range_sentence_needs_no_mark`,
-`test_the_prompt_range_paragraph_passes_with_its_numbers_and_marks`), утверждение о
-сопернике рядом — требует
-(`test_a_chart_fact_does_not_cover_a_prediction_in_the_same_sentence`). Доля из
+`equity_vs_range` (допущение). Придаточное со словом «чарт» и числом выхода
+`opponent_range` (в нём или сразу после тире) пересказывает чарт: «диапазон»,
+«рендж» и «чарт защиты» в нём метки не требуют
+(`test_a_chart_range_sentence_needs_no_mark`,
+`test_the_prompt_range_paragraph_passes_with_its_numbers_and_marks`); число не из
+этого выхода пересказом не делает
+(`test_a_chart_word_with_a_number_not_from_the_chart_needs_the_mark`). Другие
+придаточные того же предложения проверяются как обычно: слово диапазона, «держит»
+и утверждение о сопернике там требуют метки
+(`test_a_chart_fact_does_not_cover_a_prediction_in_the_same_sentence`,
+`test_the_chart_exemption_covers_only_the_clause_that_retells_the_chart`). Доля из
 выхода `equity_vs_range` без «(допущение)» в том же предложении — нарушение, даже
 без слова диапазона (`test_an_equity_against_a_narrowed_range_needs_the_mark`).
 Кроме этого, код ловит два вида предложений без
@@ -268,6 +273,11 @@ _CHART_WORD_RE = re.compile(r"чарт", re.IGNORECASE)
 # «Чарт защиты» — имя чарта, а не действие соперника
 # (`test_the_prompt_range_paragraph_passes_with_its_numbers_and_marks`).
 _CHART_NAME_RE = re.compile(r"чарт[а-яё]*\s+защит[а-яё]*", re.IGNORECASE)
+# В придаточном-пересказе чарта вырезается только имя диапазона; «держ» — глагол о
+# том, что соперник держит, и остаётся (раунд ревью 1).
+_RANGE_NOUN_RE = re.compile(r"диапазон|рендж", re.IGNORECASE)
+_CLAUSE_PIECES_RE = re.compile(r"([,;:—–()])")
+_LEADING_NUMBER_RE = re.compile(r"\s*(" + r"\d+(?:[.,]\d+)?" + r")")
 _META_RANGE_RE = re.compile(
     r"(?:про|о|об)\s+(?:его\s+|их\s+)?(?:диапазон|рендж)[а-яё]*(?:\s+[^\s.,;:!?]+){0,2}?"
     r"\s+(?:мало|ничего\s+не|почти\s+ничего\s+не)\s+говорит"
@@ -432,13 +442,31 @@ def _opponent_clause(clause: str, hypothetical: bool, noun_locked: bool) -> bool
     return False
 
 
-def _chart_backed(sentence: str, chart_numbers: frozenset[float]) -> bool:
-    """Пересказ стартового диапазона из `opponent_range`: слово «чарт» и число
-    выхода этого расчёта (`test_a_chart_range_sentence_needs_no_mark`)."""
-    if not chart_numbers or not _CHART_WORD_RE.search(sentence):
-        return False
-    chart = {round(n, 1) for n in chart_numbers}
-    return any(round(n, 1) in chart for n in numbers_in(sentence))
+def _chart_clauses(rest: str, chart_numbers: frozenset[float]) -> str:
+    """Предложение, где в придаточном-пересказе чарта вырезаны имя диапазона и «чарт
+    защиты». Пересказ — придаточное со словом «чарт» и числом выхода `opponent_range`
+    в нём же или в начале следующего придаточного после тире или двоеточия («диапазон
+    BB по чарту — 38.2% рук»; `test_a_chart_range_sentence_needs_no_mark`,
+    `test_the_prompt_range_paragraph_passes_with_its_numbers_and_marks`). Число не из
+    этого выхода пересказом не делает
+    (`test_a_chart_word_with_a_number_not_from_the_chart_needs_the_mark`); остальные
+    придаточные проверяются как обычно
+    (`test_the_chart_exemption_covers_only_the_clause_that_retells_the_chart`)."""
+    if not chart_numbers or not _CHART_WORD_RE.search(rest):
+        return rest
+    pieces = _CLAUSE_PIECES_RE.split(rest)
+    # Чётные — придаточные, нечётные — разделители между ними.
+    for i in range(0, len(pieces), 2):
+        clause = pieces[i]
+        if not _CHART_WORD_RE.search(clause):
+            continue
+        backed = any(_in(str(n), chart_numbers) for n in numbers_in(clause))
+        if not backed and i + 2 < len(pieces) and pieces[i + 1] in "—–:":
+            lead = _LEADING_NUMBER_RE.match(pieces[i + 2])
+            backed = lead is not None and _in(lead.group(1), chart_numbers)
+        if backed:
+            pieces[i] = _RANGE_NOUN_RE.sub(" ", _CHART_NAME_RE.sub(" ", clause))
+    return "".join(pieces)
 
 
 def _assumed_share_in(sentence: str, assumed_numbers: frozenset[float]) -> bool:
@@ -458,20 +486,15 @@ def _opponent_claim(
     `test_a_range_word_needs_the_mark_by_default`) или придаточное с явным
     утверждением о сопернике
     (`test_a_claim_about_what_the_opponent_holds_or_does_needs_the_mark`).
-    Слово диапазона не в счёт, если в предложении «чарт» и число выхода
-    `opponent_range` (`chart_numbers`): это пересказ стартового диапазона по чарту
-    (`test_a_chart_range_sentence_needs_no_mark`), и «чарт защиты» в нём — имя
-    чарта, а не действие
-    (`test_the_prompt_range_paragraph_passes_with_its_numbers_and_marks`); утверждение о сопернике в том же
-    предложении метку по-прежнему требует
-    (`test_a_chart_fact_does_not_cover_a_prediction_in_the_same_sentence`).
+    «Диапазон», «рендж» и «чарт защиты» не в счёт только в придаточном, которое
+    пересказывает чарт (`_chart_clauses`); в остальных придаточных слово диапазона
+    и утверждение о сопернике метку по-прежнему требуют
+    (`test_a_chart_fact_does_not_cover_a_prediction_in_the_same_sentence`,
+    `test_the_chart_exemption_covers_only_the_clause_that_retells_the_chart`).
     Остальное — судья (спека №2)."""
-    rest = _strip_backed(sentence, calc_numbers, frequency_numbers)
-    if _chart_backed(sentence, chart_numbers):
-        # Слово диапазона — о чарте, а не догадка; прогноз о сопернике в том же
-        # предложении проверяется дальше как обычно
-        # (`test_a_chart_fact_does_not_cover_a_prediction_in_the_same_sentence`).
-        rest = _RANGE_WORD_RE.sub(" ", _CHART_NAME_RE.sub(" ", rest))
+    rest = _chart_clauses(
+        _strip_backed(sentence, calc_numbers, frequency_numbers), chart_numbers
+    )
     if _RANGE_WORD_RE.search(_HERO_HOLDS_RE.sub(" ", rest)):
         return True
     hypothetical = bool(_HYPOTHETICAL_RE.search(rest))
