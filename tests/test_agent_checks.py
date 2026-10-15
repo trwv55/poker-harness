@@ -1301,3 +1301,55 @@ def test_the_turn_checks_read_chart_and_assumed_numbers_from_history():
     ])]
     assert _violations("Стартовый диапазон BB по чарту — 38.2% рук.", messages, None, frozenset()) == []
     assert _violations("У вас 31.4%.", messages, None, frozenset()) != []
+
+
+# --- Task 12 §5: два ложных отказа живой приёмки (решение владельца 2026-10-15) ----
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Порог 23.9%: ставка окупается на одних фолдах, если BB сбрасывает чаще этого порога.",
+        "Порог 23.9%: ставка окупается на одних фолдах, если BB сбрасывает чаще.",
+    ],
+)
+def test_threshold_math_with_the_threshold_earlier_in_the_sentence_passes(text: str):
+    """Число порога стоит раньше в предложении, в придаточном «если BB сбрасывает
+    чаще (этого порога)» его нет: это арифметика порога, когда число — число
+    расчёта (порог сводки или `calc_numbers`)."""
+    calc = frozenset({23.9})
+    assert _check(text, allowed=calc, calc_numbers=calc) == []
+
+
+def test_threshold_math_without_a_calculation_number_is_still_a_violation():
+    """Без числа порога из расчёта в предложении та же форма — вывод о прибыльности и
+    утверждение о сопернике, как раньше."""
+    violations = _check("Ставка окупается на одних фолдах, если BB сбрасывает чаще.")
+    assert any(ASSUMPTION_MARK in v for v in violations)
+    assert any("окупается" in v for v in violations)
+    calc = frozenset({23.9})
+    other = frozenset({23.9, 40.0})
+    assert _check(
+        "Порог 40%: ставка окупается на одних фолдах, если BB сбрасывает чаще.",
+        allowed=other, calc_numbers=calc,
+    ) != []
+
+
+def test_a_condition_on_the_opponent_with_a_conclusion_about_the_hero_hand_passes():
+    """«Когда/если <соперник> <действие>, <вывод о руке героя>» — не утверждение о
+    сопернике: условие, а не прогноз."""
+    assert _check("Когда BB коллирует, рука не пустая.") == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Когда BB коллирует, он держит пару.",
+        "Когда BB коллирует, он сбросит на тёрне.",
+        "Когда BB коллирует с парой, рука не пустая.",
+    ],
+)
+def test_a_prediction_in_the_main_clause_after_a_condition_is_still_a_violation(text: str):
+    """Прогноз или рука соперника в главной части (или рука в условии) — по-прежнему
+    нарушение."""
+    assert any(ASSUMPTION_MARK in v for v in _check(text))

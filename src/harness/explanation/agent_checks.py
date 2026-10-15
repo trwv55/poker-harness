@@ -67,7 +67,17 @@
 между условием и действием опору разрывают
 (`test_threshold_math_after_a_profit_word_is_exempt_across_commas`,
 `test_live_threshold_math_about_the_bet_passes`,
-`test_a_hero_subject_or_another_clause_breaks_the_threshold_condition`).
+`test_a_hero_subject_or_another_clause_breaks_the_threshold_condition`). Порог,
+стоящий раньше в предложении о прибыльности долей из расчёта («Порог 23.9%: ставка
+окупается…, если BB сбрасывает чаще (этого порога)»), опирает такое условие и без
+числа в нём; без доли расчёта — нет
+(`test_threshold_math_with_the_threshold_earlier_in_the_sentence_passes`,
+`test_threshold_math_without_a_calculation_number_is_still_a_violation`). Условие
+«когда/если <соперник> <действие>» перед частью о руке или шансах героя («Когда BB
+коллирует, рука не пустая») — не утверждение; рука соперника в условии или прогноз
+в главной части — по-прежнему да
+(`test_a_condition_on_the_opponent_with_a_conclusion_about_the_hero_hand_passes`,
+`test_a_prediction_in_the_main_clause_after_a_condition_is_still_a_violation`).
 
 **«В плюсе», «в минусе», «окупается» — вывод только по порогу.** Голый вывод
 допустим, только когда в разговоре есть `frequency_vs_threshold` с выводом выше
@@ -383,11 +393,42 @@ def _backed(
     return infinitive and bool(_MODAL_RE.search(clause))
 
 
+# Порог раньше в предложении, в условии его нет (решение владельца 2026-10-15):
+# «Порог 23.9%: ставка окупается…, если BB сбрасывает чаще (этого порога).»
+_THRESHOLD_BACKREF_RE = re.compile(
+    _W + r"(?:если|когда)" + _WE + r"(?P<subject>[^.,;:!?—–()]*?)"
+    r"(?:сбрас|сда[её]т|сдаю|сдава|фолд)[а-яё]*\s+(?:чаще|реже)"
+    r"(?:\s+(?:этого|того|указанного)\s+порога|\s+порога|\s+него)?"
+    r"(?=\s*(?:[.!?]|$))",
+    re.IGNORECASE,
+)
+
+
+def _threshold_backref(sentence: str, calc_numbers: frozenset[float]) -> re.Match[str] | None:
+    """Условие «если <соперник> сбрасывает чаще (этого порога)» в предложении о
+    прибыльности, где раньше стоит доля из расчёта (порог сводки или
+    `calc_numbers`, не доля банка); между «если» и действием — только подлежащее
+    (`_condition_holds`). Иначе `None`
+    (`test_threshold_math_with_the_threshold_earlier_in_the_sentence_passes`,
+    `test_threshold_math_without_a_calculation_number_is_still_a_violation`)."""
+    if not _PROFIT_RE.search(sentence):
+        return None
+    for match in _THRESHOLD_BACKREF_RE.finditer(sentence):
+        if _condition_holds(match.group("subject")) and _calc_share_in(
+            sentence[: match.start()], calc_numbers
+        ):
+            return match
+    return None
+
+
 def _strip_backed(
     sentence: str, calc_numbers: frozenset[float], frequency_numbers: frozenset[float]
 ) -> str:
     """Предложение без того, что держится на расчёте, и без метаречи."""
     rest = _META_RANGE_RE.sub(" ", sentence)
+    backref = _threshold_backref(rest, calc_numbers)
+    if backref is not None:
+        rest = rest[: backref.start()] + " " + rest[backref.end():]
     changed = True
     while changed:
         changed = False
@@ -513,9 +554,48 @@ def _opponent_claim(
         return True
     hypothetical = bool(_HYPOTHETICAL_RE.search(rest))
     noun_locked = hypothetical or bool(_FUTURE_RE.search(rest))
+    clauses = _CLAUSE_SPLIT_RE.split(rest)
     return any(
         _opponent_clause(clause, hypothetical, noun_locked)
-        for clause in _CLAUSE_SPLIT_RE.split(rest)
+        for i, clause in enumerate(clauses)
+        if not (
+            not hypothetical
+            and i + 1 < len(clauses)
+            and _condition_on_opponent(clause)
+            and _about_hero_hand(clauses[i + 1])
+        )
+    )
+
+
+# Условие на действие соперника перед выводом о руке героя (решение владельца
+# 2026-10-15): «Когда BB коллирует, рука не пустая.» Узко: придаточное начинается с
+# «когда/если», в нём соперник и действие без руки; следующая часть — о руке или
+# шансах героя, без соперника, действия и руки словом.
+_CONDITION_START_RE = re.compile(r"\s*(?:когда|если)" + _WE, re.IGNORECASE)
+_HERO_HAND_RE = re.compile(
+    _W + r"(?:рук[аиуеой]*|ваш[а-яё]*|у\s+вас|шанс[а-яё]*|эквити|аут[а-яё]*)" + _WE,
+    re.IGNORECASE,
+)
+
+
+def _condition_on_opponent(clause: str) -> bool:
+    return (
+        bool(_CONDITION_START_RE.match(clause))
+        and bool(_OPPONENT_RE.search(clause))
+        and bool(_ACTION_RE.search(clause))
+        and not _HAND_RE.search(clause)
+    )
+
+
+def _about_hero_hand(clause: str) -> bool:
+    """Часть о руке или шансах героя
+    (`test_a_condition_on_the_opponent_with_a_conclusion_about_the_hero_hand_passes`,
+    `test_a_prediction_in_the_main_clause_after_a_condition_is_still_a_violation`)."""
+    return (
+        bool(_HERO_HAND_RE.search(clause))
+        and not _OPPONENT_RE.search(clause)
+        and not _ACTION_RE.search(clause)
+        and not _HAND_RE.search(clause)
     )
 
 
@@ -574,7 +654,12 @@ def _profit_arithmetic(sentence: str, calc_numbers: frozenset[float]) -> bool:
         c for c in clauses
         if re.match(r"\s*чтобы" + _WE, c, re.IGNORECASE) and _PROFIT_RE.search(c)
     ]
-    if not conditional and not (purpose and any(_calc_share_in(c, calc_numbers) for c in clauses)):
+    backed = (
+        conditional
+        or (purpose and any(_calc_share_in(c, calc_numbers) for c in clauses))
+        or _threshold_backref(sentence, calc_numbers) is not None
+    )
+    if not backed:
         return False
     return all(
         _PROFIT_RE.search(c)
