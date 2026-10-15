@@ -25,6 +25,7 @@ from harness.agent.history import (
     calcs_in_history,
     chart_numbers_in,
     frequency_numbers,
+    merged_requests,
     player_numbers,
     player_text_numbers,
     seen_history,
@@ -123,8 +124,9 @@ class AgentTurn:
     violations: tuple[tuple[str, ...], ...]
     calls: tuple[dict[str, Any], ...]
     drafts: tuple[str, ...] = ()
-    # Где в `messages` кончается история вечера и где лежит просьба переписать —
-    # по ним `saved_messages` чистит ход, не читая текст реплик.
+    # Где в `messages` начинается ход (реплика игрока; после попытки переписать она
+    # может быть склеена с выходом вывода прошлого хода) и где лежит просьба
+    # переписать — по ним `saved_messages` чистит ход, не читая текст реплик.
     history_len: int = 0
     rewrite_at: int | None = None
     # Блок «Оценка модели», который игрок увидит; `assumption_dropped` — блок был в
@@ -309,8 +311,14 @@ async def run_agent_turn(
     drafts: list[str] = [draft.as_text()] if found or not grounded else []
 
     rewrite_at: int | None = None
+    start = len(history)
     if grounded and found:
         request = _rewrite_request(found)
+        # Склеено заранее, как склеила бы библиотека (выход вывода прошлого хода и
+        # реплика этого стоят подряд): тогда она историю не меняет, и начало хода
+        # известно по месту (`history.merged_requests`).
+        start = len(merged_requests(messages[: start + 1])) - 1
+        messages = merged_requests(messages)
         first_len = len(messages)
         draft, meta = await llm(
             "agent", AgentDraft, prompt=request, tools=tools,
@@ -349,7 +357,7 @@ async def run_agent_turn(
         violations=tuple(violations),
         calls=tuple(run_state.calls),
         drafts=tuple(drafts),
-        history_len=len(history),
+        history_len=start,
         rewrite_at=rewrite_at,
         assumption=assumption,
         assumption_dropped=fell_back

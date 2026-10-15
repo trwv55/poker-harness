@@ -46,6 +46,7 @@ __all__ = [
     "estimate_tokens",
     "frequency_numbers",
     "load_history",
+    "merged_requests",
     "player_numbers",
     "player_text_numbers",
     "seen_history",
@@ -63,8 +64,35 @@ _BYTES_PER_TOKEN = 3
 _CALC_TOOLS = frozenset(name.value for name in CalcName)
 
 
+def _is_tool_result(part: object) -> bool:
+    return isinstance(part, ToolReturnPart | RetryPromptPart)
+
+
+def merged_requests(messages: Sequence[ModelMessage]) -> list[ModelMessage]:
+    """Запросы подряд — одним запросом, выходы инструментов впереди: так их склеивает
+    библиотека перед прогоном. Склеенная заранее история проходит через неё без
+    изменений, и её длина — то место, где в `all_messages()` начинается ход
+    (`test_the_start_of_the_turn_holds_from_the_third_turn_with_output_answers`).
+    Метаданные запросов не теряются: склейка библиотеки их бросает."""
+    kept: list[ModelMessage] = []
+    for message in messages:
+        previous = kept[-1] if kept else None
+        if isinstance(message, ModelRequest) and isinstance(previous, ModelRequest):
+            tags = {**(previous.metadata or {}), **(message.metadata or {})}
+            kept[-1] = dataclasses.replace(
+                message,
+                parts=sorted([*previous.parts, *message.parts], key=lambda p: not _is_tool_result(p)),
+                instructions=previous.instructions or message.instructions,
+                metadata=tags or None,
+            )
+            continue
+        kept.append(message)
+    return kept
+
+
 def _without_thinking(messages: Sequence[ModelMessage]) -> list[ModelMessage]:
-    """Сообщения без рассуждений модели. Подпись рассуждения привязана к системному
+    """Сообщения без рассуждений модели, в том виде, в каком их склеила бы
+    библиотека (`merged_requests`). Подпись рассуждения привязана к системному
     промпту и инструментам, а инструкции агента меняются от хода к ходу — повтор
     рассуждения из истории провайдер отвергает (400). Ответ, в котором кроме
     рассуждения ничего не было, уходит целиком: вызовов в нём нет, выходов
@@ -72,43 +100,34 @@ def _without_thinking(messages: Sequence[ModelMessage]) -> list[ModelMessage]:
     (`test_a_stored_row_with_thinking_loads_without_it`).
 
     Если такой ответ — последний ответ хода, ход игроку ничего не дал и уходит
-    целиком (`turns`), с вызовами и выходами расчётов: иначе запросы, оставшиеся
-    подряд, склеила бы библиотека, длина переданной истории не совпала бы с местом,
-    где в `all_messages()` начинается ход, а выход расчёта, склеенный с репликой
-    следующего хода, после обрезки встал бы в начало истории
+    целиком (`turns`), с вызовами и выходами расчётов: иначе выход расчёта,
+    склеенный с репликой следующего хода, после обрезки встал бы в начало истории
     (`test_dropped_thinking_only_answers_do_not_shift_the_start_of_the_turn`,
     `test_a_turn_ending_in_a_thinking_only_answer_leaves_no_orphan_tool_return`).
-    Запросы, оставшиеся подряд внутри хода, склеиваются, как их склеила бы
-    библиотека."""
+    Выходы инструментов прошлого хода, склеенные с репликой ушедшего хода,
+    остаются: их вызовы в истории."""
     kept: list[ModelMessage] = []
     for turn in turns(list(messages)):
         cleaned: list[ModelMessage] = []
-        dropped = False
         answered = True
         for message in turn:
             if isinstance(message, ModelResponse):
                 parts = [part for part in message.parts if not isinstance(part, ThinkingPart)]
                 answered = bool(parts)
-                dropped = not parts
-                if dropped:
+                if not parts:
                     continue
                 if len(parts) != len(message.parts):
                     message = dataclasses.replace(message, parts=parts)
-            elif dropped and cleaned and isinstance(previous := cleaned[-1], ModelRequest):
-                merged = sorted(
-                    [*previous.parts, *message.parts],
-                    key=lambda part: not isinstance(part, ToolReturnPart | RetryPromptPart),
-                )
-                cleaned[-1] = dataclasses.replace(
-                    message, parts=merged, instructions=previous.instructions or message.instructions
-                )
-                dropped = False
-                continue
-            dropped = False
             cleaned.append(message)
         if answered:
             kept.extend(cleaned)
-    return kept
+            continue
+        head = turn[0]
+        if isinstance(head, ModelRequest) and (
+            results := [part for part in head.parts if _is_tool_result(part)]
+        ):
+            kept.append(ModelRequest(parts=results))
+    return merged_requests(kept)
 
 
 def load_history(raw: list[dict[str, Any]] | None) -> list[ModelMessage]:
@@ -180,7 +199,14 @@ def trim_history(messages: Sequence[ModelMessage], max_tokens: int) -> list[Mode
     kept = turns(_bare(messages))
     while kept and estimate_tokens([m for turn in kept for m in turn]) > max_tokens:
         kept.pop(0)
-    return [m for turn in kept for m in turn]
+    result = [m for turn in kept for m in turn]
+    # Выходы прошлого хода, склеенные с репликой (`merged_requests`), без своего вызова
+    # провайдер отвергает: в начале истории их не бывает.
+    if result and isinstance(head := result[0], ModelRequest):
+        parts = [part for part in head.parts if not _is_tool_result(part)]
+        if len(parts) != len(head.parts):
+            result[0] = dataclasses.replace(head, parts=parts)
+    return result
 
 
 def _is_output_call(part: object) -> bool:

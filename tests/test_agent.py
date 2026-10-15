@@ -1343,3 +1343,34 @@ async def test_a_turn_ending_in_a_thinking_only_answer_leaves_no_orphan_tool_ret
     # Расчёт ушёл вместе с ходом: опоры нет, ход — отказ, но начало хода не съезжает.
     assert turn.state == "refusal" and turn.history_len == len(loaded)
     assert _stored_text([turn.messages[turn.history_len]]) == "вопрос"
+
+
+async def test_the_start_of_the_turn_holds_from_the_third_turn_with_output_answers(db_factory):
+    """Ответ вызовом вывода оставляет в конце хода запрос с его выходом; в истории
+    из двух таких ходов он стоит перед репликой следующего, и библиотека склеила
+    бы их — история стала бы короче, и начало хода съехало бы. Сохранённая история
+    уже склеена, перед попыткой переписать — тоже, поэтому начало хода не съезжает ни
+    на третьем ходе, ни при попытке переписать, отвергнутый черновик не
+    сохраняется, а обрезка не оставляет выход вывода в начале истории."""
+    bad = "Вы входите в 43.0% раздач."
+    history: list[ModelMessage] = []
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8189)
+        for index in range(3):
+            script = _TurnScript([([_VPIP], _GOOD)])
+            if index == 2:
+                script = _TurnScript([([_VPIP], bad), ([], _GOOD)])
+            turn = await _turn(
+                db_factory, session, script, scope=scope, history=history,
+                text=f"вопрос {index + 1}",
+            )
+            assert turn.state == "prose"
+            assert _stored_text([turn.messages[turn.history_len]]).endswith(f"вопрос {index + 1}")
+            history = load_history(dump_history(turn.saved_messages(None)))
+            assert _strictly_alternates(history) and len(turns(history)) == index + 1
+    stored = _stored_text(history)
+    assert "43.0" not in stored and REWRITE_HEAD not in stored
+    for budget in range(0, 3000, 50):
+        trimmed = trim_history(history, budget)
+        if trimmed:
+            assert not any(isinstance(p, ToolReturnPart) for p in trimmed[0].parts)
