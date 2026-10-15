@@ -25,6 +25,7 @@ from harness.agent.history import (
     calcs_in_history,
     chart_numbers_in,
     frequency_numbers,
+    hand_boundary,
     merged_requests,
     player_numbers,
     player_text_numbers,
@@ -129,6 +130,8 @@ class AgentTurn:
     # переписать — по ним `saved_messages` чистит ход, не читая текст реплик.
     history_len: int = 0
     rewrite_at: int | None = None
+    # Указатель разбора хода — им помечается реплика в сохранённой истории.
+    analysis_id: int | None = None
     # Блок «Оценка модели», который игрок увидит; `assumption_dropped` — блок был в
     # последнем черновике (или в первом, чей ответ показан), а игрок его не увидит
     # (`test_a_block_that_fails_twice_is_dropped_and_the_answer_is_shown`,
@@ -147,6 +150,7 @@ class AgentTurn:
             start=self.history_len,
             rewrite_at=self.rewrite_at,
             final_answer=final_answer,
+            analysis_id=self.analysis_id,
         )
 
     def journal(self) -> dict[str, Any]:
@@ -272,7 +276,8 @@ async def run_agent_turn(
     прошёл целиком — показывается он
     (`test_a_rewrite_that_passes_fully_replaces_the_first_answer`). `analysis_id` — указатель
     разбора руки вечера для `opponent_range` и `equity_vs_range`; без него они
-    отвечают отказом (`test_without_a_hand_analysis_the_range_tool_says_so`).
+    отвечают отказом (`test_without_a_hand_analysis_the_range_tool_says_so`); он же
+    решает, ставить ли перед вопросом отметку смены руки (`history.hand_boundary`).
     """
     system = system_prompt if system_prompt is not None else _prompt.load_system_prompt()
     instructions = _prompt.instructions_for(system, context)
@@ -292,9 +297,13 @@ async def run_agent_turn(
         max_calcs=MAX_CALCS_PER_TURN, sizes_from=sizes_from, analysis_id=analysis_id
     )
     tools = tools_for(db, player_id, session_id, run_state)
+    # Другая рука, чем у прошлого хода вечера, — отметка перед вопросом (решение
+    # владельца 2026-10-15); она в реплике хода и уйдёт с ней в историю.
+    boundary = hand_boundary(history, analysis_id)
 
     draft, meta = await llm(
-        "agent", AgentDraft, prompt=text, tools=tools,
+        "agent", AgentDraft, prompt=text, preface=() if boundary is None else (boundary,),
+        tools=tools,
         message_history=history, instructions=instructions,
         text_output=AgentDraft.from_text, trace_id=trace_id,
     )
@@ -359,6 +368,7 @@ async def run_agent_turn(
         drafts=tuple(drafts),
         history_len=start,
         rewrite_at=rewrite_at,
+        analysis_id=analysis_id,
         assumption=assumption,
         assumption_dropped=fell_back
         or (grounded and block_text is not None and assumption is None),

@@ -42,7 +42,7 @@ from pydantic import BaseModel
 from pydantic_ai import Agent, BinaryContent, TextOutput, ToolOutput
 from pydantic_ai._genai_prices import fill_response_cost
 from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
-from pydantic_ai.messages import ModelMessage, ModelResponse
+from pydantic_ai.messages import ModelMessage, ModelResponse, TextContent
 from pydantic_ai.models import Model, ModelRequestParameters
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.wrapper import WrapperModel
@@ -286,6 +286,7 @@ class LLM:
         schema: type[T],
         *,
         prompt: str,
+        preface: Sequence[TextContent] = (),
         images: Sequence[bytes] = (),
         tools: Sequence[Tool[None]] = (),
         message_history: Sequence[ModelMessage] = (),
@@ -335,7 +336,9 @@ class LLM:
         `test_a_tool_call_round_trip_logs_a_row_per_request`).
 
         `message_history` уходит модели перед `prompt`, `instructions` — в
-        инструкции этого прогона (`test_instructions_reach_the_model`).
+        инструкции этого прогона (`test_instructions_reach_the_model`). `preface` —
+        куски той же реплики перед `prompt` (отметка-граница руки агента,
+        `test_a_new_hand_gets_a_boundary_before_the_question_and_the_same_hand_does_not`).
 
         `text_output` — ответ простым текстом тоже принимается, наравне с
         вызовом вывода: функция строит из текста `schema`. Нужен агенту, чья
@@ -349,7 +352,8 @@ class LLM:
         provider, model_name = _describe_model(model)
         if isinstance(model, str):
             model = _build_model(model)
-        user_prompt: list[str | BinaryContent] = [
+        user_prompt: list[str | TextContent | BinaryContent] = [
+            *preface,
             prompt,
             *(
                 BinaryContent(data=image, media_type=_sniff_image_media_type(image))
@@ -425,7 +429,7 @@ class LLM:
         self,
         agent: Agent[None, T],
         metered: _MeteredModel,
-        user_prompt: list[str | BinaryContent],
+        user_prompt: list[str | TextContent | BinaryContent],
         message_history: Sequence[ModelMessage],
         model_name: str,
     ) -> tuple[T, CallMeta]:

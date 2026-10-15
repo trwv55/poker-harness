@@ -12,6 +12,15 @@
 модели репликой, но игроку не принадлежит; в сохранённую историю она не
 попадает (`seen_history`), а опознаётся по месту в ходе, а не по тексту
 (`test_a_player_message_that_looks_like_a_rewrite_request_is_kept`).
+
+Граница руки (решение владельца 2026-10-15): реплика игрока в сохранённой
+истории несёт в метаданных запроса указатель разбора своего хода
+(`HAND_KEY`). Ход о другой руке, чем прошлый, — или переход между рукой и
+вопросом без разбора — получает перед вопросом отметку (`hand_boundary`):
+отдельный кусок той же реплики (`TextContent`), который модель видит, а числа
+игрока и ходы не видят
+(`test_a_new_hand_gets_a_boundary_before_the_question_and_the_same_hand_does_not`,
+`test_the_boundary_has_no_numbers_and_is_not_the_players_text`).
 """
 
 from __future__ import annotations
@@ -26,6 +35,7 @@ from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
     RetryPromptPart,
+    TextContent,
     TextPart,
     ThinkingPart,
     ToolCallPart,
@@ -38,6 +48,9 @@ from harness.explanation.agent_checks import strip_card_tokens
 from harness.explanation.faithfulness import numbers_in
 
 __all__ = [
+    "HAND_KEY",
+    "NEW_HAND_MARK",
+    "NO_HAND_MARK",
     "allowed_from_history",
     "assumed_numbers_in",
     "calcs_in_history",
@@ -45,6 +58,7 @@ __all__ = [
     "dump_history",
     "estimate_tokens",
     "frequency_numbers",
+    "hand_boundary",
     "load_history",
     "merged_requests",
     "player_numbers",
@@ -62,6 +76,20 @@ __all__ = [
 _BYTES_PER_TOKEN = 3
 
 _CALC_TOOLS = frozenset(name.value for name in CalcName)
+
+# Ключ метаданных запроса с репликой игрока: указатель разбора её хода (`None` —
+# ход без разбора).
+HAND_KEY = "analysis_id"
+# Ключ метаданных отметки-границы; текст отметки — без чисел.
+_BOUNDARY_KEY = "hand_boundary"
+NEW_HAND_MARK = (
+    "— Дальше разговор о другой руке. Ответы выше относились к прошлым рукам вечера; "
+    "не пересматривай их. —"
+)
+NO_HAND_MARK = (
+    "— Дальше вопрос не о конкретной руке. Ответы выше относились к прошлым рукам вечера; "
+    "не пересматривай их. —"
+)
 
 
 def _is_tool_result(part: object) -> bool:
@@ -158,7 +186,8 @@ def estimate_tokens(messages: Sequence[ModelMessage]) -> int:
 
 
 def _text(part: UserPromptPart) -> str:
-    """Текст реплики: фасад шлёт её списком (`[prompt, *картинки]`), а не строкой."""
+    """Текст реплики: фасад шлёт её списком (`[*отметка, prompt, *картинки]`), а не
+    строкой. Отметка-граница (`TextContent`) — не текст игрока и сюда не входит."""
     if isinstance(part.content, str):
         return part.content
     return "\n".join(item for item in part.content if isinstance(item, str))
@@ -170,6 +199,26 @@ def _player_parts(message: ModelMessage) -> list[UserPromptPart]:
     if not isinstance(message, ModelRequest):
         return []
     return [part for part in message.parts if isinstance(part, UserPromptPart)]
+
+
+def hand_boundary(
+    history: Sequence[ModelMessage], analysis_id: int | None
+) -> TextContent | None:
+    """Отметка перед вопросом хода о руке `analysis_id`, если прошлый ход вечера
+    был о другой руке или без разбора, либо наоборот
+    (`test_a_turn_without_a_hand_and_back_gets_boundaries`). Первый ход вечера
+    отметки не получает; не получает её и ход, чей прошлый ход не помечен рукой —
+    строка, сохранённая до отметок
+    (`test_an_old_row_without_hand_tags_loads_and_gets_no_boundary`)."""
+    for message in reversed(history):
+        if not isinstance(message, ModelRequest) or not _player_parts(message):
+            continue
+        tags = message.metadata
+        if not isinstance(tags, dict) or HAND_KEY not in tags or tags[HAND_KEY] == analysis_id:
+            return None
+        text = NEW_HAND_MARK if analysis_id is not None else NO_HAND_MARK
+        return TextContent(text, metadata={_BOUNDARY_KEY: True})
+    return None
 
 
 def turns(messages: list[ModelMessage]) -> list[list[ModelMessage]]:
@@ -235,6 +284,7 @@ def seen_history(
     start: int,
     rewrite_at: int | None,
     final_answer: str | None,
+    analysis_id: int | None = None,
 ) -> list[ModelMessage]:
     """История к сохранению: реплики игрока, вызовы расчётов с ответами и один
     ответ модели на ход — тот, что ушёл игроку.
@@ -261,7 +311,11 @@ def seen_history(
       — `AgentTurn.saved_messages`), подменяет последний ответ; `None` — ответ
       прошёл и остаётся как есть
       (`test_a_refused_answer_is_saved_as_the_refusal_the_player_saw`,
-      `test_a_refused_text_answer_is_saved_as_the_refusal_the_player_saw`).
+      `test_a_refused_text_answer_is_saved_as_the_refusal_the_player_saw`);
+    * реплика игрока, начавшая ход, помечается указателем разбора хода
+      `analysis_id` (`HAND_KEY`) — по нему следующий ход ставит отметку-границу
+      (`hand_boundary`), а сама отметка остаётся в реплике
+      (`test_a_rewrite_on_a_new_hand_keeps_the_boundary_and_drops_the_request`).
     """
     turn = list(messages[start:])
     answers = [answer for message in turn if (answer := _answer(message)) is not None]
@@ -300,8 +354,12 @@ def seen_history(
             if not (isinstance(part, ToolReturnPart) and part.tool_call_id in dropped)
             and not (is_rewrite and isinstance(part, UserPromptPart))
         ]
-        if request_parts:
-            kept.append(dataclasses.replace(message, parts=request_parts))
+        if not request_parts:
+            continue
+        changes: dict[str, Any] = {"parts": request_parts}
+        if offset == 0 and _player_parts(message):
+            changes["metadata"] = {**(message.metadata or {}), HAND_KEY: analysis_id}
+        kept.append(dataclasses.replace(message, **changes))
     return _without_thinking(kept)
 
 

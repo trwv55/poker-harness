@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Collection
 from itertools import pairwise
 from typing import Any
@@ -17,6 +18,7 @@ from pydantic_ai.messages import (
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
+    TextContent,
     TextPart,
     ThinkingPart,
     ToolCallPart,
@@ -28,13 +30,17 @@ from sqlalchemy import text as sql_text
 
 import harness.calcs as calcs_module
 from harness.agent.history import (
+    NEW_HAND_MARK,
+    NO_HAND_MARK,
     allowed_from_history,
     assumed_numbers_in,
     calcs_in_history,
     chart_numbers_in,
     dump_history,
+    estimate_tokens,
     frequency_numbers,
     load_history,
+    player_numbers,
     trim_history,
     turns,
 )
@@ -100,8 +106,11 @@ class _TurnScript:
         self.returns: list[str] = []
         self.think = think
         self.thinking_seen = False
+        # Что модель получила на каждом запросе — сообщения целиком.
+        self.seen: list[list[ModelMessage]] = []
 
     def __call__(self, messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        self.seen.append(list(messages))
         self.thinking_seen |= any(
             isinstance(part, ThinkingPart) for message in messages for part in message.parts
         )
@@ -1374,3 +1383,118 @@ async def test_the_start_of_the_turn_holds_from_the_third_turn_with_output_answe
         trimmed = trim_history(history, budget)
         if trimmed:
             assert not any(isinstance(p, ToolReturnPart) for p in trimmed[0].parts)
+
+
+# --- граница руки в истории вечера (решение владельца 2026-10-15) ---------------------
+
+
+def _marks(message: ModelMessage) -> list[str]:
+    """Тексты отметок-границ в реплике: части `TextContent`, не строки игрока."""
+    return [
+        item.content
+        for part in message.parts
+        if isinstance(part, UserPromptPart) and not isinstance(part.content, str)
+        for item in part.content
+        if isinstance(item, TextContent)
+    ]
+
+
+async def _evening(db_factory, session, scope, hands, history=()):
+    """Ходы вечера подряд, история — через сохранение и загрузку, как у воркера.
+    Возвращает отметки в реплике, с которой модель начала каждый ход, и историю."""
+    history = list(history)
+    marks: list[list[str]] = []
+    for index, hand in enumerate(hands):
+        script = _TurnScript([([_VPIP], _GOOD)])
+        turn = await _turn(
+            db_factory, session, script, scope=scope, history=history, analysis_id=hand,
+            text=f"вопрос {index + 1}",
+        )
+        assert turn.state == "prose"
+        question = script.seen[0][-1]
+        assert _stored_text([question]).endswith(f"вопрос {index + 1}")
+        marks.append(_marks(question))
+        history = load_history(dump_history(turn.saved_messages(None)))
+    return marks, history
+
+
+async def test_a_new_hand_gets_a_boundary_before_the_question_and_the_same_hand_does_not(
+    db_factory,
+):
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8184)
+        marks, history = await _evening(db_factory, session, scope, [1, 1, 2, 2])
+    assert marks == [[], [], [NEW_HAND_MARK], []]
+    # Отметка — перед вопросом, в той же реплике, и в сохранённой истории она остаётся.
+    third = turns(history)[2][0]
+    assert isinstance(third, ModelRequest)
+    [content] = [p.content for p in third.parts if isinstance(p, UserPromptPart)]
+    assert isinstance(content, list) and content[1:] == ["вопрос 3"]
+    assert _marks(third) == [NEW_HAND_MARK]
+    assert len(turns(history)) == 4
+
+
+async def test_a_turn_without_a_hand_and_back_gets_boundaries(db_factory):
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8185)
+        marks, _ = await _evening(db_factory, session, scope, [None, 1, None, None, 1])
+    assert marks == [[], [NEW_HAND_MARK], [NO_HAND_MARK], [], [NEW_HAND_MARK]]
+
+
+def test_the_boundary_has_no_numbers_and_is_not_the_players_text():
+    assert not re.search(r"\d", NEW_HAND_MARK) and not re.search(r"\d", NO_HAND_MARK)
+    request = ModelRequest(
+        parts=[UserPromptPart([TextContent("— 77 —", metadata={"hand_boundary": True}), "до 12"])]
+    )
+    assert player_numbers([request]) == frozenset({12.0})
+
+
+async def test_trimming_keeps_the_boundary_with_its_turn(db_factory):
+    """Отметка — часть реплики игрока: не ход и не висит в начале истории без
+    вопроса; обрезка, срезавшая руку A, оставляет её при вопросе руки B, и
+    следующий ход о руке B отметки не получает."""
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8186)
+        _, history = await _evening(db_factory, session, scope, [1, 2])
+        assert len(turns(history)) == 2
+        last_turn = turns(history)[1]
+        trimmed = trim_history(history, estimate_tokens(last_turn))
+        assert trimmed[1:] == last_turn[1:] and _marks(trimmed[0]) == [NEW_HAND_MARK]
+        assert _stored_text(trimmed[:1]).endswith("вопрос 2")
+        marks, _ = await _evening(db_factory, session, scope, [2], history=trimmed)
+    assert marks == [[]]
+
+
+async def test_a_rewrite_on_a_new_hand_keeps_the_boundary_and_drops_the_request(db_factory):
+    bad = "Вы входите в 43.0% раздач."
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8187)
+        _, history = await _evening(db_factory, session, scope, [1])
+        script = _TurnScript([([], bad), ([], "Те же 100.0% (2 из 2).")], as_text={0, 1})
+        turn = await _turn(
+            db_factory, session, script, scope=scope, history=history, analysis_id=2
+        )
+    assert turn.state == "prose" and turn.rewrite_at is not None
+    assert _stored_text([turn.messages[turn.history_len]]).endswith("вопрос")
+    assert _stored_text([turn.messages[turn.rewrite_at]]).startswith(REWRITE_HEAD)
+    # Второй прогон видит отметку там же, перед вопросом, и не получает второй.
+    marked = [m for m in script.seen[-1] if _marks(m)]
+    assert len(marked) == 1 and _stored_text(marked).endswith("вопрос")
+    assert _marks(turn.messages[turn.history_len]) == [NEW_HAND_MARK]
+    saved = load_history(dump_history(turn.saved_messages(None)))
+    assert REWRITE_HEAD not in _stored_text(saved) and "43.0" not in _stored_text(saved)
+    assert [_marks(t[0]) for t in turns(saved)] == [[], [NEW_HAND_MARK]]
+
+
+async def test_an_old_row_without_hand_tags_loads_and_gets_no_boundary(db_factory):
+    """Строка, сохранённая до отметок: о какой руке был ход, неизвестно — отметки нет;
+    сохранённый ход уже несёт свою руку, и следующая смена руки отметку даёт."""
+    old = [
+        ModelRequest(parts=[UserPromptPart("прошлый вопрос")]),
+        ModelResponse(parts=[TextPart("Прошлый ответ.")]),
+    ]
+    loaded = load_history(ModelMessagesTypeAdapter.dump_python(old, mode="json"))
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8188)
+        marks, _ = await _evening(db_factory, session, scope, [None, 3, 4], history=loaded)
+    assert marks == [[], [NEW_HAND_MARK], [NEW_HAND_MARK]]

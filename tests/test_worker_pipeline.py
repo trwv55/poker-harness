@@ -2215,6 +2215,54 @@ async def test_the_agent_job_without_an_evening_analysis_gets_the_range_refusal(
     assert any("Разбора руки в этом вечере нет" in r for r in returns)
 
 
+async def test_the_agent_job_marks_the_change_of_hand_in_the_evening_history(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    """Воркер берёт руку хода из `sessions.last_analysis_id`: два хода о руке вечера
+    идут без отметки, ход после сброса разбора получает отметку «не о конкретной
+    руке» перед вопросом; в истории вечера реплики помечены рукой, игрок отметку
+    не видит."""
+    from harness.agent.history import HAND_KEY, NO_HAND_MARK
+    from tests.test_agent import _marks, _TurnScript
+    from tests.test_calcs import stored_analysis
+
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    player_id, session_id = await _make_scope(db_factory)
+    async with db_factory() as session:
+        analysis_id = await stored_analysis(session, session_id=session_id)
+        await SessionsRepo(session).set_last_analysis(session_id, analysis_id)
+        await session.commit()
+    marks: list[list[str]] = []
+    for index in range(3):
+        if index == 2:
+            async with db_factory() as session:
+                await SessionsRepo(session).set_last_analysis(session_id, None)
+                await session.commit()
+        script = _TurnScript([([], "Ответ без чисел.")])
+        await queue.enqueue(type="agent", player_id=player_id, session_id=session_id,
+                            payload={"text": f"вопрос {index + 1}"})
+        job = await queue.claim("w1")
+        assert job is not None
+        await run_job(
+            job, replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script)))
+        )
+        marks.append(_marks(script.seen[0][-1]))
+
+    assert marks == [[], [], [NO_HAND_MARK]]
+    assert not any(NO_HAND_MARK in text for text in _all_texts(fake_sender))
+    async with db_factory() as session:
+        history = (await session.execute(
+            text("select agent_history from sessions where id = :s"), {"s": session_id}
+        )).scalar_one()
+    tags = [
+        message["metadata"][HAND_KEY]
+        for message in history
+        if message["kind"] == "request"
+        and any(part["part_kind"] == "user-prompt" for part in message["parts"])
+    ]
+    assert tags == [analysis_id, analysis_id, None]
+
+
 async def test_an_agent_job_stores_only_the_final_answer_and_no_progress_message(
     db_factory, queue, deps, fake_sender, monkeypatch
 ):
