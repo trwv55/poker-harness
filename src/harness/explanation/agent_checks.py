@@ -114,7 +114,15 @@
 `test_a_threshold_lead_in_before_its_share_is_not_a_profit_conclusion`,
 `test_a_fold_noun_after_the_word_threshold_with_a_calc_share_is_not_an_opponent_action`,
 `test_a_shot_aside_from_equity_against_the_range_is_meta_speech`,
-`test_so_often_as_a_comparison_is_not_a_habit_adverb`). Ранги аутов стрита сводка
+`test_so_often_as_a_comparison_is_not_a_habit_adverb`). Класс «нет данных» — действие
+соперника в косвенном вопросе или при «частот…» в предложении с оборотом отсутствия, без
+доли, «бы», будущего, повторяемости и слов руки в части; «в плюсе» в кавычках — упоминание
+(`test_missing_data_meta_speech_is_not_an_opponent_claim`,
+`test_missing_data_meta_speech_does_not_cover_a_real_claim`,
+`test_a_quoted_profit_phrase_is_a_mention_but_a_bare_one_is_a_conclusion`); пересказ
+вскрытия в прошедшем времени и «нужны фолды чаще N%» с порогом из расчёта
+(`test_a_showdown_narration_in_the_past_is_not_a_hand_claim`,
+`test_need_for_folds_more_often_than_a_calc_threshold_is_threshold_math`). Ранги аутов стрита сводка
 пишет словами («на даму и семёрку»), голая «7» остаётся числом
 (`test_the_straight_draw_names_the_out_ranks_in_words`,
 `test_a_bare_out_rank_is_still_a_number_and_the_words_of_the_summary_pass`).
@@ -318,6 +326,7 @@ _MODAL_RE = re.compile(
     _W + r"(?:достаточно|нужно|надо|должн[а-яё]*|требуется|необходимо|можно)" + _WE,
     re.IGNORECASE,
 )
+_NEED_RE = re.compile(_W + r"(?:нуж(?:ен|на|но|ны)|необходим[а-яё]*|требу[а-яё]*)", re.IGNORECASE)
 # Опора на расчёт (правки контроллера, раунды 2–3): действие, за которым через пять
 # слов или меньше стоит доля или «N из M». Опора — измеренная частота из расчёта
 # (`frequency_numbers`: доля и «N из M» частоты или измеренной величины
@@ -326,6 +335,7 @@ _MODAL_RE = re.compile(
 # «достаточно/нужно/должен» и инфинитивом. Не опора: доля банка («33.3% банка»), окно со ставкой героя глаголом
 # («если вы поставите 25%») и окно с рукой или диапазоном («с любой парой в 60% раз»).
 _NUMBER = r"\d+(?:[.,]\d+)?"
+_PCT_PATTERN = r"\d+(?:[.,]\d+)?\s*%"
 _CALC_NUMBER = r"(?P<pct>" + _NUMBER + r")\s*%|(?P<num>\d+)\s+из\s+(?P<den>\d+)"
 _TAIL = r"(?P<tail>\s+(?:его\s+)?(?:диапазон|рендж|фолд|эквити|случа|раз)[а-яё]*)?"
 _BACKED_RE = re.compile(
@@ -412,6 +422,53 @@ def _numbers_of(match: re.Match[str]) -> list[str]:
     if match.group("pct") is not None:
         return [match.group("pct")]
     return [match.group("num"), match.group("den")]
+
+
+# Метаречь о недостающих данных: «Какую долю BB сбрасывает… посчитать нельзя», «Частоты
+# фолдов BB на ставки тёрна в данных нет», «Мне нечем проверить, как часто BB
+# сбрасывает». Предложение с оборотом отсутствия, без доли/«N из M», «бы», будущего и
+# наречий повторяемости; освобождается только часть, где действие соперника стоит в
+# косвенном вопросе («сколько», «как часто», «какую долю») или при «частот…/
+# статистик…/долю», и в ней нет слов руки (`_strip_no_data`,
+# `test_missing_data_meta_speech_is_not_an_opponent_claim`).
+_ABSENCE_RE = re.compile(
+    _W + r"(?:нельзя|нечем|не\s+могу\s+(?:сравнить|проверить|посчитать|сказать|определить))"
+    + _WE,
+    re.IGNORECASE,
+)
+_NO_WORD_RE = re.compile(_W + r"нет" + _WE, re.IGNORECASE)
+_DATA_NOUN_RE = re.compile(r"частот|статистик|данн|инструмент", re.IGNORECASE)
+_DATA_MARKER_RE = re.compile(
+    _W + r"(?:сколько|как\s+часто|какую\s+долю|какая\s+доля)" + _WE
+    + r"|частот[а-яё]*|статистик[а-яё]*|" + _W + r"долю" + _WE,
+    re.IGNORECASE,
+)
+_ASK_OFTEN_RE = re.compile(_W + r"как\s+часто" + _WE, re.IGNORECASE)
+# Пересказ вскрытия: глагол прошедшего времени «вскрыл / вскрыла / вскрыли».
+_SHOWDOWN_RE = re.compile(_W + r"вскры(?:л|ла|ли)" + _WE, re.IGNORECASE)
+_NUMBER_SHARE_RE = re.compile(_PCT_PATTERN + r"|\d+\s+из\s+\d+", re.IGNORECASE)
+_QUOTED_RE = re.compile(r"«[^»]*»")
+
+
+def _strip_no_data(rest: str) -> str:
+    """Без частей метаречи о недостающих данных (см. `_ABSENCE_RE`)."""
+    absent = _ABSENCE_RE.search(rest) or (
+        _NO_WORD_RE.search(rest) and _DATA_NOUN_RE.search(rest)
+    )
+    plain = _ASK_OFTEN_RE.sub(" ", rest)
+    if (
+        not absent
+        or _NUMBER_SHARE_RE.search(rest)
+        or _HYPOTHETICAL_RE.search(plain)
+        or _FUTURE_RE.search(plain)
+    ):
+        return rest
+    pieces = _CLAUSE_PIECES_RE.split(rest)
+    for i in range(0, len(pieces), 2):
+        clause = pieces[i]
+        if _DATA_MARKER_RE.search(clause) and not _HAND_RE.search(clause):
+            pieces[i] = " "
+    return "".join(pieces)
 
 
 def _strip_not_equity(sentence: str) -> str:
@@ -509,7 +566,17 @@ def _backed(
     conditions = list(_CONDITION_RE.finditer(head))
     if conditions and _condition_holds(head[conditions[-1].end() :]):
         return True
-    infinitive = bool(_INFINITIVE_END_RE.search(_word_at(text, match.start())))
+    word = _word_at(text, match.start())
+    # «Ему нужны фолды чаще 33%» — «нужно» с существительным «фолды» и «чаще/реже»: та же
+    # арифметика, что «нужно сбрасывать чаще 33%»
+    # (`test_need_for_folds_more_often_than_a_calc_threshold_is_threshold_math`).
+    if (
+        _FOLD_NOUN_RE.fullmatch(word)
+        and _MORE_LESS_RE.search(match.group("window"))
+        and _NEED_RE.search(clause)
+    ):
+        return True
+    infinitive = bool(_INFINITIVE_END_RE.search(word))
     return infinitive and bool(_MODAL_RE.search(clause))
 
 
@@ -564,7 +631,9 @@ def _strip_backed(
     )
 
 
-def _opponent_clause(clause: str, hypothetical: bool, noun_locked: bool) -> bool:
+def _opponent_clause(
+    clause: str, hypothetical: bool, noun_locked: bool, showdown: bool = False
+) -> bool:
     """Придаточное утверждает, что соперник держит или сделает: слово о нём и рука
     или действие в форме прогноза. Придаточное с «вы» без соперника подлежащим — о
     герое (`test_a_clause_with_an_opponent_subject_is_checked_despite_you`). Глагол
@@ -594,7 +663,9 @@ def _opponent_clause(clause: str, hypothetical: bool, noun_locked: bool) -> bool
     # окупается») — о ставке, а не о сопернике: «он» там — ставка, и рука рядом не
     # утверждение о нём (раунд 5). Глагол соперника в ней — по-прежнему прогноз.
     claim = " ".join(part for part in parts if not _PROFIT_RE.search(part))
-    if _OPPONENT_RE.search(claim) and _HAND_RE.search(claim):
+    # Пересказ вскрытия в прошедшем времени («BB вскрыл … пару и выиграл») — рука вскрыта,
+    # а не предсказана; при `showdown` слово руки само по себе утверждением не служит.
+    if not showdown and _OPPONENT_RE.search(claim) and _HAND_RE.search(claim):
         return True
     for part in parts:
         narrated = not hypothetical and bool(_PAST_WORD_RE.search(part))
@@ -743,11 +814,13 @@ def _opponent_claim(
     )
     if _RANGE_WORD_RE.search(_HERO_HOLDS_RE.sub(" ", rest)):
         return True
+    rest = _strip_no_data(rest)
     hypothetical = bool(_HYPOTHETICAL_RE.search(_DEGREE_OFTEN_RE.sub(" ", rest)))
     noun_locked = hypothetical or bool(_FUTURE_RE.search(rest))
+    showdown = not hypothetical and bool(_SHOWDOWN_RE.search(rest))
     clauses = _CLAUSE_SPLIT_RE.split(rest)
     return any(
-        _opponent_clause(clause, hypothetical, noun_locked)
+        _opponent_clause(clause, hypothetical, noun_locked, showdown)
         for i, clause in enumerate(clauses)
         if not (
             not hypothetical
@@ -1300,7 +1373,7 @@ def check_agent_answer(
         if _BEST_LINE_RE.search(sentence) and _FLOP_TURN_RE.search(sentence):
             violations.append(f"лучшая линия на флопе или тёрне — «{quoted}»")
         if (
-            _PROFIT_RE.search(sentence)
+            _PROFIT_RE.search(_QUOTED_RE.sub(" ", sentence))
             and not _profit_arithmetic(sentence, calc_numbers)
             and not threshold_decided
             and not (profit_without_folds and _profit_without_folds(sentence))
