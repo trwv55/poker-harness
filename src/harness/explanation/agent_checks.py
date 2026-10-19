@@ -96,8 +96,9 @@
 `test_a_signed_percent_in_the_chart_clause_does_not_retell_the_chart`). Цена: целое разрешено и в
 другом смысле — 24% проходит, если 23.9 есть в наборе, даже сказанное о другом.
 Число, совпавшее и с `equity_vs_range`, и со сводкой разбора (`summary_numbers`),
-метки не требует только в предложении о шансах самой руки героя — со словом «аут»,
-«собрать», «дро», «бэкдор» или «оверкарт» и без слова «эквити»
+метки не требует только в части о шансах самой руки героя — со словом «собрать»
+(«соберёте», «соберёт»), «бэкдор» или «оверкарт» в той же части, что доля, и без слова
+«эквити» в предложении (голое «аут» и «дро» не освобождают)
 (`test_a_share_of_the_summary_that_equals_an_equity_number_needs_no_mark`,
 `test_a_share_only_from_the_equity_output_still_needs_the_mark`,
 `test_a_measured_frequency_or_a_chart_number_does_not_free_the_equity_share`,
@@ -664,10 +665,10 @@ def _chart_clauses(rest: str, chart_numbers: frozenset[float]) -> str:
     return "".join(pieces)
 
 
-# Предложение о шансах самой руки героя: ауты, дро, сбор, бэкдор, оверкарты — и без
-# слова «эквити» (`_hero_chances_share`).
+# Слово шанса сводки в той же части, что доля: «собрать / соберёте / соберёт», «бэкдор»,
+# «оверкарт»; голое «аут» и «дро» не освобождают (`_hero_chances_share`).
 _HERO_DRAW_WORD_RE = re.compile(
-    _W + r"(?:аут|собра|дро" + _WE + r"|бэкдор|оверкарт)", re.IGNORECASE
+    _W + r"(?:собра(?:ть|ться)|собер(?:у|ёшь|ёт|ём|ёте|ут)|бэкдор|оверкарт)", re.IGNORECASE
 )
 _EQUITY_WORD_RE = re.compile(r"эквити", re.IGNORECASE)
 
@@ -681,12 +682,13 @@ def _hero_chances_share(
     pct: str, sentence: str, clause: str, summary_numbers: frozenset[float]
 ) -> bool:
     """Доля совпала с числом сводки (как в `_in`, целое — тоже) в предложении о шансах
-    самой руки героя: слово «аут», «собрать», «дро», «бэкдор» или «оверкарт» в
-    предложении, нет «эквити» и в части с долей нет «против», «колл…», «выигра…» и
+    самой руки героя: в части с долей слово шанса («собрать / соберёте / соберёт»,
+    «бэкдор», «оверкарт»; «аут» и «дро» не освобождают), в предложении нет «эквити», в
+    части с долей нет «против», «колл…», «выигра…» и
     слова о сопернике подлежащим (`_OPPONENT_SUBJECT_RE`: «его» в «собрать его» — это дро, а
     не соперник). Неоднозначное число метки не требует."""
     return (
-        _HERO_DRAW_WORD_RE.search(sentence) is not None
+        _HERO_DRAW_WORD_RE.search(clause) is not None
         and _EQUITY_WORD_RE.search(sentence) is None
         and _VERSUS_RE.search(clause) is None
         and _OPPONENT_SUBJECT_RE.search(clause) is None
@@ -702,7 +704,7 @@ def _assumed_share_in(
     """Доля из выхода `equity_vs_range` в предложении
     (`test_an_equity_against_a_narrowed_range_needs_the_mark`). Метки не требует
     только доля, совпавшая и с числом сводки разбора (`summary_numbers`), когда
-    предложение — о шансах самой руки героя (`_hero_chances_share`: слово руки,
+    часть — о шансах самой руки героя (`_hero_chances_share`: слово шанса,
     «эквити» и слова соперника в части с долей закреплены порознь)
     (`test_a_share_of_the_summary_that_equals_an_equity_number_needs_no_mark`,
     `test_a_share_only_from_the_equity_output_still_needs_the_mark`)."""
@@ -1257,8 +1259,8 @@ def check_agent_answer(
     «(допущение)» — нарушение, даже без слова диапазона
     (`test_an_equity_against_a_narrowed_range_needs_the_mark`). `summary_numbers` —
     числа сводки разбора (`AgentContext.allowed` и `threshold_numbers`): доля, что
-    совпадает и с ними, и с `assumed_numbers`, в предложении о шансах самой руки героя
-    (ауты, дро, сбор, без слова «эквити») метки не требует
+    совпадает и с ними, и с `assumed_numbers`, в части о шансах самой руки героя
+    (слово шанса сводки в той же части, без слова «эквити») метки не требует
     (`test_a_share_of_the_summary_that_equals_an_equity_number_needs_no_mark`).
 
     Целый процент («24%») разрешён, если к нему половиной вверх округляется число
