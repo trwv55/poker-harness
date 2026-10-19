@@ -1800,6 +1800,13 @@ _MISSING_DATA = [
 ]
 
 
+def test_the_noun_of_a_fold_frequency_is_a_marker_without_the_absence_in_its_clause():
+    """Действие в родительном при «частоты» («частоты фолдов BB»): оборот отсутствия
+    может стоять в соседней части."""
+    text = "Частоты фолдов BB на ставки тёрна, в ваших данных нет."
+    assert _turn_check(text) == []
+
+
 @pytest.mark.parametrize("text", _MISSING_DATA)
 def test_missing_data_meta_speech_is_not_an_opponent_claim(text: str):
     """Класс «нет данных» (живой тёрн 2026-10-15 и повторы на стенде): действие соперника
@@ -1823,6 +1830,8 @@ def test_missing_data_meta_speech_is_not_an_opponent_claim(text: str):
         "Сколько BB сбрасывает, сказать нельзя, но он сделает фолд.",
         "Как часто BB сбрасывает, проверить нечем, но он всегда сбрасывал.",
         "Как часто BB сбрасывает, проверить нечем, он бы сбросил.",
+        "Частоты нет, а BB сбрасывает с частотой выше порога.",
+        "Данных нет, но по статистике BB сбрасывает слишком много.",
         "Сколько BB сбрасывает, посчитать нельзя, а на флопе 21 из 54.",
         "Как часто BB сбрасывает, посчитать нельзя, но обычно много.",
         "Сколько BB сбрасывает, посчитать нельзя, но будет видно.",
@@ -1839,6 +1848,12 @@ def test_a_quoted_profit_phrase_is_a_mention_but_a_bare_one_is_a_conclusion():
     assert any(
         "в плюсе" in v for v in _turn_check("Сказать «в плюсе» нельзя, но ставка в плюсе.")
     )
+    for text in (
+        "Ставка «в плюсе».",
+        "Тут ставка «окупается».",
+        "Ставка тут «в плюсе», и колл «окупается».",
+    ):
+        assert any("в плюсе" in v for v in _turn_check(text)), text
 
 
 def test_a_showdown_narration_in_the_past_is_not_a_hand_claim():
@@ -1853,6 +1868,9 @@ def test_a_showdown_narration_in_the_past_is_not_a_hand_claim():
         "BB вскрыл пару и сделает рейз.",
         "BB вскрыл пару и всегда держит пару.",
         "BB вскрывает пару.",
+        "BB вскрыл 9♣8♣ с парой восьмёрок, а у CO сейчас пара.",
+        "BB вскрыл 9♣8♣ с парой восьмёрок и сделает рейз.",
+        "BB вскрыл 9♣8♣ и у CO пара.",
     ):
         assert any(ASSUMPTION_MARK in v for v in _turn_check(text, **kw)), text
 

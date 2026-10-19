@@ -115,12 +115,16 @@
 `test_a_fold_noun_after_the_word_threshold_with_a_calc_share_is_not_an_opponent_action`,
 `test_a_shot_aside_from_equity_against_the_range_is_meta_speech`,
 `test_so_often_as_a_comparison_is_not_a_habit_adverb`). Класс «нет данных» — действие
-соперника в косвенном вопросе или при «частот…» в предложении с оборотом отсутствия, без
-доли, «бы», будущего, повторяемости и слов руки в части; «в плюсе» в кавычках — упоминание
-(`test_missing_data_meta_speech_is_not_an_opponent_claim`,
+соперника в косвенном вопросе («сколько», «как часто», «какую долю») или при «частот…/
+статистик…/долю» (оборот отсутствия в той же части либо действие в родительном при
+существительном) в предложении с оборотом отсутствия, без доли, «бы», будущего,
+повторяемости и слов руки в части; «в плюсе» в кавычках — упоминание только в предложении
+с отказом («нельзя», «не могу», «не делаю»)
+(`test_the_noun_of_a_fold_frequency_is_a_marker_without_the_absence_in_its_clause`,`test_missing_data_meta_speech_is_not_an_opponent_claim`,
 `test_missing_data_meta_speech_does_not_cover_a_real_claim`,
 `test_a_quoted_profit_phrase_is_a_mention_but_a_bare_one_is_a_conclusion`); пересказ
-вскрытия в прошедшем времени и «нужны фолды чаще N%» с порогом из расчёта
+вскрытия в прошедшем времени (слово руки не служит утверждением только в части с
+«вскрыл…», соседние части проверяются) и «нужны фолды чаще N%» с порогом из расчёта
 (`test_a_showdown_narration_in_the_past_is_not_a_hand_claim`,
 `test_need_for_folds_more_often_than_a_calc_threshold_is_threshold_math`). Ранги аутов стрита сводка
 пишет словами («на даму и семёрку»), голая «7» остаётся числом
@@ -429,7 +433,8 @@ def _numbers_of(match: re.Match[str]) -> list[str]:
 # сбрасывает». Предложение с оборотом отсутствия, без доли/«N из M», «бы», будущего и
 # наречий повторяемости; освобождается только часть, где действие соперника стоит в
 # косвенном вопросе («сколько», «как часто», «какую долю») или при «частот…/
-# статистик…/долю», и в ней нет слов руки (`_strip_no_data`,
+# статистик…/долю» (тогда оборот отсутствия в той же части или действие в родительном при
+# существительном), и в ней нет слов руки (`_strip_no_data`,
 # `test_missing_data_meta_speech_is_not_an_opponent_claim`).
 _ABSENCE_RE = re.compile(
     _W + r"(?:нельзя|нечем|не\s+могу\s+(?:сравнить|проверить|посчитать|сказать|определить))"
@@ -438,9 +443,17 @@ _ABSENCE_RE = re.compile(
 )
 _NO_WORD_RE = re.compile(_W + r"нет" + _WE, re.IGNORECASE)
 _DATA_NOUN_RE = re.compile(r"частот|статистик|данн|инструмент", re.IGNORECASE)
-_DATA_MARKER_RE = re.compile(
-    _W + r"(?:сколько|как\s+часто|какую\s+долю|какая\s+доля)" + _WE
-    + r"|частот[а-яё]*|статистик[а-яё]*|" + _W + r"долю" + _WE,
+# Косвенный вопрос: освобождает часть сам по себе (при обороте отсутствия в предложении).
+_ASK_MARKER_RE = re.compile(
+    _W + r"(?:сколько|как\s+часто|какую\s+долю|какая\s+доля)" + _WE, re.IGNORECASE
+)
+# Существительное «частот…/статистик…/долю»: освобождает часть, только если оборот
+# отсутствия стоит в ней же или действие соперника — в родительном при этом
+# существительном («частоты фолдов BB … нет»).
+_NOUN_MARKER_RE = re.compile(r"частот[а-яё]*|статистик[а-яё]*|" + _W + r"долю" + _WE, re.IGNORECASE)
+_NOUN_OF_ACTION_RE = re.compile(
+    r"(?:частот|статистик)[а-яё]*\s+(?:фолд|сброс|сдач|защит)[а-яё]*|"
+    + _W + r"долю\s+(?:фолд|сброс|сдач|защит)[а-яё]*",
     re.IGNORECASE,
 )
 _ASK_OFTEN_RE = re.compile(_W + r"как\s+часто" + _WE, re.IGNORECASE)
@@ -448,13 +461,24 @@ _ASK_OFTEN_RE = re.compile(_W + r"как\s+часто" + _WE, re.IGNORECASE)
 _SHOWDOWN_RE = re.compile(_W + r"вскры(?:л|ла|ли)" + _WE, re.IGNORECASE)
 _NUMBER_SHARE_RE = re.compile(_PCT_PATTERN + r"|\d+\s+из\s+\d+", re.IGNORECASE)
 _QUOTED_RE = re.compile(r"«[^»]*»")
+# Кавычки — упоминание, а не вывод, только в предложении с отказом: «нельзя сказать
+# «в плюсе»», «вывода «в плюсе» я не делаю».
+_REFUSAL_RE = re.compile(_ABSENCE_RE.pattern + r"|" + _W + r"не\s+(?:делаю|буду)" + _WE, re.IGNORECASE)
+
+
+def _unquoted_for_profit(sentence: str) -> str:
+    return _QUOTED_RE.sub(" ", sentence) if _REFUSAL_RE.search(sentence) else sentence
+
+
+def _absent(text: str) -> bool:
+    return bool(
+        _ABSENCE_RE.search(text) or (_NO_WORD_RE.search(text) and _DATA_NOUN_RE.search(text))
+    )
 
 
 def _strip_no_data(rest: str) -> str:
     """Без частей метаречи о недостающих данных (см. `_ABSENCE_RE`)."""
-    absent = _ABSENCE_RE.search(rest) or (
-        _NO_WORD_RE.search(rest) and _DATA_NOUN_RE.search(rest)
-    )
+    absent = _absent(rest)
     plain = _ASK_OFTEN_RE.sub(" ", rest)
     if (
         not absent
@@ -466,7 +490,11 @@ def _strip_no_data(rest: str) -> str:
     pieces = _CLAUSE_PIECES_RE.split(rest)
     for i in range(0, len(pieces), 2):
         clause = pieces[i]
-        if _DATA_MARKER_RE.search(clause) and not _HAND_RE.search(clause):
+        marked = _ASK_MARKER_RE.search(clause) or (
+            _NOUN_MARKER_RE.search(clause)
+            and (_absent(clause) or _NOUN_OF_ACTION_RE.search(clause))
+        )
+        if marked and not _HAND_RE.search(clause):
             pieces[i] = " "
     return "".join(pieces)
 
@@ -664,8 +692,14 @@ def _opponent_clause(
     # утверждение о нём (раунд 5). Глагол соперника в ней — по-прежнему прогноз.
     claim = " ".join(part for part in parts if not _PROFIT_RE.search(part))
     # Пересказ вскрытия в прошедшем времени («BB вскрыл … пару и выиграл») — рука вскрыта,
-    # а не предсказана; при `showdown` слово руки само по себе утверждением не служит.
-    if not showdown and _OPPONENT_RE.search(claim) and _HAND_RE.search(claim):
+    # а не предсказана: слово руки не служит утверждением только в той части, где стоит
+    # «вскрыл…» (и не при `hypothetical`: `showdown` — его отрицание), но не в соседних
+    # (`test_a_showdown_narration_in_the_past_is_not_a_hand_claim`).
+    if showdown:
+        claim = " ".join(
+            part for part in parts if not _PROFIT_RE.search(part) and not _SHOWDOWN_RE.search(part)
+        )
+    if _OPPONENT_RE.search(claim) and _HAND_RE.search(claim):
         return True
     for part in parts:
         narrated = not hypothetical and bool(_PAST_WORD_RE.search(part))
@@ -817,7 +851,7 @@ def _opponent_claim(
     rest = _strip_no_data(rest)
     hypothetical = bool(_HYPOTHETICAL_RE.search(_DEGREE_OFTEN_RE.sub(" ", rest)))
     noun_locked = hypothetical or bool(_FUTURE_RE.search(rest))
-    showdown = not hypothetical and bool(_SHOWDOWN_RE.search(rest))
+    showdown = not hypothetical
     clauses = _CLAUSE_SPLIT_RE.split(rest)
     return any(
         _opponent_clause(clause, hypothetical, noun_locked, showdown)
@@ -1373,7 +1407,7 @@ def check_agent_answer(
         if _BEST_LINE_RE.search(sentence) and _FLOP_TURN_RE.search(sentence):
             violations.append(f"лучшая линия на флопе или тёрне — «{quoted}»")
         if (
-            _PROFIT_RE.search(_QUOTED_RE.sub(" ", sentence))
+            _PROFIT_RE.search(_unquoted_for_profit(sentence))
             and not _profit_arithmetic(sentence, calc_numbers)
             and not threshold_decided
             and not (profit_without_folds and _profit_without_folds(sentence))
