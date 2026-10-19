@@ -1556,3 +1556,34 @@ async def test_an_old_row_without_hand_tags_loads_and_gets_no_boundary(db_factor
         scope = await _seeded(session, tg_user_id=8188)
         marks, _ = await _evening(db_factory, session, scope, [3, 3, None, 4], history=loaded)
     assert marks == [[], [], [NO_HAND_MARK], [NEW_HAND_MARK]]
+
+
+def test_the_summary_numbers_reach_the_check_of_the_equity_share():
+    """Шанс дро из сводки, совпавший с числом `equity_vs_range` из разговора, метки не
+    требует; доля только из выхода эквити — требует
+    (`test_a_share_of_the_summary_that_equals_an_equity_number_needs_no_mark`)."""
+    from harness.agent.run import _draft_violations
+    from harness.contracts import POSTFLOP_LINE_DETAIL, Draw, DrawKind, PostflopLineDetail
+    from tests.test_agent_checks import _TOP_PAIR, _with_line
+
+    line = PostflopLineDetail.model_validate(_with_line(_TOP_PAIR)[POSTFLOP_LINE_DETAIL])
+    draw = Draw(
+        kinds=[DrawKind.OPEN_ENDED], out_ranks=["Q", "7"], outs=["Qc"] * 8, unseen=46,
+        hit_next=0.174, hit_by_river=None,
+    )
+    detail: dict[str, object] = {
+        POSTFLOP_LINE_DETAIL: line.model_copy(update={"draw": draw}).model_dump(mode="json")
+    }
+    context = agent_context(
+        _result([_point(dp_index=0, ev_diff_bb=-1.4, detail=detail)]), _postflop_hand()
+    )
+    assert 17.4 in context.allowed
+    messages: list[ModelMessage] = [ModelRequest(parts=[ToolReturnPart(
+        "equity_vs_range", "эквити",
+        metadata={"calc": "equity_vs_range", "allowed": [17.4, 30.1], "assumed": [17.4, 30.1]},
+    )])]
+    said: frozenset[float] = frozenset()
+    summary = AgentDraft(answer="Шанс собрать стрит на следующей улице 17.4%.")
+    assert _draft_violations(summary, messages, context, said)[0] == []
+    equity = AgentDraft(answer="Против его колла у вас 30.1%.")
+    assert any("эквити" in v for v in _draft_violations(equity, messages, context, said)[0])

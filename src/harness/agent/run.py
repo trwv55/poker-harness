@@ -220,6 +220,9 @@ def _draft_violations(
         frequency_numbers=frequency_numbers(messages),
         chart_numbers=chart_numbers_in(messages),
         assumed_numbers=assumed_numbers_in(messages),
+        summary_numbers=(
+            context.allowed | context.threshold_numbers if context is not None else frozenset()
+        ),
     ), block
 
 

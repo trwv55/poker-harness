@@ -1481,3 +1481,236 @@ def test_the_block_violations_name_the_block():
     """Нарушения блока отличимы от нарушений ответа в общем списке на переписывание."""
     violations = _check_block("Эквити 55%.")
     assert violations and all(v.startswith("блок «Оценка модели»") for v in violations)
+
+
+# --- проценты целыми (план 2026-10-17, А.1) ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("whole", "exact"), [("24", 23.9), ("39", 38.9), ("13", 13.2), ("18", 17.5)]
+)
+def test_a_whole_percent_is_allowed_when_a_number_rounds_to_it(whole: str, exact: float):
+    """Целое N% разрешено, если число набора округляется к N половиной вверх; дробное
+    и не округляющееся целое — нарушение; счётное число без «%» — как раньше."""
+    numbers = frozenset({exact})
+    assert _check(f"Это около {whole}% рук.", allowed=numbers) == []
+    assert any("числа" in v for v in _check(f"Это около {int(whole) + 1}% рук.", allowed=numbers))
+    assert any("числа" in v for v in _check(f"Это около {int(whole) - 1}% рук.", allowed=numbers))
+    assert any("числа" in v for v in _check(f"Это около {whole}.5% рук.", allowed=numbers))
+    assert any("числа" in v for v in _check(f"Это {whole} раз.", allowed=numbers))
+
+
+def test_a_whole_percent_is_not_a_tenth_with_a_tail():
+    """«23.8%» при 23.9 — по-прежнему нарушение: дробное только точным совпадением."""
+    numbers = frozenset({23.9})
+    assert _check("Порог 23.9%.", allowed=numbers) == []
+    assert any("числа" in v for v in _check("Порог 23.8%.", allowed=numbers))
+
+
+def test_a_whole_percent_backs_the_threshold_arithmetic():
+    """«Если BB сбрасывает чаще 24%» при пороге 23.9 опирается так же, как «23.9%»."""
+    numbers = frozenset({23.9})
+    for share in ("23.9", "24"):
+        text = f"Ставка окупается, если BB сбрасывает чаще {share}%."
+        assert _check(text, allowed=numbers, calc_numbers=numbers) == []
+    text = "Ставка окупается, если BB сбрасывает чаще 25%."
+    assert any(ASSUMPTION_MARK in v for v in _check(text, allowed=numbers, calc_numbers=numbers))
+
+
+def test_a_whole_percent_backs_a_measured_frequency():
+    numbers = frozenset({21.0, 54.0, 38.9})
+    text = "BB сбрасывает 39% (21 из 54)."
+    assert _check(text, allowed=numbers, calc_numbers=numbers, frequency_numbers=numbers) == []
+    text = "BB сбрасывает 41% (21 из 54)."
+    assert any(
+        ASSUMPTION_MARK in v
+        for v in _check(text, allowed=numbers, calc_numbers=numbers, frequency_numbers=numbers)
+    )
+
+
+def test_a_whole_percent_of_the_equity_output_needs_the_mark_like_the_exact_one():
+    numbers = frozenset({30.8})
+    kw = {"allowed": numbers, "assumed_numbers": numbers}
+    assert any(ASSUMPTION_MARK in v for v in _check("Эквити 31%.", **kw))
+    assert any(ASSUMPTION_MARK in v for v in _check("Эквити 30.8%.", **kw))
+    assert _check(f"Эквити 31% {ASSUMPTION_MARK}.", **kw) == []
+
+
+def test_a_whole_percent_of_the_chart_retells_it_without_a_mark():
+    chart = frozenset({38.2, 105.0})
+    kw = {"allowed": chart, "chart_numbers": chart}
+    assert _check("Диапазон BB по чарту — 38% рук.", **kw) == []
+    assert any(ASSUMPTION_MARK in v for v in _check("Диапазон BB по чарту — 40% рук.", **kw))
+
+
+def test_a_whole_percent_is_allowed_in_the_assumption_block():
+    numbers = frozenset({38.2})
+    assert _check_block("BB по чарту защищает 38% рук.", allowed=numbers) == []
+    assert _check_block("BB по чарту защищает 38.2% рук.", allowed=numbers) == []
+    assert _check_block("BB по чарту защищает 40% рук.", allowed=numbers)
+
+
+# --- шанс сводки и эквити против диапазона (А.5, b) -----------------------------
+
+
+def test_a_share_of_the_summary_that_equals_an_equity_number_needs_no_mark():
+    """Шанс собрать дро из сводки (17.4) совпадает до десятых с числом выхода
+    `equity_vs_range`: неоднозначное число метки не требует (живая фраза тёрна
+    2026-10-15); целое 17% при 17.4 сводки и 17.2 эквити — тоже."""
+    summary = frozenset({17.4, 8.0})
+    assumed = frozenset({17.4, 30.1})
+    kw = {"allowed": summary | assumed, "assumed_numbers": assumed, "summary_numbers": summary}
+    live = "По сводке у вас двусторонний стрит с 8 аутами, и шанс собрать его на следующей улице 17.4%."
+    assert _check(live, **kw) == []
+    assert any(ASSUMPTION_MARK in v for v in _check(live, **{**kw, "summary_numbers": _NONE}))
+    kw["assumed_numbers"] = frozenset({17.2, 30.1})
+    assert _check(live.replace("17.4%", "17%"), **kw) == []
+
+
+def test_a_share_only_from_the_equity_output_still_needs_the_mark():
+    summary = frozenset({17.4})
+    assumed = frozenset({17.4, 30.1})
+    kw = {"allowed": summary | assumed, "assumed_numbers": assumed, "summary_numbers": summary}
+    assert any(ASSUMPTION_MARK in v for v in _check("Против его диапазона у вас 30.1%.", **kw))
+    assert any(ASSUMPTION_MARK in v for v in _check("Против такого колла у вас 30%.", **kw))
+    assert _check(f"Против такого колла у вас 30.1% {ASSUMPTION_MARK}.", **kw) == []
+
+
+# --- ложные отказы тёрна 2026-10-15 (А.5) ---------------------------------------
+
+_TURN = frozenset({33.3, 13.2})
+
+
+def _turn_check(text: str, **kw) -> list[str]:
+    kw.setdefault("allowed", _TURN)
+    kw.setdefault("calc_numbers", _TURN)
+    return _check(text, **kw)
+
+
+def test_a_threshold_clause_with_the_bluff_noun_and_a_lead_in_passes():
+    """(a) «Как чистый блеф он окупается, если BB сбрасывает чаще 33.3%, а с учётом
+    ваших аутов порог ниже: 13.2%» — арифметика порога из сводки; «блеф» в части о
+    прибыльности — имя порога, «порог ниже: N%» — подводка к доле расчёта."""
+    live = (
+        "Как чистый блеф он окупается, если BB сбрасывает чаще 33.3%, "
+        "а с учётом ваших аутов порог ниже: 13.2%."
+    )
+    assert _turn_check(live) == []
+    assert _turn_check(live.replace("33.3%", "33%").replace("13.2%", "13%")) == []
+
+
+def test_a_bluff_noun_in_a_profit_clause_is_not_an_opponent_action():
+    assert _turn_check("Как блеф он окупается, если BB сбрасывает чаще 33.3%.") == []
+    # Вне части о прибыльности и при будущем «блеф» — действие соперника.
+    assert any(ASSUMPTION_MARK in v for v in _turn_check("Он делает блеф."))
+    assert any(ASSUMPTION_MARK in v for v in _turn_check("Он сделает блеф, а ставка окупается."))
+    assert any(ASSUMPTION_MARK in v for v in _turn_check("BB блефует, и ставка окупается."))
+
+
+def test_a_threshold_lead_in_before_its_share_is_not_a_profit_conclusion():
+    # Без слова «порог» или с долей не из расчёта — вывод, как раньше.
+    base = "Ставка окупается, если BB сбрасывает чаще 33.3%, а "
+    assert any("в плюсе" in v for v in _turn_check(base + "тут так и есть: 13.2%."))
+    assert any("в плюсе" in v for v in _turn_check(base + "порог ниже: 41%.", allowed=_TURN | {41.0}))
+    assert _turn_check(base + "порог с аутами ниже: 13.2%.") == []
+
+
+def test_a_fold_noun_right_after_the_word_threshold_is_not_an_opponent_action():
+    """(c) «Порог фолдов для него: 33.3% как у чистого блефа и 13.2% с учётом аутов»."""
+    live = "Порог фолдов для него: 33.3% как у чистого блефа и 13.2% с учётом аутов."
+    assert _turn_check(live) == []
+    assert any(ASSUMPTION_MARK in v for v in _turn_check("У него много фолдов."))
+    assert any(ASSUMPTION_MARK in v for v in _turn_check("Порог высокий, фолдов он наберёт."))
+    assert any(ASSUMPTION_MARK in v for v in _turn_check("Порог высокий, он сделает фолд."))
+
+
+def test_a_shot_aside_from_equity_against_the_range_is_meta_speech():
+    """(d) «а не эквити против диапазона» — отграничение, без числа; соседи: слово
+    диапазона в другом обороте и «держит» метку требуют."""
+    assert _turn_check("Это шанс самого дро, а не эквити против диапазона.") == []
+    assert _turn_check("Это шанс самого дро, а не эквити против его диапазона.") == []
+    assert any(ASSUMPTION_MARK in v for v in _turn_check("Это эквити против диапазона."))
+    assert any(ASSUMPTION_MARK in v for v in _turn_check("Это не эквити, а диапазон у него широкий."))
+    assert any(
+        ASSUMPTION_MARK in v
+        for v in _turn_check("Это не эквити против диапазона: он держит пару.")
+    )
+
+
+def test_so_often_as_a_comparison_is_not_a_habit_adverb():
+    """(e) «чтобы BB сбрасывал так часто, как при блефе» — степень в сравнении;
+    «часто», «всегда» и «так часто» без «, как» по-прежнему обобщение."""
+    live = "Это значит, что ставке не нужно, чтобы BB сбрасывал так часто, как при блефе без equity."
+    assert _turn_check(live) == []
+    for text in (
+        "BB часто сбрасывал, как при блефе.",
+        "BB сбрасывал так часто.",
+        "BB всегда сбрасывал так часто, как нужно.",
+    ):
+        assert any(ASSUMPTION_MARK in v for v in _turn_check(text)), text
+
+
+# --- ранги аутов словами (А.4) --------------------------------------------------
+
+
+def _draw_line(draw: Draw) -> str:
+    text = _ctx(_with_line(_TOP_PAIR, draw)).text
+    return next(line for line in text.splitlines() if line.startswith("Рука героя"))
+
+
+def _straight(kinds: list[DrawKind], ranks: list[str], outs: int = 8) -> Draw:
+    return Draw(
+        kinds=kinds,
+        out_ranks=ranks,
+        outs=[f"{r}c" for r in ranks] * (outs // max(len(ranks), 1) or 1),
+        unseen=46,
+        hit_next=0.174,
+        hit_by_river=None,
+    )
+
+
+def test_the_straight_draw_names_the_out_ranks_in_words():
+    """Ранги аутов — словами в винительном падеже: «на даму и семёрку»; одиночный,
+    три и больше, десятка; флеш без стрита рангов не печатает; в комбо ранги стоят
+    вплотную к стриту."""
+    one = _draw_line(_straight([DrawKind.GUTSHOT], ["T"], outs=4))
+    assert "дро — гатшот на десятку, 4 аута," in one
+    two = _draw_line(_straight([DrawKind.OPEN_ENDED], ["Q", "7"]))
+    assert "дро — двусторонний стрит на даму и семёрку, 8 аутов," in two
+    three = _draw_line(_straight([DrawKind.DOUBLE_GUTSHOT], ["A", "K", "9"], outs=9))
+    assert "двойной гатшот на туз, короля и девятку," in three
+    combo = _draw_line(_straight([DrawKind.FLUSH, DrawKind.OPEN_ENDED], ["8", "3"], outs=15))
+    assert "дро — флеш + двусторонний стрит на восьмёрку и тройку," in combo
+    flush = _draw_line(_FLUSH_DRAW)
+    assert "дро — флеш, 9 аутов," in flush and " на " not in flush.split(",")[0]
+
+
+def test_the_rank_words_cover_every_rank_the_core_knows():
+    from harness.analysis.tools.draws import RANK_VALUE
+    from harness.explanation.agent_checks import _RANK_ACCUSATIVE
+    from harness.presentation.messages import _RANK_GENITIVE
+
+    assert set(_RANK_ACCUSATIVE) == set(RANK_VALUE) == set(_RANK_GENITIVE)
+
+
+def test_a_bare_out_rank_is_still_a_number_and_the_words_of_the_summary_pass():
+    """«Двусторонний стрит (Q, 7)» с голой «7» отклоняется (причина правки); слова
+    сводки числами не считаются."""
+    ctx = _ctx(_with_line(_TOP_PAIR, _straight([DrawKind.OPEN_ENDED], ["Q", "7"])))
+    kw = {"allowed": ctx.allowed, "hero_class": ctx.hero_class, "board_ranks": ctx.board_ranks}
+    assert any("числа" in v for v in _check("Двусторонний стрит (Q, 7), 8 аутов.", **kw))
+    assert _check("Двусторонний стрит на даму и семёрку, 8 аутов.", **kw) == []
+    body = "\n".join(line for line in ctx.text.splitlines() if not line.startswith("Точка 1 ("))
+    cleaned = strip_card_tokens(body, hero_class=ctx.hero_class, board_ranks=ctx.board_ranks)
+    assert unsupported_numbers(cleaned, ctx.allowed) == []
+
+
+def test_two_live_false_refusals_of_the_turn_stay_open():
+    """(f), (g) тёрна 2026-10-15 — другой механизм (косвенный вопрос; перечень
+    недостающих данных со словом «колла»): пока ловятся как утверждение о сопернике,
+    закрыты не были (EVALS.md, граница механических проверок)."""
+    for text in (
+        "Мне нечем проверить, как часто BB сбрасывает именно на второй баррель.",
+        "Частоты поля на ставку тёрна после колла флопа в инструментах нет.",
+    ):
+        assert any(ASSUMPTION_MARK in v for v in _turn_check(text, labels=frozenset({"stat:barrel_turn"}))), text
