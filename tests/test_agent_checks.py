@@ -1800,11 +1800,18 @@ _MISSING_DATA = [
 ]
 
 
-def test_the_noun_of_a_fold_frequency_is_a_marker_without_the_absence_in_its_clause():
-    """Действие в родительном при «частоты» («частоты фолдов BB»): оборот отсутствия
-    может стоять в соседней части."""
-    text = "Частоты фолдов BB на ставки тёрна, в ваших данных нет."
-    assert _turn_check(text) == []
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Частота фолдов BB высокая, данных нет.",
+        "Частота фолдов у BB большая, а точных данных нет.",
+        "Статистики фолдов нет, а BB сбрасывает с частотой фолдов выше нормы.",
+    ],
+)
+def test_the_noun_of_a_frequency_needs_the_absence_in_its_own_clause(text: str):
+    """«Частот…/статистик…» освобождает часть только с оборотом отсутствия в ней же;
+    действие в родительном при существительном этого не заменяет."""
+    assert any(ASSUMPTION_MARK in v for v in _turn_check(text)), text
 
 
 @pytest.mark.parametrize("text", _MISSING_DATA)

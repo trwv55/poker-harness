@@ -116,11 +116,11 @@
 `test_a_shot_aside_from_equity_against_the_range_is_meta_speech`,
 `test_so_often_as_a_comparison_is_not_a_habit_adverb`). Класс «нет данных» — действие
 соперника в косвенном вопросе («сколько», «как часто», «какую долю») или при «частот…/
-статистик…/долю» (оборот отсутствия в той же части либо действие в родительном при
-существительном) в предложении с оборотом отсутствия, без доли, «бы», будущего,
+статистик…/долю» (только с оборотом отсутствия в той же части) в предложении с оборотом отсутствия, без доли, «бы», будущего,
 повторяемости и слов руки в части; «в плюсе» в кавычках — упоминание только в предложении
 с отказом («нельзя», «не могу», «не делаю»)
-(`test_the_noun_of_a_fold_frequency_is_a_marker_without_the_absence_in_its_clause`,`test_missing_data_meta_speech_is_not_an_opponent_claim`,
+(`test_the_noun_of_a_frequency_needs_the_absence_in_its_own_clause`,
+`test_missing_data_meta_speech_is_not_an_opponent_claim`,
 `test_missing_data_meta_speech_does_not_cover_a_real_claim`,
 `test_a_quoted_profit_phrase_is_a_mention_but_a_bare_one_is_a_conclusion`); пересказ
 вскрытия в прошедшем времени (слово руки не служит утверждением только в части с
@@ -433,8 +433,7 @@ def _numbers_of(match: re.Match[str]) -> list[str]:
 # сбрасывает». Предложение с оборотом отсутствия, без доли/«N из M», «бы», будущего и
 # наречий повторяемости; освобождается только часть, где действие соперника стоит в
 # косвенном вопросе («сколько», «как часто», «какую долю») или при «частот…/
-# статистик…/долю» (тогда оборот отсутствия в той же части или действие в родительном при
-# существительном), и в ней нет слов руки (`_strip_no_data`,
+# статистик…/долю» (тогда оборот отсутствия в той же части), и в ней нет слов руки (`_strip_no_data`,
 # `test_missing_data_meta_speech_is_not_an_opponent_claim`).
 _ABSENCE_RE = re.compile(
     _W + r"(?:нельзя|нечем|не\s+могу\s+(?:сравнить|проверить|посчитать|сказать|определить))"
@@ -448,14 +447,8 @@ _ASK_MARKER_RE = re.compile(
     _W + r"(?:сколько|как\s+часто|какую\s+долю|какая\s+доля)" + _WE, re.IGNORECASE
 )
 # Существительное «частот…/статистик…/долю»: освобождает часть, только если оборот
-# отсутствия стоит в ней же или действие соперника — в родительном при этом
-# существительном («частоты фолдов BB … нет»).
+# отсутствия стоит в ней же («частоты фолдов BB … в данных нет»).
 _NOUN_MARKER_RE = re.compile(r"частот[а-яё]*|статистик[а-яё]*|" + _W + r"долю" + _WE, re.IGNORECASE)
-_NOUN_OF_ACTION_RE = re.compile(
-    r"(?:частот|статистик)[а-яё]*\s+(?:фолд|сброс|сдач|защит)[а-яё]*|"
-    + _W + r"долю\s+(?:фолд|сброс|сдач|защит)[а-яё]*",
-    re.IGNORECASE,
-)
 _ASK_OFTEN_RE = re.compile(_W + r"как\s+часто" + _WE, re.IGNORECASE)
 # Пересказ вскрытия: глагол прошедшего времени «вскрыл / вскрыла / вскрыли».
 _SHOWDOWN_RE = re.compile(_W + r"вскры(?:л|ла|ли)" + _WE, re.IGNORECASE)
@@ -491,8 +484,7 @@ def _strip_no_data(rest: str) -> str:
     for i in range(0, len(pieces), 2):
         clause = pieces[i]
         marked = _ASK_MARKER_RE.search(clause) or (
-            _NOUN_MARKER_RE.search(clause)
-            and (_absent(clause) or _NOUN_OF_ACTION_RE.search(clause))
+            _NOUN_MARKER_RE.search(clause) and _absent(clause)
         )
         if marked and not _HAND_RE.search(clause):
             pieces[i] = " "
