@@ -1587,6 +1587,26 @@ def test_a_share_only_from_the_equity_output_still_needs_the_mark():
     assert any(ASSUMPTION_MARK in v for v in _check("Против такого диапазона у вас 17%.", **kw))
     assert any(ASSUMPTION_MARK in v for v in _check("Эквити 17% вместе с аутами.", **kw))
     assert any(ASSUMPTION_MARK in v for v in _check("Эквити 17.2% и 8 аутов.", **kw))
+    # Без слова руки (аут, сбор, дро…) совпадение со сводкой метку не снимает.
+    assert any(ASSUMPTION_MARK in v for v in _check("Против такого колла у вас 17%.", **kw))
+    assert any(ASSUMPTION_MARK in v for v in _check("У вас 17%.", **kw))
+
+
+def test_an_opponent_word_in_the_clause_of_the_share_cancels_the_hand_chances_exemption():
+    """Слово руки есть, но в части с долей — «против», «колл…», «выигра…» или соперник:
+    это эквити против его действия, метка нужна (сводка 30.2, эквити 29.8)."""
+    summary = frozenset({30.2, 8.0})
+    assumed = frozenset({29.8})
+    kw = {"allowed": summary | assumed, "assumed_numbers": assumed, "summary_numbers": summary}
+    for text in (
+        "Против его колла у вас 30% с учётом аутов.",
+        "Если он заколлирует, шанс выиграть 30%, ауты есть.",
+        "Против вэлью BB с дро вы выигрываете 30%.",
+        "Если BB коллирует, шанс собрать 30%, ауты есть.",
+        "BB видит шанс собрать 30%, ауты есть.",
+    ):
+        assert any(ASSUMPTION_MARK in v for v in _check(text, **kw)), text
+    assert _check("Есть 8 аутов, шанс собрать 30%.", **kw) == []
 
 
 def test_a_measured_frequency_or_a_chart_number_does_not_free_the_equity_share():
@@ -1643,6 +1663,9 @@ def test_a_threshold_lead_in_before_its_share_is_not_a_profit_conclusion():
     assert any("в плюсе" in v for v in _turn_check(base + "тут так и есть: 13.2%."))
     assert any("в плюсе" in v for v in _turn_check(base + "порог ниже: 41%.", allowed=_TURN | {41.0}))
     assert _turn_check(base + "с учётом аутов порог ниже: 13.2%.") == []
+    # Каждое условие подводки порознь: соперник в части; слово «порог» без «ниже/выше».
+    for tail in ("BB порог выше: 13.2%.", "тут порог: 13.2%."):
+        assert _turn_check(base + tail), tail
     for tail in ("BB выше порога: 13.2%.", "он перешёл порог: 13.2%.", "порог он сбросит: 13.2%."):
         assert _turn_check(base + tail), tail
 
@@ -1653,6 +1676,8 @@ def test_a_fold_noun_after_the_word_threshold_with_a_calc_share_is_not_an_oppone
     live = "Порог фолдов для него: 33.3% как у чистого блефа и 13.2% с учётом аутов."
     assert _turn_check(live) == []
     assert any(ASSUMPTION_MARK in v for v in _turn_check("Он выше порога фолдов."))
+    for text in ("Он выше порога фолдов: 33.3%.", "BB выше порога фолдов — 13.2%."):
+        assert any(ASSUMPTION_MARK in v for v in _turn_check(text)), text
     assert any(ASSUMPTION_MARK in v for v in _turn_check("Порог фолдов для него: 41%.", allowed=_TURN | {41.0}))
     assert any(ASSUMPTION_MARK in v for v in _turn_check("У него много фолдов."))
     assert any(ASSUMPTION_MARK in v for v in _turn_check("Порог высокий, фолдов он наберёт."))
@@ -1665,6 +1690,8 @@ def test_a_shot_aside_from_equity_against_the_range_is_meta_speech():
     assert _turn_check("Это шанс самого дро, а не эквити против диапазона.") == []
     assert _turn_check("Это шанс самого дро, а не эквити против его диапазона.") == []
     assert any(ASSUMPTION_MARK in v for v in _turn_check("Это эквити против диапазона."))
+    assert any(ASSUMPTION_MARK in v for v in _turn_check("Он сбросит, а не эквити против диапазона."))
+    assert any(ASSUMPTION_MARK in v for v in _turn_check("Пары тут нет, а не эквити против диапазона."))
     for text in (
         "Это не эквити против диапазона, там много пар.",
         "Это не эквити против его диапазона, который широк.",
@@ -1767,3 +1794,16 @@ def test_a_signed_percent_is_not_freed_by_rounding():
         assert any("числа" in v for v in _check(text, allowed=numbers)), text
     assert _check_block("Порог 24%.", allowed=numbers) == []
     assert _check_block("Порог -24%.", allowed=numbers)
+
+
+def test_so_often_as_at_past_meetings_is_an_accepted_cost():
+    """Форма «так часто, как при …» шире живой фразы: «как при прошлых встречах»
+    проходит — принятая цена, её ловит судья."""
+    assert _turn_check("BB сбрасывал так часто, как при прошлых встречах.") == []
+
+
+def test_a_signed_percent_in_the_chart_clause_does_not_retell_the_chart():
+    chart = frozenset({38.2, 105.0})
+    kw = {"allowed": chart, "chart_numbers": chart}
+    assert _check("Диапазон BB по чарту 38% рук.", **kw) == []
+    assert any(ASSUMPTION_MARK in v for v in _check("Диапазон BB по чарту -38% рук.", **kw))

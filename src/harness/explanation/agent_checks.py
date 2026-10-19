@@ -92,7 +92,8 @@
 `test_a_whole_percent_of_the_equity_output_needs_the_mark_like_the_exact_one`,
 `test_a_whole_percent_of_the_chart_retells_it_without_a_mark`,
 `test_a_whole_percent_is_allowed_in_the_assumption_block`,
-`test_a_signed_percent_is_not_freed_by_rounding`). Цена: целое разрешено и в
+`test_a_signed_percent_is_not_freed_by_rounding`,
+`test_a_signed_percent_in_the_chart_clause_does_not_retell_the_chart`). Цена: целое разрешено и в
 другом смысле — 24% проходит, если 23.9 есть в наборе, даже сказанное о другом.
 Число, совпавшее и с `equity_vs_range`, и со сводкой разбора (`summary_numbers`),
 метки не требует только в предложении о шансах самой руки героя — со словом «аут»,
@@ -103,7 +104,9 @@
 `test_the_summary_numbers_reach_the_check_of_the_equity_share`). Узкие закрытия ложных
 отказов тёрна: «блеф» в части о прибыльности, «порог ниже: N%» перед долей расчёта,
 «порог фолдов» перед долей расчёта, «а не эквити против диапазона» в конце предложения,
-«так часто, как при …» — каждое с соседом,
+«так часто, как при …» (форма шире живой фразы, «как при прошлых встречах», проходит —
+принятая цена, её ловит судья,
+`test_so_often_as_at_past_meetings_is_an_accepted_cost`) — каждое с соседом,
 что настоящее утверждение той же формы ловится
 (`test_a_threshold_clause_with_the_bluff_noun_and_a_lead_in_passes`,
 `test_a_bluff_noun_in_a_profit_clause_is_not_an_opponent_action`,
@@ -421,11 +424,17 @@ def _strip_not_equity(sentence: str) -> str:
 
 
 def _strip_threshold_name(sentence: str, calc_numbers: frozenset[float]) -> str:
-    """Без имени порога «Порог фолдов для него» перед долей расчёта
-    (`_THRESHOLD_NAME_RE`)."""
-    return _THRESHOLD_NAME_RE.sub(
-        lambda m: " " if _in(m.group("n"), calc_numbers, percent=True) else m.group(0), sentence
-    )
+    """Без имени порога «Порог фолдов для него» перед долей расчёта, если до «порог» в
+    той же части нет соперника (`_THRESHOLD_NAME_RE`)."""
+
+    def strip(m: re.Match[str]) -> str:
+        # «Он выше порога фолдов: 33.3%» — не имя порога.
+        before = sentence[_clause_start(sentence, m.start()) : m.start()]
+        if _OPPONENT_RE.search(before) or not _in(m.group("n"), calc_numbers, percent=True):
+            return m.group(0)
+        return " "
+
+    return _THRESHOLD_NAME_RE.sub(strip, sentence)
 
 
 def _clause_start(text: str, position: int) -> int:
@@ -663,14 +672,24 @@ _HERO_DRAW_WORD_RE = re.compile(
 _EQUITY_WORD_RE = re.compile(r"эквити", re.IGNORECASE)
 
 
+# Слова соперника и его действия в части с долей: «против», «колл», «заколл», «выигра…»
+# (`_hero_chances_share`).
+_VERSUS_RE = re.compile(_W + r"(?:против|(?:за)?колл|выигра)", re.IGNORECASE)
+
+
 def _hero_chances_share(
-    pct: str, sentence: str, summary_numbers: frozenset[float]
+    pct: str, sentence: str, clause: str, summary_numbers: frozenset[float]
 ) -> bool:
     """Доля совпала с числом сводки (как в `_in`, целое — тоже) в предложении о шансах
-    самой руки героя: неоднозначное число метки не требует."""
+    самой руки героя: слово «аут», «собрать», «дро», «бэкдор» или «оверкарт» в
+    предложении, нет «эквити» и в части с долей нет «против», «колл…», «выигра…» и
+    слова о сопернике подлежащим (`_OPPONENT_SUBJECT_RE`: «его» в «собрать его» — это дро, а
+    не соперник). Неоднозначное число метки не требует."""
     return (
         _HERO_DRAW_WORD_RE.search(sentence) is not None
         and _EQUITY_WORD_RE.search(sentence) is None
+        and _VERSUS_RE.search(clause) is None
+        and _OPPONENT_SUBJECT_RE.search(clause) is None
         and _in(pct, summary_numbers, percent=True)
     )
 
@@ -683,13 +702,18 @@ def _assumed_share_in(
     """Доля из выхода `equity_vs_range` в предложении
     (`test_an_equity_against_a_narrowed_range_needs_the_mark`). Метки не требует
     только доля, совпавшая и с числом сводки разбора (`summary_numbers`), когда
-    предложение — о шансах самой руки героя: есть «аут», «собрать», «дро», «бэкдор»
-    или «оверкарт» и нет «эквити»
+    предложение — о шансах самой руки героя (`_hero_chances_share`: слово руки,
+    «эквити» и слова соперника в части с долей закреплены порознь)
     (`test_a_share_of_the_summary_that_equals_an_equity_number_needs_no_mark`,
     `test_a_share_only_from_the_equity_output_still_needs_the_mark`)."""
+
+    def clause_of(m: re.Match[str]) -> str:
+        end = _CLAUSE_SPLIT_RE.search(sentence, m.end())
+        return sentence[_clause_start(sentence, m.start()) : end.start() if end else len(sentence)]
+
     return any(
         _in(m.group("pct"), assumed_numbers, percent=True)
-        and not _hero_chances_share(m.group("pct"), sentence, summary_numbers)
+        and not _hero_chances_share(m.group("pct"), sentence, clause_of(m), summary_numbers)
         for m in _PCT_RE.finditer(sentence)
     )
 
