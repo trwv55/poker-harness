@@ -218,7 +218,9 @@ class CalcRun:
     def last_for(self, analysis_id: int, opponent_position: str) -> RangeNarrowing | None:
         """Последнее сужение этого соперника в этой руке, любой улицы: его классы вне
         чарта `added` принимает без новой просьбы игрока
-        (`test_classes_named_earlier_in_the_same_hand_are_added_and_after_a_new_hand_not`)."""
+        (`test_classes_named_earlier_in_the_same_hand_are_added_and_after_a_new_hand_not`);
+        сужение другой руки или другого соперника — нет
+        (`test_an_added_class_of_one_hand_and_opponent_opens_no_other`)."""
         for narrowing in reversed(self.narrowings):
             if (narrowing.analysis_id, narrowing.opponent_position) == (
                 analysis_id, opponent_position

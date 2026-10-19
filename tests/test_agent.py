@@ -49,8 +49,9 @@ from harness.agent.history import (
 )
 from harness.agent.prompt import instructions_for, load_system_prompt
 from harness.agent.run import MAX_CALCS_PER_TURN, REWRITE_HEAD, AgentDraft, run_agent_turn
-from harness.analysis.charts import lookup
+from harness.analysis.charts import lookup, parse_range
 from harness.analysis.frequency import defense_from_bet
+from harness.analysis.opponent_range import RangeRefused, narrow
 from harness.calcs.routing import CalcRun, tools_for
 from harness.contracts import (
     AGENT_ONLY_CALCS,
@@ -1801,6 +1802,21 @@ async def test_classes_named_earlier_in_the_same_hand_are_added_and_after_a_new_
     # названные до смены руки, но не добавленные, — уже нет.
     assert "error" not in back.calls[0]
     assert "игрок не назвал эти классы записью: 55" in back.calls[1]["error"]
+
+
+@pytest.mark.parametrize(("analysis_id", "position"), [(2, "BB"), (1, "SB")])
+def test_an_added_class_of_one_hand_and_opponent_opens_no_other(analysis_id: int, position: str):
+    """Добавленное в руке 1 против BB не открывает `added` ни в руке 2 против BB, ни
+    против SB в руке 1: ключ `last_for` — и рука, и позиция соперника."""
+    run_state = CalcRun(max_calcs=8, sizes_from=frozenset(), narrowings=[
+        _narrowing("flop", ["AA", "22"]),
+    ])
+    same = run_state.last_for(1, "BB")
+    assert same is not None
+    assert narrow(parse_range("88+"), "AA", added="22", kept=same.classes).weight("22") == 1.0
+    other = run_state.last_for(analysis_id, position)
+    with pytest.raises(RangeRefused, match="игрок не назвал эти классы записью: 22"):
+        narrow(parse_range("88+"), "AA", added="22", kept=other.classes if other else [])
 
 
 def test_a_narrowing_trimmed_from_the_history_is_no_bound():
