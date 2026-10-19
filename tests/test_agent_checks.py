@@ -802,6 +802,17 @@ def test_the_fold_to_turn_barrel_stat_grounds_the_barrel_term():
     assert _check(text, labels=frozenset({STAT_LABEL + "fold_to_turn_barrel"})) == []
 
 
+def test_the_fold_to_turn_barrel_stat_grounds_the_cbet_term():
+    """Знаменатель сдачи на второй баррель — колл с-бета: эта частота в разговоре опирает
+    и термин «с-бет»; без неё и без меток с-бета — по-прежнему нарушение."""
+    text = "BB сбрасывал на второй баррель после колла с-бета."
+    assert _check(text, labels=frozenset({STAT_LABEL + "fold_to_turn_barrel"})) == []
+    assert any("c-бет" in v for v in _check(text, labels=frozenset({"action:barrel"})))
+    assert any(
+        "c-бет" in v for v in _check(text, labels=frozenset({STAT_LABEL + "barrel_turn"}))
+    )
+
+
 def test_a_bare_label_without_its_kind_does_not_count():
     """Метки с пространством имён: голое `cbet` — не метка классификатора."""
     assert any("c-бет" in v for v in _check("Ваш c-бет на флопе.", labels=frozenset({"cbet"})))

@@ -1022,7 +1022,12 @@ STAT_LABEL = "stat:"
 TERM_LABELS: dict[str, tuple[re.Pattern[str], frozenset[str]]] = {
     "c-бет": (
         re.compile(r"[cс]-?бет|контбет", re.IGNORECASE),
-        frozenset({"action:cbet", "action:delayed_cbet", "stat:cbet_flop", "stat:fold_to_cbet"}),
+        # Знаменатель сдачи на второй баррель — колл с-бета: «после колла с-бета» опирается
+        # и на эту частоту (`test_the_fold_to_turn_barrel_stat_grounds_the_cbet_term`).
+        frozenset({
+            "action:cbet", "action:delayed_cbet", "stat:cbet_flop", "stat:fold_to_cbet",
+            "stat:fold_to_turn_barrel",
+        }),
     ),
     "донк": (re.compile(r"(?<![а-яё])донк", re.IGNORECASE), frozenset({"action:donk"})),
     "проба": (
