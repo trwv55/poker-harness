@@ -209,6 +209,10 @@ _DIGITS_ONLY_RE = re.compile(r"\d+")
 # Позиция с цифрой — имя, а не число (решение контроллера R12): «UTG+1», «UTG+2» и
 # написание «UTG1». Только целым словом: «+1 BB» и «1 из 5» остаются числами.
 _POSITION_RE = re.compile(r"(?<!\w)UTG\+?[12]" + _EDGE_R)
+# Имя повышения с цифрой — термин, а не число: «3-бет», «3-бетит», «4-бет», «3бет»
+# (план 2026-10-17, п. 8: выход `opponent_range` пишет «ими 3-бетит»). Цифра
+# вплотную к «бет» и только целым словом слева: «3 бета» и «13-бет» остаются числами.
+_BET_TERM_RE = re.compile(r"(?<![\w.,])[2-5]-?(?:бет|bet)", re.IGNORECASE)
 # Без разделителя ранги борда слипаются, только если рядом буква («KQ7»): три
 # цифры подряд («258») — сумма, а не борд 2-5-8.
 _BOARD_JOIN = r"(?:[-–]|(?<=[TJQKA])|(?=[TJQKA]))"
@@ -1297,11 +1301,12 @@ def strip_card_tokens(
 
     Вырезается только однозначное: карта с мастью, класс с буквой (`A5s`,
     `T9o`, `KQ`, `98s`), ранги борда через дефис, имя позиции с цифрой (`UTG+1`,
-    `UTG1`; `test_a_position_name_with_a_digit_is_not_a_number`). Две цифры без буквы и масти
+    `UTG1`; `test_a_position_name_with_a_digit_is_not_a_number`), имя повышения с цифрой
+    (`3-бет`, `3-бетит`, `4бет`; `test_a_raise_name_with_a_digit_is_not_a_number`). Две цифры без буквы и масти
     (`22`) остаются числом всегда. `hero_class` сохранён ради интерфейса
     (`AgentContext.hero_class`, `check_agent_answer`) и на вырезание не влияет.
     """
-    text = _POSITION_RE.sub(" ", _SUITED_CARD_RE.sub(" ", text))
+    text = _BET_TERM_RE.sub(" ", _POSITION_RE.sub(" ", _SUITED_CARD_RE.sub(" ", text)))
     board = Counter(board_ranks)
 
     def board_sub(match: re.Match[str]) -> str:

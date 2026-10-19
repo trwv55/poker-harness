@@ -84,6 +84,26 @@ def test_a_position_name_with_a_digit_is_not_a_number(text: str):
     assert _check(f"Чарт защиты: {text}.") == []
 
 
+@pytest.mark.parametrize(
+    "text", ["ими 3-бетит", "3-бет против опена", "был 4-бет", "3бет лайт", "в 3-бет-банке"]
+)
+def test_a_raise_name_with_a_digit_is_not_a_number(text: str):
+    """Имя повышения — термин: «3-бетит» выхода `opponent_range` (план 2026-10-17, п. 8)
+    проходит сверку при пустом наборе разрешённых."""
+    assert numbers_in(strip_card_tokens(text)) == []
+    assert not any("числа" in v for v in _check(f"По чарту BB {text}."))
+
+
+@pytest.mark.parametrize("text", ["3 бета за вечер", "13-бет", "ставка 3 BB", "6-бет"])
+def test_a_digit_next_to_a_bet_word_is_a_number_unless_glued(text: str):
+    assert numbers_in(strip_card_tokens(text)) != []
+
+
+def test_the_sizes_next_to_a_raise_name_stay_numbers():
+    """Вырезается только имя повышения: размер рядом с ним остаётся числом."""
+    assert numbers_in(strip_card_tokens("3-бет 7.0, 4-бет до 18 BB")) == [7.0, 18.0]
+
+
 @pytest.mark.parametrize("text", ["Он поставил 1 BB.", "Ставка +1 BB.", "Это 1 из 5 раз."])
 def test_a_digit_outside_a_position_name_stays_a_number(text: str):
     assert any("числа" in v for v in _check(text))
