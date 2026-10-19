@@ -1555,25 +1555,49 @@ def test_a_whole_percent_is_allowed_in_the_assumption_block():
 
 def test_a_share_of_the_summary_that_equals_an_equity_number_needs_no_mark():
     """Шанс собрать дро из сводки (17.4) совпадает до десятых с числом выхода
-    `equity_vs_range`: неоднозначное число метки не требует (живая фраза тёрна
-    2026-10-15); целое 17% при 17.4 сводки и 17.2 эквити — тоже."""
+    `equity_vs_range`: в предложении о шансах самой руки (ауты, сбор, без «эквити»)
+    метки не нужно — обе живые фразы тёрна 2026-10-15; целое 17% при 17.4 сводки и
+    17.2 эквити — тоже."""
     summary = frozenset({17.4, 8.0})
     assumed = frozenset({17.4, 30.1})
     kw = {"allowed": summary | assumed, "assumed_numbers": assumed, "summary_numbers": summary}
-    live = "По сводке у вас двусторонний стрит с 8 аутами, и шанс собрать его на следующей улице 17.4%."
-    assert _check(live, **kw) == []
-    assert any(ASSUMPTION_MARK in v for v in _check(live, **{**kw, "summary_numbers": _NONE}))
+    lives = (
+        (
+            "При колле рука у вас не пустая: двусторонний стрит, 8 аутов, "
+            "собрать его на следующей улице 17.4%."
+        ),
+        "По сводке у вас двусторонний стрит с 8 аутами, и шанс собрать его на следующей улице 17.4%.",
+    )
+    for live in lives:
+        assert _check(live, **kw) == []
+        assert any(ASSUMPTION_MARK in v for v in _check(live, **{**kw, "summary_numbers": _NONE}))
     kw["assumed_numbers"] = frozenset({17.2, 30.1})
-    assert _check(live.replace("17.4%", "17%"), **kw) == []
+    assert _check(lives[1].replace("17.4%", "17%"), **kw) == []
 
 
 def test_a_share_only_from_the_equity_output_still_needs_the_mark():
-    summary = frozenset({17.4})
-    assumed = frozenset({17.4, 30.1})
+    """Доля только из выхода эквити; совпавшая со сводкой, но не в предложении о шансах
+    руки или со словом «эквити», — тоже требует метки."""
+    summary = frozenset({17.4, 8.0})
+    assumed = frozenset({17.2, 30.1})
     kw = {"allowed": summary | assumed, "assumed_numbers": assumed, "summary_numbers": summary}
-    assert any(ASSUMPTION_MARK in v for v in _check("Против его диапазона у вас 30.1%.", **kw))
+    assert any(ASSUMPTION_MARK in v for v in _check("Против его колла у вас 30.1%.", **kw))
     assert any(ASSUMPTION_MARK in v for v in _check("Против такого колла у вас 30%.", **kw))
     assert _check(f"Против такого колла у вас 30.1% {ASSUMPTION_MARK}.", **kw) == []
+    assert any(ASSUMPTION_MARK in v for v in _check("Против такого диапазона у вас 17%.", **kw))
+    assert any(ASSUMPTION_MARK in v for v in _check("Эквити 17% вместе с аутами.", **kw))
+    assert any(ASSUMPTION_MARK in v for v in _check("Эквити 17.2% и 8 аутов.", **kw))
+
+
+def test_a_measured_frequency_or_a_chart_number_does_not_free_the_equity_share():
+    """Только число сводки, не измеренная частота и не чарт: 17.4 из частоты не снимает
+    метку с эквити в предложении об аутах."""
+    freq = frozenset({17.4, 8.0})
+    kw = {"allowed": freq, "assumed_numbers": frozenset({17.4}), "frequency_numbers": freq,
+          "chart_numbers": freq}
+    assert any(
+        ASSUMPTION_MARK in v for v in _check("Шанс собрать 17.4%, 8 аутов.", **kw)
+    )
 
 
 # --- ложные отказы тёрна 2026-10-15 (А.5) ---------------------------------------
@@ -1601,6 +1625,12 @@ def test_a_threshold_clause_with_the_bluff_noun_and_a_lead_in_passes():
 
 def test_a_bluff_noun_in_a_profit_clause_is_not_an_opponent_action():
     assert _turn_check("Как блеф он окупается, если BB сбрасывает чаще 33.3%.") == []
+    # Только оборот «как (чистый) блеф»: «против блефа BB» в части о прибыльности — нет.
+    for text in (
+        "Ставка окупается против блефа BB.",
+        "Колл окупается: против блефа BB это в плюсе.",
+    ):
+        assert any(ASSUMPTION_MARK in v for v in _turn_check(text, threshold_decided=True)), text
     # Вне части о прибыльности и при будущем «блеф» — действие соперника.
     assert any(ASSUMPTION_MARK in v for v in _turn_check("Он делает блеф."))
     assert any(ASSUMPTION_MARK in v for v in _turn_check("Он сделает блеф, а ставка окупается."))
@@ -1612,13 +1642,18 @@ def test_a_threshold_lead_in_before_its_share_is_not_a_profit_conclusion():
     base = "Ставка окупается, если BB сбрасывает чаще 33.3%, а "
     assert any("в плюсе" in v for v in _turn_check(base + "тут так и есть: 13.2%."))
     assert any("в плюсе" in v for v in _turn_check(base + "порог ниже: 41%.", allowed=_TURN | {41.0}))
-    assert _turn_check(base + "порог с аутами ниже: 13.2%.") == []
+    assert _turn_check(base + "с учётом аутов порог ниже: 13.2%.") == []
+    for tail in ("BB выше порога: 13.2%.", "он перешёл порог: 13.2%.", "порог он сбросит: 13.2%."):
+        assert _turn_check(base + tail), tail
 
 
-def test_a_fold_noun_right_after_the_word_threshold_is_not_an_opponent_action():
-    """(c) «Порог фолдов для него: 33.3% как у чистого блефа и 13.2% с учётом аутов»."""
+def test_a_fold_noun_after_the_word_threshold_with_a_calc_share_is_not_an_opponent_action():
+    """(c) «Порог фолдов для него: 33.3% как у чистого блефа и 13.2% с учётом аутов» —
+    только когда за именем порога стоит доля расчёта."""
     live = "Порог фолдов для него: 33.3% как у чистого блефа и 13.2% с учётом аутов."
     assert _turn_check(live) == []
+    assert any(ASSUMPTION_MARK in v for v in _turn_check("Он выше порога фолдов."))
+    assert any(ASSUMPTION_MARK in v for v in _turn_check("Порог фолдов для него: 41%.", allowed=_TURN | {41.0}))
     assert any(ASSUMPTION_MARK in v for v in _turn_check("У него много фолдов."))
     assert any(ASSUMPTION_MARK in v for v in _turn_check("Порог высокий, фолдов он наберёт."))
     assert any(ASSUMPTION_MARK in v for v in _turn_check("Порог высокий, он сделает фолд."))
@@ -1630,6 +1665,11 @@ def test_a_shot_aside_from_equity_against_the_range_is_meta_speech():
     assert _turn_check("Это шанс самого дро, а не эквити против диапазона.") == []
     assert _turn_check("Это шанс самого дро, а не эквити против его диапазона.") == []
     assert any(ASSUMPTION_MARK in v for v in _turn_check("Это эквити против диапазона."))
+    for text in (
+        "Это не эквити против диапазона, там много пар.",
+        "Это не эквити против его диапазона, который широк.",
+    ):
+        assert any(ASSUMPTION_MARK in v for v in _turn_check(text)), text
     assert any(ASSUMPTION_MARK in v for v in _turn_check("Это не эквити, а диапазон у него широкий."))
     assert any(
         ASSUMPTION_MARK in v
@@ -1643,6 +1683,8 @@ def test_so_often_as_a_comparison_is_not_a_habit_adverb():
     live = "Это значит, что ставке не нужно, чтобы BB сбрасывал так часто, как при блефе без equity."
     assert _turn_check(live) == []
     for text in (
+        "BB сбрасывал так часто, как никто за столом.",
+        "BB сбрасывал так часто, как я и ждал.",
         "BB часто сбрасывал, как при блефе.",
         "BB сбрасывал так часто.",
         "BB всегда сбрасывал так часто, как нужно.",
@@ -1678,7 +1720,7 @@ def test_the_straight_draw_names_the_out_ranks_in_words():
     two = _draw_line(_straight([DrawKind.OPEN_ENDED], ["Q", "7"]))
     assert "дро — двусторонний стрит на даму и семёрку, 8 аутов," in two
     three = _draw_line(_straight([DrawKind.DOUBLE_GUTSHOT], ["A", "K", "9"], outs=9))
-    assert "двойной гатшот на туз, короля и девятку," in three
+    assert "двойной гатшот на туза, короля и девятку," in three
     combo = _draw_line(_straight([DrawKind.FLUSH, DrawKind.OPEN_ENDED], ["8", "3"], outs=15))
     assert "дро — флеш + двусторонний стрит на восьмёрку и тройку," in combo
     flush = _draw_line(_FLUSH_DRAW)
@@ -1714,3 +1756,14 @@ def test_two_live_false_refusals_of_the_turn_stay_open():
         "Частоты поля на ставку тёрна после колла флопа в инструментах нет.",
     ):
         assert any(ASSUMPTION_MARK in v for v in _turn_check(text, labels=frozenset({"stat:barrel_turn"}))), text
+
+
+def test_a_signed_percent_is_not_freed_by_rounding():
+    """«-24%» при 23.9 в наборе — по-прежнему число с минусом, проверяется как раньше
+    (модуль 24 не равен 23.9); «24%» без знака проходит."""
+    numbers = frozenset({23.9})
+    assert _check("Порог 24%.", allowed=numbers) == []
+    for text in ("Порог -24%.", "Порог −24%."):
+        assert any("числа" in v for v in _check(text, allowed=numbers)), text
+    assert _check_block("Порог 24%.", allowed=numbers) == []
+    assert _check_block("Порог -24%.", allowed=numbers)
