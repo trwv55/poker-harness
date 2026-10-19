@@ -410,11 +410,14 @@ def narrow(
     prior: RangeNarrowing | None = None,
     added: str | None = None,
     named: Collection[str] = (),
+    kept: Collection[str] = (),
 ) -> Range:
     """Сужение агентом: классы без весов, только из стартового диапазона с ненулевой
     долей; доли — чарта. С `prior` (сужение более ранней улицы `street` того же
     соперника) — только из его классов; добавленные по просьбе игрока классы `prior`
-    (вне чарта) сохраняют долю 1.0. `added` — классы вне чарта, только из `named`."""
+    (вне чарта) сохраняют долю 1.0. `added` — классы вне чарта, только из `named` или
+    `kept` — классов последнего сужения этого соперника в этой руке
+    (`test_an_added_class_kept_from_the_last_narrowing_needs_no_new_request`)."""
     asked = _classes(hands)
     if not asked.weights:
         raise RangeRefused("не названо ни одной руки")
@@ -425,7 +428,7 @@ def narrow(
             "эти классы есть в стартовом диапазоне по чарту: " + ", ".join(charted)
             + " — передайте их в hands, а в added — только классы вне чарта"
         )
-    allowed_extra = set(named)
+    allowed_extra = {*named, *kept}
     unnamed = [cls for cls in all_classes() if cls in extra.weights and cls not in allowed_extra]
     if unnamed:
         raise RangeRefused(
@@ -467,7 +470,13 @@ _HAND = r"[2-9TJQKA]{2}[so]?"
 _NAMED_RE = re.compile(
     r"(?<![\w.,+])(" + _HAND + r")(?:\s?[-–—]\s?(" + _HAND + r")|(\+))?(?![\w+%]|[.,]\d)"
 )
-_UNIT_AFTER_RE = re.compile(r"\s*(?:bb|бб)(?!\w)", re.IGNORECASE)
+# Число, а не класс: за записью из одних цифр — единица, «%», «/», «:» или
+# существительное счёта; перед ней — «№» или «уровень».
+_UNIT_AFTER_RE = re.compile(
+    r"\s*(?:%|/|:|(?:bb|бб)(?!\w)|(?:игрок|фиш|уровн|раздач|рук|мест|турнир|мин|сек|час))",
+    re.IGNORECASE,
+)
+_MARK_BEFORE_RE = re.compile(r"(?:№|уровень|уровне|уровня)\s*$", re.IGNORECASE)
 
 
 def classes_named(text: str) -> frozenset[str]:
@@ -477,8 +486,11 @@ def classes_named(text: str) -> frozenset[str]:
     named: set[str] = set()
     for match in _NAMED_RE.finditer(text):
         left, right, plus = match.groups()
-        bare_pair = right is None and plus is None and left.isdigit()
-        if bare_pair and _UNIT_AFTER_RE.match(text, match.end()):
+        digits = left.isdigit() and (right is None or right.isdigit())
+        if digits and (
+            _UNIT_AFTER_RE.match(text, match.end())
+            or _MARK_BEFORE_RE.search(text, 0, match.start())
+        ):
             continue
         token = left + (f"-{right}" if right else "") + (plus or "")
         try:
@@ -497,12 +509,13 @@ def equity_spot(
     added: str | None = None,
     prior: RangeNarrowing | None = None,
     named: Collection[str] = (),
+    kept: Collection[str] = (),
     open_path: Path | None = None,
     defend_path: Path | None = None,
 ) -> EquitySpot:
     """Всё, что нужно расчёту эквити, кроме самого Монте-Карло: рука героя, борд
-    улицы, стартовый и суженный диапазоны, их живые комбо. `added`, `prior`, `named` —
-    как у `narrow`."""
+    улицы, стартовый и суженный диапазоны, их живые комбо. `added`, `prior`, `named`,
+    `kept` — как у `narrow`."""
     cards = hero_cards(hand)
     if len(cards) != 2:
         raise RangeRefused("карты героя неизвестны — эквити считать не от чего")
@@ -516,7 +529,8 @@ def equity_spot(
             "на точке решения героя в банке больше двух игроков — мультивей в этом срезе "
             "не считается"
         )
-    narrowed = narrow(start.range, hands, street=street, prior=prior, added=added, named=named)
+    narrowed = narrow(start.range, hands, street=street, prior=prior, added=added, named=named,
+                      kept=kept)
     dead = [*cards, *board]
     combos = live_combos(narrowed, dead)
     if combos == 0.0:

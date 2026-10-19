@@ -368,6 +368,7 @@ async def _equity_vs_range(
     spot = equity_spot(
         hand, params.opponent_position, params.street, params.hands,
         added=params.added, prior=params.prior, named=params.player_classes,
+        kept=params.kept_classes,
     )
     cache = CalcCacheRepo(db)
     prefix = equity_cache_prefix()

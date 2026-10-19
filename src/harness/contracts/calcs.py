@@ -493,7 +493,8 @@ class OpponentRangeParams(BaseModel):
 class EquityVsRangeParams(BaseModel):
     """`hands` — классы без весов, `added` — классы вне чарта по просьбе игрока; оба от
     модели. `analysis_id`, `prior` (сужение ближайшей более ранней улицы) и
-    `player_classes` (классы, названные игроком записью в репликах этой руки) — от кода."""
+    `player_classes` (классы, названные игроком записью в репликах этой руки),
+    `kept_classes` (классы последнего сужения этого соперника в этой руке) — от кода."""
 
     calc: Literal[CalcName.EQUITY_VS_RANGE] = CalcName.EQUITY_VS_RANGE
     analysis_id: int
@@ -503,6 +504,7 @@ class EquityVsRangeParams(BaseModel):
     added: str | None = None
     prior: RangeNarrowing | None = None
     player_classes: list[str] = []
+    kept_classes: list[str] = []
 
 
 CalcParams = Annotated[

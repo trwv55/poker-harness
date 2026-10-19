@@ -1746,6 +1746,8 @@ async def test_a_class_the_player_named_is_added_and_said_in_its_own_line(
     assert ("Добавлено по вашей просьбе: пара семёрок, пара шестёрок, пара пятёрок, пара "
             "четвёрок, пара троек, пара двоек — по чарту их здесь нет.") in turn.calls[0]["output"]
     assert turn.calls[0]["params"]["player_classes"] == sorted(["22", "33", "44", "55", "66", "77"])
+    assert "стартового" not in turn.calls[0]["output"]
+    assert assumed_numbers_in(turn.messages) == frozenset({round(100.0 * result.equity, 1)})
 
 
 async def test_classes_the_player_did_not_name_are_not_added(db_factory, tmp_path, monkeypatch):
@@ -1772,7 +1774,7 @@ async def test_classes_named_earlier_in_the_same_hand_are_added_and_after_a_new_
         scope, analysis_id = await _evening_through_the_turn(session, tg_user_id=8406)
         said = await _turn(
             db_factory, session, _TurnScript([([], "Понял.")]), scope=scope,
-            analysis_id=analysis_id, text="допустим, у него бывают 22-44",
+            analysis_id=analysis_id, text="допустим, у него бывают 22-55",
         )
         history = load_history(dump_history(said.saved_messages(None)))
         same = await _turn(
@@ -1780,6 +1782,7 @@ async def test_classes_named_earlier_in_the_same_hand_are_added_and_after_a_new_
             scope=scope, history=history, analysis_id=analysis_id, text="посчитай",
         )
         assert "error" not in same.calls[0]
+        history = load_history(dump_history(same.saved_messages(None)))
         other_id = await stored_analysis(
             session, session_id=scope[1], actions=_THROUGH_TURN_ACTIONS
         )
@@ -1789,10 +1792,34 @@ async def test_classes_named_earlier_in_the_same_hand_are_added_and_after_a_new_
         )
         history = load_history(dump_history(between.saved_messages(None)))
         back = await _turn(
-            db_factory, session, _TurnScript([([_equity("flop", "QQ", added="22-44")], answer)]),
+            db_factory, session, _TurnScript([([
+                _equity("flop", "QQ", added="22-44"), _equity("flop", "QQ", added="55"),
+            ], answer)]),
             scope=scope, history=history, analysis_id=analysis_id, text="посчитай",
         )
-    assert "игрок не назвал эти классы записью" in back.calls[0]["error"]
+    # После возврата к руке: добавленные в её последнем сужении — без новой просьбы;
+    # названные до смены руки, но не добавленные, — уже нет.
+    assert "error" not in back.calls[0]
+    assert "игрок не назвал эти классы записью: 55" in back.calls[1]["error"]
+
+
+def test_a_narrowing_trimmed_from_the_history_is_no_bound():
+    """Ход с сужением ушёл обрезкой — его сужения в истории больше нет."""
+    narrowed = _narrowing("flop", ["AA"]).model_dump(mode="json")
+    old = [
+        ModelRequest(parts=[UserPromptPart("старый вопрос")], metadata={HAND_KEY: 1}),
+        ModelResponse(parts=[ToolCallPart("equity_vs_range", {}, tool_call_id="c1")]),
+        ModelRequest(parts=[ToolReturnPart("equity_vs_range", "выход", tool_call_id="c1",
+                                           metadata={"calc": "equity_vs_range",
+                                                     "narrowed": narrowed})]),
+        ModelResponse(parts=[TextPart("ответ")]),
+    ]
+    new = [ModelRequest(parts=[UserPromptPart("новый")], metadata={HAND_KEY: 1}),
+           ModelResponse(parts=[TextPart("ответ")])]
+    assert narrowings_in([*old, *new]) == [_narrowing("flop", ["AA"])]
+    trimmed = trim_history([*old, *new], estimate_tokens(new))
+    assert len(trimmed) == len(new)
+    assert narrowings_in(trimmed) == []
 
 
 def test_the_player_texts_of_the_hand_stop_at_the_last_boundary():

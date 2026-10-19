@@ -553,6 +553,15 @@ def test_weights_in_the_added_classes_are_refused():
         narrow(parse_range("88+"), "AA", added="22:0.5", named=frozenset({"22"}))
 
 
+def test_an_added_class_kept_from_the_last_narrowing_needs_no_new_request():
+    """Класс вне чарта, уже добавленный в этой руке, принимается в `added` без новой
+    записи игрока; новый — нет."""
+    start = parse_range("88+")
+    assert narrow(start, "AA", added="22", kept=["AA", "22"]).weight("22") == 1.0
+    with pytest.raises(RangeRefused, match="игрок не назвал эти классы записью: 33"):
+        narrow(start, "AA", added="22, 33", kept=["AA", "22"])
+
+
 def test_an_added_class_is_inherited_by_the_next_street():
     """Добавленный на флопе класс вне чарта на тёрне — обычный класс прошлого сужения,
     с долей 1.0 и без повторной просьбы игрока."""
@@ -577,10 +586,17 @@ def test_the_player_names_classes_by_notation(text: str, classes: str):
 
 
 @pytest.mark.parametrize(
-    "text", ["мелкие пары", "все пары", "AK", "стек 22 BB", "22 бб", "в 33% случаев", "25-30"],
+    "text",
+    [
+        "мелкие пары", "все пары", "AK", "стек 22 BB", "22 бб", "в 33% случаев", "25-30",
+        "стек 33-44 BB", "55 % эквити", "блайнды 55/110", "уровень 22", "на уровне 22",
+        "88 игроков", "в 22:30", "№66", "77 фишек", "33 раздачи",
+    ],
 )
 def test_words_name_no_classes(text: str):
-    """Слова, непара без суффикса, пара цифрами перед BB или % — не запись класса."""
+    """Слова, непара без суффикса и число из цифр в контексте счёта — не запись класса:
+    перед единицей (BB, %, игроки, фишки, раздачи…), «/» или «:», после «№» или
+    «уровень»; диапазон цифр — так же."""
     assert classes_named(text) == frozenset()
 
 

@@ -478,6 +478,8 @@ def _absent_line(result: OpponentRangeResult, book: NumberBook) -> str:
 
 
 def _agent_equity_lines(result: EquityVsRangeResult, book: NumberBook) -> list[str]:
+    """С добавленными по просьбе игрока классами доли от стартового нет — она может
+    быть больше 100% (`test_the_added_classes_are_a_separate_line_without_the_share`)."""
     named = _range_text(", ".join(result.added), book)
     added = [f"Добавлено по вашей просьбе: {named} — по чарту их здесь нет."] if result.added else []
     return [
@@ -487,7 +489,9 @@ def _agent_equity_lines(result: EquityVsRangeResult, book: NumberBook) -> list[s
             "Диапазон сужен агентом — это допущение."
         ),
         (
-            f"Комбо: {book.count(round(result.live_combos))} — "
+            f"Комбо: {book.count(round(result.live_combos))}."
+            if result.added
+            else f"Комбо: {book.count(round(result.live_combos))} — "
             f"{book.pct(100.0 * result.share_of_start, trim=True)}% стартового диапазона."
         ),
         *added,

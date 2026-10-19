@@ -215,6 +215,17 @@ class CalcRun:
                     return narrowing
         return None
 
+    def last_for(self, analysis_id: int, opponent_position: str) -> RangeNarrowing | None:
+        """Последнее сужение этого соперника в этой руке, любой улицы: его классы вне
+        чарта `added` принимает без новой просьбы игрока
+        (`test_classes_named_earlier_in_the_same_hand_are_added_and_after_a_new_hand_not`)."""
+        for narrowing in reversed(self.narrowings):
+            if (narrowing.analysis_id, narrowing.opponent_position) == (
+                analysis_id, opponent_position
+            ):
+                return narrowing
+        return None
+
     def unsourced_sizes(self, calc: CalcName, pot_before_bb: float, bet_bb: float) -> str | None:
         """Отказ модели, если банк или ставка (в BB) не из разрешённого источника;
         `None` — размеры годятся. Отказ пишется в журнал ошибкой вызова."""
@@ -381,7 +392,10 @@ async def _perform(
     if isinstance(result, OpponentRangeResult):
         chart = [round(100.0 * result.hands_share, 1), float(round(result.live_combos))]
     elif isinstance(result, EquityVsRangeResult) and isinstance(params, EquityVsRangeParams):
-        assumed = [round(100.0 * result.equity, 1), round(100.0 * result.share_of_start, 1)]
+        # Доля от стартового не печатается при добавленных классах — её и не разрешать.
+        assumed = [round(100.0 * result.equity, 1)]
+        if not result.added:
+            assumed.append(round(100.0 * result.share_of_start, 1))
         narrowing = RangeNarrowing(
             analysis_id=params.analysis_id,
             opponent_position=params.opponent_position,
@@ -713,6 +727,7 @@ def tools_for(
         """
         if run_state.analysis_id is None:
             return _NO_HAND
+        last = run_state.last_for(run_state.analysis_id, opponent_position)
         return await _perform(
             db, player_id, run_state,
             EquityVsRangeParams(
@@ -723,6 +738,7 @@ def tools_for(
                 added=added,
                 prior=run_state.prior_for(run_state.analysis_id, opponent_position, street),
                 player_classes=sorted(run_state.player_classes),
+                kept_classes=last.classes if last is not None else [],
             ),
         )
 

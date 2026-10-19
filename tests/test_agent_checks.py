@@ -94,9 +94,14 @@ def test_a_raise_name_with_a_digit_is_not_a_number(text: str):
     assert not any("числа" in v for v in _check(f"По чарту BB {text}."))
 
 
-@pytest.mark.parametrize("text", ["3 бета за вечер", "13-бет", "ставка 3 BB", "6-бет"])
-def test_a_digit_next_to_a_bet_word_is_a_number_unless_glued(text: str):
-    assert numbers_in(strip_card_tokens(text)) != []
+@pytest.mark.parametrize(
+    ("text", "numbers"),
+    [("3 бета за вечер", [3.0]), ("13-бет", [13.0]), ("2.5-бет", [2.5]), ("ставка 3 BB", [3.0]),
+     ("6-бет", [6.0])],
+)
+def test_a_digit_next_to_a_bet_word_is_a_number_unless_glued(text: str, numbers: list[float]):
+    """Цифра не вплотную к «бет», вне 2–5 или с цифрой либо дробью слева — число целиком."""
+    assert numbers_in(strip_card_tokens(text)) == numbers
 
 
 def test_the_sizes_next_to_a_raise_name_stay_numbers():

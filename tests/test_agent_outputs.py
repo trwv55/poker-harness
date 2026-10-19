@@ -299,12 +299,16 @@ def test_the_absent_groups_line_adds_no_number_and_passes_the_block_check():
     assert check_agent_assumption(absent_line, allowed=frozenset(), leaks_called=False) == []
 
 
-def test_the_added_classes_are_a_separate_line_and_the_numbers_stay_the_same():
+def test_the_added_classes_are_a_separate_line_without_the_share():
+    """С добавленными классами доля от стартового не печатается и не разрешается: она
+    может быть больше 100%; комбо и эквити — как раньше."""
     plain = agent_digest(equity_result())
     digest = agent_digest(equity_result(range_text="99, A5s, 22, 33", added=["33", "22"]))
     assert (
         "Добавлено по вашей просьбе: пара троек, пара двоек — по чарту их здесь нет." in digest.text
     )
     assert "Диапазон сужен агентом — это допущение." in digest.text
-    assert digest.allowed == plain.allowed
+    assert "Комбо: 7." in digest.text and "стартового" not in digest.text
+    assert "Эквити вашей руки при вскрытии: 31.4%." in digest.text
+    assert digest.allowed == plain.allowed - {31.8}
     assert "Добавлено" not in plain.text
