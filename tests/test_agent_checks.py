@@ -795,6 +795,13 @@ def test_a_term_passes_only_with_its_classifier_label():
     assert _check("Ваш с-бет на флопе.", labels=frozenset({STAT_LABEL + "cbet_flop"})) == []
 
 
+def test_the_fold_to_turn_barrel_stat_grounds_the_barrel_term():
+    """Частота «сдача на второй баррель» в разговоре — опора термина «баррель»."""
+    text = "Это частота сдачи на второй баррель."
+    assert any("баррель" in v for v in _check(text))
+    assert _check(text, labels=frozenset({STAT_LABEL + "fold_to_turn_barrel"})) == []
+
+
 def test_a_bare_label_without_its_kind_does_not_count():
     """Метки с пространством имён: голое `cbet` — не метка классификатора."""
     assert any("c-бет" in v for v in _check("Ваш c-бет на флопе.", labels=frozenset({"cbet"})))

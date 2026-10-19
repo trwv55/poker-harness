@@ -81,6 +81,10 @@ _STAT_BRIEF: dict[FrequencyStat, str] = {
     FrequencyStat.CBET_FLOP: "продолженная ставка на флопе (из флопов в роли агрессора)",
     FrequencyStat.BARREL_TURN: "ставка на тёрне после своей ставки на флопе",
     FrequencyStat.BARREL_RIVER: "ставка на ривере после своей ставки на тёрне",
+    FrequencyStat.FOLD_TO_TURN_BARREL: (
+        "сдача на второй баррель (из случаев, когда после колла продолженной ставки "
+        "агрессор поставил и на тёрне)"
+    ),
     FrequencyStat.SHOWDOWN: "доход до вскрытия (из сыгранных флопов)",
 }
 

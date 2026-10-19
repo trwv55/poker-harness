@@ -33,6 +33,7 @@ from harness.contracts import (
 from harness.explanation.faithfulness import numbers_in
 from harness.explanation.question import check_answer, question_digest
 from harness.explanation.verdict_text import UnfaithfulText
+from harness.presentation.messages import question_msg
 
 
 def _frequency() -> FrequencyResult:
@@ -146,6 +147,23 @@ def test_every_calculation_name_has_a_digest():
     """У каждого имени `/ask` есть выжимка — непокрытого имени в наборе нет; у
     расчётов агента выжимки `/ask` нет (`test_ask_has_no_digest_for_agent_only_calculations`)."""
     assert {result.calc for result in ALL_RESULTS} == set(CalcName) - AGENT_ONLY_CALCS
+
+
+@pytest.mark.parametrize("stat", list(FrequencyStat), ids=lambda s: s.value)
+def test_every_named_frequency_has_words_in_the_digest_and_the_message(stat: FrequencyStat):
+    """У каждой частоты набора есть подпись и в выжимке модели, и в ответе игроку."""
+    result = _threshold(ThresholdOutcome.ABOVE, None).model_copy(update={"stat": stat})
+    assert question_digest(result).text
+    assert question_msg(result, None).text
+
+
+def test_the_fold_to_turn_barrel_is_named_as_such():
+    """Подпись частоты — «сдача на второй баррель» и в выжимке, и в ответе игроку."""
+    result = _threshold(ThresholdOutcome.ABOVE, None).model_copy(
+        update={"stat": FrequencyStat.FOLD_TO_TURN_BARREL}
+    )
+    assert "сдача на второй баррель" in question_digest(result).text
+    assert "Сдача на второй баррель" in question_msg(result, None).text
 
 
 def test_a_measurement_without_observations_gets_no_share():

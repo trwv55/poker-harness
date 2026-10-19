@@ -482,6 +482,12 @@ class PlayerStats(BaseModel):
     barrel_turn_chances: int = 0
     barrel_river: int = 0
     barrel_river_chances: int = 0
+    # Сдача на второй баррель: знаменатель — встреченные ставки агрессора на тёрне
+    # после своего колла его продолженной ставки, поэтому он не больше числа
+    # коллов продолженной ставки (`cbet_faced - fold_to_cbet`)
+    # (`test_every_numerator_stays_within_its_own_denominator`).
+    fold_to_turn_barrel: int = 0
+    turn_barrel_faced: int = 0
     showdowns: int = 0
     flops_seen: int = 0
 
@@ -516,6 +522,10 @@ class PlayerStats(BaseModel):
     @property
     def barrel_river_pct(self) -> float | None:
         return self._share(self.barrel_river, self.barrel_river_chances)
+
+    @property
+    def fold_to_turn_barrel_pct(self) -> float | None:
+        return self._share(self.fold_to_turn_barrel, self.turn_barrel_faced)
 
     @property
     def showdown_pct(self) -> float | None:

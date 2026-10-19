@@ -1031,7 +1031,9 @@ TERM_LABELS: dict[str, tuple[re.Pattern[str], frozenset[str]]] = {
     ),
     "баррель": (
         re.compile(r"баррел", re.IGNORECASE),
-        frozenset({"action:barrel", "stat:barrel_turn", "stat:barrel_river"}),
+        frozenset(
+            {"action:barrel", "stat:barrel_turn", "stat:barrel_river", "stat:fold_to_turn_barrel"}
+        ),
     ),
     "чек-рейз": (re.compile(r"чек-?рейз", re.IGNORECASE), frozenset({"action:check_raise"})),
     "сет": (

@@ -130,6 +130,7 @@ class FrequencyStat(StrEnum):
     CBET_FLOP = "cbet_flop"
     BARREL_TURN = "barrel_turn"
     BARREL_RIVER = "barrel_river"
+    FOLD_TO_TURN_BARREL = "fold_to_turn_barrel"
     SHOWDOWN = "showdown"
 
 

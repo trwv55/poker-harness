@@ -257,6 +257,8 @@ def test_every_named_frequency_matches_the_share_the_contract_computes():
         barrel_turn_chances=8,
         barrel_river=2,
         barrel_river_chances=4,
+        fold_to_turn_barrel=3,
+        turn_barrel_faced=7,
         showdowns=6,
         flops_seen=17,
     )
@@ -268,6 +270,7 @@ def test_every_named_frequency_matches_the_share_the_contract_computes():
         FrequencyStat.CBET_FLOP: stats.cbet_flop_pct,
         FrequencyStat.BARREL_TURN: stats.barrel_turn_pct,
         FrequencyStat.BARREL_RIVER: stats.barrel_river_pct,
+        FrequencyStat.FOLD_TO_TURN_BARREL: stats.fold_to_turn_barrel_pct,
         FrequencyStat.SHOWDOWN: stats.showdown_pct,
     }
     assert set(shares) == set(FrequencyStat)
