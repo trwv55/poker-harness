@@ -46,6 +46,7 @@ from pydantic_ai import ToolReturn
 from pydantic_ai.tools import Tool
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from harness.analysis.charts import parse_range
 from harness.calcs import run
 from harness.contracts import (
     BetSizeThreshold,
@@ -65,6 +66,7 @@ from harness.contracts import (
     OpponentRangeParams,
     OpponentRangeResult,
     PointFilter,
+    RangeNarrowing,
     SpotKind,
     Street,
     Subject,
@@ -173,6 +175,12 @@ class CalcRun:
     `analysis_id` — указатель разбора руки вечера, его подставляет код, не
     модель. Без него `opponent_range` и `equity_vs_range` не считают и отвечают
     модели отказом (`test_without_a_hand_analysis_the_range_tool_says_so`).
+
+    `narrowings` — сужения `equity_vs_range` из истории вечера, к ним добавляются
+    удачные сужения этого хода; `equity_vs_range` берёт из них сужение ближайшей более
+    ранней улицы (`prior_for`). `player_classes` — классы, которые игрок назвал записью
+    в репликах этой руки: только их `equity_vs_range` добавляет вне чарта
+    (план 2026-10-17, пп. 6 и 9).
     """
 
     def __init__(
@@ -180,13 +188,32 @@ class CalcRun:
         max_calcs: int = 1,
         sizes_from: frozenset[float] | None = None,
         analysis_id: int | None = None,
+        narrowings: Sequence[RangeNarrowing] = (),
+        player_classes: frozenset[str] = frozenset(),
     ) -> None:
         self.max_calcs = max_calcs
         self.sizes_from = sizes_from
         self.analysis_id = analysis_id
+        self.narrowings: list[RangeNarrowing] = list(narrowings)
+        self.player_classes = player_classes
         self.results: list[CalcResult] = []
         self.digests: list[Digest] = []
         self.calls: list[dict[str, Any]] = []
+
+    def prior_for(
+        self, analysis_id: int, opponent_position: str, street: Street
+    ) -> RangeNarrowing | None:
+        """Последнее сужение того же соперника в той же руке на ближайшей более ранней
+        улице, по которой сужение есть; `None` — сужать от стартового
+        (`test_the_turn_takes_the_flop_narrowing_and_without_it_the_start`)."""
+        streets = list(Street)
+        for earlier in reversed(streets[: streets.index(street)]):
+            for narrowing in reversed(self.narrowings):
+                if (narrowing.analysis_id, narrowing.opponent_position, narrowing.street) == (
+                    analysis_id, opponent_position, earlier
+                ):
+                    return narrowing
+        return None
 
     def unsourced_sizes(self, calc: CalcName, pot_before_bb: float, bet_bb: float) -> str | None:
         """Отказ модели, если банк или ставка (в BB) не из разрешённого источника;
@@ -300,6 +327,8 @@ async def _perform(
     ни те, ни другие не попадают в `frequency`
     (`test_the_agent_reads_the_range_by_the_chart_and_counts_equity_against_its_narrowing`,
     `test_equity_numbers_are_calculation_numbers_and_never_a_measured_frequency`).
+    Сужение удачного `equity_vs_range` (`RangeNarrowing`) лежит в `narrowed` и
+    добавляется в `run_state.narrowings` (`history.narrowings_in`).
     """
     params_json = params.model_dump(mode="json")
     if sizes_bb is not None:
@@ -348,10 +377,19 @@ async def _perform(
             frequency.append(round(100.0 * measurement.share, 1))
     chart: list[float] = []
     assumed: list[float] = []
+    narrowed: dict[str, Any] | None = None
     if isinstance(result, OpponentRangeResult):
         chart = [round(100.0 * result.hands_share, 1), float(round(result.live_combos))]
-    elif isinstance(result, EquityVsRangeResult):
+    elif isinstance(result, EquityVsRangeResult) and isinstance(params, EquityVsRangeParams):
         assumed = [round(100.0 * result.equity, 1), round(100.0 * result.share_of_start, 1)]
+        narrowing = RangeNarrowing(
+            analysis_id=params.analysis_id,
+            opponent_position=params.opponent_position,
+            street=params.street,
+            classes=list(parse_range(result.range_text).weights),
+        )
+        run_state.narrowings.append(narrowing)
+        narrowed = narrowing.model_dump(mode="json")
     return ToolReturn(
         return_value=digest.text,
         metadata={
@@ -362,6 +400,7 @@ async def _perform(
             "frequency": frequency,
             "chart": chart,
             "assumed": assumed,
+            "narrowed": narrowed,
         },
     )
 
@@ -656,17 +695,21 @@ def tools_for(
         )
 
     async def equity_vs_range(
-        opponent_position: str, street: Street, hands: str
+        opponent_position: str, street: Street, hands: str, added: str | None = None
     ) -> str | ToolReturn:
         """Эквити вашей руки при вскрытии против диапазона соперника, суженного вами.
 
         Классы — только из стартового диапазона `opponent_range` этого соперника и
-        без весов: доли берутся из чарта. Сужение — допущение.
+        без весов: доли берутся из чарта. Сужение — допущение. Если вы уже сужали
+        диапазон этого соперника на более ранней улице этой руки, классы — только из
+        того сужения.
 
         Args:
             opponent_position: позиция соперника за столом, как в сводке разбора.
             street: улица точки решения; борд и ваши карты берутся из руки.
             hands: классы рук через запятую, например «AA, KQs, 88-66, A5s-A2s».
+            added: классы вне чарта, которые игрок сам назвал в своём сообщении
+                («22-77»), — только по его просьбе; иначе не передавать.
         """
         if run_state.analysis_id is None:
             return _NO_HAND
@@ -677,6 +720,9 @@ def tools_for(
                 opponent_position=opponent_position,
                 street=street,
                 hands=hands,
+                added=added,
+                prior=run_state.prior_for(run_state.analysis_id, opponent_position, street),
+                player_classes=sorted(run_state.player_classes),
             ),
         )
 
@@ -696,8 +742,13 @@ def tools_for(
     if in_bb:
         by_name[CalcName.OPPONENT_RANGE] = opponent_range
         by_name[CalcName.EQUITY_VS_RANGE] = equity_vs_range
+    # Эквити — барьер (`sequential`): сужение тёрна, вызванное в одном ответе после
+    # флопа, видит сужение флопа (`test_the_flop_and_the_turn_narrowed_in_one_answer_chain`).
     return [
-        Tool(function, name=name.value, max_retries=_TOOL_RETRIES)
+        Tool(
+            function, name=name.value, max_retries=_TOOL_RETRIES,
+            sequential=name is CalcName.EQUITY_VS_RANGE,
+        )
         for name, function in by_name.items()
     ]
 

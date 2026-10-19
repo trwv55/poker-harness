@@ -431,7 +431,7 @@ def _agent_range_lines(result: OpponentRangeResult, book: NumberBook) -> list[st
             f"{book.count(result.chart_seats)}-max по позиции от конца (правило, не допущение)"
         )
     line = _LINE_BRIEF[result.line].format(opener=result.opener_position)
-    return [
+    lines = [
         f"Соперник: {result.opponent_position}, линия до флопа — {line}.",
         f"Источник: {source}.",
         f"Стартовый диапазон: {_range_text(result.range_text, book)}.",
@@ -441,9 +441,45 @@ def _agent_range_lines(result: OpponentRangeResult, book: NumberBook) -> list[st
             f"{book.count(round(result.live_combos))}."
         ),
     ]
+    if result.absent:
+        lines.append(_absent_line(result, book))
+    return lines
+
+
+_ABSENT_GROUP: dict[str, str] = {
+    "pairs": "карманных пар",
+    "suited_aces": "одномастных тузов",
+    "offsuit_aces": "разномастных тузов",
+    "broadways": "бродвеев без туза",
+}
+
+
+def _absent_line(result: OpponentRangeResult, book: NumberBook) -> str:
+    """Группы, которых нет в колле (чеке) защиты, и чем их играет чарт — факт чарта
+    (план 2026-10-17, п. 8). Чисел в строке нет: классы — запись (`_range_text`, пары
+    словами), действие — словом (`test_the_absent_groups_line_names_the_chart_actions`)."""
+    checked = result.line == "check"
+    raised = "рейзит" if checked else "3-бетит"
+    parts: list[str] = []
+    for group in result.absent:
+        verb = " или ".join(
+            word for word, used in ((raised, group.raised), ("идёт олл-ин", group.all_in)) if used
+        )
+        name = _ABSENT_GROUP[group.group]
+        if group.whole:
+            parts.append(f"{name} — ни одной, ими {verb}")
+        else:
+            parts.append(f"{name}: {_range_text(', '.join(group.classes), book)} — ими {verb}")
+    played = "чек" if checked else "колл"
+    return (
+        f"Чего нет в {played}-диапазоне по чарту {result.chart_position} против "
+        f"{result.vs_chart_position} (факт чарта, не допущение): " + "; ".join(parts) + "."
+    )
 
 
 def _agent_equity_lines(result: EquityVsRangeResult, book: NumberBook) -> list[str]:
+    named = _range_text(", ".join(result.added), book)
+    added = [f"Добавлено по вашей просьбе: {named} — по чарту их здесь нет."] if result.added else []
     return [
         f"Соперник: {result.opponent_position}, улица: {_STREET_WORD[result.street]}.",
         (
@@ -454,6 +490,7 @@ def _agent_equity_lines(result: EquityVsRangeResult, book: NumberBook) -> list[s
             f"Комбо: {book.count(round(result.live_combos))} — "
             f"{book.pct(100.0 * result.share_of_start, trim=True)}% стартового диапазона."
         ),
+        *added,
         f"Эквити вашей руки при вскрытии: {book.pct(100.0 * result.equity, trim=True)}%.",
     ]
 

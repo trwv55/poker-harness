@@ -26,13 +26,16 @@ from harness.agent.history import (
     chart_numbers_in,
     frequency_numbers,
     hand_boundary,
+    hand_player_texts,
     merged_requests,
+    narrowings_in,
     player_numbers,
     player_text_numbers,
     seen_history,
     stats_in_history,
     threshold_decided,
 )
+from harness.analysis.opponent_range import classes_named
 from harness.calcs.routing import CalcRun, tools_for
 from harness.contracts import CalcName, CalcResult, ModelOutput
 from harness.explanation.agent_checks import (
@@ -281,6 +284,10 @@ async def run_agent_turn(
     разбора руки вечера для `opponent_range` и `equity_vs_range`; без него они
     отвечают отказом (`test_without_a_hand_analysis_the_range_tool_says_so`); он же
     решает, ставить ли перед вопросом отметку смены руки (`history.hand_boundary`).
+    Сужения `equity_vs_range` прошлых ходов (`history.narrowings_in`) и классы, названные
+    игроком записью в репликах этой руки (`history.hand_player_texts`), уходят в `CalcRun`
+    (`test_a_turn_in_the_next_turn_is_bound_by_the_flop_of_the_history`,
+    `test_classes_named_earlier_in_the_same_hand_are_added_and_after_a_new_hand_not`).
     """
     system = system_prompt if system_prompt is not None else _prompt.load_system_prompt()
     instructions = _prompt.instructions_for(system, context)
@@ -296,8 +303,16 @@ async def run_agent_turn(
     sizes_from = said | allowed_from_history(history)
     if context is not None:
         sizes_from |= context.allowed
+    # Сужения прошлых ходов — граница сужения следующей улицы; классы, названные игроком
+    # записью в репликах этой руки, — единственное, что `equity_vs_range` добавит вне
+    # чарта (план 2026-10-17, пп. 6 и 9).
+    named: frozenset[str] = frozenset()
+    if analysis_id is not None:
+        for said_text in [*hand_player_texts(history, analysis_id), text]:
+            named |= classes_named(said_text)
     run_state = CalcRun(
-        max_calcs=MAX_CALCS_PER_TURN, sizes_from=sizes_from, analysis_id=analysis_id
+        max_calcs=MAX_CALCS_PER_TURN, sizes_from=sizes_from, analysis_id=analysis_id,
+        narrowings=narrowings_in(history), player_classes=named,
     )
     tools = tools_for(db, player_id, session_id, run_state)
     # Другая рука, чем у прошлого хода вечера, — отметка перед вопросом (решение

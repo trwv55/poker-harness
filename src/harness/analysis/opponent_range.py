@@ -23,6 +23,21 @@
 
 **Сужение — подмножество, целыми классами** (`narrow`): класс вне стартового или с
 долей 0 — отказ; оставленные классы сохраняют долю чарта, модель весов не задаёт.
+Есть сужение ближайшей более ранней улицы того же соперника в той же руке (`prior`) —
+сужение улицы обязано быть его подмножеством, иначе отказ с убранными классами
+(`test_a_class_removed_on_the_flop_is_refused_on_the_turn_by_name`); без него — от
+стартового (`test_without_an_earlier_narrowing_the_start_is_the_bound`).
+
+**Добавление по просьбе игрока** (`added`, план 2026-10-17, п. 9) — единственный путь
+класса вне чарта в диапазон: только класс, которого в стартовом нет, и только если игрок
+назвал его записью в репликах этой руки (`classes_named`); доля — 1.0, полные комбо
+(`test_a_class_the_player_named_is_added_with_full_combos`). Добавленный класс входит в
+сужение своей улицы и на следующей наследуется как обычный
+(`test_an_added_class_is_inherited_by_the_next_street`).
+
+**Чего нет в колле защиты** (`absent_groups`, п. 8): у колла и чека BB — классы
+заметных групп, которых в этом действии нет вовсе, а чарт той же записи играет их
+рейзом или олл-ином (`test_the_absent_groups_are_the_classes_the_chart_raises_or_shoves`).
 
 **Мёртвые карты** — карты героя и борд улицы — убираются из комбо (`live_combos`);
 полностью заблокированный диапазон — отказ, а не эквити 0.
@@ -30,6 +45,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,11 +65,14 @@ from harness.analysis.charts import (
 from harness.analysis.open_chart import chart_table, defend_table
 from harness.analysis.tools.equity import combos_of_class
 from harness.contracts import (
+    AbsentGroup,
+    AbsentGroupName,
     ActionKind,
     CanonicalAction,
     CanonicalHand,
     Range,
     RangeLine,
+    RangeNarrowing,
     Street,
     all_classes,
 )
@@ -64,7 +83,9 @@ __all__ = [
     "RangeRefused",
     "RangeSpot",
     "StartRange",
+    "absent_groups",
     "board_at",
+    "classes_named",
     "equity_spot",
     "hero_cards",
     "live_at",
@@ -112,6 +133,7 @@ class StartRange:
     chart_position: str
     vs_chart_position: str | None
     chart_depth_bb: float
+    absent: tuple[AbsentGroup, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -122,6 +144,7 @@ class EquitySpot:
     narrowed: Range
     live_combos: float
     share_of_start: float
+    added: tuple[str, ...] = ()
 
     @property
     def cache_key(self) -> str:
@@ -267,8 +290,57 @@ def _charted(spot: RangeSpot, open_path: Path | None, defend_path: Path | None) 
         "three_bet": defence.raise_range,
         "allin": defence.allin_range,
     }[spot.line]
+    absent = (
+        absent_groups(rng, defence.raise_range, defence.allin_range)
+        if spot.line in ("call", "check")
+        else ()
+    )
     return StartRange(
-        spot, rng, "defend", chart_seats, chart_position, chart_vs, defence_key.depth_bb
+        spot, rng, "defend", chart_seats, chart_position, chart_vs, defence_key.depth_bb, absent
+    )
+
+
+def _group_of(cls: str) -> AbsentGroupName | None:
+    if len(cls) == 2:
+        return "pairs"
+    if cls[0] == "A":
+        return "suited_aces" if cls[2] == "s" else "offsuit_aces"
+    if cls[0] in _BROADWAY and cls[1] in _BROADWAY:
+        return "broadways"
+    return None
+
+
+_BROADWAY = frozenset("KQJT")
+_GROUPS: tuple[AbsentGroupName, ...] = ("pairs", "suited_aces", "offsuit_aces", "broadways")
+
+
+def absent_groups(
+    played: Range, raised: Range, all_in: Range
+) -> tuple[AbsentGroup, ...]:
+    """Заметные группы (пары, одномастные и разномастные тузы, бродвеи без туза), в
+    которых есть класс без доли в `played` (колл или чек), но с долей в `raised` или
+    `all_in` той же записи; класс с любой ненулевой долей в `played` отсутствующим не
+    считается (`test_a_class_partly_called_is_not_absent`). Группы без таких классов не
+    возвращаются."""
+    found: dict[AbsentGroupName, list[str]] = {group: [] for group in _GROUPS}
+    members: dict[AbsentGroupName, int] = dict.fromkeys(_GROUPS, 0)
+    for cls in all_classes():
+        group = _group_of(cls)
+        if group is None:
+            continue
+        members[group] += 1
+        if played.weight(cls) <= 0.0 and (raised.weight(cls) > 0.0 or all_in.weight(cls) > 0.0):
+            found[group].append(cls)
+    return tuple(
+        AbsentGroup(
+            group=group,
+            classes=classes,
+            whole=len(classes) == members[group],
+            raised=any(raised.weight(cls) > 0.0 for cls in classes),
+            all_in=any(all_in.weight(cls) > 0.0 for cls in classes),
+        )
+        for group, classes in found.items()
+        if classes
     )
 
 
@@ -311,24 +383,109 @@ def live_combos(rng: Range, dead: Collection[str]) -> float:
     ))
 
 
-def narrow(start: Range, hands: str) -> Range:
-    """Сужение агентом: классы без весов, только из стартового диапазона с ненулевой
-    долей; доли — чарта."""
-    if ":" in hands:
+_STREET_AT: dict[Street, str] = {
+    Street.PREFLOP: "до флопа", Street.FLOP: "на флопе", Street.TURN: "на тёрне",
+    Street.RIVER: "на ривере",
+}
+_STREET_OF: dict[Street, str] = {
+    Street.PREFLOP: "префлопа", Street.FLOP: "флопа", Street.TURN: "тёрна",
+    Street.RIVER: "ривера",
+}
+
+
+def _classes(text: str) -> Range:
+    if ":" in text:
         raise RangeRefused("веса не задаются: перечислите классы рук, доли берутся из чарта")
     try:
-        asked = parse_range(hands)
+        return parse_range(text)
     except (NotationError, ValueError) as exc:
         raise RangeRefused(f"запись рук не разобрана: {exc}") from exc
+
+
+def narrow(
+    start: Range,
+    hands: str,
+    *,
+    street: Street | None = None,
+    prior: RangeNarrowing | None = None,
+    added: str | None = None,
+    named: Collection[str] = (),
+) -> Range:
+    """Сужение агентом: классы без весов, только из стартового диапазона с ненулевой
+    долей; доли — чарта. С `prior` (сужение более ранней улицы `street` того же
+    соперника) — только из его классов; добавленные по просьбе игрока классы `prior`
+    (вне чарта) сохраняют долю 1.0. `added` — классы вне чарта, только из `named`."""
+    asked = _classes(hands)
     if not asked.weights:
         raise RangeRefused("не названо ни одной руки")
-    outside = [cls for cls in all_classes() if cls in asked.weights and start.weight(cls) <= 0.0]
+    extra = _classes(added) if added and added.strip() else Range(weights={})
+    charted = [cls for cls in all_classes() if cls in extra.weights and start.weight(cls) > 0.0]
+    if charted:
+        raise RangeRefused(
+            "эти классы есть в стартовом диапазоне по чарту: " + ", ".join(charted)
+            + " — передайте их в hands, а в added — только классы вне чарта"
+        )
+    allowed_extra = set(named)
+    unnamed = [cls for cls in all_classes() if cls in extra.weights and cls not in allowed_extra]
+    if unnamed:
+        raise RangeRefused(
+            "игрок не назвал эти классы записью: " + ", ".join(unnamed)
+            + " — вне чарта добавляются только классы, которые игрок назвал сам "
+            "(«22-77», «A5s»); уточните у него"
+        )
+    earlier = set(prior.classes) if prior is not None else set()
+    outside = [
+        cls for cls in all_classes()
+        if cls in asked.weights and start.weight(cls) <= 0.0 and cls not in earlier
+    ]
     if outside:
         raise RangeRefused(
             "этих рук нет в стартовом диапазоне: " + ", ".join(outside)
-            + " — сужение рук не добавляет"
+            + " — сужение рук не добавляет; вне чарта — только параметром added и только "
+            "классы, которые игрок назвал сам"
         )
-    return Range(weights={cls: start.weight(cls) for cls in asked.weights})
+    if prior is not None:
+        removed = [cls for cls in all_classes() if cls in asked.weights and cls not in earlier]
+        if removed:
+            later = _STREET_OF[street] if street is not None else "этой улицы"
+            raise RangeRefused(
+                f"{_STREET_AT[prior.street]} эти классы вы уже убрали: " + ", ".join(removed)
+                + f" — сужение {later} берётся из сужения {_STREET_OF[prior.street]}"
+            )
+    weights = {
+        cls: start.weight(cls) if start.weight(cls) > 0.0 else 1.0 for cls in asked.weights
+    }
+    weights.update(dict.fromkeys(extra.weights, 1.0))
+    return Range(weights=weights)
+
+
+# Запись класса или диапазона классов в тексте игрока: «A5s», «KQo», «77», «77+»,
+# «A2s-A5s», «22–77» (дефис, короткое или длинное тире, пробел вокруг допустим). Ранги —
+# заглавными, суффикс — строчной; непара без суффикса («AK») — не запись (грамматика
+# `parse_range`). Голая пара цифрами перед «BB», «бб» или «%» — стек или доля, не класс.
+_HAND = r"[2-9TJQKA]{2}[so]?"
+_NAMED_RE = re.compile(
+    r"(?<![\w.,+])(" + _HAND + r")(?:\s?[-–—]\s?(" + _HAND + r")|(\+))?(?![\w+%]|[.,]\d)"
+)
+_UNIT_AFTER_RE = re.compile(r"\s*(?:bb|бб)(?!\w)", re.IGNORECASE)
+
+
+def classes_named(text: str) -> frozenset[str]:
+    """Классы, которые игрок назвал записью (`_NAMED_RE`); слова («мелкие пары»)
+    классов не дают (`test_words_name_no_classes`). Запись, которую `parse_range` не
+    разбирает, пропускается."""
+    named: set[str] = set()
+    for match in _NAMED_RE.finditer(text):
+        left, right, plus = match.groups()
+        bare_pair = right is None and plus is None and left.isdigit()
+        if bare_pair and _UNIT_AFTER_RE.match(text, match.end()):
+            continue
+        token = left + (f"-{right}" if right else "") + (plus or "")
+        try:
+            named.update(parse_range(token).weights)
+        except (NotationError, ValueError):
+            continue
+    return frozenset(named)
 
 
 def equity_spot(
@@ -337,11 +494,15 @@ def equity_spot(
     street: Street,
     hands: str,
     *,
+    added: str | None = None,
+    prior: RangeNarrowing | None = None,
+    named: Collection[str] = (),
     open_path: Path | None = None,
     defend_path: Path | None = None,
 ) -> EquitySpot:
     """Всё, что нужно расчёту эквити, кроме самого Монте-Карло: рука героя, борд
-    улицы, стартовый и суженный диапазоны, их живые комбо."""
+    улицы, стартовый и суженный диапазоны, их живые комбо. `added`, `prior`, `named` —
+    как у `narrow`."""
     cards = hero_cards(hand)
     if len(cards) != 2:
         raise RangeRefused("карты героя неизвестны — эквити считать не от чего")
@@ -355,7 +516,7 @@ def equity_spot(
             "на точке решения героя в банке больше двух игроков — мультивей в этом срезе "
             "не считается"
         )
-    narrowed = narrow(start.range, hands)
+    narrowed = narrow(start.range, hands, street=street, prior=prior, added=added, named=named)
     dead = [*cards, *board]
     combos = live_combos(narrowed, dead)
     if combos == 0.0:
@@ -364,4 +525,7 @@ def equity_spot(
     return EquitySpot(
         hero=(low, high), board=board, start=start, narrowed=narrowed,
         live_combos=combos, share_of_start=combos / live_combos(start.range, dead),
+        added=tuple(
+            cls for cls in all_classes() if cls in narrowed.weights and start.range.weight(cls) <= 0.0
+        ),
     )

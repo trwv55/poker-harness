@@ -16,7 +16,9 @@ import pytest
 from harness.analysis.charts import open_strategy, parse_range
 from harness.analysis.opponent_range import (
     RangeRefused,
+    absent_groups,
     board_at,
+    classes_named,
     equity_spot,
     live_at,
     live_combos,
@@ -24,7 +26,16 @@ from harness.analysis.opponent_range import (
     range_spot,
     start_range,
 )
-from harness.contracts import Post, PostKind, Provenance, Range, RawHand, SeatInfo, Street
+from harness.contracts import (
+    Post,
+    PostKind,
+    Provenance,
+    Range,
+    RangeNarrowing,
+    RawHand,
+    SeatInfo,
+    Street,
+)
 from tests.test_postflop_line import F, P, R, T, _bet, _call, _check, _fold, _played_out, _raise
 
 _SB, _BB = 50, 100
@@ -447,3 +458,193 @@ def test_an_empty_chart_range_is_refused_not_an_empty_start(tmp_path: Path):
 def test_a_player_who_folded_preflop_has_no_range():
     with pytest.raises(RangeRefused, match="сбросил"):
         range_spot(_hand(BTN_OPENS_BB_CALLS), "SB")
+
+
+# --- план 2026-10-17, п. 6: сужение улицы — подмножество прошлой ---------------------
+
+_THROUGH_RIVER = [
+    *BTN_OPENS_BB_CALLS,
+    _check(T, "P6"), _bet(T, "Hero", 400), _call(T, "P6", 400),
+    _check(R, "P6"), _bet(R, "Hero", 900), _call(R, "P6", 900),
+]
+
+
+def _prior(street: Street, classes: str) -> RangeNarrowing:
+    return RangeNarrowing(
+        analysis_id=1, opponent_position="BB", street=street,
+        classes=list(parse_range(classes).weights),
+    )
+
+
+def test_a_class_removed_on_the_flop_is_refused_on_the_turn_by_name(tmp_path: Path):
+    """Класс стартового, убранный на флопе, тёрн не возвращает: отказ называет классы,
+    улицу, где их убрали, и откуда берётся сужение."""
+    with pytest.raises(RangeRefused) as refused:
+        equity_spot(
+            _hand(_THROUGH_RIVER), "BB", Street.TURN, "QQ, 77, A5s, KJo",
+            prior=_prior(Street.FLOP, "QQ, 77"), defend_path=defend_file(tmp_path),
+        )
+    assert str(refused.value) == (
+        "на флопе эти классы вы уже убрали: A5s, KJo — сужение тёрна берётся из сужения флопа"
+    )
+
+
+def test_without_an_earlier_narrowing_the_start_is_the_bound(tmp_path: Path):
+    """Без сужения более ранней улицы тёрн сужается от стартового, как флоп."""
+    spot = equity_spot(
+        _hand(_THROUGH_RIVER), "BB", Street.TURN, "QQ, A5s", defend_path=defend_file(tmp_path)
+    )
+    assert spot.narrowed == Range(weights={"QQ": 1.0, "A5s": 1.0})
+
+
+def test_a_subset_of_the_earlier_narrowing_keeps_the_chart_weights():
+    start = parse_range("QQ, AKs:0.5, A5s")
+    narrowed = narrow(start, "AKs", street=Street.TURN, prior=_prior(Street.FLOP, "QQ, AKs"))
+    assert narrowed == Range(weights={"AKs": 0.5})
+
+
+def test_a_class_outside_the_start_is_still_refused_as_outside_with_a_prior():
+    """Класса нет ни в стартовом, ни в прошлом сужении — это «нет в стартовом», а не
+    «уже убрали»."""
+    with pytest.raises(RangeRefused, match="нет в стартовом диапазоне: 72o"):
+        narrow(_START, "AA, 72o", street=Street.TURN, prior=_prior(Street.FLOP, "AA"))
+
+
+def test_the_river_is_bound_by_the_turn_and_the_message_names_the_streets():
+    with pytest.raises(RangeRefused, match="на тёрне эти классы вы уже убрали: KK — сужение "
+                       "ривера берётся из сужения тёрна"):
+        narrow(_START, "AA, KK", street=Street.RIVER, prior=_prior(Street.TURN, "AA"))
+
+
+# --- план 2026-10-17, п. 9: классы вне чарта по просьбе игрока ------------------------
+
+
+def test_a_class_the_player_named_is_added_with_full_combos(tmp_path: Path):
+    """«22–77» игрока: классы вне чарта входят с долей 1.0 и названы в `added`."""
+    start = parse_range("88+, AKs:0.5")
+    narrowed = narrow(start, "AA, AKs", added="22-77", named=classes_named("а если пары 22–77?"))
+    assert narrowed.weights == {
+        "AA": 1.0, "AKs": 0.5, **dict.fromkeys(["77", "66", "55", "44", "33", "22"], 1.0),
+    }
+
+
+def test_the_equity_spot_names_the_added_classes(tmp_path: Path):
+    spot = equity_spot(
+        _hand(BTN_OPENS_BB_CALLS), "BB", Street.FLOP, "QQ", added="KJs",
+        named=frozenset({"KJs"}), defend_path=defend_file(tmp_path, call="QQ+, A2s-AQs"),
+    )
+    assert spot.added == ("KJs",)
+    assert spot.narrowed.weight("KJs") == 1.0
+
+
+def test_a_class_the_player_did_not_name_is_refused():
+    with pytest.raises(RangeRefused, match="игрок не назвал эти классы записью: 33 .*уточните"):
+        narrow(parse_range("88+"), "AA", added="22-33", named=frozenset({"22"}))
+
+
+def test_a_charted_class_cannot_be_added():
+    """Класс из чарта — в `hands`, а не в `added`, даже если игрок его назвал."""
+    with pytest.raises(RangeRefused, match="есть в стартовом диапазоне по чарту: AA"):
+        narrow(parse_range("88+"), "KK", added="AA", named=frozenset({"AA"}))
+
+
+def test_weights_in_the_added_classes_are_refused():
+    with pytest.raises(RangeRefused, match="веса"):
+        narrow(parse_range("88+"), "AA", added="22:0.5", named=frozenset({"22"}))
+
+
+def test_an_added_class_is_inherited_by_the_next_street():
+    """Добавленный на флопе класс вне чарта на тёрне — обычный класс прошлого сужения,
+    с долей 1.0 и без повторной просьбы игрока."""
+    start = parse_range("88+")
+    narrowed = narrow(start, "AA, 22", street=Street.TURN, prior=_prior(Street.FLOP, "AA, 22"))
+    assert narrowed == Range(weights={"AA": 1.0, "22": 1.0})
+
+
+@pytest.mark.parametrize(
+    ("text", "classes"),
+    [
+        ("а если у него бывают пары 22–77?", "22-77"),
+        ("пары 22-77", "22-77"),
+        ("пары 22 — 44", "22-44"),
+        ("A2s-A5s и KQo", "A2s-A5s, KQo"),
+        ("а 77+?", "77+"),
+        ("AJs+ тоже", "AJs+"),
+    ],
+)
+def test_the_player_names_classes_by_notation(text: str, classes: str):
+    assert classes_named(text) == frozenset(parse_range(classes).weights)
+
+
+@pytest.mark.parametrize(
+    "text", ["мелкие пары", "все пары", "AK", "стек 22 BB", "22 бб", "в 33% случаев", "25-30"],
+)
+def test_words_name_no_classes(text: str):
+    """Слова, непара без суффикса, пара цифрами перед BB или % — не запись класса."""
+    assert classes_named(text) == frozenset()
+
+
+# --- план 2026-10-17, п. 8: чего нет в колле защиты -----------------------------------
+
+
+def test_the_absent_groups_are_the_classes_the_chart_raises_or_shoves():
+    """Пары целиком — рейз и олл-ин; тузы — по составу; бродвей без туза — олл-ин.
+    Класс, который чарт сбрасывает (нет ни в одном действии), не отсутствующий."""
+    groups = absent_groups(
+        parse_range("A2s-A9s, KJs+, KQo"),
+        parse_range("TT+, AKs, ATs-AQs"),
+        parse_range("22-99, A9o+, QJs"),
+    )
+    assert [g.model_dump() for g in groups] == [
+        {"group": "pairs", "classes": list(parse_range("22+").weights)[::-1], "whole": True,
+         "raised": True, "all_in": True},
+        {"group": "suited_aces", "classes": ["AKs", "AQs", "AJs", "ATs"], "whole": False,
+         "raised": True, "all_in": False},
+        {"group": "offsuit_aces", "classes": ["AKo", "AQo", "AJo", "ATo", "A9o"],
+         "whole": False, "raised": False, "all_in": True},
+        {"group": "broadways", "classes": ["QJs"], "whole": False, "raised": False,
+         "all_in": True},
+    ]
+
+
+def test_a_class_partly_called_is_not_absent():
+    """Доля колла 0.2 — класс в колле есть, хоть чарт и 3-бетит его чаще."""
+    assert absent_groups(parse_range("AA:0.2"), parse_range("AA:0.8"), Range(weights={})) == ()
+
+
+def test_the_bb_call_range_carries_its_absent_groups_and_a_three_bet_does_not(tmp_path: Path):
+    path = defend_file(tmp_path)
+    call = start_range(range_spot(_hand(BTN_OPENS_BB_CALLS), "BB"), defend_path=path)
+    assert [(g.group, g.classes) for g in call.absent] == [
+        ("suited_aces", ["AKs"]), ("offsuit_aces", ["AKo"]),
+    ]
+    three_bet = [
+        _fold(P, "P1"), _fold(P, "P2"), _fold(P, "P3"), _raise(P, "Hero", 250), _fold(P, "P5"),
+        _raise(P, "P6", 800), _call(P, "Hero", 550),
+    ]
+    assert start_range(range_spot(_hand(three_bet), "BB"), defend_path=path).absent == ()
+
+
+def test_the_bb_check_after_a_limp_carries_the_groups_it_raises(tmp_path: Path):
+    spot = range_spot(_hand(_HERO_LIMPS_BB_CHECKS, button="P3"), "BB")
+    start = start_range(spot, defend_path=limp_file(tmp_path))
+    assert [g.group for g in start.absent] == ["pairs", "suited_aces", "offsuit_aces"]
+    assert start.absent[0].classes == ["AA", "KK", "QQ", "JJ", "TT"]
+
+
+def test_the_opener_range_has_no_absent_groups():
+    """Строка о группах — только у колла и чека защиты, у опена её нет."""
+    actions = [
+        _fold(P, "P5"), _fold(P, "P6"), _fold(P, "P1"), _raise(P, "P2", 250), _fold(P, "P3"),
+        _call(P, "Hero", 150),
+    ]
+    assert start_range(range_spot(_hand(actions, button="P2"), "BTN")).absent == ()
+
+
+def test_the_share_of_the_start_counts_the_added_combos_over_the_start(tmp_path: Path):
+    """Добавленные комбо считаются сверх стартового: доля может быть больше единицы."""
+    spot = equity_spot(
+        _hand(BTN_OPENS_BB_CALLS), "BB", Street.FLOP, "AA", added="KJo, K9o",
+        named=frozenset({"KJo", "K9o"}), defend_path=defend_file(tmp_path, call="AA"),
+    )
+    assert spot.share_of_start > 1.0

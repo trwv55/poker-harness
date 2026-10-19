@@ -352,6 +352,7 @@ async def _opponent_range(
         range_text=to_notation(start.range),
         hands_share=start.range.fraction_of_hands(),
         live_combos=live_combos(start.range, dead),
+        absent=list(start.absent),
     )
 
 
@@ -364,7 +365,10 @@ async def _equity_vs_range(
     Счёт — в потоке, чтобы не держать цикл событий воркера."""
     _check_position(params.opponent_position)
     hand = await _analysed_hand(db, player_id, params.analysis_id)
-    spot = equity_spot(hand, params.opponent_position, params.street, params.hands)
+    spot = equity_spot(
+        hand, params.opponent_position, params.street, params.hands,
+        added=params.added, prior=params.prior, named=params.player_classes,
+    )
     cache = CalcCacheRepo(db)
     prefix = equity_cache_prefix()
     equity = await cache.get(prefix, spot.cache_key)
@@ -382,6 +386,7 @@ async def _equity_vs_range(
         live_combos=spot.live_combos,
         share_of_start=spot.share_of_start,
         equity=equity,
+        added=list(spot.added),
     )
 
 

@@ -12,6 +12,7 @@ from typing import get_args
 import pytest
 
 from harness.contracts import (
+    AbsentGroup,
     CalcName,
     CalcResult,
     EquityVsRangeResult,
@@ -23,7 +24,7 @@ from harness.contracts import (
     Subject,
     ThresholdOutcome,
 )
-from harness.explanation.agent_checks import strip_card_tokens
+from harness.explanation.agent_checks import check_agent_assumption, strip_card_tokens
 from harness.explanation.faithfulness import numbers_in, unsupported_numbers
 from harness.explanation.question import MIN_STAT_OPPORTUNITIES, agent_digest, question_digest
 from tests.test_question_text import ALL_RESULTS, _defense, _frequency, _threshold
@@ -242,3 +243,68 @@ def test_the_equity_output_says_the_narrowing_is_an_assumption():
 def test_ask_has_no_digest_for_agent_only_calculations():
     with pytest.raises(ValueError, match="расчёт агента"):
         question_digest(range_result())
+
+
+# --- план 2026-10-17, пп. 8 и 9: группы вне колла и классы по просьбе игрока -----------
+
+_ABSENT = [
+    AbsentGroup(group="pairs", classes=["AA", "KK", "QQ", "JJ", "TT", "99", "88", "77", "66",
+                                        "55", "44", "33", "22"],
+                whole=True, raised=True, all_in=True),
+    AbsentGroup(group="suited_aces", classes=["AKs", "AQs"], whole=False, raised=True,
+                all_in=False),
+    AbsentGroup(group="offsuit_aces", classes=["AKo", "A9o"], whole=False, raised=False,
+                all_in=True),
+    AbsentGroup(group="broadways", classes=["KQo"], whole=False, raised=False, all_in=True),
+]
+
+
+def test_the_absent_groups_line_names_the_chart_actions():
+    text = agent_digest(range_result(absent=_ABSENT)).text
+    assert (
+        "Чего нет в колл-диапазоне по чарту BB против BTN (факт чарта, не допущение): "
+        "карманных пар — ни одной, ими 3-бетит или идёт олл-ин; одномастных тузов: AKs, AQs "
+        "— ими 3-бетит; разномастных тузов: AKo, A9o — ими идёт олл-ин; бродвеев без туза: "
+        "KQo — ими идёт олл-ин."
+    ) in text
+
+
+def test_partly_absent_pairs_are_named_in_words():
+    pairs = AbsentGroup(group="pairs", classes=["AA", "99"], whole=False, raised=True,
+                        all_in=False)
+    text = agent_digest(range_result(absent=[pairs])).text
+    assert "карманных пар: пара тузов, пара девяток — ими 3-бетит." in text
+
+
+def test_the_check_after_a_limp_says_check_and_raise():
+    """Против лимпа SB у BB чек, а не колл, и рейз (изоляция), а не 3-бет."""
+    text = agent_digest(range_result(
+        line="check", opener_position="SB", vs_chart_position="SB", absent=_ABSENT[:2],
+    )).text
+    assert "Чего нет в чек-диапазоне по чарту BB против SB" in text
+    assert "ими рейзит или идёт олл-ин" in text and "3-бет" not in text.split("Чего нет")[1]
+
+
+def test_without_absent_groups_there_is_no_line():
+    assert "Чего нет" not in agent_digest(range_result()).text
+
+
+def test_the_absent_groups_line_adds_no_number_and_passes_the_block_check():
+    """Строка о группах не регистрирует чисел и не даёт модели числа, которое сверка
+    отвергла бы: классы с буквой вырезаются, пары — словами, «3-бетит» — термин."""
+    digest = agent_digest(range_result(absent=_ABSENT))
+    assert digest.allowed == agent_digest(range_result()).allowed
+    absent_line = digest.text.splitlines()[-1]
+    assert numbers_in(strip_card_tokens(absent_line)) == []
+    assert check_agent_assumption(absent_line, allowed=frozenset(), leaks_called=False) == []
+
+
+def test_the_added_classes_are_a_separate_line_and_the_numbers_stay_the_same():
+    plain = agent_digest(equity_result())
+    digest = agent_digest(equity_result(range_text="99, A5s, 22, 33", added=["33", "22"]))
+    assert (
+        "Добавлено по вашей просьбе: пара троек, пара двоек — по чарту их здесь нет." in digest.text
+    )
+    assert "Диапазон сужен агентом — это допущение." in digest.text
+    assert digest.allowed == plain.allowed
+    assert "Добавлено" not in plain.text

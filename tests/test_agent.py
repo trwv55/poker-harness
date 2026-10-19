@@ -30,6 +30,7 @@ from sqlalchemy import text as sql_text
 
 import harness.calcs as calcs_module
 from harness.agent.history import (
+    HAND_KEY,
     NEW_HAND_MARK,
     NO_HAND_MARK,
     allowed_from_history,
@@ -39,7 +40,9 @@ from harness.agent.history import (
     dump_history,
     estimate_tokens,
     frequency_numbers,
+    hand_player_texts,
     load_history,
+    narrowings_in,
     player_numbers,
     trim_history,
     turns,
@@ -55,6 +58,8 @@ from harness.contracts import (
     DefenseResult,
     EquityVsRangeResult,
     OpponentRangeResult,
+    RangeNarrowing,
+    Street,
 )
 from harness.explanation.agent_checks import agent_context
 from harness.memory.repos import SessionsRepo
@@ -63,7 +68,8 @@ from harness.presentation.messages import agent_turn_msg
 from tests.conftest import requires_agent_prompt
 from tests.test_calcs import stored_analysis
 from tests.test_hand_replay import _postflop_hand
-from tests.test_opponent_range import defend_file
+from tests.test_opponent_range import BTN_OPENS_BB_CALLS, defend_file
+from tests.test_postflop_line import T, _bet, _call, _check
 from tests.test_question_routing import _TEST_CFG, _seeded
 from tests.test_verdict_text import _point, _result
 
@@ -1587,3 +1593,215 @@ def test_the_summary_numbers_reach_the_check_of_the_equity_share():
     assert _draft_violations(summary, messages, context, said)[0] == []
     equity = AgentDraft(answer="Против его колла у вас 30.1%.")
     assert any("эквити" in v for v in _draft_violations(equity, messages, context, said)[0])
+
+
+# --- план 2026-10-17, пп. 6 и 9: сужение по улицам и классы по просьбе игрока ----------
+
+
+def _narrowing(street: str, classes: list[str], *, analysis_id: int = 1, position: str = "BB"):
+    return RangeNarrowing(
+        analysis_id=analysis_id, opponent_position=position, street=Street(street),
+        classes=classes,
+    )
+
+
+def test_the_turn_takes_the_flop_narrowing_and_without_it_the_start():
+    """Ключ — разбор, позиция соперника, улица; берётся последнее сужение ближайшей
+    более ранней улицы, по которой оно есть; нет ни одного — `None` (от стартового)."""
+    run_state = CalcRun(max_calcs=8, sizes_from=frozenset(), narrowings=[
+        _narrowing("flop", ["AA", "KK"]),
+        _narrowing("flop", ["AA"]),
+        _narrowing("flop", ["QQ"], analysis_id=2),
+        _narrowing("flop", ["JJ"], position="SB"),
+    ])
+    assert run_state.prior_for(1, "BB", Street.TURN) == _narrowing("flop", ["AA"])
+    assert run_state.prior_for(1, "BB", Street.RIVER) == _narrowing("flop", ["AA"])
+    assert run_state.prior_for(1, "BB", Street.FLOP) is None
+    assert run_state.prior_for(3, "BB", Street.TURN) is None
+    run_state.narrowings.append(_narrowing("turn", ["AA"]))
+    assert run_state.prior_for(1, "BB", Street.RIVER) == _narrowing("turn", ["AA"])
+
+
+_THROUGH_TURN_ACTIONS = [
+    *BTN_OPENS_BB_CALLS, _check(T, "P6"), _bet(T, "Hero", 400), _call(T, "P6", 400),
+]
+
+
+def _equity(street: str, hands: str, **extra: str) -> tuple[str, dict[str, Any]]:
+    return ("equity_vs_range", {"opponent_position": "BB", "street": street, "hands": hands,
+                                **extra})
+
+
+async def _evening_through_the_turn(session, tg_user_id: int):
+    scope = await _seeded(session, tg_user_id=tg_user_id)
+    analysis_id = await stored_analysis(
+        session, session_id=scope[1], actions=_THROUGH_TURN_ACTIONS
+    )
+    await SessionsRepo(session).set_last_analysis(scope[1], analysis_id)
+    await session.commit()
+    return scope, analysis_id
+
+
+async def test_a_class_removed_on_the_flop_of_the_same_turn_is_refused_on_the_turn(
+    db_factory, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 500)
+    async with db_factory() as session:
+        scope, analysis_id = await _evening_through_the_turn(session, tg_user_id=8401)
+        script = _TurnScript([([
+            _equity("flop", "QQ, 77, A5s"),
+            _equity("flop", "QQ, 77"),
+            _equity("turn", "QQ, 77, A5s"),
+            _equity("turn", "QQ"),
+        ], "Ответ без чисел (допущение).")])
+        turn = await _turn(db_factory, session, script, scope=scope, analysis_id=analysis_id)
+    assert [c.get("error") for c in turn.calls] == [
+        None, None,
+        "на флопе эти классы вы уже убрали: A5s — сужение тёрна берётся из сужения флопа",
+        None,
+    ]
+    assert len(turn.results) == 3
+    assert any("Расчёт не выполнен: на флопе эти классы" in text for text in script.returns)
+
+
+async def test_the_flop_and_the_turn_narrowed_in_one_answer_chain(
+    db_factory, tmp_path, monkeypatch
+):
+    """Оба вызова в одном ответе модели: эквити — барьер, тёрн видит сужение флопа."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 500)
+
+    def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(parts=[
+                ToolCallPart(tool_name=name, args=args)
+                for name, args in (_equity("flop", "QQ, 77"), _equity("turn", "QQ, A5s"))
+            ])
+        return ModelResponse(parts=[
+            ToolCallPart(info.output_tools[0].name, {"answer": "Ответ без чисел (допущение)."})
+        ])
+
+    async with db_factory() as session:
+        scope, analysis_id = await _evening_through_the_turn(session, tg_user_id=8402)
+        player_id, session_id, trace_id = scope
+        llm = LLM(_TEST_CFG, db_factory, model_override=FunctionModel(model))
+        turn = await run_agent_turn(
+            session, llm, player_id=player_id, session_id=session_id, text="вопрос",
+            trace_id=trace_id, history=(), context=None, system_prompt=_SYSTEM,
+            analysis_id=analysis_id,
+        )
+    assert turn.calls[1]["error"] == (
+        "на флопе эти классы вы уже убрали: A5s — сужение тёрна берётся из сужения флопа"
+    )
+
+
+async def test_a_turn_in_the_next_turn_is_bound_by_the_flop_of_the_history(
+    db_factory, tmp_path, monkeypatch
+):
+    """Сужение флопа прошлого хода лежит в метаданных истории и ограничивает тёрн."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 500)
+    async with db_factory() as session:
+        scope, analysis_id = await _evening_through_the_turn(session, tg_user_id=8403)
+        first = await _turn(
+            db_factory, session,
+            _TurnScript([([_equity("flop", "QQ, 77")], "Ответ без чисел (допущение).")]),
+            scope=scope, analysis_id=analysis_id,
+        )
+        saved = load_history(dump_history(first.saved_messages(None)))
+        assert narrowings_in(saved) == [
+            RangeNarrowing(analysis_id=analysis_id, opponent_position="BB",
+                           street=Street.FLOP, classes=["QQ", "77"]),
+        ]
+        second = await _turn(
+            db_factory, session,
+            _TurnScript([([_equity("turn", "QQ, AQs"), _equity("turn", "QQ")],
+                          "Ответ без чисел (допущение).")]),
+            scope=scope, history=saved, analysis_id=analysis_id,
+        )
+    assert "на флопе эти классы вы уже убрали: AQs" in second.calls[0]["error"]
+    assert "error" not in second.calls[1]
+
+
+async def test_a_class_the_player_named_is_added_and_said_in_its_own_line(
+    db_factory, tmp_path, monkeypatch
+):
+    """Игрок назвал «22–77» — агент добавляет их параметром `added`: зона по-прежнему
+    assuming, в выходе отдельная строка, доля добавленных — полные комбо."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path, call="88+, AQs"))
+    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 500)
+    async with db_factory() as session:
+        scope, analysis_id = await _evening_through_the_turn(session, tg_user_id=8404)
+        script = _TurnScript([([_equity("flop", "QQ, AQs", added="22-77")],
+                               "Ответ без чисел (допущение).")])
+        turn = await _turn(
+            db_factory, session, script, scope=scope, analysis_id=analysis_id,
+            text="а если у него бывают пары 22–77?",
+        )
+    assert [c["zone"] for c in turn.calls] == ["assuming"]
+    (result,) = turn.results
+    assert isinstance(result, EquityVsRangeResult)
+    assert result.added == ["77", "66", "55", "44", "33", "22"]
+    assert ("Добавлено по вашей просьбе: пара семёрок, пара шестёрок, пара пятёрок, пара "
+            "четвёрок, пара троек, пара двоек — по чарту их здесь нет.") in turn.calls[0]["output"]
+    assert turn.calls[0]["params"]["player_classes"] == sorted(["22", "33", "44", "55", "66", "77"])
+
+
+async def test_classes_the_player_did_not_name_are_not_added(db_factory, tmp_path, monkeypatch):
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path, call="88+, AQs"))
+    async with db_factory() as session:
+        scope, analysis_id = await _evening_through_the_turn(session, tg_user_id=8405)
+        script = _TurnScript([([_equity("flop", "QQ", added="22-77")],
+                               "Ответ без чисел (допущение).")])
+        turn = await _turn(
+            db_factory, session, script, scope=scope, analysis_id=analysis_id,
+            text="а если у него бывают мелкие пары?",
+        )
+    assert turn.results == ()
+    assert "игрок не назвал эти классы записью" in turn.calls[0]["error"]
+
+
+async def test_classes_named_earlier_in_the_same_hand_are_added_and_after_a_new_hand_not(
+    db_factory, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path, call="88+, AQs"))
+    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 500)
+    answer = "Ответ без чисел (допущение)."
+    async with db_factory() as session:
+        scope, analysis_id = await _evening_through_the_turn(session, tg_user_id=8406)
+        said = await _turn(
+            db_factory, session, _TurnScript([([], "Понял.")]), scope=scope,
+            analysis_id=analysis_id, text="допустим, у него бывают 22-44",
+        )
+        history = load_history(dump_history(said.saved_messages(None)))
+        same = await _turn(
+            db_factory, session, _TurnScript([([_equity("flop", "QQ", added="22-44")], answer)]),
+            scope=scope, history=history, analysis_id=analysis_id, text="посчитай",
+        )
+        assert "error" not in same.calls[0]
+        other_id = await stored_analysis(
+            session, session_id=scope[1], actions=_THROUGH_TURN_ACTIONS
+        )
+        between = await _turn(
+            db_factory, session, _TurnScript([([], "Понял.")]), scope=scope,
+            history=history, analysis_id=other_id, text="другая рука",
+        )
+        history = load_history(dump_history(between.saved_messages(None)))
+        back = await _turn(
+            db_factory, session, _TurnScript([([_equity("flop", "QQ", added="22-44")], answer)]),
+            scope=scope, history=history, analysis_id=analysis_id, text="посчитай",
+        )
+    assert "игрок не назвал эти классы записью" in back.calls[0]["error"]
+
+
+def test_the_player_texts_of_the_hand_stop_at_the_last_boundary():
+    def said(text: str, analysis_id: int | None) -> ModelRequest:
+        return ModelRequest(parts=[UserPromptPart(text)], metadata={HAND_KEY: analysis_id})
+
+    history = [said("о первой: 22-77", 1), said("о второй", 2), said("снова первая", 1),
+               ModelResponse(parts=[TextPart("ответ")]), said("и ещё A5s", 1)]
+    assert hand_player_texts(history, 1) == ["и ещё A5s", "снова первая"]
+    assert hand_player_texts(history, 2) == []
+    assert hand_player_texts(history, None) == []
+    assert hand_player_texts([ModelRequest(parts=[UserPromptPart("без пометки")])], 1) == []

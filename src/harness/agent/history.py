@@ -43,7 +43,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
-from harness.contracts import CalcName
+from harness.contracts import CalcName, RangeNarrowing
 from harness.explanation.agent_checks import strip_card_tokens
 from harness.explanation.faithfulness import numbers_in
 
@@ -59,8 +59,10 @@ __all__ = [
     "estimate_tokens",
     "frequency_numbers",
     "hand_boundary",
+    "hand_player_texts",
     "load_history",
     "merged_requests",
+    "narrowings_in",
     "player_numbers",
     "player_text_numbers",
     "seen_history",
@@ -415,6 +417,37 @@ def assumed_numbers_in(messages: Sequence[ModelMessage]) -> frozenset[float]:
     числа расчёта, но не измеренная частота
     (`test_equity_numbers_are_calculation_numbers_and_never_a_measured_frequency`)."""
     return frozenset(float(n) for meta in _metadata(messages) for n in meta.get("assumed", []))
+
+
+def narrowings_in(messages: Sequence[ModelMessage]) -> list[RangeNarrowing]:
+    """Сужения `equity_vs_range` из выходов расчётов, в порядке разговора: по ним
+    сужение следующей улицы обязано быть подмножеством прошлой
+    (`test_a_turn_in_the_next_turn_is_bound_by_the_flop_of_the_history`). Что ушло из
+    истории обрезкой, границей больше не служит."""
+    return [
+        RangeNarrowing.model_validate(meta["narrowed"])
+        for meta in _metadata(messages)
+        if isinstance(meta.get("narrowed"), dict)
+    ]
+
+
+def hand_player_texts(history: Sequence[ModelMessage], analysis_id: int | None) -> list[str]:
+    """Реплики игрока о руке `analysis_id` с конца истории до первой реплики другого хода:
+    о другой руке, без разбора или без пометки руки — так же, как ставится отметка смены
+    руки (`hand_boundary`). Без руки — пусто
+    (`test_the_player_texts_of_the_hand_stop_at_the_last_boundary`)."""
+    if analysis_id is None:
+        return []
+    texts: list[str] = []
+    for message in reversed(history):
+        parts = _player_parts(message)
+        if not parts:
+            continue
+        tags = message.metadata if isinstance(message, ModelRequest) else None
+        if not isinstance(tags, dict) or tags.get(HAND_KEY) != analysis_id:
+            break
+        texts.extend(_text(part) for part in parts)
+    return texts
 
 
 def threshold_decided(messages: Sequence[ModelMessage]) -> bool:

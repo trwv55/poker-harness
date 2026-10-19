@@ -42,6 +42,8 @@ from harness.contracts.raw import Street
 __all__ = [
     "AGENT_ONLY_CALCS",
     "POSITIONS",
+    "AbsentGroup",
+    "AbsentGroupName",
     "BetSizeThreshold",
     "CalcName",
     "CalcParams",
@@ -64,6 +66,7 @@ __all__ = [
     "OpponentRangeResult",
     "PointFilter",
     "RangeLine",
+    "RangeNarrowing",
     "Subject",
     "ThresholdOutcome",
     "ThresholdParams",
@@ -328,6 +331,37 @@ class ThresholdResult(BaseModel):
     observations_needed: int | None = None
 
 
+# Заметные группы классов, о которых выход `opponent_range` говорит, что их нет в колл-
+# или чек-диапазоне защиты (план 2026-10-17, п. 8): карманные пары, одномастные и
+# разномастные тузы, бродвеи — две карты от десятки, без туза и не пара.
+AbsentGroupName = Literal["pairs", "suited_aces", "offsuit_aces", "broadways"]
+
+
+class AbsentGroup(BaseModel):
+    """Классы группы, которых нет в колл- (чек-) диапазоне защиты вовсе, но которые
+    чарт той же записи играет рейзом и/или олл-ином (`analysis.opponent_range.absent_groups`).
+
+    `classes` — в порядке `all_classes()`; `whole` — отсутствуют все классы группы;
+    `raised`, `all_in` — хоть один из них чарт играет рейзом, олл-ином."""
+
+    group: AbsentGroupName
+    classes: list[str]
+    whole: bool
+    raised: bool
+    all_in: bool
+
+
+class RangeNarrowing(BaseModel):
+    """Сужение диапазона соперника на улице — классы, переданные в `equity_vs_range`
+    (вместе с добавленными по просьбе игрока). Ключ — разбор руки, позиция соперника,
+    улица (план 2026-10-17, п. 6)."""
+
+    analysis_id: int
+    opponent_position: str
+    street: Street
+    classes: list[str]
+
+
 class OpponentRangeResult(BaseModel):
     """Стартовый диапазон соперника по чарту — зона `strict`: диапазон не угадан, а
     взят из эталона владельца по линии, которую код прочёл в руке.
@@ -351,6 +385,8 @@ class OpponentRangeResult(BaseModel):
     range_text: str
     hands_share: float
     live_combos: float
+    # Только у колла и чека защиты; у прочих линий пусто.
+    absent: list[AbsentGroup] = []
 
 
 class EquityVsRangeResult(BaseModel):
@@ -365,6 +401,8 @@ class EquityVsRangeResult(BaseModel):
     live_combos: float
     share_of_start: float
     equity: float
+    # Классы вне чарта, добавленные по просьбе игрока (входят и в `range_text`).
+    added: list[str] = []
 
 
 class HeroFrequencyParams(BaseModel):
@@ -453,13 +491,18 @@ class OpponentRangeParams(BaseModel):
 
 
 class EquityVsRangeParams(BaseModel):
-    """`hands` — классы без весов; `analysis_id` — от кода, как у `OpponentRangeParams`."""
+    """`hands` — классы без весов, `added` — классы вне чарта по просьбе игрока; оба от
+    модели. `analysis_id`, `prior` (сужение ближайшей более ранней улицы) и
+    `player_classes` (классы, названные игроком записью в репликах этой руки) — от кода."""
 
     calc: Literal[CalcName.EQUITY_VS_RANGE] = CalcName.EQUITY_VS_RANGE
     analysis_id: int
     opponent_position: str
     street: Street
     hands: str
+    added: str | None = None
+    prior: RangeNarrowing | None = None
+    player_classes: list[str] = []
 
 
 CalcParams = Annotated[
