@@ -118,6 +118,7 @@ from harness.contracts.analysis import (
     turn_flop_call_detail,
 )
 from harness.contracts.calcs import (
+    RANGE_CATEGORY_NAMES,
     CalcName,
     CalcResult,
     CoverageResult,
@@ -2778,7 +2779,7 @@ _CALC_WORD: dict[CalcName, str] = {
     CalcName.DEFENSE_FREQUENCY: "требуемая частота защиты",
     CalcName.FREQUENCY_VS_THRESHOLD: "частота против порога",
     CalcName.OPPONENT_RANGE: "диапазон соперника по чарту",
-    CalcName.EQUITY_VS_RANGE: "эквити против суженного диапазона",
+    CalcName.EQUITY_VS_RANGE: "эквити по категориям суженного диапазона",
 }
 
 _STAT_WORD: dict[FrequencyStat, str] = {
@@ -2952,14 +2953,28 @@ def _opponent_range_answer(result: OpponentRangeResult, trim: bool = False) -> l
 
 
 def _equity_answer(result: EquityVsRangeResult, trim: bool = False) -> list[str]:
-    return [
-        (
-            f"Эквити против диапазона {result.opponent_position}, суженного по линии "
-            f"(допущение): {_calc_pct(100.0 * result.equity, trim)} — "
-            f"{round(result.live_combos)} комбо, "
-            f"{_calc_pct(100.0 * result.share_of_start, trim)} стартового."
-        )
+    """Сужение и эквити по его категориям — одного общего числа нет (спека 2026-10-24,
+    §14.4; `test_agent_numbers_print_the_chart_range_and_the_equity_by_category`); до флопа
+    — одно эквити с «(допущение)» (§14.11; `test_agent_numbers_print_the_preflop_equity`)."""
+    parts = [
+        f"{RANGE_CATEGORY_NAMES[group.category]} — {round(group.combos)} комбо, "
+        f"{_calc_pct(100.0 * group.equity, trim)}"
+        for group in result.layout
+        if group.equity is not None
     ]
+    if result.preflop_equity is not None:
+        return [(
+            f"Эквити против диапазона {result.opponent_position}, суженного по линии "
+            f"(допущение): {_calc_pct(100.0 * result.preflop_equity, trim)} — "
+            f"{round(result.live_combos)} комбо."
+        )]
+    head = (
+        f"Диапазон {result.opponent_position}, суженный по линии (допущение): "
+        f"{round(result.live_combos)} комбо."
+    )
+    if not parts:
+        return [head]
+    return [head, "Эквити вашей руки против каждой категории: " + "; ".join(parts) + "."]
 
 
 def question_msg(result: CalcResult, prose: str | None) -> Msg:
@@ -3163,8 +3178,8 @@ _COUNTED_ITEMS: tuple[str, ...] = (
 )
 _AGENT_ONLY_ITEMS: tuple[str, ...] = (
     (
-        "в разобранной руке — стартовый диапазон соперника по чарту и эквити вашей руки "
-        "против него, суженного по линии (допущение)"
+        "в разобранной руке — стартовый диапазон соперника по чарту и его сужение по линии "
+        "(допущение) с эквити вашей руки против каждой категории"
     ),
 )
 

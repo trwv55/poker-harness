@@ -22,8 +22,11 @@ _HERO = ["Kd", "Tc"]
 
 
 @pytest.mark.parametrize(
-    "board", [_PAIRED, ["Th", "9h", "2c"], ["As", "Ks", "Qs"], ["Th", "9h", "2c", "5d"]],
-    ids=["paired", "two-tone", "mono", "turn"],
+    "board", [
+        _PAIRED, ["Th", "9h", "2c"], ["As", "Ks", "Qs"], ["Th", "9h", "2c", "5d"],
+        ["Th", "9h", "2c", "5d", "3h"],
+    ],
+    ids=["paired", "two-tone", "mono", "turn", "river"],
 )
 def test_every_class_is_in_exactly_one_category_and_the_combos_add_up(board: list[str]):
     """Каждый класс с живыми комбо — ровно в одной категории; сумма комбо категорий (с
@@ -160,7 +163,7 @@ def test_a_category_name_is_read_regardless_of_case_spaces_and_dashes(name: str)
         ("оверпара", "board", "нет ни одного класса"),
         ("трипс -AKo", "board", "среди названного нет: AKo"),
         ("трипс -A8s -K8s", "board", "не осталось ни одной руки"),
-        ("трипс", None, "только на флопе и тёрне"),
+        ("трипс", None, "только после флопа"),
         ("сильные руки", "board", "ни класс, ни категория"),
     ],
 )
@@ -180,3 +183,20 @@ def test_the_equity_output_sums_up_what_is_kept():
         (RangeCategory.BACKDOORS_OVERCARDS, 0, 1, ["AKo"]),
     ]
     assert sum(k.combos for k in kept) == pytest.approx(sum(g.combos for g in groups))
+
+
+def test_the_river_layout_has_no_draw_categories():
+    """Ривер (спека 2026-10-24, §14.2): дро, бэкдоров и оверкарт нет — категории только
+    готовые руки и «ничего»; пометок дро у готовых рук тоже нет."""
+    board = ["Th", "9h", "2c", "5d", "3h"]
+    rng = Range(weights=dict.fromkeys(all_classes(), 1.0))
+    groups = layout(rng, board, [*_HERO, *board])
+    drawing = {
+        RangeCategory.COMBO_DRAW, RangeCategory.FLUSH_DRAW, RangeCategory.OPEN_ENDED,
+        RangeCategory.DOUBLE_GUTSHOT, RangeCategory.GUTSHOT, RangeCategory.BACKDOORS_OVERCARDS,
+    }
+    found = {group.category for group in groups}
+    assert RangeCategory.NOTHING in found and not found & drawing
+    assert not any(
+        mark.category in drawing for group in groups for item in group.classes for mark in item.marks
+    )

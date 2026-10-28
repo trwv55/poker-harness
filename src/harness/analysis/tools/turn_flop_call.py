@@ -51,12 +51,12 @@
 from __future__ import annotations
 
 from itertools import combinations
-from math import comb
 
 import eval7
 from pydantic import BaseModel, model_validator
 
 from harness.analysis.tools.equity import _FULL_DECK
+from harness.analysis.tools.exact_equity import equity_by_combo
 from harness.analysis.tools.pot_odds import required_equity
 
 # Класс комбинации берётся у риверного перебора: правило минимального вэлью —
@@ -138,7 +138,7 @@ def turn_flop_call_requirement(
     board_cards = [eval7.Card(card) for card in board]
     hero_cards = [eval7.Card(card) for card in hero]
 
-    equity = _equity_by_combo(hero_cards, board_cards, cards, _FULL_BOARD - len(board))
+    equity = equity_by_combo(hero_cards, board_cards, cards, _FULL_BOARD - len(board))
     hero_score = eval7.evaluate(hero_cards + board_cards)
     hero_type = _type_index(hero_score)
 
@@ -162,49 +162,6 @@ def turn_flop_call_requirement(
         min_value_equity=sum(value) / len(value) if value else 0.0,
         bluffs_needed_min_value=_bluffs_needed(value, pool, req),
     )
-
-
-def _equity_by_combo(
-    hero_cards: list[eval7.Card],
-    board_cards: list[eval7.Card],
-    cards: list[eval7.Card],
-    to_come: int,
-) -> dict[tuple[int, int], float]:
-    """Доля героя во вскрытии против каждого комбо — перебором всех доборов.
-
-    Ключ — пара индексов в `cards` (i < j). Ничья считается половиной.
-
-    Знаменатель один на все комбо: доборы, не задевающие двух карт комбо, — это
-    сочетания из оставшихся `size - 2` карт, и их число от самого комбо не
-    зависит (`test_every_combo_is_dealt_the_same_number_of_run_outs`).
-
-    Цикл идёт по доборам, а не по комбо: рука героя на добранном борде считается
-    тогда один раз на добор, а не заново на каждое комбо соперника.
-    """
-    size = len(cards)
-    won = [[0.0] * size for _ in range(size)]
-    evaluate = eval7.evaluate
-    for run_out in combinations(range(size), to_come):
-        taken = set(run_out)
-        full_board = board_cards + [cards[x] for x in run_out]
-        hero_score = evaluate(hero_cards + full_board)
-        for i in range(size):
-            if i in taken:
-                continue
-            row = won[i]
-            with_first = full_board + [cards[i]]
-            for j in range(i + 1, size):
-                if j in taken:
-                    continue
-                score = evaluate(with_first + [cards[j]])
-                if score < hero_score:
-                    row[j] += 1.0
-                elif score == hero_score:
-                    row[j] += 0.5
-    run_outs = comb(size - 2, to_come)
-    return {
-        (i, j): won[i][j] / run_outs for i in range(size) for j in range(i + 1, size)
-    }
 
 
 def _bluffs_needed(value: list[float], pool: list[float], req: float) -> int | None:

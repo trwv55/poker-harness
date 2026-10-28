@@ -201,11 +201,37 @@ class CalcRun:
         self.digests: list[Digest] = []
         self.calls: list[dict[str, Any]] = []
 
+    def actual_for(
+        self, analysis_id: int, opponent_position: str
+    ) -> tuple[dict[Street, RangeNarrowing], list[Street]]:
+        """Актуальные сужения этого соперника в этой руке по улицам и улицы, чьё сужение
+        сброшено: по порядку сужений в разговоре пересужение более ранней улицы
+        сбрасывает сужения более поздних (решение владельца 2026-10-28;
+        `test_a_new_flop_narrowing_resets_the_turn_narrowing`). Позицию к верхнему регистру
+        приводит граница инструмента (`test_a_lower_case_position_is_the_same_opponent`)."""
+        streets = list(Street)
+        actual: dict[Street, RangeNarrowing] = {}
+        reset: set[Street] = set()
+        for narrowing in self.narrowings:
+            if (narrowing.analysis_id, narrowing.opponent_position) != (
+                analysis_id, opponent_position
+            ):
+                continue
+            later = [st for st in actual if streets.index(st) > streets.index(narrowing.street)]
+            for st in later:
+                del actual[st]
+                reset.add(st)
+            reset.discard(narrowing.street)
+            actual[narrowing.street] = narrowing
+        return actual, sorted(reset, key=streets.index)
+
     def prior_for(
         self, analysis_id: int, opponent_position: str, street: Street
     ) -> RangeNarrowing | None:
-        """Последнее сужение того же соперника в той же руке строго на предыдущей
-        улице; `None` — его нет
+        """Актуальное сужение того же соперника в той же руке строго на предыдущей
+        улице (`actual_for`); у ривера без сужения тёрна — сужение флопа (годно оно,
+        только если на тёрне ставок не было: это решает ядро по руке,
+        `opponent_range.previous_streets`); `None` — нет ни того, ни другого
         (`test_the_prior_is_the_last_narrowing_of_the_previous_street`). Что без него,
         решает `opponent_range.narrow`: флоп сужается от стартового, тёрн и ривер —
         отказ."""
@@ -213,13 +239,18 @@ class CalcRun:
         index = streets.index(street)
         if index == 0:
             return None
-        previous = streets[index - 1]
-        for narrowing in reversed(self.narrowings):
-            if (narrowing.analysis_id, narrowing.opponent_position, narrowing.street) == (
-                analysis_id, opponent_position, previous
-            ):
-                return narrowing
+        actual, _reset = self.actual_for(analysis_id, opponent_position)
+        candidates = [streets[index - 1]]
+        if street is Street.RIVER:
+            candidates.append(Street.FLOP)
+        for previous in candidates:
+            if previous in actual:
+                return actual[previous]
         return None
+
+    def reset_for(self, analysis_id: int, opponent_position: str) -> list[Street]:
+        """Улицы, чьё сужение сброшено пересужением более ранней (`actual_for`)."""
+        return self.actual_for(analysis_id, opponent_position)[1]
 
     def last_for(self, analysis_id: int, opponent_position: str) -> RangeNarrowing | None:
         """Последнее сужение этого соперника в этой руке, любой улицы: его классы вне
@@ -302,9 +333,9 @@ _BB_SCALE = 100
 
 _CALC_CAP = "Потолок расчётов на один ответ — {cap}: ответьте по тому, что уже посчитано."
 
-# Зона доверия по инструменту (CLAUDE.md): измерения, арифметика и диапазон по
-# чарту не опираются на угаданный диапазон; эквити против диапазона, суженного
-# агентом, — опирается (спека 2026-10-14, §6.2).
+# Зона доверия по инструменту (CLAUDE.md): измерения, арифметика, диапазон по чарту и
+# эквити против категорий его раскладки не опираются на угаданный диапазон; сужение
+# агентом — опирается (спека 2026-10-14, §6.2; спека 2026-10-24, §14.2).
 _TOOL_ZONE: dict[CalcName, Zone] = {
     name: Zone.ASSUMING if name is CalcName.EQUITY_VS_RANGE else Zone.STRICT for name in CalcName
 }
@@ -342,8 +373,10 @@ async def _perform(
     `test_the_ask_digest_is_unchanged_by_the_agent_one`).
     Вывод порога (`outcome`) лежит в метаданных: по нему проверка агента
     разрешает «в плюсе» и «в минусе» (`threshold_decided`).
-    Числа `opponent_range` лежат в `chart`, эквити `equity_vs_range` — в `assumed`, и
-    ни те, ни другие не попадают в `frequency`
+    Числа `opponent_range` (доля рук и комбо) лежат в `chart`; эквити по категориям
+    обоих выходов — в `equity`, одно эквити до флопа — в `preflop_equity`
+    (`_equity_numbers`); все они и в `allowed`, но ни в `frequency`, ни в `chart`
+    эквити не попадает
     (`test_the_agent_reads_the_range_by_the_chart_and_counts_equity_against_its_narrowing`,
     `test_equity_numbers_are_calculation_numbers_and_never_a_measured_frequency`).
     Сужение удачного `equity_vs_range` (`RangeNarrowing`) лежит в `narrowed` и
@@ -400,15 +433,11 @@ async def _perform(
         [round(100.0 * result.threshold, 1)] if isinstance(result, ThresholdResult) else []
     )
     chart: list[float] = []
-    assumed: list[float] = []
+    equity, preflop_equity = _equity_numbers(result, opponent)
     narrowed: dict[str, Any] | None = None
     if isinstance(result, OpponentRangeResult):
         chart = [round(100.0 * result.hands_share, 1), float(round(result.live_combos))]
     elif isinstance(result, EquityVsRangeResult) and isinstance(params, EquityVsRangeParams):
-        # В `assumed` — только эквити: доля от стартового и комбо сужения совпадали бы с
-        # процентами прозы (порогом), метки не требуют и пересказываются в блоке
-        # «Оценка модели» (живой прогон 2026-10-24).
-        assumed = [round(100.0 * result.equity, 1)]
         narrowing = RangeNarrowing(
             analysis_id=params.analysis_id,
             opponent_position=params.opponent_position,
@@ -427,11 +456,31 @@ async def _perform(
             "outcome": outcome.value if outcome is not None else None,
             "frequency": frequency,
             "chart": chart,
-            "assumed": assumed,
+            "equity": equity,
+            "preflop_equity": preflop_equity,
             "threshold": thresholds,
             "narrowed": narrowed,
         },
     )
+
+
+def _equity_numbers(result: CalcResult, opponent: str | None) -> tuple[list[float], list[float]]:
+    """Эквити выхода в процентах, как его печатает выжимка: по категориям и одно до
+    флопа. Число, совпавшее с другим числом того же выхода (комбо, доля чарта), сюда не
+    идёт — правило эквити в проверке ответа его не касается (§14.11)."""
+    if not isinstance(result, (OpponentRangeResult, EquityVsRangeResult)):
+        return [], []
+    found = {round(100.0 * g.equity, 1) for g in result.layout if g.equity is not None}
+    update: dict[str, Any] = {
+        "layout": [g.model_copy(update={"equity": None}) for g in result.layout]
+    }
+    single: set[float] = set()
+    if isinstance(result, EquityVsRangeResult):
+        update["preflop_equity"] = None
+        if result.preflop_equity is not None:
+            single = {round(100.0 * result.preflop_equity, 1)}
+    plain = agent_digest(result.model_copy(update=update), opponent=opponent).allowed
+    return sorted(found - plain), sorted(single - plain)
 
 
 def _window(window: WindowArg, session_id: int) -> Window:
@@ -707,9 +756,12 @@ def tools_for(
         """Стартовый диапазон соперника по чарту в последней разобранной руке.
 
         Линию соперника до флопа, глубину, число мест и анте код берёт из руки сам.
-        На флопе и тёрне — и раскладка по категориям на борде: на флопе — стартового
-        диапазона, на тёрне — вашего сужения флопа этого соперника (без него —
-        стартового). Имена категорий можно передать в `equity_vs_range`.
+        После флопа — и раскладка по категориям на борде с эквити вашей руки против
+        каждой: на флопе — стартового диапазона, на тёрне — вашего сужения флопа этого
+        соперника, на ривере — сужения тёрна (если на тёрне ставок не было — и флопа). Без
+        прошлого сужения раскладки нет — сначала сузьте прошлую улицу; новое сужение
+        ранней улицы сбрасывает сужения поздних. Имена категорий можно передать в
+        `equity_vs_range`.
 
         Args:
             opponent_position: позиция соперника за столом, как в сводке разбора, например BB.
@@ -717,6 +769,7 @@ def tools_for(
         """
         if run_state.analysis_id is None:
             return _NO_HAND
+        opponent_position = opponent_position.upper()
         return await _perform(
             db, player_id, run_state,
             OpponentRangeParams(
@@ -724,6 +777,7 @@ def tools_for(
                 opponent_position=opponent_position,
                 street=street,
                 prior=run_state.prior_for(run_state.analysis_id, opponent_position, street),
+                reset=run_state.reset_for(run_state.analysis_id, opponent_position),
             ),
         )
 
@@ -734,18 +788,20 @@ def tools_for(
         added: str | None = None,
         added_reason: str | None = None,
     ) -> str | ToolReturn:
-        """Эквити вашей руки при вскрытии против диапазона соперника, суженного вами.
+        """Сужение диапазона соперника вами и эквити вашей руки против каждой категории
+        суженного — одного общего числа после флопа нет; до флопа — одно эквити.
 
         Классы — только из стартового диапазона `opponent_range` этого соперника и
         без весов: доли берутся из чарта. Сужение — допущение. Тёрн сужается только из
-        вашего сужения флопа этого соперника в этой руке, ривер — из сужения тёрна:
-        без него — отказ, сначала сузьте предыдущую улицу.
+        вашего сужения флопа этого соперника в этой руке, ривер — из сужения тёрна (если
+        на тёрне ставок не было — и из сужения флопа): без него — отказ, сначала сузьте
+        предыдущую улицу. Новое сужение ранней улицы сбрасывает сужения поздних.
 
         Args:
             opponent_position: позиция соперника за столом, как в сводке разбора.
             street: улица точки решения; борд и ваши карты берутся из руки.
             hands: классы рук и имена категорий из раскладки `opponent_range` этой улицы
-                (флоп, тёрн) через запятую, вперемешку, например «трипс, гатшот -T7o,
+                через запятую, вперемешку, например «трипс, гатшот -T7o,
                 AA, A5s-A2s»; «-<класс>» убирает класс из названного.
             added: классы вне чарта: которые игрок сам назвал в своём сообщении
                 («22-77») — по его просьбе, или ваши — тогда с `added_reason`.
@@ -755,6 +811,9 @@ def tools_for(
         """
         if run_state.analysis_id is None:
             return _NO_HAND
+        # Позиция — верхним регистром на границе инструмента: «bb» — тот же BB
+        # (`test_a_lower_case_position_is_the_same_opponent`).
+        opponent_position = opponent_position.upper()
         last = run_state.last_for(run_state.analysis_id, opponent_position)
         return await _perform(
             db, player_id, run_state,
@@ -766,6 +825,7 @@ def tools_for(
                 added=added,
                 added_reason=added_reason,
                 prior=run_state.prior_for(run_state.analysis_id, opponent_position, street),
+                reset=run_state.reset_for(run_state.analysis_id, opponent_position),
                 player_classes=sorted(run_state.player_classes),
                 kept_classes=last.classes if last is not None else [],
                 kept_agent=last.agent_added if last is not None else {},

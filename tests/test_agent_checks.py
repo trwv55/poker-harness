@@ -1311,15 +1311,276 @@ def test_the_chart_exemption_covers_only_the_clause_that_retells_the_chart(sente
     assert any(ASSUMPTION_MARK in v for v in _check(sentence, **kw))
 
 
-def test_an_equity_against_a_narrowed_range_needs_the_mark():
-    """Эквити против суженного — допущение даже без слова «диапазон»."""
-    eq = frozenset({31.4, 31.8})
-    kw = {"allowed": eq, "calc_numbers": eq, "assumed_numbers": eq}
-    assert any("суженного" in v for v in _check("Против этих рук у вас 31.4%.", **kw))
-    assert _check("Против этих рук у вас 31.4% (допущение).", **kw) == []
+def test_a_category_equity_number_needs_no_mark():
+    """Число эквити против названной категории — факт расчёта (спека 2026-10-24, §14.5,
+    §14.11): без метки проходит, если категория названа в той же части предложения;
+    допущение ловится словами — утверждение о сопернике и слово диапазона требуют метки."""
+    eq = frozenset({22.0, 61.4})
+    kw = {"allowed": eq, "calc_numbers": eq, "equity_numbers": eq}
+    assert _check("Против топ-пар у вас 22%, против гатшотов — 61.4%.", **kw) == []
+    assert _check("Против двух пар у вас 22%.", **kw) == []
+    assert _check("У вас 22% против сетов.", **kw) == []
+    assert any(
+        ASSUMPTION_MARK in v for v in _check("Он продолжит сильными руками, у вас 22%.", **kw)
+    )
+    assert any(ASSUMPTION_MARK in v for v in _check("Против его диапазона у вас 22%.", **kw))
+    assert _check("Против его диапазона у вас 22% (допущение).", **kw) == []
+
+
+_NO_CATEGORY = [
+    "Ваше эквити — 38%.",
+    "Против его колла у вас 38%.",
+    "Против продолжающих рук у вас 38%.",
+    "У вас 38%.",
+    "Против одной категории у вас 38%, против топ-пар — 61%.",
+]
+
+
+@pytest.mark.parametrize("text", _NO_CATEGORY)
+def test_an_equity_number_without_a_named_category_is_a_violation(text: str):
+    """Число эквити категории без названной категории в той же части предложения —
+    нарушение «эквити без названной категории»; с «(допущение)» — проходит."""
+    eq = frozenset({38.2, 61.4})
+    kw = {"allowed": eq, "calc_numbers": eq, "equity_numbers": eq}
+    assert any("без названной категории" in v for v in _check(text, **kw))
+    assert not any(
+        "без названной категории" in v for v in _check(text.rstrip(".") + " (допущение).", **kw)
+    )
+
+
+def test_a_share_that_equals_another_calculation_number_is_not_an_equity():
+    """Правилу эквити подлежит только доля, не совпавшая (с округлением до целого) ни с
+    одним другим числом расчётов, сводки, порогов, частот или чарта: совпавшая проходит —
+    принятая цена. Точная доля эквити, другим числом не являющаяся, — по-прежнему
+    нарушение."""
+    eq = frozenset({32.6})
+    threshold = frozenset({33.3})
+    kw = {"allowed": eq | threshold, "calc_numbers": eq | threshold, "equity_numbers": eq,
+          "other_numbers": threshold}
+    assert _check("Порог 33%.", **kw) == []
+    assert _check("У вас 33%.", **kw) == []
+    assert any("без названной категории" in v for v in _check("У вас 32.6%.", **kw))
+    assert any(
+        "без названной категории" in v
+        for v in _check("У вас 33%.", **{**kw, "other_numbers": _NONE})
+    )
+    preflop = {**kw, "equity_numbers": _NONE, "preflop_equity_numbers": eq}
+    assert _check("У вас 33%.", **preflop) == []
+    assert any(ASSUMPTION_MARK in v for v in _check("У вас 32.6%.", **preflop))
+
+
+def test_a_category_name_beside_its_equity_is_not_a_hero_term():
+    """Имя категории в части с числом эквити — о руках соперника: проверку терминов
+    против меток героя не проходит. Без числа эквити в части — сверяется, как раньше."""
+    eq = frozenset({22.0, 61.4})
+    kw = {"allowed": eq, "calc_numbers": eq, "equity_numbers": eq}
+    assert _check("Против топ-пар у вас 22%.", **kw) == []
+    assert any("термин «топ-пара»" in v for v in _check("У вас топ-пара.", **kw))
+    assert any(
+        "термин «топ-пара»" in v
+        for v in _check("У вас топ-пара, против гатшотов у вас 61.4%.", **kw)
+    )
     assert _check(
-        "Если BB держит только пары и дамы (допущение), эквити 31.4%.", **kw
+        "У вас топ-пара, против гатшотов у вас 61.4%.",
+        **{**kw, "labels": frozenset({"hand:top_pair_strong_kicker"})},
     ) == []
+
+
+@pytest.mark.parametrize(
+    "text", ["У вас сет и 45.3% против топ-пар.", "У вас сет: 45.3% против топ-пар."]
+)
+def test_only_the_category_the_equity_belongs_to_is_freed_from_the_term_check(text: str):
+    """Вырезается только имя категории в обороте «против <категория>»: «сет» о руке героя
+    в той же части по-прежнему сверяется с его метками."""
+    eq = frozenset({45.3})
+    kw = {"allowed": eq, "calc_numbers": eq, "equity_numbers": eq}
+    violations = _check(text, **kw)
+    assert any("термин «сет»" in v for v in violations)
+    assert not any("термин «топ-пара»" in v for v in violations)
+    assert _check(text, **{**kw, "labels": frozenset({"hand:set"})}) == []
+
+
+@pytest.mark.parametrize(
+    ("text", "term"),
+    [
+        ("У вас сет — 45.3% против топ-пар.", "сет"),
+        ("Сет — 45.3% против топ-пар.", "сет"),
+        ("Против топ-пар ваш сет — 45.3%.", "сет"),
+        ("У вас флеш-дро — 45.3%.", "флеш-дро"),
+    ],
+)
+def test_a_category_with_a_dash_before_the_equity_is_still_a_hero_term(text: str, term: str):
+    """От проверки терминов освобождает только «против <категория>»: имя перед тире у
+    числа — термин руки героя (ревью 2026-10-28)."""
+    eq = frozenset({45.3})
+    kw = {"allowed": eq, "calc_numbers": eq, "equity_numbers": eq}
+    assert any(f"термин «{term}»" in v for v in _check(text, **kw))
+    assert not any("термин «топ-пара»" in v for v in _check(text, **kw))
+
+
+def test_a_dash_list_of_categories_does_not_name_the_category_of_the_equity():
+    """Перечень «топ-пары — 22%» в ответе категорию не называет — нужно «против» или
+    метка; перечню место в блоке «Оценка модели»."""
+    eq = frozenset({22.0})
+    kw = {"allowed": eq, "calc_numbers": eq, "equity_numbers": eq,
+          "labels": frozenset({"hand:top_pair_strong_kicker"})}
+    assert any("без названной категории" in v for v in _check("Топ-пары — 22%.", **kw))
+    assert _check("Против топ-пар у вас 22%.", **kw) == []
+    assert _check("Топ-пары — 22% (допущение).", **kw) == []
+
+
+def test_a_word_nothing_is_a_category_only_as_its_name():
+    """«Ничего» — категория только в обороте «против ничего» (любой пробел, и
+    неразрывный); «ничего страшного» и перечень «ничего — N%» — не категория."""
+    eq = frozenset({61.4})
+    kw = {"allowed": eq, "calc_numbers": eq, "equity_numbers": eq}
+    assert _check("Против ничего у вас 61.4%.", **kw) == []
+    assert _check("Против\u00a0ничего у вас 61.4%.", **kw) == []
+    assert _check("Против  ничего у вас 61.4%.", **kw) == []
+    assert any(
+        "без названной категории" in v
+        for v in _check("Против двух пар у вас мало, ничего — 61.4%.", **kw)
+    )
+    assert any(
+        "без названной категории" in v for v in _check("Ничего страшного, у вас 61.4%.", **kw)
+    )
+
+
+def test_an_equity_in_words_of_percent_is_a_share_too():
+    """«45.3 процента» — доля для правил эквити, как «45.3%»."""
+    eq = frozenset({45.3})
+    kw = {"allowed": eq, "calc_numbers": eq, "equity_numbers": eq}
+    assert any(
+        "без названной категории" in v for v in _check("У вас 45.3 процента эквити.", **kw)
+    )
+    assert _check("Против топ-пар у вас 45.3 процента.", **kw) == []
+    preflop = {"allowed": eq, "calc_numbers": eq, "preflop_equity_numbers": eq}
+    assert any("суженного" in v for v in _check("У вас 45.3 процента эквити.", **preflop))
+
+
+def test_the_preflop_equity_needs_the_mark():
+    """Одно эквити до флопа (категорий нет) без «(допущение)» в предложении — нарушение,
+    даже без слова диапазона; с меткой — проходит."""
+    eq = frozenset({31.4})
+    kw = {"allowed": eq, "calc_numbers": eq, "preflop_equity_numbers": eq}
+    assert any("суженного" in v for v in _check("У вас 31.4%.", **kw))
+    assert any("суженного" in v for v in _check("Против этих рук у вас 31%.", **kw))
+    assert _check("Против этих рук у вас 31.4% (допущение).", **kw) == []
+
+
+def test_his_likely_continuations_need_the_mark():
+    """«Против его вероятных продолжений у вас от 22% до 61%» — утверждение, что
+    соперник продолжает (§14.5): «у вас» его не освобождает, метка нужна."""
+    eq = frozenset({22.0, 61.4})
+    kw = {"allowed": eq, "calc_numbers": eq}
+    for text in (
+        "Против его вероятных продолжений у вас от 22% до 61%.",
+        "BB продолжает сильными руками, у вас от 22% до 61%.",
+        "Соперник продолжит, и у вас 22%.",
+        "Если бы он продолжил, у вас 22%.",
+        "Он продолжает сильными руками.",
+        "Продолжения BB — сильные руки.",
+    ):
+        assert any(ASSUMPTION_MARK in v for v in _check(text, **kw)), text
+    assert _check("Против его вероятных продолжений у вас от 22% до 61% (допущение).", **kw) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Если вы продолжите на тёрне, решение примете по борду.",
+        "Продолжение розыгрыша зависит от тёрна.",
+        "Если вы продолжите против него на тёрне, решение примете по борду.",
+        "BB продолжил коллом.",
+    ],
+)
+def test_continuing_without_the_opponent_needs_no_mark(text: str):
+    """Без слова о сопернике, глагол героя и пересказ в прошедшем времени — не
+    утверждение о продолжении соперника."""
+    assert not any(ASSUMPTION_MARK in v for v in _check(text, allowed=_NONE))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Продолжать против него ставку на тёрне стоит, если порог 33.3%.",
+        "Стоит ли продолжать против BB на тёрне — решает порог 33.3%.",
+        "Продолжайте ставить против него.",
+        "Продолжение против него — чек.",
+    ],
+)
+def test_continuing_as_the_hero_line_needs_no_mark(text: str):
+    """Инфинитив, повелительное и «продолжение» без «его/их» — о линии героя, а не
+    утверждение о сопернике (ревью 2026-10-28)."""
+    calc = frozenset({33.3})
+    assert _check(text, allowed=calc, calc_numbers=calc) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Соперник будет продолжать.",
+        "Соперник может продолжать.",
+        "Он склонен продолжать.",
+        "Продолжать соперник будет только сильным.",
+        "Продолжения у BB — топ-пары.",
+    ],
+)
+def test_an_opponent_subject_with_an_infinitive_continuing_needs_the_mark(text: str):
+    """Инфинитив при сопернике-подлежащем и «продолжения у <соперник>» — утверждение о
+    нём (ревью 2026-10-28): без метки — нарушение."""
+    assert any(ASSUMPTION_MARK in v for v in _check(text))
+
+
+@pytest.mark.parametrize("text", ["Они продолжат.", "Они сбросят."])
+def test_they_is_an_opponent_word(text: str):
+    assert any(ASSUMPTION_MARK in v for v in _check(text))
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["BB, скорее всего, продолжит.", "Соперник, вероятно, заколлирует.",
+     "BB, скорее всего, сбросит.", "Он, видимо, продолжит.", "Он, наверное, сбросит."],
+)
+def test_a_parenthetical_word_between_commas_does_not_split_the_claim(text: str):
+    """Вводное слово в запятых не делит придаточное: утверждение ловится целиком."""
+    assert any(ASSUMPTION_MARK in v for v in _check(text))
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["BB, похоже, продолжит.", "Он, наверняка, сбросит.", "BB, вероятнее всего, сбросит.",
+     "Соперник, по всей видимости, продолжит.", "BB, судя по всему, сбросит.",
+     "Он, кажется, продолжит.", "BB, думаю, сбросит.", "Он, пожалуй, сбросит.",
+     "BB — вероятно — сбросит.", "BB (вероятно) сбросит.", "Он, очевидно, продолжит."],
+)
+def test_more_parenthetical_words_and_their_dash_and_bracket_forms_do_not_split(text: str):
+    assert any(ASSUMPTION_MARK in v for v in _check(text))
+
+
+def test_a_bluff_name_before_a_parenthetical_passes():
+    """Имя порога «как у чистого блефа» снимается до вырезки вводного: фраза о пороге
+    проходит, как без вводного; утверждение о сопернике с вводным — ловится."""
+    calc = frozenset({33.3})
+    kw = {"allowed": calc, "calc_numbers": calc, "threshold_numbers": calc}
+    assert _check("Как у чистого блефа, вероятно, ему нужно сбросить 33.3%.", **kw) == []
+    assert any(ASSUMPTION_MARK in v for v in _check("BB, вероятно, сбросит.", **kw))
+
+
+def test_a_parenthetical_after_a_condition_keeps_the_condition_apart():
+    """После «если/когда …» вводное оставляет запятую: условие на соперника и вывод о
+    шансах героя — как без вводного."""
+    assert _check("Если BB коллирует, вероятно, у вас есть шансы.") == []
+    assert _check("Если BB коллирует, у вас есть шансы.") == []
+
+
+def test_a_parenthetical_word_without_the_opponent_is_still_free():
+    calc = frozenset({33.3})
+    assert _check("Вы, скорее всего, продолжите ставкой.") == []
+    assert _check("Вы — похоже — продолжите ставкой.") == []
+    assert _check("Порог (вероятно) 33.3%.", allowed=calc, calc_numbers=calc) == []
+    assert _check("Порог, вероятно, 33.3%.", allowed=calc, calc_numbers=calc) == []
+    assert _check("Ауты есть, они дают шанс собрать стрит.") == []
 
 
 def test_the_prompt_range_paragraph_passes_with_its_numbers_and_marks():
@@ -1331,7 +1592,6 @@ def test_the_prompt_range_paragraph_passes_with_its_numbers_and_marks():
         "allowed": chart | eq,
         "calc_numbers": chart | eq,
         "chart_numbers": chart,
-        "assumed_numbers": eq,
         "board_ranks": ("8", "8", "J"),
     }
     paragraph = (
@@ -1341,14 +1601,14 @@ def test_the_prompt_range_paragraph_passes_with_its_numbers_and_marks():
     )
     assert _check(paragraph, **kw) == []
     violations = _check("Против этого диапазона у вас 22%.", **kw)
-    assert any("суженного" in v for v in violations)
+    assert any(ASSUMPTION_MARK in v for v in violations)
     assert any(
         ASSUMPTION_MARK in v
         for v in _check("По чарту защиты у BB 38.2% рук, и он сбросит всё без пары.", **kw)
     )
 
 
-def test_the_turn_checks_read_chart_and_assumed_numbers_from_history():
+def test_the_turn_checks_read_chart_and_equity_numbers_from_history():
     from pydantic_ai.messages import ModelRequest, ToolReturnPart
 
     from harness.agent.run import _violations
@@ -1358,11 +1618,16 @@ def test_the_turn_checks_read_chart_and_assumed_numbers_from_history():
             "calc": "opponent_range", "allowed": [38.2, 410.0], "chart": [38.2, 410.0],
         }),
         ToolReturnPart(tool_name="equity_vs_range", content="…", tool_call_id="c2", metadata={
-            "calc": "equity_vs_range", "allowed": [31.4], "assumed": [31.4],
+            "calc": "equity_vs_range", "allowed": [31.4, 7.0], "equity": [31.4],
         }),
     ])]
     assert _violations("Стартовый диапазон BB по чарту — 38.2% рук.", messages, None, frozenset()) == []
-    assert _violations("У вас 31.4%.", messages, None, frozenset()) != []
+    assert _violations("Против сетов у вас 31.4%.", messages, None, frozenset()) == []
+    assert any(
+        "без названной категории" in v
+        for v in _violations("Против этой категории у вас 31.4%.", messages, None, frozenset())
+    )
+    assert _violations("Против его диапазона у вас 31.4%.", messages, None, frozenset()) != []
 
 
 # --- Task 12 §5: два ложных отказа живой приёмки (решение владельца 2026-10-15) ----
@@ -1589,14 +1854,6 @@ def test_a_whole_percent_backs_a_measured_frequency():
     )
 
 
-def test_a_whole_percent_of_the_equity_output_needs_the_mark_like_the_exact_one():
-    numbers = frozenset({30.8})
-    kw = {"allowed": numbers, "assumed_numbers": numbers}
-    assert any(ASSUMPTION_MARK in v for v in _check("Эквити 31%.", **kw))
-    assert any(ASSUMPTION_MARK in v for v in _check("Эквити 30.8%.", **kw))
-    assert _check(f"Эквити 31% {ASSUMPTION_MARK}.", **kw) == []
-
-
 def test_a_whole_percent_of_the_chart_retells_it_without_a_mark():
     chart = frozenset({38.2, 105.0})
     kw = {"allowed": chart, "chart_numbers": chart}
@@ -1609,81 +1866,6 @@ def test_a_whole_percent_is_allowed_in_the_assumption_block():
     assert _check_block("BB по чарту защищает 38% рук.", allowed=numbers) == []
     assert _check_block("BB по чарту защищает 38.2% рук.", allowed=numbers) == []
     assert _check_block("BB по чарту защищает 40% рук.", allowed=numbers)
-
-
-# --- шанс сводки и эквити против диапазона (А.5, b) -----------------------------
-
-
-def test_a_share_of_the_summary_that_equals_an_equity_number_needs_no_mark():
-    """Шанс собрать дро из сводки (17.4) совпадает до десятых с числом выхода
-    `equity_vs_range`: в части о шансах самой руки (слово «собрать», без «эквити»)
-    метки не нужно — обе живые фразы тёрна 2026-10-15; целое 17% при 17.4 сводки и
-    17.2 эквити — тоже."""
-    summary = frozenset({17.4, 8.0})
-    assumed = frozenset({17.4, 30.1})
-    kw = {"allowed": summary | assumed, "assumed_numbers": assumed, "summary_numbers": summary}
-    lives = (
-        (
-            "При колле рука у вас не пустая: двусторонний стрит, 8 аутов, "
-            "собрать его на следующей улице 17.4%."
-        ),
-        "По сводке у вас двусторонний стрит с 8 аутами, и шанс собрать его на следующей улице 17.4%.",
-    )
-    for live in lives:
-        assert _check(live, **kw) == []
-        assert any(ASSUMPTION_MARK in v for v in _check(live, **{**kw, "summary_numbers": _NONE}))
-    kw["assumed_numbers"] = frozenset({17.2, 30.1})
-    assert _check(lives[1].replace("17.4%", "17%"), **kw) == []
-
-
-def test_a_share_only_from_the_equity_output_still_needs_the_mark():
-    """Доля только из выхода эквити; совпавшая со сводкой, но не в предложении о шансах
-    руки или со словом «эквити», — тоже требует метки."""
-    summary = frozenset({17.4, 8.0})
-    assumed = frozenset({17.2, 30.1})
-    kw = {"allowed": summary | assumed, "assumed_numbers": assumed, "summary_numbers": summary}
-    assert any(ASSUMPTION_MARK in v for v in _check("Против его колла у вас 30.1%.", **kw))
-    assert any(ASSUMPTION_MARK in v for v in _check("Против такого колла у вас 30%.", **kw))
-    assert _check(f"Против такого колла у вас 30.1% {ASSUMPTION_MARK}.", **kw) == []
-    assert any(ASSUMPTION_MARK in v for v in _check("Против такого диапазона у вас 17%.", **kw))
-    assert any(ASSUMPTION_MARK in v for v in _check("Эквити 17% вместе с аутами.", **kw))
-    assert any(ASSUMPTION_MARK in v for v in _check("Эквити 17.2% и 8 аутов.", **kw))
-    # Без слова руки (аут, сбор, дро…) совпадение со сводкой метку не снимает.
-    assert any(ASSUMPTION_MARK in v for v in _check("Против такого колла у вас 17%.", **kw))
-    assert any(ASSUMPTION_MARK in v for v in _check("У вас 17%.", **kw))
-
-
-def test_an_opponent_word_in_the_clause_of_the_share_cancels_the_hand_chances_exemption():
-    """Слово руки есть, но в части с долей — «против», «колл…», «выигра…» или соперник:
-    это эквити против его действия, метка нужна (сводка 30.2, эквити 29.8)."""
-    summary = frozenset({30.2, 8.0})
-    assumed = frozenset({29.8})
-    kw = {"allowed": summary | assumed, "assumed_numbers": assumed, "summary_numbers": summary}
-    for text in (
-        "Против его колла у вас 30% с учётом аутов.",
-        "Если он заколлирует, шанс выиграть 30%, ауты есть.",
-        "Против вэлью BB с дро вы выигрываете 30%.",
-        "Если он заколлирует — у вас 30%, ауты есть.",
-        "Если он заколлирует, у вас 30%, ауты есть.",
-        "Когда BB коллирует, с аутами у вас 30%.",
-        "Его линия сильная; с аутами у вас 30%.",
-        "С аутами у вас 30%.",
-        "Дро можно собрать; у вас 30%.",
-        "BB видит шанс собрать 30%, ауты есть.",
-    ):
-        assert any(ASSUMPTION_MARK in v for v in _check(text, **kw)), text
-    assert _check("Есть 8 аутов, шанс собрать 30%.", **kw) == []
-
-
-def test_a_measured_frequency_or_a_chart_number_does_not_free_the_equity_share():
-    """Только число сводки, не измеренная частота и не чарт: 17.4 из частоты не снимает
-    метку с эквити в предложении об аутах."""
-    freq = frozenset({17.4, 8.0})
-    kw = {"allowed": freq, "assumed_numbers": frozenset({17.4}), "frequency_numbers": freq,
-          "chart_numbers": freq}
-    assert any(
-        ASSUMPTION_MARK in v for v in _check("Шанс собрать 17.4%, 8 аутов.", **kw)
-    )
 
 
 # --- ложные отказы тёрна 2026-10-15 (А.5) ---------------------------------------
@@ -1785,101 +1967,20 @@ def test_so_often_as_a_comparison_is_not_a_habit_adverb():
         assert any(ASSUMPTION_MARK in v for v in _turn_check(text)), text
 
 
-# --- порог сводки, совпавший с эквити (двойное сужение, 2026-10-24) -------------
+# --- имя порога и «как у чистого блефа» (двойное сужение, 2026-10-24) -----------
 
 _THRESHOLDS = frozenset({13.2, 23.9, 33.3})
-_TWO_EQUITIES = frozenset({32.6, 43.2})
 _DOUBLE_NARROWING = {
-    "allowed": _THRESHOLDS | _TWO_EQUITIES | {33.6},
-    "calc_numbers": _THRESHOLDS | _TWO_EQUITIES | {33.6},
-    "assumed_numbers": _TWO_EQUITIES,
-    "summary_numbers": _THRESHOLDS,
+    "allowed": _THRESHOLDS | {32.6, 43.2, 33.6},
+    "calc_numbers": _THRESHOLDS | {32.6, 43.2, 33.6},
     "threshold_numbers": _THRESHOLDS | {33.6},
 }
-_THRESHOLD_LIVES = (
-    "Порог фолдов у него 33% как у чистого блефа и 13% с учётом аутов.",
-    "Для вашей ставки порог фолдов 33% как у чистого блефа и 13% с учётом аутов.",
-    (
-        "Как у чистого блефа ему нужно, чтобы BB сбрасывал чаще 33%, а с учётом аутов хватает "
-        "фолдов чаще 13%."
-    ),
-    (
-        "Если считать его чистым блефом, он окупается на одних фолдах, когда BB сбрасывает "
-        "чаще 33%."
-    ),
-)
-
-
-@pytest.mark.parametrize("live", _THRESHOLD_LIVES)
-def test_a_summary_threshold_share_equal_to_an_equity_number_needs_no_mark(live: str):
-    """Порог сводки 33.3 → 33% совпал с эквити флопа 32.6 → 33%: доля сразу после имени
-    порога — арифметика порога, а не эквити и не утверждение о сопернике."""
-    assert _check(live, **_DOUBLE_NARROWING) == []
-
-
-def test_the_threshold_of_frequency_vs_threshold_frees_its_share_too():
-    """Порог выхода `frequency_vs_threshold` (33.6 → 34%) — тоже порог."""
-    kw = {**_DOUBLE_NARROWING, "assumed_numbers": frozenset({34.2})}
-    assert _check("Порог: 34%.", **kw) == []
-    assert _check("Порог фолдов у него 34%.", **kw) == []
-    assert any("эквити" in v for v in _check("Порог: 34%.", **{**kw, "threshold_numbers": _THRESHOLDS}))
-
-
-def test_an_equity_share_against_the_range_still_needs_the_mark_despite_the_threshold():
-    kw = {**_DOUBLE_NARROWING, "assumed_numbers": frozenset({32.6})}
-    assert any("эквити" in v for v in _check("Против его диапазона у вас 33%.", **kw))
-    for text in (
-        "У вас 33%, порог фолдов 33%.",
-        "Порог фолдов 33%, эквити у вас тоже 33%.",
-        "Порог фолдов 33% против его колла.",
-        "Порог фолдов 33%, диапазон широкий.",
-        "Порог фолдов 33%, рендж широкий.",
-        "У вас 33%.",
-    ):
-        assert any("эквити" in v for v in _check(text, **_DOUBLE_NARROWING)), text
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "Порог фолдов — 33%.",
-        "Порог фолдов для BB 33%.",
-        "Ставке хватает фолдов чаще 33%.",
-        "Ставке хватает фолдов 33%.",
-        "Ставка в минусе, если BB сбрасывает реже 33%.",
-        "Ставка окупается, если фолдов чаще 33%.",
-    ],
-)
-def test_each_form_tying_the_share_to_the_threshold_frees_it(text: str):
-    assert _check(text, **_DOUBLE_NARROWING) == []
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "Порог фолдов 33% — ваша рука выигрывает в 33% случаев.",
-        "Порог фолдов 33% — а выигрываете вы 33%.",
-        "Порог фолдов 33% при ваших 33% победы.",
-    ],
-)
-def test_a_share_beside_the_threshold_but_not_tied_to_it_needs_the_mark(text: str):
-    """Освобождается только доля сразу после имени порога; вторая 33% — эквити."""
-    assert any("эквити" in v for v in _check(text, **_DOUBLE_NARROWING))
-
-
-def test_a_threshold_share_not_from_the_thresholds_still_needs_the_mark():
-    """Число порога, совпавшее с эквити, но не из порогов, метку не снимает — даже если
-    оно есть в остальной сводке."""
-    kw = {**_DOUBLE_NARROWING, "threshold_numbers": frozenset({13.2})}
-    for live in _THRESHOLD_LIVES:
-        if "33%" in live:
-            assert any("эквити" in v for v in _check(live, **kw)), live
 
 
 def test_the_threshold_name_with_the_opponent_before_its_share_without_a_colon():
     """«Порог фолдов у него 33%» — имя порога перед порогом и без двоеточия; доля не из
     порогов и действие рядом — по-прежнему утверждение."""
-    kw = {**_DOUBLE_NARROWING, "assumed_numbers": _NONE, "allowed": _DOUBLE_NARROWING["allowed"] | {41.0}}
+    kw = {**_DOUBLE_NARROWING, "allowed": _DOUBLE_NARROWING["allowed"] | {41.0}}
     assert _check("Порог фолдов у него 33%.", **kw) == []
     assert _check("Порог фолдов для BB 13%.", **kw) == []
     for text in (
@@ -1896,7 +1997,7 @@ def test_the_bluff_noun_naming_the_threshold_with_a_threshold_share_is_not_an_ac
     """«Как у чистого блефа», «считать его (чистым) блефом» в начале придаточного — имя
     порога, если в предложении порог привязан к имени; без него, при «бы», в другом
     обороте и при доле не из порогов — действие соперника."""
-    kw = {**_DOUBLE_NARROWING, "assumed_numbers": _NONE}
+    kw = dict(_DOUBLE_NARROWING)
     assert _check("Как у чистого блефа ему нужно, чтобы BB сбрасывал чаще 33%.", **kw) == []
     assert _check("Если считать его блефом, BB нужно сбрасывать чаще 33%.", **kw) == []
     for text in (
@@ -1924,108 +2025,8 @@ def test_the_bluff_noun_naming_the_threshold_with_a_threshold_share_is_not_an_ac
     ],
 )
 def test_the_bluff_name_with_the_opponent_in_its_clause_is_still_a_claim(text: str):
-    kw = {**_DOUBLE_NARROWING, "assumed_numbers": _NONE}
+    kw = dict(_DOUBLE_NARROWING)
     assert any("утверждение" in v for v in _check(text, **kw))
-
-
-# --- измеренная частота с выборкой, совпавшая с эквити (стенд b60cfc0) ----------
-
-_FOLD_TO_CBET = frozenset({21.0, 54.0, 38.9})
-_FREQUENCY_AND_EQUITY = {
-    "allowed": _FOLD_TO_CBET | {29.1, 39.4},
-    "calc_numbers": _FOLD_TO_CBET | {29.1, 39.4},
-    "frequency_numbers": _FOLD_TO_CBET,
-    "assumed_numbers": frozenset({29.1, 39.4}),
-    "labels": frozenset({"stat:fold_to_cbet"}),
-}
-
-
-@pytest.mark.parametrize(
-    "live",
-    [
-        "Поле в BB сбрасывает на с-бет 39% (21 из 54), выборка достаточная.",
-        "Измеренная сдача на с-бет у поля в позиции BB — 21 из 54 (39%), выборка достаточная.",
-    ],
-)
-def test_a_measured_frequency_with_its_own_sample_needs_no_equity_mark(live: str):
-    """Частота 21 из 54 (38.9 → 39%) совпала с эквити 39.4 → 39%: доля с выборкой этой
-    частоты в скобках рядом — частота, а не эквити."""
-    assert _check(live, **_FREQUENCY_AND_EQUITY) == []
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "Поле сбрасывает 39% ( 21 из 54 ).",
-        "Поле сбрасывает 39%(21 из 54).",
-        "Противник сбрасывает 39% (21 из 54).",
-        "Поле сбрасывает 21 из 54 (39%.",
-    ],
-)
-def test_a_frequency_share_allows_spaces_around_its_sample(text: str):
-    """Пробелы внутри и вокруг скобок — любые; в форме «N из M (доля)» закрывающая скобка
-    не нужна."""
-    assert _check(text, **_FREQUENCY_AND_EQUITY) == []
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "Ваши шансы выиграть 39% (21 из 54).",
-        "Шансы вашей руки 39% (21 из 54).",
-        "Шансы руки 21 из 54 (39%).",
-        "У вас 39% (21 из 54).",
-        "Ваша рука выигрывает 39% (21 из 54) до ривера.",
-        "Вы впереди в 39% (21 из 54) раздач.",
-        "Ваши ауты дают 39% (21 из 54).",
-        "Вы соберёте дро в 39% (21 из 54).",
-        "Вы забираете банк в 39% (21 из 54) случаев.",
-        "Equity 39% (21 из 54).",
-        "Поле сбрасывает, а ваша рука выигрывает 39% (21 из 54).",
-        "Поле сбрасывает, ваш шанс 39% (21 из 54).",
-        "Поле сбрасывает и ваша рука выигрывает 39% (21 из 54).",
-        "При колле ваш шанс 39% (21 из 54).",
-        "При рейзе вы впереди в 39% (21 из 54).",
-        "При колле шанс 39% (21 из 54).",
-        "При колле у вас 39% (21 из 54).",
-    ],
-)
-def test_a_sample_without_a_frequency_sign_in_its_part_needs_the_mark(text: str):
-    """Без действия поля или соперника в части с долей, или с шансом / исходом руки героя
-    там — это не частота, выборка рядом метку не снимает."""
-    assert any("эквити" in v for v in _check(text, **_FREQUENCY_AND_EQUITY))
-
-
-def test_a_frequency_share_without_its_own_sample_still_needs_the_mark():
-    kw = _FREQUENCY_AND_EQUITY
-    for text in (
-        "Против его диапазона у вас 39% (21 из 54).",
-        "Эквити 39% (21 из 54).",
-        "Поле сбрасывает 39% (21 из 54), диапазон широкий.",
-        "Поле сбрасывает 39% (21 из 54), рендж широкий.",
-        "У вас 39%.",
-        "У вас 39%, выборка 21 из 54.",
-    ):
-        assert any("эквити" in v for v in _check(text, **kw)), text
-    # Выборка не той частоты: 21 из 54 при частоте 4 из 8 (50%).
-    other = frozenset({4.0, 8.0, 50.0})
-    kw_other = {**kw, "allowed": kw["allowed"] | other | {21.0, 54.0}, "frequency_numbers": other}
-    assert any("эквити" in v for v in _check("Поле сбрасывает 39% (21 из 54).", **kw_other))
-    # Выборка из частот, но её доля (4 из 8 = 50%) до 39% не округляется.
-    both = _FOLD_TO_CBET | other
-    kw_both = {**kw, "allowed": kw["allowed"] | other, "frequency_numbers": both}
-    assert any("эквити" in v for v in _check("Поле сбрасывает 39% (4 из 8).", **kw_both))
-    # Та же доля 38.9, но у частоты выборка 7 из 18: 21 из 54 — не её выборка.
-    seven = frozenset({7.0, 18.0, 38.9})
-    kw_seven = {**kw, "allowed": kw["allowed"] | seven, "frequency_numbers": seven}
-    assert any("эквити" in v for v in _check("Поле сбрасывает 39% (21 из 54).", **kw_seven))
-    # N и M из разных частот (20 из 50 и 21 из 54): 20 из 54 = 37.0 — не измерено.
-    mixed = _FOLD_TO_CBET | {20.0, 50.0, 40.0}
-    kw_mixed = {
-        **kw, "allowed": kw["allowed"] | mixed | {37.2}, "frequency_numbers": mixed,
-        "assumed_numbers": frozenset({37.2}),
-    }
-    assert any("эквити" in v for v in _check("Поле сбрасывает 37% (20 из 54).", **kw_mixed))
 
 
 # --- ранги аутов словами (А.4) --------------------------------------------------

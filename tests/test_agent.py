@@ -28,21 +28,21 @@ from pydantic_ai.messages import (
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from sqlalchemy import text as sql_text
 
-import harness.calcs as calcs_module
 from harness.agent.history import (
     HAND_KEY,
     NEW_HAND_MARK,
     NO_HAND_MARK,
     allowed_from_history,
-    assumed_numbers_in,
     calcs_in_history,
     chart_numbers_in,
     dump_history,
+    equity_numbers_in,
     estimate_tokens,
     frequency_numbers,
     hand_player_texts,
     load_history,
     narrowings_in,
+    non_equity_numbers_in,
     player_numbers,
     trim_history,
     turns,
@@ -1010,7 +1010,6 @@ async def test_the_agent_reads_the_range_by_the_chart_and_counts_equity_against_
     db_factory, tmp_path, monkeypatch
 ):
     monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
-    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 2_000)
     async with db_factory() as session:
         scope, analysis_id = await _evening_with_hand(session, tg_user_id=8301)
         script = _TurnScript([([_RANGE_CALL, _EQUITY_CALL], "Ответ без чисел (допущение).")])
@@ -1023,46 +1022,36 @@ async def test_the_agent_reads_the_range_by_the_chart_and_counts_equity_against_
     assert chart_numbers_in(turn.messages) == frozenset(
         {round(100.0 * range_result.hands_share, 1), float(round(range_result.live_combos))}
     )
-    assert assumed_numbers_in(turn.messages) == frozenset({round(100.0 * equity_result.equity, 1)})
+    equities = {
+        round(100.0 * g.equity, 1)
+        for result in (range_result, equity_result) for g in result.layout if g.equity is not None
+    }
+    found = equity_numbers_in(turn.messages)
+    assert found and found <= equities
+    assert not found & non_equity_numbers_in(turn.messages)
+    assert all(
+        "assumed" not in part.metadata
+        for message in turn.messages if isinstance(message, ModelRequest)
+        for part in message.parts if isinstance(part, ToolReturnPart) and part.metadata
+    )
 
 
 async def test_equity_numbers_are_calculation_numbers_and_never_a_measured_frequency(
     db_factory, tmp_path, monkeypatch
 ):
-    """Эквити и доля от стартового — числа расчёта (`allowed`), но не измеренная
-    частота: частота — опора действию соперника, а сужение агента ею не бывает."""
+    """Эквити по категориям — числа расчёта (`allowed`), но не измеренная частота и не
+    числа чарта: частота — опора действию соперника, а сужение агента ею не бывает."""
     monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
-    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 2_000)
     async with db_factory() as session:
         scope, analysis_id = await _evening_with_hand(session, tg_user_id=8304)
         script = _TurnScript([([_RANGE_CALL, _EQUITY_CALL], "Ответ без чисел (допущение).")])
         turn = await _turn(db_factory, session, script, scope=scope, analysis_id=analysis_id)
-    assumed = assumed_numbers_in(turn.messages)
-    assert assumed and assumed <= allowed_from_history(turn.messages)
+    equity_result = turn.results[1]
+    assert isinstance(equity_result, EquityVsRangeResult)
+    equities = {round(100.0 * g.equity, 1) for g in equity_result.layout if g.equity is not None}
+    assert equities and equities <= allowed_from_history(turn.messages)
     assert chart_numbers_in(turn.messages) <= allowed_from_history(turn.messages)
     assert frequency_numbers(turn.messages) == frozenset()
-
-
-async def test_the_fold_hint_numbers_are_allowed_but_never_assumed(
-    db_factory, tmp_path, monkeypatch
-):
-    """Ориентир сдачи (доля оставленного, сдача на с-бет с выборкой) — числа выхода:
-    они в `allowed`, но не в `assumed` — там только эквити (2f3d92a, 5394010)."""
-    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
-    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 500)
-    async with db_factory() as session:
-        scope, analysis_id = await _evening_with_hand(session, tg_user_id=8305)
-        script = _TurnScript([([_EQUITY_CALL], "Ответ без чисел (допущение).")])
-        turn = await _turn(db_factory, session, script, scope=scope, analysis_id=analysis_id)
-    (result,) = turn.results
-    assert isinstance(result, EquityVsRangeResult) and result.fold_hint is not None
-    assert result.kept_combos is not None and result.source_combos is not None
-    kept = round(100.0 * result.kept_combos / result.source_combos, 1)
-    hint = {kept, round(100.0 - kept, 1), 0.0, 1.0}
-    output = turn.calls[0]["output"]
-    assert "сдаёт" in output and "Для сверки с долей" in output
-    assert hint <= allowed_from_history(turn.messages)
-    assert assumed_numbers_in(turn.messages) == frozenset({round(100.0 * result.equity, 1)})
 
 
 async def test_without_a_hand_analysis_the_range_tool_says_so(db_factory):
@@ -1599,37 +1588,6 @@ async def test_an_old_row_without_hand_tags_loads_and_gets_no_boundary(db_factor
     assert marks == [[], [], [NO_HAND_MARK], [NEW_HAND_MARK]]
 
 
-def test_the_summary_numbers_reach_the_check_of_the_equity_share():
-    """Шанс дро из сводки, совпавший с числом `equity_vs_range` из разговора, метки не
-    требует; доля только из выхода эквити — требует
-    (`test_a_share_of_the_summary_that_equals_an_equity_number_needs_no_mark`)."""
-    from harness.agent.run import _draft_violations
-    from harness.contracts import POSTFLOP_LINE_DETAIL, Draw, DrawKind, PostflopLineDetail
-    from tests.test_agent_checks import _TOP_PAIR, _with_line
-
-    line = PostflopLineDetail.model_validate(_with_line(_TOP_PAIR)[POSTFLOP_LINE_DETAIL])
-    draw = Draw(
-        kinds=[DrawKind.OPEN_ENDED], out_ranks=["Q", "7"], outs=["Qc"] * 8, unseen=46,
-        hit_next=0.174, hit_by_river=None,
-    )
-    detail: dict[str, object] = {
-        POSTFLOP_LINE_DETAIL: line.model_copy(update={"draw": draw}).model_dump(mode="json")
-    }
-    context = agent_context(
-        _result([_point(dp_index=0, ev_diff_bb=-1.4, detail=detail)]), _postflop_hand()
-    )
-    assert 17.4 in context.allowed
-    messages: list[ModelMessage] = [ModelRequest(parts=[ToolReturnPart(
-        "equity_vs_range", "эквити",
-        metadata={"calc": "equity_vs_range", "allowed": [17.4, 30.1], "assumed": [17.4, 30.1]},
-    )])]
-    said: frozenset[float] = frozenset()
-    summary = AgentDraft(answer="Шанс собрать стрит на следующей улице 17.4%.")
-    assert _draft_violations(summary, messages, context, said)[0] == []
-    equity = AgentDraft(answer="Против его колла у вас 30.1%.")
-    assert any("эквити" in v for v in _draft_violations(equity, messages, context, said)[0])
-
-
 # --- план 2026-10-17, пп. 6 и 9: сужение по улицам и классы по просьбе игрока ----------
 
 
@@ -1642,8 +1600,9 @@ def _narrowing(street: str, classes: list[str], *, analysis_id: int = 1, positio
 
 def test_the_prior_is_the_last_narrowing_of_the_previous_street():
     """Ключ — разбор, позиция соперника, улица; берётся последнее сужение строго
-    предыдущей улицы: у ривера при одном флопе — `None`, флоп другой руки или другого
-    соперника не засчитывается."""
+    предыдущей улицы; у ривера без тёрна — сужение флопа (годно ли оно, решает ядро по
+    чек-чек тёрну), с тёрном — тёрн; флоп другой руки или другого соперника не
+    засчитывается."""
     run_state = CalcRun(max_calcs=8, sizes_from=frozenset(), narrowings=[
         _narrowing("flop", ["AA", "KK"]),
         _narrowing("flop", ["AA"]),
@@ -1651,7 +1610,8 @@ def test_the_prior_is_the_last_narrowing_of_the_previous_street():
         _narrowing("flop", ["JJ"], position="SB"),
     ])
     assert run_state.prior_for(1, "BB", Street.TURN) == _narrowing("flop", ["AA"])
-    assert run_state.prior_for(1, "BB", Street.RIVER) is None
+    assert run_state.prior_for(1, "BB", Street.RIVER) == _narrowing("flop", ["AA"])
+    assert run_state.prior_for(3, "BB", Street.RIVER) is None
     assert run_state.prior_for(1, "BB", Street.FLOP) is None
     assert run_state.prior_for(1, "BB", Street.PREFLOP) is None
     assert run_state.prior_for(3, "BB", Street.TURN) is None
@@ -1686,7 +1646,6 @@ async def test_a_class_removed_on_the_flop_of_the_same_turn_is_refused_on_the_tu
     db_factory, tmp_path, monkeypatch
 ):
     monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
-    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 500)
     async with db_factory() as session:
         scope, analysis_id = await _evening_through_the_turn(session, tg_user_id=8401)
         script = _TurnScript([([
@@ -1710,7 +1669,6 @@ async def test_the_flop_and_the_turn_narrowed_in_one_answer_chain(
 ):
     """Оба вызова в одном ответе модели: эквити — барьер, тёрн видит сужение флопа."""
     monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
-    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 500)
 
     def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         if len(messages) == 1:
@@ -1756,7 +1714,6 @@ async def test_a_later_street_without_the_previous_narrowing_of_this_opponent_is
     флопа в том же ходе) — отказ модели; ключ соперника и руки — в
     `test_the_prior_is_the_last_narrowing_of_the_previous_street`."""
     monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
-    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 500)
     async with db_factory() as session:
         scope, analysis_id = await _evening_through_the_turn(session, tg_user_id=8404)
         calls = [*([flop] if flop else []), _equity(street, "QQ")]
@@ -1772,7 +1729,6 @@ async def test_a_turn_in_the_next_turn_is_bound_by_the_flop_of_the_history(
 ):
     """Сужение флопа прошлого хода лежит в метаданных истории и ограничивает тёрн."""
     monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
-    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 500)
     async with db_factory() as session:
         scope, analysis_id = await _evening_through_the_turn(session, tg_user_id=8403)
         first = await _turn(
@@ -1801,7 +1757,6 @@ async def test_a_class_the_player_named_is_added_and_said_in_its_own_line(
     """Игрок назвал «22–77» — агент добавляет их параметром `added`: зона по-прежнему
     assuming, в выходе отдельная строка, доля добавленных — полные комбо."""
     monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path, call="88+, AQs"))
-    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 500)
     async with db_factory() as session:
         scope, analysis_id = await _evening_through_the_turn(session, tg_user_id=8404)
         script = _TurnScript([([_equity("flop", "QQ, AQs", added="22-77")],
@@ -1818,7 +1773,6 @@ async def test_a_class_the_player_named_is_added_and_said_in_its_own_line(
             "четвёрок, пара троек, пара двоек — по чарту их здесь нет.") in turn.calls[0]["output"]
     assert turn.calls[0]["params"]["player_classes"] == sorted(["22", "33", "44", "55", "66", "77"])
     assert "стартового" not in turn.calls[0]["output"]
-    assert assumed_numbers_in(turn.messages) == frozenset({round(100.0 * result.equity, 1)})
 
 
 async def test_classes_the_agent_adds_with_a_reason_pass_and_carry_to_the_turn(
@@ -1828,7 +1782,6 @@ async def test_classes_the_agent_adds_with_a_reason_pass_and_carry_to_the_turn(
     сужение флопа помнит их причину, и тёрн, вызванный в том же ответе, печатает их
     строкой агента (спека 2026-10-24, §7)."""
     monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path, call="88+, AQs"))
-    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 500)
     reason = "на этих лимитах BB так коллирует"
     async with db_factory() as session:
         scope, analysis_id = await _evening_through_the_turn(session, tg_user_id=8417)
@@ -1855,7 +1808,6 @@ async def test_an_agent_class_passed_again_in_added_without_a_reason_stays_the_a
     (`kept_agent`), остаётся «добавлено агентом» с прежней причиной, а не «по вашей
     просьбе»."""
     monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path, call="88+, AQs"))
-    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 500)
     reason = "на этих лимитах BB так коллирует"
     async with db_factory() as session:
         scope, analysis_id = await _evening_through_the_turn(session, tg_user_id=8419)
@@ -1875,13 +1827,12 @@ async def test_an_agent_class_passed_again_in_added_without_a_reason_stays_the_a
     assert turn.calls[1]["params"]["kept_agent"] == {"22": reason}
 
 
-async def test_the_category_summary_combos_are_not_assumed_numbers(
+async def test_the_category_summary_combos_are_output_numbers_and_not_a_frequency(
     db_factory, tmp_path, monkeypatch
 ):
-    """Комбо сводки по категориям — числа выхода (`allowed`), но не `assumed` и не
-    измеренная частота: метки они не требуют."""
+    """Комбо сводки по категориям — числа выхода (`allowed`), но не измеренная частота:
+    метки они не требуют."""
     monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
-    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 500)
     async with db_factory() as session:
         scope, analysis_id = await _evening_through_the_turn(session, tg_user_id=8418)
         script = _TurnScript([([_equity("flop", "оверпара, AQs")], "Ответ без чисел (допущение).")])
@@ -1891,7 +1842,6 @@ async def test_the_category_summary_combos_are_not_assumed_numbers(
     assert result.kept_combos is not None and result.source_combos is not None
     counts = {float(round(result.kept_combos)), float(round(result.source_combos))}
     assert counts <= allowed_from_history(turn.messages)
-    assert assumed_numbers_in(turn.messages) == frozenset({round(100.0 * result.equity, 1)})
     assert frequency_numbers(turn.messages) == frozenset()
 
 
@@ -1913,7 +1863,6 @@ async def test_classes_named_earlier_in_the_same_hand_are_added_and_after_a_new_
     db_factory, tmp_path, monkeypatch
 ):
     monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path, call="88+, AQs"))
-    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 500)
     answer = "Ответ без чисел (допущение)."
     async with db_factory() as session:
         scope, analysis_id = await _evening_through_the_turn(session, tg_user_id=8406)
@@ -2001,3 +1950,52 @@ def test_the_player_texts_of_the_hand_stop_at_the_last_boundary():
     assert hand_player_texts(history, 2) == []
     assert hand_player_texts(history, None) == []
     assert hand_player_texts([ModelRequest(parts=[UserPromptPart("без пометки")])], 1) == []
+
+
+def test_an_equity_equal_to_another_number_of_the_same_output_is_not_an_equity_number():
+    """Эквити, совпавшее с другим числом того же выхода (комбо), в `equity` не пишется:
+    правилу эквити в проверке ответа подлежит только доля, не совпавшая ни с чем другим
+    (спека 2026-10-24, §14.11); одно эквити до флопа — в `preflop_equity`."""
+    from harness.calcs.routing import _equity_numbers
+    from tests.test_agent_outputs import equity_result
+
+    result = equity_result()
+    groups = [result.layout[0].model_copy(update={"equity": 0.07}), result.layout[1]]
+    assert _equity_numbers(result.model_copy(update={"layout": groups}), None) == ([61.7], [])
+    preflop = equity_result(street=Street.PREFLOP, layout=[], preflop_equity=0.314)
+    assert _equity_numbers(preflop, None) == ([], [31.4])
+
+
+def test_a_new_flop_narrowing_resets_the_turn_narrowing():
+    """По порядку сужений в разговоре пересужение более ранней улицы сбрасывает более
+    поздние: F1 → T1 → F2 — у ривера тёрна нет (исходный — F2, годность решает ядро),
+    тёрн в сброшенных; F1 → T1 — ривер от T1; новый тёрн сбрасывает ривер."""
+    def run_with(*narrowings: RangeNarrowing) -> CalcRun:
+        return CalcRun(max_calcs=8, sizes_from=frozenset(), narrowings=list(narrowings))
+
+    f1, t1, f2 = _narrowing("flop", ["AA", "KK"]), _narrowing("turn", ["AA"]), _narrowing(
+        "flop", ["KK"]
+    )
+    reset = run_with(f1, t1, f2)
+    assert reset.prior_for(1, "BB", Street.RIVER) == f2
+    assert reset.prior_for(1, "BB", Street.TURN) == f2
+    assert reset.reset_for(1, "BB") == [Street.TURN]
+    plain = run_with(f1, t1)
+    assert plain.prior_for(1, "BB", Street.RIVER) == t1
+    assert plain.reset_for(1, "BB") == []
+    again = run_with(f1, t1, _narrowing("river", ["AA"]), _narrowing("turn", ["AA"]))
+    assert again.reset_for(1, "BB") == [Street.RIVER]
+    assert run_with(f1, t1, f2).reset_for(1, "SB") == []
+
+
+def test_a_number_the_player_typed_does_not_free_an_equity_number():
+    """Число игрока, совпавшее с эквити категории, коллизию не освобождает (§14.11,
+    п. 9 (б)): «у вас 38.2%» без категории — по-прежнему нарушение."""
+    from harness.agent.run import _violations
+
+    messages: list[ModelMessage] = [ModelRequest(parts=[ToolReturnPart(
+        "equity_vs_range", "эквити",
+        metadata={"calc": "equity_vs_range", "allowed": [38.2, 7.0], "equity": [38.2]},
+    )])]
+    found = _violations("У вас 38.2%.", messages, None, frozenset({38.2}))
+    assert any("без названной категории" in v for v in found)

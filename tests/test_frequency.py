@@ -312,6 +312,41 @@ def test_the_line_range_left_no_trace():
     assert RangeNarrowing.model_validate(old).classes == ["AA"]  # старая история читается
 
 
+def test_the_fold_hint_and_the_single_equity_left_no_trace():
+    """Ориентир сдачи (§13) и одно общее эквити сняты (спека 2026-10-24, §14.4): ни
+    подсказки, ни линии ставки героя, ни `assumed` с его исключениями, ни Монте-Карло
+    агента; старый выход эквити в истории читается."""
+    import inspect
+
+    from harness import contracts
+    from harness.agent import history
+    from harness.analysis import player_stats
+    from harness.calcs import routing
+    from harness.contracts import EquityVsRangeResult
+    from harness.explanation import agent_checks
+    from harness.memory.repos import OpponentsRepo
+
+    assert not hasattr(contracts, "FoldHint")
+    assert not {"fold_hint", "equity", "share_of_start"} & set(EquityVsRangeResult.model_fields)
+    for name in ("_fold_hint", "AGENT_EQUITY_ITERATIONS", "AGENT_EQUITY_SEED",
+                 "equity_cache_prefix"):
+        assert not hasattr(calcs_module, name), name
+    assert not hasattr(player_stats, "hero_bet_called")
+    assert not hasattr(player_stats, "bet_reply")
+    assert not hasattr(OpponentsRepo, "holder")
+    assert not hasattr(history, "assumed_numbers_in")
+    for name in ("_assumed_share_in", "_frequency_share", "_threshold_share",
+                 "_hero_chances_share"):
+        assert not hasattr(agent_checks, name), name
+    parameters = inspect.signature(agent_checks.check_agent_answer).parameters
+    assert not {"assumed_numbers", "summary_numbers"} & set(parameters)
+    assert '"assumed"' not in inspect.getsource(routing._perform)
+    old = {"calc": "equity_vs_range", "opponent_position": "BB", "street": "flop",
+           "range_text": "AA", "live_combos": 6.0, "share_of_start": 0.1, "equity": 0.3,
+           "fold_hint": None}
+    assert EquityVsRangeResult.model_validate(old).layout == []
+
+
 # --- выбор мест ---------------------------------------------------------------------
 
 

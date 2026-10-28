@@ -23,6 +23,7 @@ from harness.analysis.charts import lookup, parse_range, to_notation
 from harness.analysis.frequency import wilson_interval
 from harness.analysis.opponent_range import live_combos
 from harness.analysis.tools.equity import equity_vs_range
+from harness.analysis.tools.exact_equity import class_equities
 from harness.calcs import run
 from harness.contracts import (
     ActionKind,
@@ -35,11 +36,9 @@ from harness.contracts import (
     DefenseParams,
     EquityVsRangeParams,
     FieldThreshold,
-    FoldHint,
     FrequencyStat,
     HeroFrequencyParams,
     LeaksParams,
-    Measurement,
     OpponentFrequencyParams,
     OpponentRangeParams,
     PointFilter,
@@ -65,9 +64,10 @@ from harness.memory.repos import (
 )
 from harness.normalizer import normalize
 from tests.test_opponent_range import (
-    _BB_DONKS,
+    _BB_THREE_BETS,
     _DEFEND_CALL,
     _THROUGH_RIVER,
+    _TURN_CHECKED,
     BTN_OPENS_BB_CALLS,
     _raw,
     defend_file,
@@ -630,10 +630,10 @@ async def test_another_players_analysis_is_not_read(db, tmp_path, monkeypatch):
 
 
 async def test_equity_is_deterministic_and_cached(db, tmp_path, monkeypatch):
-    """Тот же вход — то же число, равное прямому расчёту с тем же сидом; второй раз
-    — из `calc_cache`."""
+    """Эквити по категориям — точный перебор: число категории равно взвешенному среднему
+    эквити классов `class_equities`; эквити каждого класса с живыми комбо уходит в
+    `calc_cache` (`eqc:v1:exact:`), повтор — то же число."""
     monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
-    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 2_000)
     player_id, session_id = await _player_with_session(db, tg_user_id=9204)
     analysis_id = await stored_analysis(db, session_id=session_id)
     params = EquityVsRangeParams(
@@ -641,55 +641,124 @@ async def test_equity_is_deterministic_and_cached(db, tmp_path, monkeypatch):
         hands="QQ, 77, 22, AQs",
     )
     first = await run(db, player_id, params)
-    prefix, key = calcs_module.equity_cache_prefix(), "KdTc|Qc7d2s|" + to_notation(
-        parse_range("QQ, 77, 22, AQs")
+    by_class = class_equities(("Kd", "Tc"), ["Qc", "7d", "2s"])
+    prefix = calcs_module.CLASS_EQUITY_PREFIX
+    cached = await CalcCacheRepo(db).get_all(prefix)
+    assert prefix == "eqc:v1:exact:"
+    assert cached == {f"KdTc|Qc7d2s|{cls}": value for cls, value in by_class.items()}
+    (sets,) = [g for g in first.layout if g.category is RangeCategory.SET]
+    assert sets.equity == pytest.approx(
+        (3 * by_class["QQ"] + 3 * by_class["77"] + 3 * by_class["22"]) / 9
     )
-    assert await CalcCacheRepo(db).get(prefix, key) == first.equity
-    assert first.equity == equity_vs_range(
-        ("Kd", "Tc"), parse_range("QQ, 77, 22, AQs"), ["Qc", "7d", "2s"], iterations=2_000,
-        seed=42,
-    )
-    assert (await run(db, player_id, params)).equity == first.equity
+    assert (await run(db, player_id, params)).layout == first.layout
     assert first.live_combos == 12.0
 
 
-async def test_a_cached_equity_is_returned_without_counting_again(db, tmp_path, monkeypatch):
-    """Строка кэша с тем же ключом отдаётся как есть: Монте-Карло не зовётся."""
+async def test_a_cached_class_equity_is_returned_without_counting_again(
+    db, tmp_path, monkeypatch
+):
+    """Строки кэша всех классов сужения отдаются как есть: перебор не зовётся."""
     monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
     player_id, session_id = await _player_with_session(db, tg_user_id=9206)
     analysis_id = await stored_analysis(db, session_id=session_id)
-    key = "KdTc|Qc7d2s|" + to_notation(parse_range("QQ, AQs"))
-    await CalcCacheRepo(db).upsert_many(calcs_module.equity_cache_prefix(), {key: 0.25})
+    await CalcCacheRepo(db).upsert_many(calcs_module.CLASS_EQUITY_PREFIX, {
+        calcs_module.class_equity_key(("Kd", "Tc"), ["Qc", "7d", "2s"], "QQ"): 0.25,
+        calcs_module.class_equity_key(("Kd", "Tc"), ["Qc", "7d", "2s"], "AQs"): 0.75,
+    })
 
-    def must_not_run(*_args: object, **_kw: object) -> float:
-        raise AssertionError("эквити посчитано заново при строке в кэше")
+    def must_not_run(*_args: object, **_kw: object) -> dict[str, float]:
+        raise AssertionError("эквити посчитано заново при строках в кэше")
 
-    monkeypatch.setattr(calcs_module, "equity_vs_range", must_not_run)
+    monkeypatch.setattr(calcs_module, "class_equities", must_not_run)
     result = await run(db, player_id, EquityVsRangeParams(
         analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP, hands="QQ, AQs",
     ))
-    assert result.equity == 0.25
+    assert [(g.category, g.equity) for g in result.layout] == [
+        (RangeCategory.SET, 0.25), (RangeCategory.TOP_PAIR_STRONG_KICKER, 0.75),
+    ]
 
 
-@pytest.mark.parametrize(
-    ("name", "value"), [("AGENT_EQUITY_ITERATIONS", 1_000), ("AGENT_EQUITY_SEED", 7)]
-)
-async def test_another_iteration_count_or_seed_misses_the_cache(
-    db, tmp_path, monkeypatch, name: str, value: int
+async def test_a_class_missing_from_the_cache_counts_the_whole_board_again(
+    db, tmp_path, monkeypatch
 ):
-    """Число, посчитанное на других итерациях или с другим сидом, не отдаётся:
-    они входят в префикс ключа `calc_cache`."""
+    """Нет в кэше хоть одного класса — перебор заново, и число кэша другого метода
+    (Монте-Карло, `eqr:`) не отдаётся."""
     monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
     player_id, session_id = await _player_with_session(db, tg_user_id=9207)
     analysis_id = await stored_analysis(db, session_id=session_id)
-    key = "KdTc|Qc7d2s|" + to_notation(parse_range("QQ, AQs"))
-    await CalcCacheRepo(db).upsert_many(calcs_module.equity_cache_prefix(), {key: 0.25})
-    monkeypatch.setattr(calcs_module, name, value)
-    monkeypatch.setattr(calcs_module, "equity_vs_range", lambda *_a, **_kw: 0.5)
+    key = calcs_module.class_equity_key(("Kd", "Tc"), ["Qc", "7d", "2s"], "QQ")
+    await CalcCacheRepo(db).upsert_many(calcs_module.CLASS_EQUITY_PREFIX, {key: 0.25})
+    await CalcCacheRepo(db).upsert_many("eqr:v1:50000:42:", {key: 0.5})
+    monkeypatch.setattr(
+        calcs_module, "class_equities", lambda *_a, **_kw: {"QQ": 0.1, "AQs": 0.9}
+    )
     result = await run(db, player_id, EquityVsRangeParams(
         analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP, hands="QQ, AQs",
     ))
-    assert result.equity == 0.5
+    assert [g.equity for g in result.layout] == pytest.approx([0.1, 0.9])
+
+
+async def test_every_category_of_the_narrowed_range_carries_its_own_equity(
+    db, tmp_path, monkeypatch
+):
+    """Выход `equity_vs_range` (спека 2026-10-24, §14): раскладка суженного — у каждой
+    категории своё эквити, общего числа нет; на ривере — из сужения тёрна."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    player_id, session_id = await _player_with_session(db, tg_user_id=9213)
+    analysis_id = await stored_analysis(db, session_id=session_id, actions=_THROUGH_RIVER)
+    flop = await run(db, player_id, EquityVsRangeParams(
+        analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP,
+        hands="сет, AQs, AJo",
+    ))
+    assert "equity" not in flop.model_dump() and "share_of_start" not in flop.model_dump()
+    assert [g.category for g in flop.layout] == [
+        RangeCategory.SET, RangeCategory.TOP_PAIR_STRONG_KICKER,
+        RangeCategory.BACKDOORS_OVERCARDS,
+    ]
+    assert all(g.equity is not None and 0.0 <= g.equity <= 1.0 for g in flop.layout)
+    turn_narrowing = RangeNarrowing(
+        analysis_id=analysis_id, opponent_position="BB", street=Street.TURN,
+        classes=["QQ", "77", "JTs"],
+    )
+    river = await run(db, player_id, EquityVsRangeParams(
+        analysis_id=analysis_id, opponent_position="BB", street=Street.RIVER,
+        hands="сет, ничего", prior=turn_narrowing,
+    ))
+    assert river.categories_of == "turn"
+    # У героя K-T на Q-7-2-5-9: сеты его бьют, J-T без пары — нет.
+    assert [(g.category, g.equity) for g in river.layout] == [
+        (RangeCategory.SET, 0.0), (RangeCategory.NOTHING, 1.0),
+    ]
+    with pytest.raises(ValueError, match="сначала сузьте тёрн"):
+        await run(db, player_id, EquityVsRangeParams(
+            analysis_id=analysis_id, opponent_position="BB", street=Street.RIVER, hands="сет",
+        ))
+
+
+async def test_the_preflop_equity_is_one_number_deterministic_and_cached(
+    db, tmp_path, monkeypatch
+):
+    """До флопа категорий нет (§14.11): одно эквити против суженного — Монте-Карло с
+    фиксированным сидом, равное прямому расчёту; строка `calc_cache` — своё пространство
+    ключей; раскладки нет."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    player_id, session_id = await _player_with_session(db, tg_user_id=9214)
+    analysis_id = await stored_analysis(db, session_id=session_id, actions=_BB_THREE_BETS)
+    params = EquityVsRangeParams(
+        analysis_id=analysis_id, opponent_position="BB", street=Street.PREFLOP, hands="AKs",
+    )
+    first = await run(db, player_id, params)
+    expected = equity_vs_range(
+        ("Kd", "Tc"), parse_range("AKs"), [],
+        iterations=calcs_module.PREFLOP_EQUITY_ITERATIONS, seed=calcs_module.PREFLOP_EQUITY_SEED,
+    )
+    assert first.preflop_equity == expected
+    assert first.layout == [] and first.categories_of is None
+    assert calcs_module.PREFLOP_EQUITY_PREFIX == "eqr:v1:50000:42:"
+    key = "KdTc||" + to_notation(parse_range("AKs"))
+    assert await CalcCacheRepo(db).get(calcs_module.PREFLOP_EQUITY_PREFIX, key) == expected
+    monkeypatch.setattr(calcs_module, "equity_vs_range", lambda *_a, **_kw: 0.0)
+    assert (await run(db, player_id, params)).preflop_equity == expected
 
 
 async def test_a_narrowing_outside_the_start_is_refused_by_the_calculation(
@@ -704,11 +773,14 @@ async def test_a_narrowing_outside_the_start_is_refused_by_the_calculation(
         ))
 
 
-async def test_the_turn_layout_is_of_the_flop_narrowing_and_without_it_of_the_start(
+async def test_the_turn_layout_is_of_the_flop_narrowing_and_without_it_is_refused(
     db, tmp_path, monkeypatch
 ):
-    """Раскладка по категориям (спека 2026-10-24, §4): флоп — стартового; тёрн — сужения
-    флопа этой руки, без него — стартового; на ривере раскладки нет."""
+    """Раскладка по категориям (спека 2026-10-24, §4, §14.11): флоп — стартового; тёрн —
+    сужения флопа этой руки, ривер — сужения тёрна; без них раскладки нет, вместо неё —
+    «сначала сузьте …», и от стартового тёрн и ривер не раскладываются (ставка на тёрне
+    была); стартовый по чарту — как прежде. После чек-чек тёрна ривер — из сужения
+    флопа."""
     monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
     player_id, session_id = await _player_with_session(db, tg_user_id=9208)
     analysis_id = await stored_analysis(db, session_id=session_id, actions=_THROUGH_RIVER)
@@ -721,12 +793,16 @@ async def test_the_turn_layout_is_of_the_flop_narrowing_and_without_it_of_the_st
     def classes(result) -> set[str]:
         return {item.hand_class for group in result.layout for item in group.classes}
 
+    preflop = await run(db, player_id, params(Street.PREFLOP))
+    assert (preflop.layout_of, preflop.layout) == (None, [])
     flop = await run(db, player_id, params(Street.FLOP))
     assert flop.layout_of == "start"
     assert classes(flop) == set(parse_range(_DEFEND_CALL).weights)
     assert sum(group.combos for group in flop.layout) == pytest.approx(flop.live_combos)
     bare_turn = await run(db, player_id, params(Street.TURN))
-    assert bare_turn.layout_of == "start"
+    assert (bare_turn.layout_of, bare_turn.layout) == (None, [])
+    assert (bare_turn.layout_refusal or "").startswith("сначала сузьте флоп")
+    assert bare_turn.range_text == flop.range_text
     narrowing = RangeNarrowing(
         analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP,
         classes=["QQ", "77", "AQs", "KQo"],
@@ -734,55 +810,63 @@ async def test_the_turn_layout_is_of_the_flop_narrowing_and_without_it_of_the_st
     turn = await run(db, player_id, params(Street.TURN, narrowing))
     assert turn.layout_of == "flop"
     assert classes(turn) == {"QQ", "77", "AQs", "KQo"}
-    river = await run(db, player_id, params(Street.RIVER))
-    assert (river.layout_of, river.layout) == (None, [])
-
-
-async def test_the_flop_equity_after_a_called_cbet_carries_the_fold_to_cbet_hint(
-    db, tmp_path, monkeypatch
-):
-    """Герой поставил продолженную, BB коллировал: рядом со сводкой — сдача на с-бет.
-    Без сшивки места в этом турнире — поле (как у `opponent_frequency` без ника), со
-    сшивкой — этот соперник с ником; выборка — числитель и знаменатель."""
-    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
-    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 300)
-    player_id, session_id = await _player_with_session(db, tg_user_id=9211)
-    analysis_id = await stored_analysis(db, session_id=session_id)
-    params = EquityVsRangeParams(
-        analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP, hands="QQ, AQs",
-    )
-    field = await run(db, player_id, params)
-    assert field.fold_hint == FoldHint(
-        stat=FrequencyStat.FOLD_TO_CBET, subject=Subject.FIELD,
-        measurement=Measurement(numerator=0, denominator=1),
-    )
-    opponents = OpponentsRepo(db)
-    opponent_id = await opponents.get_or_create(owner_player_id=player_id, nick="syn_villain")
-    await opponents.link(
-        owner_player_id=player_id, opponent_id=opponent_id, room_tournament_id="TSYN",
-        participant_label="P6",
-    )
-    named = await run(db, player_id, params)
-    assert named.fold_hint == FoldHint(
-        stat=FrequencyStat.FOLD_TO_CBET, subject=Subject.OPPONENT, opponent="syn_villain",
-        measurement=Measurement(numerator=0, denominator=1),
-    )
-
-
-async def test_without_a_called_hero_bet_the_equity_has_no_fold_hint(
-    db, tmp_path, monkeypatch
-):
-    """BB поставил сам (донк), герой коллировал: линию к частоте сдачи не привязать —
-    статистики нет, доля оставленного остаётся."""
-    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
-    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 300)
-    player_id, session_id = await _player_with_session(db, tg_user_id=9212)
-    analysis_id = await stored_analysis(db, session_id=session_id, actions=_BB_DONKS)
-    result = await run(db, player_id, EquityVsRangeParams(
-        analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP, hands="QQ, AQs",
+    bare_river = await run(db, player_id, params(Street.RIVER))
+    assert (bare_river.layout_of, bare_river.layout) == (None, [])
+    assert (bare_river.layout_refusal or "").startswith("сначала сузьте тёрн")
+    from_flop = await run(db, player_id, params(Street.RIVER, narrowing))
+    assert (from_flop.layout_of, from_flop.layout) == (None, [])
+    assert (from_flop.layout_refusal or "").startswith("сначала сузьте тёрн")
+    turn_narrowing = narrowing.model_copy(update={"street": Street.TURN, "classes": ["QQ", "KQo"]})
+    river = await run(db, player_id, params(Street.RIVER, turn_narrowing))
+    assert river.layout_of == "turn"
+    assert classes(river) == {"QQ", "KQo"}
+    assert river.layout_refusal is None
+    checked_id = await stored_analysis(db, session_id=session_id, actions=_TURN_CHECKED)
+    checked = await run(db, player_id, OpponentRangeParams(
+        analysis_id=checked_id, opponent_position="BB", street=Street.RIVER,
+        prior=narrowing.model_copy(update={"analysis_id": checked_id}),
     ))
-    assert result.fold_hint is None
-    assert result.kept_combos is not None and result.source_combos is not None
+    assert checked.layout_of == "flop_turn_checked"
+    assert classes(checked) == {"QQ", "77", "AQs", "KQo"}
+
+
+async def test_every_category_of_the_range_layout_carries_its_own_equity(
+    db, tmp_path, monkeypatch
+):
+    """Выход `opponent_range` на флопе, тёрне и ривере (спека 2026-10-24, §14): у каждой
+    категории раскладки своё эквити руки героя — взвешенное среднее эквити её классов;
+    общего числа нет; у категорий ориентира солвера эквити нет."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    library = tmp_path / "solver"
+    monkeypatch.setattr(solver_guide, "DEFAULT_SOLVER_DIR", library)
+    hand = _played_out(_raw(_THROUGH_RIVER)).hand
+    write_dump(library, "dry.json", ante_type=hand.ante_type, call="QQ, 77, AKo")
+    player_id, session_id = await _player_with_session(db, tg_user_id=9215)
+    analysis_id = await stored_analysis(db, session_id=session_id, actions=_THROUGH_RIVER)
+    boards = {
+        Street.FLOP: ["Qc", "7d", "2s"], Street.TURN: ["Qc", "7d", "2s", "5h"],
+        Street.RIVER: ["Qc", "7d", "2s", "5h", "9s"],
+    }
+    priors = {
+        Street.TURN: RangeNarrowing(analysis_id=analysis_id, opponent_position="BB",
+                                    street=Street.FLOP, classes=["QQ", "77", "AQs", "KQo"]),
+        Street.RIVER: RangeNarrowing(analysis_id=analysis_id, opponent_position="BB",
+                                     street=Street.TURN, classes=["QQ", "KQo"]),
+    }
+    for street, board in boards.items():
+        result = await run(db, player_id, OpponentRangeParams(
+            analysis_id=analysis_id, opponent_position="BB", street=street,
+            prior=priors.get(street),
+        ))
+        assert "equity" not in result.model_dump(exclude={"layout", "solver"})
+        by_class = class_equities(("Kd", "Tc"), board)
+        assert result.layout
+        for group in result.layout:
+            expected = sum(by_class[c.hand_class] * c.combos for c in group.classes) / group.combos
+            assert group.equity == pytest.approx(expected)
+        if street is Street.FLOP:
+            assert result.solver is not None
+            assert all(g.equity is None for a in result.solver.actions for g in a.layout)
 
 
 async def test_a_narrowing_by_category_counts_what_is_kept(db, tmp_path, monkeypatch):
@@ -790,7 +874,6 @@ async def test_a_narrowing_by_category_counts_what_is_kept(db, tmp_path, monkeyp
     классы стартового на борде, «-класс» вычитает; сводка — сколько оставлено из
     стартового. Тёрн по категории — из сужения флопа, правило подмножества прежнее."""
     monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
-    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 300)
     player_id, session_id = await _player_with_session(db, tg_user_id=9209)
     analysis_id = await stored_analysis(db, session_id=session_id, actions=_THROUGH_RIVER)
     flop = await run(db, player_id, EquityVsRangeParams(
@@ -848,3 +931,60 @@ async def test_the_flop_output_carries_the_nearest_solver_guide(db, tmp_path, mo
     (library / "broken.json").write_text("{", encoding="utf-8")
     broken = await run(db, player_id, params(Street.FLOP))
     assert broken.solver is None and "broken.json" in (broken.solver_error or "")
+
+
+async def test_the_tool_passes_the_reset_streets_to_the_calculation(db, tmp_path, monkeypatch):
+    """Сквозь `tools_for`: F1 → T1 → F2 в истории, на тёрне была ставка — ривер получает
+    сброшенный тёрн (`reset`) и отказывает «флоп сужен заново»; без сброса (F1 → T1) —
+    считается от T1."""
+    from harness.calcs.routing import CalcRun, tools_for
+
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    player_id, session_id = await _player_with_session(db, tg_user_id=9216)
+    analysis_id = await stored_analysis(db, session_id=session_id, actions=_THROUGH_RIVER)
+
+    def narrowing(street: Street, classes: list[str]) -> RangeNarrowing:
+        return RangeNarrowing(
+            analysis_id=analysis_id, opponent_position="BB", street=street, classes=classes,
+        )
+
+    async def river(*history: RangeNarrowing) -> str:
+        run_state = CalcRun(
+            max_calcs=8, sizes_from=frozenset(), analysis_id=analysis_id,
+            narrowings=list(history),
+        )
+        tool = next(t for t in tools_for(db, player_id, session_id, run_state)
+                    if t.name == "equity_vs_range")
+        function = cast(Any, tool.function)
+        out = await function(opponent_position="BB", street=Street.RIVER, hands="QQ")
+        return out if isinstance(out, str) else str(out.return_value)
+
+    f1, t1 = narrowing(Street.FLOP, ["QQ", "77"]), narrowing(Street.TURN, ["QQ"])
+    f2 = narrowing(Street.FLOP, ["QQ"])
+    refused = await river(f1, t1, f2)
+    assert "сначала сузьте тёрн: флоп сужен заново" in refused
+    counted = await river(f1, t1)
+    assert "Расчёт не выполнен" not in counted and "Эквити вашей руки" in counted
+
+
+async def test_a_lower_case_position_is_the_same_opponent(db, tmp_path, monkeypatch):
+    """Позиция приводится к верхнему регистру на границе инструмента: «bb» считается, а
+    не отвергается, и сужение пишется на того же BB — тёрн «bb» берёт его исходным."""
+    from harness.calcs.routing import CalcRun, tools_for
+
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    player_id, session_id = await _player_with_session(db, tg_user_id=9217)
+    analysis_id = await stored_analysis(db, session_id=session_id, actions=_THROUGH_RIVER)
+    run_state = CalcRun(max_calcs=8, sizes_from=frozenset(), analysis_id=analysis_id)
+    tools = {
+        t.name: cast(Any, t.function) for t in tools_for(db, player_id, session_id, run_state)
+    }
+    flop = await tools["equity_vs_range"](
+        opponent_position="bb", street=Street.FLOP, hands="QQ, 77"
+    )
+    assert not isinstance(flop, str), flop
+    assert run_state.narrowings[-1].opponent_position == "BB"
+    assert run_state.prior_for(analysis_id, "BB", Street.TURN) == run_state.narrowings[-1]
+    turn = await tools["opponent_range"](opponent_position="bb", street=Street.TURN)
+    assert not isinstance(turn, str), turn
+    assert "Раскладка по категориям (тёрн; ваше сужение флопа" in str(turn.return_value)

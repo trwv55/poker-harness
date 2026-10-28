@@ -17,8 +17,8 @@ from harness.contracts import (
     AbsentGroup,
     CalcName,
     CalcResult,
+    CategoryGroup,
     EquityVsRangeResult,
-    FoldHint,
     FrequencyStat,
     Measurement,
     OpponentRangeResult,
@@ -30,7 +30,6 @@ from harness.contracts import (
     ThresholdOutcome,
 )
 from harness.explanation.agent_checks import (
-    check_agent_answer,
     check_agent_assumption,
     strip_card_tokens,
 )
@@ -167,41 +166,59 @@ def range_result(**over: object) -> OpponentRangeResult:
     return OpponentRangeResult.model_validate(base)
 
 
+_LAYOUT_BOARD = ["Qc", "7d", "2s"]
+
+
+def _with_equities(groups: list[CategoryGroup], equities: list[float]) -> list[CategoryGroup]:
+    return [
+        group.model_copy(update={"equity": equity}) for group, equity in zip(groups, equities, strict=True)
+    ]
+
+
 def equity_result(**over: object) -> EquityVsRangeResult:
+    """Синтетика: суженный «99, A5s» на Q-7-2 — средняя пара (6 комбо, эквити 31.4%) и
+    бэкдоры (4 комбо, 61.7%)."""
+    narrowed = layout(parse_range("99, A5s"), _LAYOUT_BOARD, ["Kd", "Tc", *_LAYOUT_BOARD])
     base: dict[str, object] = {
         "calc": CalcName.EQUITY_VS_RANGE, "opponent_position": "BB", "street": Street.FLOP,
-        "range_text": "99, A5s", "live_combos": 7.0, "share_of_start": 0.318, "equity": 0.314,
+        "range_text": "99, A5s", "live_combos": 7.0,
+        "layout": _with_equities(narrowed, [0.314, 0.617]),
     }
     base.update(over)
     return EquityVsRangeResult.model_validate(base)
 
 
-_LAYOUT_BOARD = ["Qc", "7d", "2s"]
-
-
 def layout_result() -> OpponentRangeResult:
-    """`range_result` с раскладкой ядра на синтетическом флопе Q-7-2 (герой — K♦T♦)."""
+    """`range_result` с раскладкой ядра на синтетическом флопе Q-7-2 (герой — K♦T♦) и
+    эквити против каждой категории."""
     groups = layout(
         parse_range("99, 66:0.5, A5s, KQo"), _LAYOUT_BOARD, ["Kd", "Tc", *_LAYOUT_BOARD]
     )
-    return range_result(layout_of="start", layout=groups)
+    return range_result(
+        layout_of="start", layout=_with_equities(groups, [0.22, 0.385, 0.556, 0.61])
+    )
 
 
 def test_the_layout_lines_name_every_class_with_its_category():
-    """Строка категории: имя, число классов и комбо, все классы — пары словами, доля
-    меньше целой процентом; числа зарегистрированы."""
+    """Строка категории: имя, число классов и комбо, эквити руки героя против неё, все
+    классы — пары словами, доля меньше целой процентом; числа зарегистрированы, общего
+    эквити нет."""
     digest = agent_digest(layout_result())
     lines = digest.text.splitlines()
     head = lines.index(
         "Раскладка по категориям (флоп; стартовый диапазон; категорию руки на борде "
-        "определяет код):"
+        "определяет код; эквити — против каждой категории отдельно, а не всего диапазона):"
     )
     assert lines[head + 1 :] == [
-        "топ-пара с сильным кикером — 1 класс, 7 комбо: KQo.",
-        "средняя пара — 1 класс, 6 комбо: пара девяток.",
-        "слабая пара — 1 класс, 3 комбо: пара шестёрок (50%).",
-        "бэкдоры и старшие карты — 1 класс, 4 комбо: A5s.",
+        "топ-пара с сильным кикером — 1 класс, 7 комбо, эквити вашей руки против неё — 22%: KQo.",
+        "средняя пара — 1 класс, 6 комбо, эквити вашей руки против неё — 38.5%: пара девяток.",
+        (
+            "слабая пара — 1 класс, 3 комбо, эквити вашей руки против неё — 55.6%: пара "
+            "шестёрок (50%)."
+        ),
+        "бэкдоры и старшие карты — 1 класс, 4 комбо, эквити вашей руки против неё — 61%: A5s.",
     ]
+    assert {22.0, 38.5, 55.6, 61.0} <= digest.allowed
     assert unsupported_numbers(strip_card_tokens(digest.text), digest.allowed) == []
 
 
@@ -246,6 +263,7 @@ def test_the_solver_guide_line_names_the_nearest_line_and_its_categories():
         ),
         "фолд — бэкдоры и старшие карты — 1 класс, 12 комбо: 43o.",
     ]
+    assert not any("эквити" in line for line in lines[head:])
     assert unsupported_numbers(strip_card_tokens(digest.text), digest.allowed) == []
     broken = agent_digest(layout_result().model_copy(update={"solver_error": "нет файла"}))
     assert "Ориентир солвера: нет файла — ориентира нет." in broken.text.splitlines()
@@ -253,7 +271,8 @@ def test_the_solver_guide_line_names_the_nearest_line_and_its_categories():
 
 def test_the_equity_digest_prints_the_kept_summary():
     """Сводка сужения по категориям: целиком, частью с убранными классами (пары
-    словами), убрана целиком; итог «оставлено N комбо из M»; числа зарегистрированы."""
+    словами), убрана целиком; итог «Оставлено N комбо из M» — без доли оставленного и
+    сданного (спека 2026-10-24, §14.4); числа зарегистрированы."""
     groups = layout_result().layout
     kept = kept_by_category(groups, parse_range("99, KQo"))
     result = equity_result(
@@ -266,76 +285,37 @@ def test_the_equity_digest_prints_the_kept_summary():
         "целиком, 7 комбо; средняя пара — целиком, 6 комбо; слабая пара — убрана целиком "
         "(3 комбо); бэкдоры и старшие карты — убрана целиком (4 комбо)."
     ) in digest.text.splitlines()
-    assert (
-        "Оставлено 65% диапазона на начало улицы (13 комбо из 20): соперник продолжает 65%, "
-        "сдаёт 35%."
-    ) in digest.text.splitlines()
+    assert "Оставлено 13 комбо из 20." in digest.text.splitlines()
+    assert "сдаёт" not in digest.text and "на начало улицы" not in digest.text
+    assert 65.0 not in digest.allowed
     assert unsupported_numbers(strip_card_tokens(digest.text), digest.allowed) == []
 
 
-def _kept_result(**over: object) -> EquityVsRangeResult:
-    """Синтетика сводки: из 20 комбо исходного оставлено 13."""
-    groups = layout_result().layout
-    kept = kept_by_category(groups, parse_range("99, KQo"))
-    fields: dict[str, object] = {
-        "range_text": "99, KQo", "categories_of": "start", "categories": kept,
-        "source_combos": 20.0, "kept_combos": 13.0,
-    }
-    return equity_result(**{**fields, **over})
-
-
-def test_the_kept_share_registers_both_percents_and_rounds_half_up_in_the_check():
-    """Доля оставленного и сданного — числа выхода: обе в `allowed`, целый процент
-    ответа проходит по правилу половины вверх (38.5 → 39, 61.5 → 62)."""
-    digest = agent_digest(_kept_result(source_combos=200.0, kept_combos=77.0))
-    assert (
-        "Оставлено 38.5% диапазона на начало улицы (77 комбо из 200): соперник продолжает "
-        "38.5%, сдаёт 61.5%."
-    ) in digest.text.splitlines()
-    assert {38.5, 61.5} <= digest.allowed
-    answer = "По сужению BB продолжает около 39% диапазона и сдаёт 62% (допущение)."
-    violations = check_agent_answer(
-        answer, allowed=digest.allowed, labels=frozenset(), leaks_called=False,
-        calc_numbers=digest.allowed, frequency_numbers=frozenset(),
-    )
-    assert not [v for v in violations if v.startswith("числа")]
-    off = check_agent_answer(
-        "По сужению BB продолжает около 40% диапазона (допущение).", allowed=digest.allowed,
-        labels=frozenset(), leaks_called=False, calc_numbers=digest.allowed,
-        frequency_numbers=frozenset(),
-    )
-    assert [v for v in off if v.startswith("числа")]
-
-
-def test_the_fold_hint_names_the_stat_its_sample_and_whose_it_is():
-    """С-бет героя, соперник коллировал: рядом с долей — его частота сдачи на
-    продолженную ставку с выборкой и уровнем данных; числа зарегистрированы."""
-    hint = FoldHint(
-        stat=FrequencyStat.FOLD_TO_CBET, subject=Subject.FIELD,
-        measurement=Measurement(numerator=39, denominator=100),
-    )
-    digest = agent_digest(_kept_result(fold_hint=hint))
+def test_the_equity_digest_has_an_equity_per_category_and_no_total():
+    """Эквити — по категориям суженного, у каждой комбо и своё число; строки одного
+    общего эквити нет (спека 2026-10-24, §14.6)."""
+    digest = agent_digest(equity_result())
     lines = digest.text.splitlines()
-    assert (
-        "Для сверки с долей (подсказка, сужение не меняет): сдача на продолженную ставку "
-        "(из случаев, когда она сделана) — 39 из 100 (39%)."
-    ) in lines
-    assert "Уровень данных: поле в целом, все позиции." in lines
-    assert "Выборка достаточная." in lines
-    assert unsupported_numbers(strip_card_tokens(digest.text), digest.allowed) == []
-    named = FoldHint(
-        stat=FrequencyStat.FOLD_TO_TURN_BARREL, subject=Subject.OPPONENT, opponent="syn7",
-        measurement=Measurement(numerator=1, denominator=4),
+    assert lines[-1] == (
+        "Эквити вашей руки по категориям суженного (каждое — против этой категории, а не "
+        "всего диапазона): средняя пара — 6 комбо, 31.4%; бэкдоры и старшие карты — 4 комбо, "
+        "61.7%."
     )
-    text = agent_digest(_kept_result(fold_hint=named)).text
-    assert "Уровень данных: этот соперник (syn7), все позиции." in text
-    assert "сдача на второй баррель" in text
-    assert "Выборка мала" in text
+    assert not any("при вскрытии" in line for line in lines)
+    assert {31.4, 61.7} <= digest.allowed
+    assert unsupported_numbers(strip_card_tokens(digest.text), digest.allowed) == []
 
 
-def test_without_a_fold_hint_there_is_no_stat_line():
-    text = agent_digest(_kept_result()).text
-    assert "Для сверки" not in text and "Уровень данных" not in text
+def test_the_turn_and_the_river_name_the_narrowing_they_come_from():
+    """Сводка на тёрне — из сужения флопа, на ривере — из сужения тёрна."""
+    kept = kept_by_category(layout_result().layout, parse_range("99, KQo"))
+    river = agent_digest(equity_result(street=Street.RIVER, categories_of="turn", categories=kept))
+    assert "По категориям (исходный — ваше сужение тёрна):" in river.text
+    turn = agent_digest(range_result(street=Street.RIVER, layout_of="turn",
+                                     layout=layout_result().layout))
+    assert "Раскладка по категориям (ривер; ваше сужение тёрна этого соперника (допущение);" in (
+        turn.text
+    )
 
 
 @pytest.mark.parametrize("result", [range_result(), equity_result()], ids=["range", "equity"])
@@ -407,8 +387,7 @@ def test_the_equity_output_says_the_narrowing_is_an_assumption():
     text = agent_digest(equity_result()).text
     assert "Диапазон, суженный агентом: пара девяток, A5s." in text
     assert "Диапазон сужен агентом — это допущение." in text
-    assert "Комбо: 7 — 31.8% стартового диапазона." in text
-    assert "Эквити вашей руки при вскрытии: 31.4%." in text
+    assert "Комбо: 7." in text and "стартового" not in text
 
 
 def test_ask_has_no_digest_for_agent_only_calculations():
@@ -484,8 +463,8 @@ def test_the_agent_added_classes_are_said_with_the_reason():
 
 
 def test_the_added_classes_are_a_separate_line_without_the_share():
-    """С добавленными классами доля от стартового не печатается и не разрешается: она
-    может быть больше 100%; комбо и эквити — как раньше."""
+    """С добавленными классами — отдельная строка, доли от стартового нет; комбо и эквити
+    по категориям — как без них."""
     plain = agent_digest(equity_result())
     digest = agent_digest(equity_result(range_text="99, A5s, 22, 33", added=["33", "22"]))
     assert (
@@ -493,6 +472,46 @@ def test_the_added_classes_are_a_separate_line_without_the_share():
     )
     assert "Диапазон сужен агентом — это допущение." in digest.text
     assert "Комбо: 7." in digest.text and "стартового" not in digest.text
-    assert "Эквити вашей руки при вскрытии: 31.4%." in digest.text
-    assert digest.allowed == plain.allowed - {31.8}
+    assert digest.allowed == plain.allowed
     assert "Добавлено" not in plain.text
+
+
+def test_the_layout_head_promises_no_equity_without_it():
+    """Карты героя неизвестны — раскладка без эквити: заголовок его не обещает, строк
+    эквити нет."""
+    groups = layout(parse_range("99, A5s"), _LAYOUT_BOARD, _LAYOUT_BOARD)
+    text = agent_digest(range_result(layout_of="start", layout=groups)).text
+    assert (
+        "Раскладка по категориям (флоп; стартовый диапазон; категорию руки на борде "
+        "определяет код):"
+    ) in text.splitlines()
+    assert "эквити" not in text
+
+
+def test_without_the_previous_narrowing_the_layout_is_a_refusal_line():
+    """Тёрн без сужения флопа (ривер без тёрна): вместо раскладки — «сначала сузьте …»,
+    стартовый по чарту печатается как прежде (§14.11)."""
+    refusal = "сначала сузьте флоп: вызовите equity_vs_range для флопа этого соперника"
+    text = agent_digest(range_result(street=Street.TURN, layout_refusal=refusal)).text
+    assert f"Раскладки по категориям нет: {refusal}." in text.splitlines()
+    assert "Стартовый диапазон: пара девяток, пара шестёрок (50%), A5s, KQo." in text
+    assert "Раскладка по категориям (" not in text
+
+
+def test_the_preflop_equity_digest_prints_one_number():
+    """До флопа категорий нет — одно эквити; число зарегистрировано."""
+    digest = agent_digest(equity_result(street=Street.PREFLOP, layout=[], preflop_equity=0.314))
+    assert "Эквити вашей руки при вскрытии (до флопа категорий нет): 31.4%." in (
+        digest.text.splitlines()
+    )
+    assert 31.4 in digest.allowed
+    assert "по категориям суженного" not in digest.text
+
+
+def test_the_river_after_a_checked_turn_names_the_flop_narrowing():
+    text = agent_digest(range_result(street=Street.RIVER, layout_of="flop_turn_checked",
+                                     layout=layout_result().layout)).text
+    assert (
+        "Раскладка по категориям (ривер; ваше сужение флопа этого соперника; на тёрне ставок "
+        "не было (допущение);"
+    ) in text

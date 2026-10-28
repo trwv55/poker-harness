@@ -28,7 +28,9 @@
 классами (`test_a_class_removed_on_the_flop_is_refused_on_the_turn_by_name`). Тёрн без
 сужения флопа и ривер без сужения тёрна — отказ «сначала сузьте …»
 (`test_a_later_street_without_the_previous_narrowing_is_refused`); флоп без него — от
-стартового (решение владельца 2026-10-23).
+стартового (решение владельца 2026-10-23). Тёрн, прошедший чек-чек (ставок на нём не
+было), ривер сужает и из сужения флопа (`previous_streets`, решение владельца
+2026-10-28; `test_a_checked_through_turn_lets_the_river_narrow_from_the_flop`).
 
 **Добавление по просьбе игрока** (`added`, план 2026-10-17, п. 9) — единственный путь
 класса вне чарта в диапазон: только класс, которого в стартовом нет, и только если игрок
@@ -62,7 +64,6 @@ from harness.analysis.charts import (
     load_chart_book,
     load_defend_book,
     parse_range,
-    to_notation,
 )
 from harness.analysis.open_chart import chart_table, defend_table
 from harness.analysis.range_categories import (
@@ -90,6 +91,7 @@ from harness.contracts import (
 __all__ = [
     "DEFEND_DEPTH_TOLERANCE_BB",
     "EquitySpot",
+    "LayoutOf",
     "RangeRefused",
     "RangeSpot",
     "StartRange",
@@ -98,12 +100,16 @@ __all__ = [
     "classes_named",
     "equity_spot",
     "hero_cards",
+    "layout_source",
     "live_at",
     "live_combos",
     "narrow",
+    "previous_streets",
     "prior_range",
     "range_spot",
+    "require_previous",
     "start_range",
+    "turn_checked_through",
 ]
 
 _STREETS: list[Street] = list(Street)
@@ -154,16 +160,11 @@ class EquitySpot:
     start: StartRange
     narrowed: Range
     live_combos: float
-    share_of_start: float
     added: tuple[str, ...] = ()
     agent_added: dict[str, str] | None = None
-    categories_of: Literal["start", "flop"] | None = None
+    categories_of: Literal["start", "flop", "turn", "flop_turn_checked"] | None = None
     categories: tuple[CategoryKept, ...] = ()
-
-    @property
-    def cache_key(self) -> str:
-        """Ключ `calc_cache`: рука героя, борд, суженный диапазон по классам с долями."""
-        return f"{''.join(self.hero)}|{''.join(self.board)}|{to_notation(self.narrowed)}"
+    narrowed_layout: tuple[CategoryGroup, ...] = ()
 
 
 def range_spot(hand: CanonicalHand, position: str) -> RangeSpot:
@@ -426,6 +427,75 @@ _PREVIOUS_REQUIRED: dict[Street, tuple[Street, str]] = {
 }
 
 
+# Ривер после чек-чек тёрна сужается из сужения флопа (решение владельца 2026-10-28):
+# без него — отказ с этой причиной.
+_FIRST_THE_FLOP_TURN_CHECKED = (
+    "сначала сузьте флоп: вызовите equity_vs_range для флопа этого соперника — на тёрне "
+    "ставок не было, ривер сужается из сужения флопа"
+)
+
+
+def turn_checked_through(hand: CanonicalHand) -> bool:
+    """Тёрн роздан, и ставок на нём не было ни у кого — ни бета, ни рейза; после олл-ина
+    на флопе ходов на тёрне нет — ставок тоже не было
+    (`test_a_checked_through_turn_lets_the_river_narrow_from_the_flop`,
+    `test_a_turn_with_a_raise_or_not_dealt_is_not_checked_through`)."""
+    return bool(hand.boards.get(Street.TURN)) and not any(
+        a.street is Street.TURN and a.kind in (ActionKind.BET, ActionKind.RAISE)
+        for a in hand.actions
+    )
+
+
+def previous_streets(hand: CanonicalHand, street: Street) -> tuple[Street, ...]:
+    """Улицы, сужение которых годится исходным для сужения этой: тёрн — флоп; ривер —
+    тёрн, а после чек-чек тёрна — и флоп; флоп и префлоп — никакая (флоп — от
+    стартового)."""
+    if street is Street.TURN:
+        return (Street.FLOP,)
+    if street is Street.RIVER:
+        return (Street.TURN, Street.FLOP) if turn_checked_through(hand) else (Street.TURN,)
+    return ()
+
+
+def require_previous(
+    street: Street,
+    prior: RangeNarrowing | None,
+    previous: Collection[Street],
+    reset: Collection[Street] = (),
+) -> None:
+    """Отказ словами, если исходного сужения нужной улицы нет (сужают по очереди по
+    улицам, `test_a_later_street_without_the_previous_narrowing_is_refused`); сужение,
+    сброшенное пересужением более ранней улицы (`reset`), — «флоп (префлоп) сужен заново»
+    (`test_a_turn_narrowing_reset_by_a_new_flop_is_refused_by_name`,
+    `test_a_flop_narrowing_reset_by_a_new_preflop_is_refused_by_name`); причина — по
+    самой ранней сброшенной улице
+    (`test_a_river_after_a_new_preflop_names_the_preflop_reset`)."""
+    if not previous or (prior is not None and prior.street in previous):
+        return
+    required = _PREVIOUS_REQUIRED[street][0]
+    chain = set(_STREETS[_STREETS.index(Street.FLOP) : _STREETS.index(required) + 1])
+    dropped = [st for st in _STREETS if st in reset and st in chain and st in _RESET_REFUSAL]
+    if dropped:
+        # Причина — по самой ранней сброшенной улице: «префлоп сужен заново» важнее тёрна.
+        raise RangeRefused(_RESET_REFUSAL[dropped[0]])
+    if street is Street.RIVER and Street.FLOP in previous:
+        raise RangeRefused(_FIRST_THE_FLOP_TURN_CHECKED)
+    raise RangeRefused(_PREVIOUS_REQUIRED[street][1])
+
+
+# Сужение улицы сброшено пересужением более ранней (решение владельца 2026-10-28).
+_RESET_REFUSAL: dict[Street, str] = {
+    Street.TURN: (
+        "сначала сузьте тёрн: флоп сужен заново — вызовите equity_vs_range для тёрна этого "
+        "соперника, ривер сужается из него"
+    ),
+    Street.FLOP: (
+        "сначала сузьте флоп: префлоп сужен заново — вызовите equity_vs_range для флопа "
+        "этого соперника, тёрн сужается из него"
+    ),
+}
+
+
 def prior_range(start: Range, prior: RangeNarrowing) -> Range:
     """Диапазон прошлого сужения с долями: класс стартового — с долей чарта, добавленный
     вне чарта — 1.0, как его записывает `narrow`."""
@@ -453,6 +523,7 @@ def narrow(
     named: Collection[str] = (),
     kept: Collection[str] = (),
     reason: str | None = None,
+    previous: Collection[Street] | None = None,
 ) -> Range:
     """Сужение агентом: классы без весов, только из стартового диапазона с ненулевой
     долей; доли — чарта. С `prior` (сужение предыдущей улицы `street` того же
@@ -460,13 +531,15 @@ def narrow(
     (вне чарта) сохраняют долю 1.0. Тёрн и ривер без `prior` предыдущей улицы — отказ
     (`_PREVIOUS_REQUIRED`). `added` — классы вне чарта, только из `named` или
     `kept` — классов последнего сужения этого соперника в этой руке
-    (`test_an_added_class_kept_from_the_last_narrowing_needs_no_new_request`); с
+    (`test_an_added_class_kept_from_the_last_narrowing_needs_no_new_request`);
+    `previous` — улицы, чьё сужение годится `prior` (`previous_streets`; по умолчанию —
+    строго предыдущая); с
     `reason` (причина модели) — любые классы вне чарта
     (`test_a_class_added_with_the_model_reason_needs_no_player_record`)."""
     if street is not None and street in _PREVIOUS_REQUIRED:
-        previous, refusal = _PREVIOUS_REQUIRED[street]
-        if prior is None or prior.street is not previous:
-            raise RangeRefused(refusal)
+        require_previous(
+            street, prior, previous if previous is not None else (_PREVIOUS_REQUIRED[street][0],)
+        )
     asked = _classes(hands)
     if not asked.weights:
         raise RangeRefused("не названо ни одной руки")
@@ -564,17 +637,22 @@ def equity_spot(
     kept: Collection[str] = (),
     reason: str | None = None,
     kept_agent: Mapping[str, str] | None = None,
+    reset: Collection[Street] = (),
     open_path: Path | None = None,
     defend_path: Path | None = None,
 ) -> EquitySpot:
-    """Всё, что нужно расчёту эквити, кроме самого Монте-Карло: рука героя, борд
-    улицы, стартовый и суженный диапазоны, их живые комбо. `added`, `prior`, `named`,
-    `kept`, `reason` — как у `narrow`. Класс вне чарта — агента (`agent_added`, класс →
+    """Всё, что нужно расчёту эквити, кроме самого перебора: рука героя, борд улицы,
+    стартовый и суженный диапазоны, их живые комбо. `added`, `prior`, `named`, `kept`,
+    `reason` — как у `narrow`. Класс вне чарта — агента (`agent_added`, класс →
     причина), если добавлен в этом вызове с `reason` или был агента в `prior` или
     `kept_agent` (последнем сужении), иначе — игрока
-    (`test_an_agent_class_is_inherited_by_the_next_street_with_its_reason`). На флопе и тёрне `hands` может называть категории раскладки
-    исходного диапазона (стартового, на тёрне — сужения флопа) — `expand_hands`; сводка
-    по категориям — в `categories`."""
+    (`test_an_agent_class_is_inherited_by_the_next_street_with_its_reason`). После флопа
+    `hands` может называть категории раскладки исходного диапазона (на флопе —
+    стартового, на тёрне и ривере — сужения прошлой улицы, на ривере после чек-чек
+    тёрна — и флопа) — `expand_hands`; сводка по категориям — в `categories`, раскладка
+    суженного — в `narrowed_layout`
+    (`test_a_river_narrowing_takes_categories_of_the_turn_narrowing`). Тёрн и ривер без
+    исходного сужения — отказ раньше разбора категорий."""
     cards = hero_cards(hand)
     if len(cards) != 2:
         raise RangeRefused("карты героя неизвестны — эквити считать не от чего")
@@ -589,20 +667,17 @@ def equity_spot(
             "не считается"
         )
     dead = [*cards, *board]
-    categories_of: Literal["start", "flop"] | None = None
-    groups: list[CategoryGroup] | None = None
-    if street in (Street.FLOP, Street.TURN):
-        categories_of, source = "start", start.range
-        if street is Street.TURN and prior is not None and prior.street is Street.FLOP:
-            categories_of, source = "flop", prior_range(start.range, prior)
-        groups = layout(source, board, dead)
+    previous = previous_streets(hand, street)
+    categories_of, groups = layout_source(
+        start.range, street, prior, board, dead, previous, reset
+    )
     try:
         expanded = expand_hands(hands, groups)
     except CategoryError as exc:
         raise RangeRefused(str(exc)) from exc
     reason = reason.strip() if reason and reason.strip() else None
     narrowed = narrow(start.range, expanded, street=street, prior=prior, added=added,
-                      named=named, kept=kept, reason=reason)
+                      named=named, kept=kept, reason=reason, previous=previous)
     combos = live_combos(narrowed, dead)
     if combos == 0.0:
         raise RangeRefused("все комбо этих рук заблокированы вашими картами и бордом")
@@ -620,9 +695,40 @@ def equity_spot(
             agent_added[cls] = inherited[cls]
     return EquitySpot(
         hero=(low, high), board=board, start=start, narrowed=narrowed,
-        live_combos=combos, share_of_start=combos / live_combos(start.range, dead),
+        live_combos=combos,
         added=outside,
         agent_added=agent_added,
         categories_of=categories_of,
         categories=tuple(kept_by_category(groups, narrowed)) if groups is not None else (),
+        narrowed_layout=tuple(layout(narrowed, board, dead)) if groups is not None else (),
     )
+
+
+LayoutOf = Literal["start", "flop", "turn", "flop_turn_checked"]
+
+
+def layout_source(
+    start: Range,
+    street: Street,
+    prior: RangeNarrowing | None,
+    board: list[str],
+    dead: Collection[str],
+    previous: Collection[Street] = (),
+    reset: Collection[Street] = (),
+) -> tuple[LayoutOf | None, list[CategoryGroup] | None]:
+    """Чья раскладка по категориям на этой улице и она сама: до флопа — нет; на флопе —
+    стартового; на тёрне и ривере — исходного сужения (`prior` с долями — `prior_range`;
+    годные улицы — `previous`), без него — `RangeRefused` «сначала сузьте …»: от
+    стартового тёрн и ривер не раскладываются
+    (`test_the_turn_layout_is_of_the_flop_narrowing_and_without_it_is_refused`)."""
+    if street is Street.PREFLOP:
+        return None, None
+    if street is Street.FLOP:
+        return "start", layout(start, board, dead)
+    require_previous(street, prior, previous, reset)
+    if prior is None:  # без `previous` исходного нет — не раскладывается
+        raise RangeRefused(_PREVIOUS_REQUIRED[street][1])
+    source: LayoutOf = "turn" if prior.street is Street.TURN else "flop"
+    if street is Street.RIVER and prior.street is Street.FLOP:
+        source = "flop_turn_checked"
+    return source, layout(prior_range(start, prior), board, dead)

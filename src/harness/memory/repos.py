@@ -1143,6 +1143,17 @@ class CalcCacheRepo:
         )
         return None if value is None else float(value)
 
+    async def get_many(self, prefix: str, keys: Sequence[str]) -> dict[str, float]:
+        """Значения по ключам `prefix + key` одним запросом: ключ — без префикса; ключей,
+        которых в кэше нет, в ответе нет (`test_get_many_returns_only_the_stored_keys`)."""
+        if not keys:
+            return {}
+        stmt = select(CalcCache.key, CalcCache.value).where(
+            CalcCache.key.in_([f"{prefix}{key}" for key in keys])
+        )
+        rows = (await self.db.execute(stmt)).all()
+        return {key[len(prefix) :]: float(value) for key, value in rows}
+
     async def upsert_many(self, prefix: str, entries: Mapping[str, float]) -> None:
         """Записать пачку значений, разбивая её на куски по `_UPSERT_CHUNK` строк.
 
@@ -2059,24 +2070,6 @@ class OpponentsRepo:
             OpponentLink.owner_player_id == owner_player_id,
         )
         return {row[0]: row[1] for row in await self.db.execute(stmt)}
-
-    async def holder(
-        self, owner_player_id: int, room_tournament_id: str, participant_label: str
-    ) -> tuple[int, str] | None:
-        """Оппонент (номер, ник), за которым закреплена пара «турнир + метка»; `None` —
-        пара не привязана (`test_the_flop_equity_after_a_called_cbet_carries_the_fold_to_cbet_hint`)."""
-        row = (
-            await self.db.execute(
-                select(Opponent.id, Opponent.opponent_nick)
-                .join(OpponentLink, OpponentLink.opponent_id == Opponent.id)
-                .where(
-                    OpponentLink.owner_player_id == owner_player_id,
-                    OpponentLink.room_tournament_id == room_tournament_id,
-                    OpponentLink.participant_label == participant_label,
-                )
-            )
-        ).first()
-        return None if row is None else (int(row[0]), str(row[1]))
 
     async def _find_by_nick(self, owner_player_id: int, nick: str) -> int | None:
         return await self.db.scalar(

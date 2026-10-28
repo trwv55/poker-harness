@@ -4,7 +4,9 @@
 `hand_strength` (`HandCategory`), дро — `draw_of`, когда готовой руки нет или она слабее
 пары (рука «на борде» — тоже нет), бэкдоры и оверкарты — `backdoors`, `overcards`, иначе
 «ничего». У готовой руки дро — пометка, а не категория
-(`test_a_pair_with_a_draw_stays_a_pair_with_a_mark`).
+(`test_a_pair_with_a_draw_stays_a_pair_with_a_mark`). На ривере дро, бэкдоров и
+оверкарт нет: категория — готовая рука или «ничего»
+(`test_the_river_layout_has_no_draw_categories`).
 
 **Категория класса** (`layout`) — та, в которую попадает большинство его живых комбо;
 при равенстве — более слабая, так что блокер героя на ничьей класс выше не поднимает
@@ -110,7 +112,7 @@ def _combo_category(
 def combo_category(
     combo: Sequence[str], board: Sequence[str]
 ) -> tuple[RangeCategory, RangeCategory | None]:
-    """Категория комбо на борде (флоп или тёрн) и дро готовой руки (пометка); у
+    """Категория комбо на борде (флоп, тёрн или ривер) и дро готовой руки (пометка); у
     категории без готовой руки второе — `None`."""
     first, second = combo
     return _combo_category((first, second), tuple(board))
@@ -211,8 +213,8 @@ def expand_hands(hands: str, groups: Sequence[CategoryGroup] | None) -> str:
     """`hands` с именами категорий — классами через запятую. Категория разворачивается в
     свои классы из `groups` (раскладка исходного диапазона на этом борде), «-<классы>»
     вычитает их из всего названного. Вычтенный класс, которого среди названного нет, —
-    отказ, как и пустой итог. `groups is None` — категорий на этой улице нет (до флопа и
-    на ривере): имя категории — отказ. Без категорий и вычитаний строка уходит как есть."""
+    отказ, как и пустой итог. `groups is None` — категорий на этой улице нет (до флопа):
+    имя категории — отказ. Без категорий и вычитаний строка уходит как есть."""
     if ":" in hands:
         return hands  # веса — отказ `narrow`, как без категорий
     by_category = {group.category: group for group in groups or ()}
@@ -235,7 +237,7 @@ def expand_hands(hands: str, groups: Sequence[CategoryGroup] | None) -> str:
         used_categories = True
         if groups is None:
             raise CategoryError(
-                "категории — только на флопе и тёрне; на этой улице назовите классы"
+                "категории — только после флопа; до флопа назовите классы"
             )
         if category not in by_category:
             raise CategoryError(

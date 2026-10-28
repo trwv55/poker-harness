@@ -23,7 +23,7 @@
 `ThresholdResult`, и порог у него приходит либо арифметикой от размера ставки
 (`BetSizeThreshold`), либо измерением поля (`FieldThreshold`) — третьего
 источника в наборе нет. Стартовый диапазон соперника (`OpponentRangeResult`) берётся
-из чарта — эталона владельца; эквити против суженного диапазона
+из чарта — эталона владельца; сужение диапазона с эквити по его категориям
 (`EquityVsRangeResult`) — допущение агента, оценкой не является.
 """
 
@@ -60,7 +60,6 @@ __all__ = [
     "EquityVsRangeParams",
     "EquityVsRangeResult",
     "FieldThreshold",
-    "FoldHint",
     "FrequencyResult",
     "FrequencyStat",
     "HeroFrequencyParams",
@@ -430,10 +429,13 @@ class CategoryClass(BaseModel):
 
 
 class CategoryGroup(BaseModel):
-    """Категория раскладки и её классы в порядке `all_classes()`."""
+    """Категория раскладки и её классы в порядке `all_classes()`. `equity` — эквити руки
+    героя против этой категории (спека 2026-10-24, §14) в раскладках `opponent_range` и
+    суженного в `equity_vs_range`; у категорий ориентира солвера (борд выгрузки) — `None`."""
 
     category: RangeCategory
     classes: list[CategoryClass]
+    equity: float | None = None
 
     @property
     def combos(self) -> float:
@@ -510,55 +512,46 @@ class OpponentRangeResult(BaseModel):
     live_combos: float
     # Только у колла и чека защиты; у прочих линий пусто.
     absent: list[AbsentGroup] = []
-    # Раскладка по категориям на борде улицы (спека 2026-10-24, §4): на флопе — стартового
-    # диапазона, на тёрне — сужения флопа этой руки (`layout_of="flop"`), а без него —
-    # стартового. До флопа и на ривере раскладки нет.
-    layout_of: Literal["start", "flop"] | None = None
+    # Раскладка по категориям на борде улицы (спека 2026-10-24, §4, §14) с эквити руки
+    # героя против каждой категории: на флопе — стартового диапазона, на тёрне — сужения
+    # флопа этой руки (`layout_of="flop"`), на ривере — сужения тёрна (`"turn"`), после
+    # чек-чек тёрна — и флопа (`"flop_turn_checked"`). Без исходного сужения раскладки нет,
+    # а `layout_refusal` — «сначала сузьте …» (§14.11). До флопа раскладки нет.
+    layout_of: Literal["start", "flop", "turn", "flop_turn_checked"] | None = None
     layout: list[CategoryGroup] = []
+    layout_refusal: str | None = None
     # Солверный ориентир — только на флопе и только при выгрузке в библиотеке (§6);
     # `solver_error` — библиотека не прочиталась.
     solver: SolverGuide | None = None
     solver_error: str | None = None
 
 
-class FoldHint(BaseModel):
-    """Частота сдачи соперника на ставку героя, которую он в этой руке уравнял (спека
-    2026-10-24, §13): на флопе — `fold_to_cbet`, на тёрне — `fold_to_turn_barrel`.
-    Подлежащее — по правилу `opponent_frequency`: соперник со сшивкой места в этом
-    турнире (`opponent` — его ник), иначе поле."""
-
-    stat: FrequencyStat
-    subject: Subject
-    opponent: str | None = None
-    measurement: Measurement
-
-
 class EquityVsRangeResult(BaseModel):
-    """Эквити героя при вскрытии против диапазона, суженного агентом, — зона
-    `assuming`: сужение — допущение агента, классы — подмножество стартового с
-    долями чарта. `share_of_start` — доля живых комбо суженного от стартового."""
+    """Сужение диапазона соперника агентом и эквити героя по его категориям — зона
+    `assuming`: сужение — допущение агента, классы — подмножество стартового с долями
+    чарта. После флопа одного общего эквити нет (спека 2026-10-24, §14): `layout` —
+    раскладка суженного по категориям на борде с эквити против каждой. До флопа категорий
+    нет, и `preflop_equity` — одно эквити против суженного (§14.11)."""
 
     calc: CalcName
     opponent_position: str
     street: Street
     range_text: str
     live_combos: float
-    share_of_start: float
-    equity: float
     # Классы вне чарта (входят и в `range_text`): все добавленные — и игроком, и агентом;
     # из них агентом по своей причине — `agent_added` (класс → причина, спека 2026-10-24, §7).
     added: list[str] = []
     agent_added: dict[str, str] = {}
     # Сводка по категориям раскладки исходного диапазона на борде (спека 2026-10-24, §5):
-    # исходный — стартовый на флопе, сужение флопа на тёрне; на ривере сводки нет.
+    # исходный — стартовый на флопе, сужение флопа на тёрне, сужение тёрна на ривере.
     # `kept_combos` из `source_combos` — без добавленных вне исходного.
-    categories_of: Literal["start", "flop"] | None = None
+    categories_of: Literal["start", "flop", "turn", "flop_turn_checked"] | None = None
     categories: list[CategoryKept] = []
     source_combos: float | None = None
     kept_combos: float | None = None
-    # Ориентир к доле оставленного (§13): только если соперник уравнял с-бет или второй
-    # баррель героя хедз-апом; подсказка, сужения не меняет.
-    fold_hint: FoldHint | None = None
+    # Раскладка суженного (оставленные и добавленные классы) с эквити по категориям.
+    layout: list[CategoryGroup] = []
+    preflop_equity: float | None = None
 
 
 class HeroFrequencyParams(BaseModel):
@@ -646,6 +639,8 @@ class OpponentRangeParams(BaseModel):
     opponent_position: str
     street: Street
     prior: RangeNarrowing | None = None
+    # Улицы, чьё сужение сброшено пересужением более ранней (§14.11) — от кода.
+    reset: list[Street] = []
 
 
 class EquityVsRangeParams(BaseModel):
@@ -663,6 +658,7 @@ class EquityVsRangeParams(BaseModel):
     added: str | None = None
     added_reason: str | None = None
     prior: RangeNarrowing | None = None
+    reset: list[Street] = []
     player_classes: list[str] = []
     kept_classes: list[str] = []
     kept_agent: dict[str, str] = {}

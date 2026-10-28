@@ -2690,19 +2690,37 @@ def test_agent_numbers_print_whole_percents_without_a_trailing_zero():
     assert "50.0% (1 из 2)" in question_msg(half, None).text
 
 
-def test_agent_numbers_print_the_chart_range_and_the_assumed_equity():
+def test_agent_numbers_print_the_chart_range_and_the_equity_by_category():
+    """Числа без прозы: диапазон по чарту — без метки; сужение — с «(допущение)», эквити
+    — по категориям суженного, одного общего числа нет (спека 2026-10-24, §14.4)."""
     from harness.presentation import agent_turn_msg
     from tests.test_agent_outputs import equity_result, range_result
 
     msg = agent_turn_msg("numbers", None, [range_result(), equity_result()], from_context=True, job_id=7)
-    assert "Посчитано: диапазон соперника по чарту, эквити против суженного диапазона." in msg.text
+    assert "Посчитано: диапазон соперника по чарту, эквити по категориям суженного диапазона." in msg.text
     assert (
         "Диапазон BB по чарту защиты BB против BTN (8-max, 25.0BB; мест за столом: 6): "
         "1.9% рук, 22 комбо." in msg.text
     )
+    lines = msg.text.splitlines()
+    assert "Диапазон BB, суженный по линии (допущение): 7 комбо." in lines
     assert (
-        "Эквити против диапазона BB, суженного по линии (допущение): 31.4% — 7 комбо, "
-        "31.8% стартового." in msg.text
+        "Эквити вашей руки против каждой категории: средняя пара — 6 комбо, 31.4%; "
+        "бэкдоры и старшие карты — 4 комбо, 61.7%." in lines
+    )
+    assert "стартового" not in msg.text
+
+
+def test_agent_numbers_print_the_preflop_equity():
+    """До флопа — одно эквити против суженного с «(допущение)», как до §14."""
+    from harness.contracts import Street
+    from harness.presentation import agent_turn_msg
+    from tests.test_agent_outputs import equity_result
+
+    result = equity_result(street=Street.PREFLOP, layout=[], preflop_equity=0.314)
+    msg = agent_turn_msg("numbers", None, [result], from_context=True, job_id=7)
+    assert "Эквити против диапазона BB, суженного по линии (допущение): 31.4% — 7 комбо." in (
+        msg.text.splitlines()
     )
 
 

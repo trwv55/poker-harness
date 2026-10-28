@@ -17,12 +17,10 @@ import eval7
 import pytest
 
 from harness.analysis.tools.equity import _FULL_DECK
+from harness.analysis.tools.exact_equity import equity_by_combo
 from harness.analysis.tools.pot_odds import required_equity
 from harness.analysis.tools.river_call import _HAND_TYPES
-from harness.analysis.tools.turn_flop_call import (
-    _equity_by_combo,
-    turn_flop_call_requirement,
-)
+from harness.analysis.tools.turn_flop_call import turn_flop_call_requirement
 
 # Живая рука владельца на тёрне: у героя вторая пара, борд тузовый и несдвоенный.
 _LIVE_TURN = ["Jc", "6d", "As", "2h"]
@@ -143,7 +141,7 @@ def test_the_turn_enumerates_every_river_card():
     naive = _naive_equity(_SECOND_PAIR, _LIVE_TURN)
     dead = set(_SECOND_PAIR) | set(_LIVE_TURN)
     rest = [name for name in _FULL_DECK if name not in dead]
-    working = _equity_by_combo(_cards(_SECOND_PAIR), _cards(_LIVE_TURN), _cards(rest), 1)
+    working = equity_by_combo(_cards(_SECOND_PAIR), _cards(_LIVE_TURN), _cards(rest), 1)
     assert len(working) == _TURN_COMBOS
     assert working == naive
 
@@ -154,7 +152,7 @@ def test_the_flop_enumerates_every_pair_of_run_outs():
     naive = _naive_equity(_SECOND_PAIR, _LIVE_FLOP)
     dead = set(_SECOND_PAIR) | set(_LIVE_FLOP)
     rest = [name for name in _FULL_DECK if name not in dead]
-    working = _equity_by_combo(_cards(_SECOND_PAIR), _cards(_LIVE_FLOP), _cards(rest), 2)
+    working = equity_by_combo(_cards(_SECOND_PAIR), _cards(_LIVE_FLOP), _cards(rest), 2)
     assert len(working) == _FLOP_COMBOS
     assert working == naive
 

@@ -21,16 +21,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from harness.agent import prompt as _prompt
 from harness.agent.history import (
     allowed_from_history,
-    assumed_numbers_in,
     calcs_in_history,
     chart_numbers_in,
+    equity_numbers_in,
     frequency_numbers,
     hand_boundary,
     hand_player_texts,
     merged_requests,
     narrowings_in,
+    non_equity_numbers_in,
     player_numbers,
     player_text_numbers,
+    preflop_equity_numbers_in,
     seen_history,
     stats_in_history,
     threshold_decided,
@@ -223,10 +225,10 @@ def _draft_violations(
         calc_numbers=calc_numbers,
         frequency_numbers=frequency_numbers(messages),
         chart_numbers=chart_numbers_in(messages),
-        assumed_numbers=assumed_numbers_in(messages),
-        summary_numbers=(
-            context.allowed | context.threshold_numbers if context is not None else frozenset()
-        ),
+        equity_numbers=equity_numbers_in(messages),
+        preflop_equity_numbers=preflop_equity_numbers_in(messages),
+        other_numbers=non_equity_numbers_in(messages)
+        | (context.allowed | context.threshold_numbers if context is not None else frozenset()),
         threshold_numbers=threshold_numbers_in(messages)
         | (context.threshold_numbers if context is not None else frozenset()),
     ), block
