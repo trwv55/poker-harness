@@ -31,18 +31,31 @@ status='running'`) — вторая линия защиты и настояща�
 `hh_scan` — 200 не срочен, `eval_run` — 900 самый терпеливый) `enqueue`
 подставляет сама по `type`, если вызывающий явно не передал `priority`.
 `question` — вопрос игрока о своей игре — тоже 100: игрок ждёт ответа так же,
-как разбора. CHECK-констрейнт `jobs.type_allowed` ограничивает `type` этими же
-значениями, поэтому на сегодня таблица покрывает все возможные типы. Дефолт
+как разбора; сообщение агенту (`agent`, спека агента №1) — тоже 100.
+CHECK-констрейнт `jobs.type_allowed` ограничивает `type` этими же значениями,
+поэтому на сегодня таблица покрывает все возможные типы. Дефолт
 `.get(type, 100)` в `enqueue` — не признание неполноты, а решение о том, что
-делать с ПЯТЫМ типом, когда его добавят: пятый тип задачи почти наверняка
+делать со СЛЕДУЮЩИМ типом, когда его добавят: новый тип задачи почти наверняка
 интерактивный, и получить приоритет самого срочного класса ему безопаснее, чем
 уехать в конец очереди по недосмотру (round 5, Item K.10: раньше таблица тут
 называлась «исчерпывающей», и это спорило с `.get(..., 100)` двумя сотнями
 строк ниже).
+
+Число попыток `enqueue` тоже берёт по `type`, если не передан явный
+`max_attempts`: задаче `agent` — одна попытка (решение владельца 2026-10-11:
+упавший ход агента не повторяется), остальным типам — дефолт колонки
+`jobs.max_attempts` (3) (`test_an_agent_job_gets_a_single_attempt`,
+`test_other_job_types_keep_three_attempts`).
+
+`reap()` возвращает номера задач, которые закрыл `failed`, отдельно от
+вернувшихся в очередь: сообщить игроку о провале — дело воркера (здесь
+Телеграма нет), и ему нужны именно первые
+(`test_a_job_failed_by_the_reaper_tells_its_player_once`).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from asyncpg.exceptions import UniqueViolationError
@@ -64,13 +77,21 @@ class JobPreconditionFailed(Exception):
     тот же молчаливый провал.
     """
 
-# Порядок и значения — спека §8.1 дословно.
+# Порядок и значения — спека §8.1 дословно; `question` и `agent` дописаны
+# позже (миграции 0009 и 0014), см. модульный докстринг.
 _DEFAULT_PRIORITY_BY_TYPE: dict[str, int] = {
     "screenshot_analyze": 100,
     "deep_dive": 100,
     "question": 100,
     "hh_scan": 200,
     "eval_run": 900,
+    "agent": 100,
+}
+
+# Только отличия от дефолта колонки `jobs.max_attempts` (3); тип вне таблицы
+# получает дефолт колонки — см. модульный докстринг.
+_DEFAULT_MAX_ATTEMPTS_BY_TYPE: dict[str, int] = {
+    "agent": 1,
 }
 
 # Единственный SQL, которому доверена сама атомарность захвата: WHERE-подзапрос
@@ -122,6 +143,18 @@ def _is_running_serialization_conflict(exc: IntegrityError) -> bool:
     return getattr(cause, "constraint_name", None) == JOBS_RUNNING_UNIQUE_INDEX
 
 
+@dataclass(frozen=True, slots=True)
+class Reaped:
+    """Итог одного `reap()`: номера задач, закрытых `failed`, и вернувшихся в очередь."""
+
+    failed: tuple[int, ...]
+    requeued: tuple[int, ...]
+
+    @property
+    def total(self) -> int:
+        return len(self.failed) + len(self.requeued)
+
+
 class JobsQueue:
     """Очередь + журнал `jobs`: захват, статусы, эскалация, страховочный reaper."""
 
@@ -136,13 +169,19 @@ class JobsQueue:
         session_id: int,
         payload: dict,
         priority: int | None = None,
+        max_attempts: int | None = None,
     ) -> int:
         """Поставить задачу в очередь. `priority=None` — дефолт по `type` (см.
         модульный докстринг); явный `priority` переопределяет его — нужен эскалации
         и ручным сценариям, где приоритет диктует не тип задачи, а обстоятельство.
+        `max_attempts` устроен так же: `None` — дефолт по `type`, явное значение
+        его переопределяет (`test_an_explicit_max_attempts_overrides_the_type_default`).
         """
         resolved_priority = (
             _DEFAULT_PRIORITY_BY_TYPE.get(type, 100) if priority is None else priority
+        )
+        resolved_attempts = (
+            _DEFAULT_MAX_ATTEMPTS_BY_TYPE.get(type) if max_attempts is None else max_attempts
         )
         async with self._session_factory() as session:
             job = Job(
@@ -152,6 +191,8 @@ class JobsQueue:
                 payload=payload,
                 priority=resolved_priority,
             )
+            if resolved_attempts is not None:
+                job.max_attempts = resolved_attempts
             session.add(job)
             await session.commit()
             return job.id
@@ -296,7 +337,7 @@ class JobsQueue:
                 values={"status": "queued"},
             )
 
-    async def reap(self, older_than_minutes: int = 10) -> int:
+    async def reap(self, older_than_minutes: int = 10) -> Reaped:
         """Страховка по возрасту лока (спека §8.1): если воркер умер, не дойдя
         до `complete()`/`fail()`, его задача осталась `running` с устаревшим
         `locked_at` навсегда — транзакция `claim()` уже закоммичена и своей
@@ -305,7 +346,7 @@ class JobsQueue:
         `reap()` его не трогает, а лишь читает: не исчерпан лимит — назад в
         `queued` на следующую попытку; исчерпан (`attempts >= max_attempts`) —
         `failed` с честной причиной, а не тихий бесконечный повтор.
-        Возвращает число обработанных задач (обе ветки вместе).
+        Возвращает номера задач обеих веток порознь (`Reaped`).
         """
         threshold = datetime.now(UTC) - timedelta(minutes=older_than_minutes)
         async with self._session_factory() as session:
@@ -337,10 +378,10 @@ class JobsQueue:
                 .execution_options(synchronize_session=False)
                 .returning(Job.id)
             )
-            # `.returning(Job.id)` вместо `.rowcount`: у последнего нет надёжной
-            # типизации на общем `Result[Any]` (pyright ругается), а посчитать
-            # вернувшиеся id — тот же результат и без приведения типов.
-            reaped = len(failed.all()) + len(requeued.all())
+            reaped = Reaped(
+                failed=tuple(sorted(failed.scalars())),
+                requeued=tuple(sorted(requeued.scalars())),
+            )
             await session.commit()
             return reaped
 

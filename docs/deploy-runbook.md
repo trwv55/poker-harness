@@ -137,6 +137,7 @@ git config core.hooksPath .githooks
 ```bash
 rsync -av src/harness/parsers/prompts/      harness@<сервер>:/srv/poker-harness/src/harness/parsers/prompts/
 rsync -av src/harness/explanation/prompts/  harness@<сервер>:/srv/poker-harness/src/harness/explanation/prompts/
+rsync -av src/harness/agent/prompts/        harness@<сервер>:/srv/poker-harness/src/harness/agent/prompts/
 ```
 
 На сервере:
@@ -145,9 +146,11 @@ rsync -av src/harness/explanation/prompts/  harness@<сервер>:/srv/poker-ha
 find src/harness -path '*/prompts/*.md' | sort
 ```
 
-Должно быть ровно три строки:
+Должно быть ровно пять строк:
 
 ```
+src/harness/agent/prompts/system.md
+src/harness/explanation/prompts/question.md
 src/harness/explanation/prompts/tournament.md
 src/harness/explanation/prompts/verdict.md
 src/harness/parsers/prompts/vision.md
@@ -285,7 +288,14 @@ nano .env     # раскомментировать строку и вписат�
 ## 6. Сборка образа **[только на сервере]**
 
 ```bash
-docker compose build
+docker compose build --build-arg GIT_SHA=$(git rev-parse HEAD)
+```
+
+`GIT_SHA` попадает в метку образа `org.opencontainers.image.revision`; без
+аргумента метка — `unknown`, и сверить, какой коммит работает, нечем:
+
+```bash
+docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' $(docker compose ps -q worker)
 ```
 
 Последняя строка — `naming to docker.io/library/poker-harness:local done`.
@@ -564,7 +574,7 @@ docker compose up -d
 ```bash
 cd /srv/poker-harness
 git pull --ff-only
-docker compose build
+docker compose build --build-arg GIT_SHA=$(git rev-parse HEAD)
 docker compose run --rm migrate
 docker compose up -d
 ```

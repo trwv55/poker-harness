@@ -63,6 +63,7 @@ from harness.memory.models import (
     OpponentLink,
     Player,
     Tournament,
+    Trace,
 )
 from harness.memory.models import Session as SessionRow
 
@@ -226,6 +227,14 @@ class PlayersRepo:
 _SESSIONS_LOCK_NS = 0x53455353  # "SESS"
 
 
+@dataclass(frozen=True, slots=True)
+class AgentState:
+    """История вечера и указатель разбора — то, с чем воркер начинает ход агента."""
+
+    history: list[dict[str, Any]] | None
+    last_analysis_id: int | None
+
+
 class SessionsRepo:
     """`sessions`: молчаливый путь из SESSIONS_UX.md — скрин без активной сессии не
     отказывает игроку, а тихо открывает новую сессию. "Активная" — самая свежая
@@ -383,17 +392,54 @@ class SessionsRepo:
         открытая строка навсегда осталась бы невидимым мусором, который никакой
         `/new` больше не тронет. В норме она одна — инвариант поддерживается
         именно здесь.
+
+        История диалога с агентом уходит вместе с вечером (спека агента №1, §8;
+        `test_the_evening_history_is_written_read_and_erased_by_new`).
         """
         result = await self.db.execute(
             update(SessionRow)
             .where(SessionRow.player_id == player_id, SessionRow.closed_at.is_(None))
-            .values(closed_at=datetime.now(UTC))
+            .values(closed_at=datetime.now(UTC), agent_history=None)
             .execution_options(synchronize_session=False)
             .returning(SessionRow.id)
         )
         closed = result.all()
         await self.db.flush()
         return bool(closed)
+
+    async def agent_state(self, session_id: int) -> AgentState:
+        row = (
+            await self.db.execute(
+                select(SessionRow.agent_history, SessionRow.last_analysis_id).where(
+                    SessionRow.id == session_id
+                )
+            )
+        ).one()
+        return AgentState(history=row.agent_history, last_analysis_id=row.last_analysis_id)
+
+    async def save_agent_history(self, session_id: int, history: list[dict[str, Any]]) -> bool:
+        """Записать историю, только пока сессия открыта.
+
+        Ход агента может закончиться после `/new`: тогда сессия уже закрыта, её
+        история стёрта, и запись вернула бы её обратно
+        (`test_history_is_not_written_into_a_closed_session`).
+        """
+        result = await self.db.execute(
+            update(SessionRow)
+            .where(SessionRow.id == session_id, SessionRow.closed_at.is_(None))
+            .values(agent_history=history)
+            .execution_options(synchronize_session=False)
+            .returning(SessionRow.id)
+        )
+        return result.first() is not None
+
+    async def set_last_analysis(self, session_id: int, analysis_id: int | None) -> None:
+        await self.db.execute(
+            update(SessionRow)
+            .where(SessionRow.id == session_id)
+            .values(last_analysis_id=analysis_id)
+            .execution_options(synchronize_session=False)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -852,6 +898,29 @@ class AnalysesRepo:
             range_images=record.range_images,
         )
 
+    async def get(self, analysis_id: int) -> AnalysisRecord | None:
+        """Разбор по его номеру — через `get_by_hand`, чтобы точки собирались одним путём."""
+        hand_id = await self.db.scalar(select(Analysis.hand_id).where(Analysis.id == analysis_id))
+        record = None if hand_id is None else await self.get_by_hand(hand_id)
+        # `analyses.hand_id` не уникален в схеме: чужой разбор той же руки — не ответ
+        # (`test_an_analysis_is_never_answered_by_another_one_of_the_same_hand`).
+        return record if record is not None and record.id == analysis_id else None
+
+    async def enriched_hand(self, analysis_id: int, player_id: int) -> EnrichedHand | None:
+        """Рука разбора — только если разбор этого игрока; чужой или пропавший — `None`
+        (`test_another_players_analysis_is_not_read`)."""
+        record = await self.get(analysis_id)
+        if record is None:
+            return None
+        owner = await self.db.scalar(
+            select(SessionRow.player_id)
+            .join(Hand, Hand.session_id == SessionRow.id)
+            .where(Hand.id == record.hand_id)
+        )
+        if owner != player_id:
+            return None
+        return (await HandsRepo(self.db).get(record.hand_id)).enriched
+
 
 class TournamentsRepo:
     """`tournaments`: HH-вход и сводка скана (задача 18, встык с `hh_scan`).
@@ -924,6 +993,16 @@ class TournamentsRepo:
         return record
 
 
+@dataclass(frozen=True, slots=True)
+class AgentTurnRecord:
+    """Ход агента: вопрос из `jobs.payload` и запись `agent_turn` последнего трейса."""
+
+    job_id: int
+    trace_id: int
+    question: str
+    turn: dict[str, Any]
+
+
 class JobsRepo:
     """Чтение `jobs` для решений бота. Записью и жизненным циклом задач владеет
     `platform/queue.py` — сюда попадают только вопросы, на которые надо ответить
@@ -991,6 +1070,32 @@ class JobsRepo:
         )
         return await self.db.scalar(stmt)
 
+    async def agent_turn(self, job_id: int, player_id: int) -> AgentTurnRecord | None:
+        """Ход агента по номеру задачи из кнопки — только этого игрока.
+
+        Ход берётся из последнего трейса задачи: запись `agent_turn` в `spans`
+        кладёт воркер (`test_an_agent_turn_is_found_only_for_its_player`).
+        """
+        job = await self.db.scalar(
+            select(Job).where(Job.id == job_id, Job.player_id == player_id, Job.type == "agent")
+        )
+        if job is None:
+            return None
+        trace = await self.db.scalar(
+            select(Trace).where(Trace.job_id == job_id).order_by(Trace.id.desc()).limit(1)
+        )
+        if trace is None:
+            return None
+        turn = next((s for s in trace.spans or [] if s.get("name") == "agent_turn"), None)
+        if turn is None:
+            return None
+        return AgentTurnRecord(
+            job_id=job.id,
+            trace_id=trace.id,
+            question=str((job.payload or {}).get("text", "")),
+            turn=turn,
+        )
+
 
 class CalcCacheRepo:
     """`calc_cache`: кэш расчётов, общий между турнирами и пользователями (§6).
@@ -1031,6 +1136,13 @@ class CalcCacheRepo:
         rows = (await self.db.execute(stmt)).all()
         return {key[len(prefix) :]: float(value) for key, value in rows}
 
+    async def get(self, prefix: str, key: str) -> float | None:
+        """Одно значение по полному ключу `prefix + key`; нет строки — `None`."""
+        value = await self.db.scalar(
+            select(CalcCache.value).where(CalcCache.key == f"{prefix}{key}")
+        )
+        return None if value is None else float(value)
+
     async def upsert_many(self, prefix: str, entries: Mapping[str, float]) -> None:
         """Записать пачку значений, разбивая её на куски по `_UPSERT_CHUNK` строк.
 
@@ -1064,18 +1176,20 @@ class CalcCacheRepo:
 _UPSERT_CHUNK = 5000
 
 
-# Квота по умолчанию (спека §9, пример дословно: «разборов 17/50 за 24 ч») — действует,
+# Квота по умолчанию (спека §9, пример: «17/50 за 24 ч») — действует,
 # когда у игрока нет персонального переопределения (`players.quota_daily IS NULL`).
 QUOTA_DAILY_DEFAULT = 50
 
 # Квоту тратят только ИНТЕРАКТИВНЫЕ задачи (спека §9). `hh_scan` в список не входит
 # намеренно: он дёшев для нас и «поощряется щедрее» — это продуктовый рычаг
-# (SCALING.md), а не недосмотр. `question` не входит по другой причине: этот
-# счётчик подписан игроку словом «разборов» (`quota_exceeded_msg`,
-# `_quota_line`), и списанный с него вопрос сделал бы подпись неверной
-# (`test_a_question_does_not_spend_the_daily_quota`). Своего предела у вопросов
-# сегодня нет — есть только кросс-процессный лимитер модели.
-QUOTA_INTERACTIVE_JOB_TYPES = ("deep_dive", "screenshot_analyze")
+# (SCALING.md), а не недосмотр. `agent` входит: одно сообщение агенту — одна
+# единица (спека агента №1, §9;
+# `test_an_agent_message_spends_the_daily_quota_and_a_failed_one_does_not`).
+# `question` не входит: решение «вопрос бесплатен»
+# (`test_a_question_does_not_spend_the_daily_quota`) принято раньше агента, и
+# `/ask` живёт до открытия агента у игроков без доступа. Своего предела у
+# вопросов нет — есть только кросс-процессный лимитер модели.
+QUOTA_INTERACTIVE_JOB_TYPES = ("deep_dive", "screenshot_analyze", "agent")
 
 # Скользящее окно, а не календарные сутки (спека §9 дословно: ни поля пояса, ни
 # cron-сброса, ни полуночного «обнуления посреди ночной сессии»).
@@ -1101,7 +1215,7 @@ class QuotaRepo:
     """Квота игрока за скользящие 24 ч (спека §9) — ОДНА реализация на два процесса.
 
     Бот спрашивает «пускать ли» ДО постановки задачи в очередь (задача 19), воркер
-    берёт отсюда же числа для строки «разборов X/Y за 24 ч» (задача 18) — он уже
+    берёт отсюда же числа для строки «запросов X/Y за 24 ч» (задача 18) — он уже
     взял задачу в работу и отказывать не вправе. Соблазн держать по счётчику в
     каждом процессе этот проект уже наказывал (второй словарь словоформ, четыре
     расхождения с библиотекой по памяти): два SQL с одинаковым смыслом разошлись
@@ -1184,7 +1298,8 @@ class QuotaRepo:
 
 
 class EvalCasesRepo:
-    """`eval_cases`: копится сам — подтверждения/возражения игрока, эскалации vision."""
+    """`eval_cases`: копится сам — подтверждения/возражения игрока, эскалации vision
+    и «не то посчитано» агента (без руки — `hand_id=None`)."""
 
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
@@ -1193,7 +1308,7 @@ class EvalCasesRepo:
         self,
         *,
         kind: str,
-        hand_id: int,
+        hand_id: int | None,
         ground_truth: dict,
         source: str,
         field: str | None = None,
@@ -1944,6 +2059,24 @@ class OpponentsRepo:
             OpponentLink.owner_player_id == owner_player_id,
         )
         return {row[0]: row[1] for row in await self.db.execute(stmt)}
+
+    async def holder(
+        self, owner_player_id: int, room_tournament_id: str, participant_label: str
+    ) -> tuple[int, str] | None:
+        """Оппонент (номер, ник), за которым закреплена пара «турнир + метка»; `None` —
+        пара не привязана (`test_the_flop_equity_after_a_called_cbet_carries_the_fold_to_cbet_hint`)."""
+        row = (
+            await self.db.execute(
+                select(Opponent.id, Opponent.opponent_nick)
+                .join(OpponentLink, OpponentLink.opponent_id == Opponent.id)
+                .where(
+                    OpponentLink.owner_player_id == owner_player_id,
+                    OpponentLink.room_tournament_id == room_tournament_id,
+                    OpponentLink.participant_label == participant_label,
+                )
+            )
+        ).first()
+        return None if row is None else (int(row[0]), str(row[1]))
 
     async def _find_by_nick(self, owner_player_id: int, nick: str) -> int | None:
         return await self.db.scalar(

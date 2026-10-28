@@ -58,7 +58,11 @@ packages = ["src/harness"]
 # перед игроком. Лишнего не заберёт: каталог `prompts` в этом дереве существует
 # ровно для промптов (проверено подсадными файлами — шаблон забрал все шесть,
 # включая `prompts/nested/deep.md` и `prompts/decoy.txt`).
-artifacts = ["src/harness/**/prompts/*"]
+#
+# Библиотека солверных выгрузок (`analysis/charts/solver/`, спека 2026-10-24, §6) закрыта
+# тем же `.gitignore` и по той же причине названа здесь: без строки ориентир молча
+# пропал бы из колеса — а с ним и из образа стенда.
+artifacts = ["src/harness/**/prompts/*", "src/harness/analysis/charts/solver/*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

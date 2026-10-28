@@ -1,6 +1,8 @@
 """Вердикт по чарту: открытие первым при стеке от 13bb (`analysis.open_chart`).
 
-Раздачи — синтетика 8-max, чтобы в справочнике владельца был чарт для стола.
+Раздачи — синтетика 8-max, чтобы в справочнике владельца был чарт для стола;
+столы на 4–7 мест судятся 8-max чартом по позиции от конца (решение владельца
+2026-10-10).
 Где частоты руки нужны точными, они берутся из чарта в репозитории (CO 35bb:
 AJo — рейз 100%, 22 — рейз 42% и фолд 58%); где нужен порог 30% — из
 временного файла с подобранными частотами.
@@ -15,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from harness.analysis import analyze_hand, open_chart
-from harness.analysis.charts import load_chart_book
+from harness.analysis.charts import ChartMissing, load_chart_book
 from harness.analysis.classifier import classify, table_state
 from harness.contracts import (
     ActionKind,
@@ -34,7 +36,11 @@ from harness.normalizer import normalize
 
 _SB, _BB, _ANTE = 50, 100, 12
 _EIGHT_MAX = ("SB", "BB", "UTG", "UTG+1", "LJ", "HJ", "CO", "BTN")
-_ACTION_ORDER = ("UTG", "UTG+1", "LJ", "HJ", "CO", "BTN", "SB", "BB")
+_SEVEN_MAX = ("SB", "BB", "UTG", "UTG+1", "HJ", "CO", "BTN")
+_SIX_MAX = ("SB", "BB", "UTG", "HJ", "CO", "BTN")
+_FOUR_MAX = ("SB", "BB", "UTG", "BTN")
+_THREE_MAX = ("SB", "BB", "BTN")
+_NINE_MAX = ("SB", "BB", "UTG", "UTG+1", "UTG+2", "LJ", "HJ", "CO", "BTN")
 
 
 def _act(
@@ -61,14 +67,23 @@ def _leak_key(point) -> str | None:
     return None if rule is None else rule.key
 
 
-def _hand(hero: str, cards: tuple[str, str], eff_bb: float, action: str, *, opener: str = ""):
+def _hand(
+    hero: str,
+    cards: tuple[str, str],
+    eff_bb: float,
+    action: str,
+    *,
+    opener: str = "",
+    table: tuple[str, ...] = _EIGHT_MAX,
+):
     """Hero действует первым в неоткрытом банке (или после рейза `opener`).
 
-    `action`: fold, raise (до 2.5bb), shove, limp (только SB).
+    `action`: fold, raise (до 2.5bb), shove, limp (только SB). `table` — раскладка
+    позиций стола от SB до BTN (`POSITIONS_BY_COUNT`), кнопка на последнем месте.
     """
     stack = round(eff_bb * _BB)
-    labels = {pos: ("Hero" if pos == hero else pos) for pos in _EIGHT_MAX}
-    seats = [SeatInfo(seat=i + 1, label=labels[p], stack=stack) for i, p in enumerate(_EIGHT_MAX)]
+    labels = {pos: ("Hero" if pos == hero else pos) for pos in table}
+    seats = [SeatInfo(seat=i + 1, label=labels[p], stack=stack) for i, p in enumerate(table)]
     posts = [Post(label=s.label, kind=PostKind.ANTE, amount=_ANTE) for s in seats] + [
         Post(label=labels["SB"], kind=PostKind.SMALL_BLIND, amount=_SB),
         Post(label=labels["BB"], kind=PostKind.BIG_BLIND, amount=_BB),
@@ -76,7 +91,7 @@ def _hand(hero: str, cards: tuple[str, str], eff_bb: float, action: str, *, open
     already = {"SB": _SB, "BB": _BB}.get(hero, 0)
     behind_stack = stack - _ANTE
     actions: list[RawAction] = []
-    for pos in _ACTION_ORDER:
+    for pos in (*table[2:], *table[:2]):
         if pos == hero:
             break
         if pos == opener:
@@ -111,8 +126,8 @@ def _hand(hero: str, cards: tuple[str, str], eff_bb: float, action: str, *, open
         ante=_ANTE,
         timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC),
         table_name="syn",
-        max_seats=8,
-        button_seat=8,
+        max_seats=len(table),
+        button_seat=len(table),
         seats=seats,
         posts=posts,
         dealt={"Hero": list(cards)},
@@ -336,7 +351,7 @@ def test_the_chart_verdict_line_shows_frequencies_and_no_price():
     from harness.presentation.messages import _verdict_lines
 
     (line,) = _verdict_lines(_chart(0.6, mismatch=False))
-    assert "открытие по чарту 35bb" in line and "зона строго" in line
+    assert "открытие по чарту 35BB" in line and "зона строго" in line
     assert "по чарту: рейз 40.0%, фолд 60.0%" in line and line.endswith("в пределах чарта")
     assert "цена" not in line and "лучше" not in line
     (line,) = _verdict_lines(_chart(0.0, mismatch=True))
@@ -448,4 +463,167 @@ def test_a_chart_leak_is_shown_without_a_price():
 
     rule = next(r for r in LEAK_RULES if r.key == "open_too_wide")
     line = _leak_line(LeakStat(rule=rule, count=3, loss_bb=0.0))
-    assert line.endswith("по чарту, без цены") and "bb" not in line and "ББ" not in line
+    assert line.endswith("по чарту, без цены") and "bb" not in line and "BB" not in line
+
+
+# --- стол меньше 8 мест: 8-max чарт по позиции от конца (решение владельца 2026-10-10) ---
+
+
+@pytest.mark.parametrize(
+    ("seats", "position", "chart"),
+    [
+        (8, "UTG", (8, "UTG")),
+        (8, "LJ", (8, "LJ")),
+        (7, "BTN", (8, "BTN")),
+        (7, "CO", (8, "CO")),
+        (7, "HJ", (8, "HJ")),
+        (7, "UTG+1", (8, "LJ")),
+        (7, "UTG", (8, "UTG+1")),
+        (7, "SB", (8, "SB")),
+        (6, "UTG", (8, "LJ")),
+        (6, "HJ", (8, "HJ")),
+        (6, "BTN", (8, "BTN")),
+        (4, "UTG", (8, "CO")),
+        (4, "BTN", (8, "BTN")),
+        (4, "SB", (8, "SB")),
+        (3, "BTN", (3, "BTN")),
+        (3, "SB", (3, "SB")),
+        (2, "BTN", (2, "BTN")),
+        (9, "UTG+2", (9, "UTG+2")),
+    ],
+)
+def test_the_chart_table_counts_the_players_behind(seats, position, chart):
+    """На 4–7 местах позиция 8-max — та, у которой столько же игроков позади до BB;
+    8, 9, 3 места и хедз-ап — как есть."""
+    assert open_chart.chart_table(seats, position) == chart
+
+
+@pytest.mark.parametrize(
+    ("seats", "position", "chart"),
+    [
+        (7, "UTG", "UTG+1"), (7, "UTG+1", "LJ"), (7, "HJ", "HJ"), (7, "CO", "CO"),
+        (7, "BTN", "BTN"), (7, "SB", "SB"), (7, "BB", "BB"),
+        (6, "UTG", "LJ"), (6, "HJ", "HJ"), (6, "CO", "CO"), (6, "BTN", "BTN"),
+        (6, "SB", "SB"), (6, "BB", "BB"),
+        (5, "UTG", "HJ"), (5, "CO", "CO"), (5, "BTN", "BTN"), (5, "SB", "SB"), (5, "BB", "BB"),
+        (4, "UTG", "CO"), (4, "BTN", "BTN"), (4, "SB", "SB"), (4, "BB", "BB"),
+    ],
+)
+def test_the_short_table_rule_covers_the_whole_table_of_the_spec(seats, position, chart):
+    """Таблица §5 спеки 2026-10-14 строка в строку: стол на 4–7 мест — 8-max и
+    позиция с тем же числом игроков позади до BB."""
+    assert open_chart.chart_table(seats, position) == (8, chart)
+
+
+@pytest.mark.parametrize(
+    ("seats", "opener", "chart_opener"),
+    [(7, "UTG", "UTG+1"), (6, "UTG", "LJ"), (5, "UTG", "HJ"), (4, "UTG", "CO"),
+     (6, "BTN", "BTN"), (8, "LJ", "LJ")],
+)
+def test_the_defence_maps_the_opener_by_the_same_rule(seats, opener, chart_opener):
+    assert open_chart.defend_table(seats, "BB", opener) == (8, "BB", chart_opener)
+
+
+def test_three_and_nine_handed_defences_keep_their_own_table():
+    """Меньше 4 и больше 8 мест — только своя запись (§5): позиции не сдвигаются."""
+    assert open_chart.defend_table(3, "BB", "BTN") == (3, "BB", "BTN")
+    assert open_chart.defend_table(9, "BB", "UTG+2") == (9, "BB", "UTG+2")
+
+
+@pytest.mark.parametrize(
+    ("seats", "position", "opener"),
+    [(6, "BB", "LJ"), (7, "BB", "LJ"), (7, "BB", "XX"), (5, "XX", "UTG"), (10, "BB", "UTG")],
+)
+def test_a_seat_missing_at_the_table_has_no_defence_chart(seats, position, opener):
+    """Позиции нет в раскладке стола на N мест — `ChartMissing`, как у лукапа, а не
+    запись 8-max с тем же именем."""
+    with pytest.raises(ChartMissing):
+        open_chart.defend_table(seats, position, opener)
+
+
+def _same_hand_on_eight_max(hero8: str, cards: tuple[str, str], eff_bb: float, action: str):
+    return _point(_hand(hero8, cards, eff_bb, action))
+
+
+def test_a_seven_handed_button_is_judged_by_the_eight_max_button():
+    point = _point(_hand("BTN", ("Kh", "9h"), 35.0, "raise", table=_SEVEN_MAX))
+    eight = _same_hand_on_eight_max("BTN", ("Kh", "9h"), 35.0, "raise")
+    assert point.spot == SpotKind.OPEN_CHART and point.zone == "strict"
+    assert (point.detail["chart_seats"], point.detail["chart_position"]) == (8, "BTN")
+    assert point.detail["chart_frequencies"] == eight.detail["chart_frequencies"]
+    assert point.mismatch is eight.mismatch is False
+
+
+def test_a_seven_handed_utg_is_judged_by_the_eight_max_utg1():
+    point = _point(_hand("UTG", ("Ah", "Jd"), 35.0, "fold", table=_SEVEN_MAX))
+    eight = _same_hand_on_eight_max("UTG+1", ("Ah", "Jd"), 35.0, "fold")
+    assert (point.detail["chart_seats"], point.detail["chart_position"]) == (8, "UTG+1")
+    assert point.detail["chart_frequencies"] == eight.detail["chart_frequencies"]
+    assert point.mismatch is eight.mismatch
+
+
+def test_a_six_handed_table_is_judged_by_position_from_the_end():
+    """6 мест: UTG — пятеро позади, как у LJ за 8-max."""
+    point = _point(_hand("UTG", ("Ah", "Jd"), 35.0, "raise", table=_SIX_MAX))
+    eight = _same_hand_on_eight_max("LJ", ("Ah", "Jd"), 35.0, "raise")
+    assert (point.detail["chart_seats"], point.detail["chart_position"]) == (8, "LJ")
+    assert point.detail["chart_frequencies"] == eight.detail["chart_frequencies"]
+
+
+def test_a_four_handed_table_is_judged_by_position_from_the_end():
+    """4 места: UTG — трое позади до BB, как у CO за 8-max."""
+    point = _point(_hand("UTG", ("Ah", "Jd"), 35.0, "raise", table=_FOUR_MAX))
+    eight = _same_hand_on_eight_max("CO", ("Ah", "Jd"), 35.0, "raise")
+    assert point.spot == SpotKind.OPEN_CHART and point.zone == "strict"
+    assert (point.detail["chart_seats"], point.detail["chart_position"]) == (8, "CO")
+    assert point.detail["chart_frequencies"] == eight.detail["chart_frequencies"]
+
+
+def test_three_handed_and_heads_up_tables_get_no_chart_verdict():
+    """3 места и хедз-ап 8-max чартом не судятся: причина словами игрока."""
+    from tests.test_postflop_line import P, _fold, _raise
+    from tests.test_postflop_line import _hand as _heads_up_hand
+
+    three = _point(_hand("BTN", ("Ah", "Jd"), 35.0, "raise", table=_THREE_MAX))
+    assert three.spot == SpotKind.OPEN_CHART and three.best_action == ""
+    assert three.detail["unjudged"] == "чарта открытия для стола на 3 места в справочнике нет"
+    assert "chart_seats" not in three.detail
+
+    heads_up = _point(_heads_up_hand([_raise(P, "Hero", 300), _fold(P, "V")], button="Hero"))
+    assert heads_up.spot == SpotKind.OPEN_CHART and heads_up.best_action == ""
+    assert heads_up.detail["unjudged"] == "чарта открытия для хедз-апа в справочнике нет"
+
+
+def test_an_eight_max_point_carries_no_mark_of_another_table():
+    point = _point(_hand("CO", ("Ah", "Jd"), 35.0, "raise"))
+    assert "chart_seats" not in point.detail and "chart_position" not in point.detail
+
+
+def test_the_verdict_line_names_the_eight_max_chart_of_a_smaller_table():
+    from harness.presentation.messages import _detail_lines, _verdict_lines
+
+    point = _point(_hand("UTG", ("Ah", "Jd"), 35.0, "raise", table=_SEVEN_MAX))
+    (line,) = _verdict_lines(point)
+    assert line.startswith("    вердикт: открытие по чарту 35BB · чарт 8-max UTG+1 · зона строго")
+    assert not any("chart_seats" in row or "chart_position" in row for row in _detail_lines(point))
+    (line,) = _verdict_lines(_point(_hand("CO", ("Ah", "Jd"), 35.0, "raise")))
+    assert "чарт 8-max" not in line
+
+
+def test_a_missing_chart_names_the_real_reason():
+    """9 мест: чартов для такого стола нет — и об анте, которое есть, ни слова."""
+    point = _point(_hand("CO", ("Ah", "Jd"), 35.0, "raise", table=_NINE_MAX))
+    assert point.detail["unjudged"] == "чарта открытия для стола на 9 мест в справочнике нет"
+    en = _hand("CO", ("Ah", "Jd"), 35.0, "raise", table=_SEVEN_MAX)
+    en.hand.ante_type = "bb_ante"
+    dp = en.report.decision_points[0]
+    reason = open_chart.open_chart_verdict(dp, en, table_state(dp, en)).detail["unjudged"]
+    assert reason == "чарта открытия для анте «bb_ante» в справочнике нет"
+
+
+def test_a_table_without_its_own_chart_keeps_the_push_fold_verdict_up_to_15bb():
+    """7 мест на 14bb: шов судит равновесие этого стола, рейз — 8-max чарт от конца."""
+    shove = _point(_hand("CO", ("Ah", "Ad"), 14.0, "shove", table=_SEVEN_MAX))
+    assert shove.spot == SpotKind.PUSHFOLD_UNOPENED and shove.best_action == "shove"
+    raised = _point(_hand("CO", ("Ah", "Ad"), 14.0, "raise", table=_SEVEN_MAX))
+    assert raised.spot == SpotKind.OPEN_CHART and raised.detail["chart_seats"] == 8

@@ -69,6 +69,13 @@ NOTE_DELETE_PREFIX = "notedel:"
 SET_NICKNAME_DATA = "setnick"
 RANGES_PREFIX = "ranges:"
 DISAGREE_PREFIX = "disagree:"
+AGENT_MISS_PREFIX = "agentmiss:"
+
+
+def agent_miss_button(job_id: int) -> Btn:
+    """«Не то посчитано» под ответом агента — зеркало «Не согласен», но про маршрут
+    (EVALS, этаж 5). Несёт номер задачи: ход лежит в её трейсе."""
+    return Btn(text="Не то посчитано", callback_data=f"{AGENT_MISS_PREFIX}{job_id}")
 
 
 def deep_dive_button(hand_no: str) -> Btn:

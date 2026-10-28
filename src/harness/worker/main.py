@@ -34,8 +34,10 @@ import os
 import signal
 import socket
 from asyncio import FIRST_COMPLETED
+from collections.abc import Awaitable, Callable
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import suppress
+from functools import partial
 from pathlib import Path
 
 import httpx
@@ -48,7 +50,7 @@ from harness.platform.llm import LLM
 from harness.platform.logs import configure_logging
 from harness.platform.queue import JobsQueue
 from harness.presentation import Btn, Msg, Photo
-from harness.worker.pipeline import Deps, run_job
+from harness.worker.pipeline import Deps, notify_reaped_failures, run_job
 
 __all__ = [
     "TelegramDeliveryError",
@@ -176,9 +178,10 @@ _MESSAGE_NOT_MODIFIED = "message is not modified"
 
 
 class TelegramSender:
-    """`Sender` поверх Bot API — прямые HTTP-вызовы (`sendMessage`/`editMessageText`),
-    без aiogram: тот приходит вместе с ботом (задача 19), а односторонней доставке
-    результата из воркера не нужен весь SDK — только эти два эндпоинта.
+    """`Sender` поверх Bot API — прямые HTTP-вызовы (`sendMessage`, `editMessageText`,
+    `sendPhoto`, `sendChatAction`), без aiogram: тот приходит вместе с ботом
+    (задача 19), а односторонней доставке результата из воркера не нужен весь
+    SDK — только эти четыре эндпоинта.
 
     В сеть тесты не ходят (то же ограничение, что у `platform/llm.py`, задача 16),
     но сама обёртка тестами покрыта: `httpx.MockTransport` подставляется через
@@ -252,6 +255,11 @@ class TelegramSender:
         if not response.is_success:
             raise TelegramDeliveryError("sendPhoto", response.status_code, self._describe(response))
         return int(response.json()["result"]["message_id"])
+
+    async def typing(self, chat_id: int) -> None:
+        """«Печатает…» в чате игрока (`sendChatAction`) — пока идёт ход агента
+        (`test_typing_sends_a_chat_action`)."""
+        await self._call("sendChatAction", {"chat_id": chat_id, "action": "typing"})
 
     async def edit(self, chat_id: int, message_id: int, msg: Msg) -> None:
         """Отредактировать сообщение. «Нечего менять» — это УСПЕХ, а не отказ.
@@ -334,10 +342,17 @@ async def worker_loop(
 async def reap_loop(
     queue: JobsQueue,
     *,
+    notify: Callable[[tuple[int, ...]], Awaitable[None]],
     interval_s: float = _REAP_INTERVAL_S,
     stop: asyncio.Event | None = None,
 ) -> None:
-    """Раз в минуту (спека §8.1) подбирает задачи, зависшие дольше окна `reap()`."""
+    """Раз в минуту (спека §8.1) подбирает задачи, зависшие дольше окна `reap()`.
+
+    Задачи, закрытые `failed`, уходят в `notify` — в проде это
+    `pipeline.notify_reaped_failures`; вернувшиеся в очередь — нет
+    (`test_the_reaper_loop_hands_only_failed_jobs_to_the_notifier`).
+    `notify` обязателен, чтобы забытая проводка не вернула молчаливый провал.
+    """
     log = structlog.get_logger(__name__)
     while stop is None or not stop.is_set():
         await _sleep_or_stop(stop, interval_s)
@@ -345,8 +360,12 @@ async def reap_loop(
             return
         try:
             reaped = await queue.reap()
-            if reaped:
-                log.warning("jobs_reaped", count=reaped)
+            if reaped.total:
+                log.warning(
+                    "jobs_reaped", failed=len(reaped.failed), requeued=len(reaped.requeued)
+                )
+            if reaped.failed:
+                await notify(reaped.failed)
         except Exception:
             log.exception("reap_failed")
 
@@ -476,13 +495,18 @@ async def main() -> None:
             # ступень каскада зрения или сразу спрашивать игрока. Переменная
             # необязательна (`.env.example`), и незаданная означает «каскада нет».
             vision_fallback=bool(cfg.llm_vision_fallback_model),
+            agent_history_max_tokens=cfg.agent_history_max_tokens,
         )
         stop = _install_stop_handlers()
         tasks = [
             asyncio.create_task(worker_loop(deps, worker_id=f"{_PROCESS_ID}-{i}", stop=stop))
             for i in range(concurrency)
         ]
-        tasks.append(asyncio.create_task(reap_loop(queue, stop=stop)))
+        tasks.append(
+            asyncio.create_task(
+                reap_loop(queue, notify=partial(notify_reaped_failures, deps), stop=stop)
+            )
+        )
         await _run_until_stopped(tasks, stop)
 
 

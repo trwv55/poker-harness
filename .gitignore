@@ -37,8 +37,14 @@ fixtures/hh/
 # eval-датасет и промпты: ров продукта, см. docs/publishing-policy.md
 evals/vision/
 evals/e2e/
+evals/agent/
 src/harness/parsers/prompts/
 src/harness/explanation/prompts/
+src/harness/agent/prompts/
+
+# Библиотека солверных выгрузок владельца — ориентир агента (спека 2026-10-24, §6, §11 п. 1):
+# закрыта, как eval-датасет; в образ стенда попадает с `COPY src`, в гит — нет.
+src/harness/analysis/charts/solver/
 
 # Кэш равновесий пуш-фолда: чистый производный артефакт, считается кодом за секунды
 # и восстанавливается при пустом кэше. В отличие от таблицы эквити (её генерация —

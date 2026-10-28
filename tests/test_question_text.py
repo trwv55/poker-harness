@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from harness.contracts import (
+    AGENT_ONLY_CALCS,
     CalcName,
     CalcResult,
     CoverageResult,
@@ -32,6 +33,7 @@ from harness.contracts import (
 from harness.explanation.faithfulness import numbers_in
 from harness.explanation.question import check_answer, question_digest
 from harness.explanation.verdict_text import UnfaithfulText
+from harness.presentation.messages import question_msg
 
 
 def _frequency() -> FrequencyResult:
@@ -113,6 +115,10 @@ ALL_RESULTS: list[CalcResult] = [
     _coverage(),
     _leaks(),
     _defense(),
+    # Размеры агента в BB (сотые доли BB внутри): печатаются BB, не масштаб.
+    _defense().model_copy(
+        update={"pot_before": 660, "bet": 330, "pot_before_bb": 6.6, "bet_bb": 3.3}
+    ),
     _threshold(ThresholdOutcome.ABOVE, None),
     _threshold(ThresholdOutcome.UNDECIDED, 42),
 ]
@@ -125,7 +131,7 @@ def test_the_digest_registers_every_number_it_prints(result: CalcResult):
     Дисциплина автора выжимки, которую реестр гарантировать не может: обычная
     f-строка ему не подотчётна. Вычитаем разрешённые из чисел готового текста и
     требуем пустоты — тот же тест, что у выжимок разбора и турнира, на всех
-    шести расчётах разом.
+    расчётах `/ask` разом.
     """
     digest = question_digest(result)
     assert set(numbers_in(digest.text)) - digest.allowed == set()
@@ -138,8 +144,39 @@ def test_the_digest_names_the_calculation_it_came_from(result: CalcResult):
 
 
 def test_every_calculation_name_has_a_digest():
-    """У каждого имени словаря есть выжимка — непокрытого имени в наборе нет."""
-    assert {result.calc for result in ALL_RESULTS} == set(CalcName)
+    """У каждого имени `/ask` есть выжимка — непокрытого имени в наборе нет; у
+    расчётов агента выжимки `/ask` нет (`test_ask_has_no_digest_for_agent_only_calculations`)."""
+    assert {result.calc for result in ALL_RESULTS} == set(CalcName) - AGENT_ONLY_CALCS
+
+
+@pytest.mark.parametrize("stat", list(FrequencyStat), ids=lambda s: s.value)
+def test_every_named_frequency_has_words_in_the_digest_and_the_message(stat: FrequencyStat):
+    """У каждой частоты набора есть подпись и в выжимке модели, и в ответе игроку."""
+    result = _threshold(ThresholdOutcome.ABOVE, None).model_copy(update={"stat": stat})
+    assert question_digest(result).text
+    assert question_msg(result, None).text
+
+
+def test_the_fold_to_turn_barrel_is_named_as_such():
+    """Подпись частоты — «сдача на второй баррель» и в выжимке, и в ответе игроку."""
+    result = _threshold(ThresholdOutcome.ABOVE, None).model_copy(
+        update={"stat": FrequencyStat.FOLD_TO_TURN_BARREL}
+    )
+    assert "сдача на второй баррель" in question_digest(result).text
+    assert "Сдача на второй баррель" in question_msg(result, None).text
+
+
+@pytest.mark.parametrize(
+    ("stat", "brief", "word"),
+    [
+        (FrequencyStat.RAISE_CBET, "рейз на продолженную ставку", "Рейз на продолженную ставку"),
+        (FrequencyStat.RAISE_TURN_BARREL, "рейз на второй баррель", "Рейз на второй баррель"),
+    ],
+)
+def test_the_raise_stats_are_named_as_such(stat: FrequencyStat, brief: str, word: str):
+    result = _threshold(ThresholdOutcome.ABOVE, None).model_copy(update={"stat": stat})
+    assert brief in question_digest(result).text
+    assert word in question_msg(result, None).text
 
 
 def test_a_measurement_without_observations_gets_no_share():

@@ -15,6 +15,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from harness.analysis import analyze_hand
+from harness.analysis.classifier import POSTFLOP_CHECK_REASON
 from harness.analysis.river import river_verdict
 from harness.analysis.tools.river_call import river_call_requirement
 from harness.contracts import (
@@ -219,12 +220,16 @@ def test_a_river_point_matches_no_leak_rule():
 
 
 def test_a_check_on_the_river_is_not_a_call_decision():
-    """Перед героем нет ставки — коллировать нечего, и числа не считаются."""
+    """Перед героем нет ставки — коллировать нечего, и числа не считаются.
+
+    Причины «вердикта нет» у чека нет вовсе (спека постфлоп-линии, §4.9): пустая
+    строка, а не граница инструмента колла.
+    """
     en = _river_hand(hero_faces_a_bet=False)
     point = analyze_hand(en).points[-1]
     assert point.street is Street.RIVER
     assert river_call_detail(point) is None
-    assert "нет ставки" in point.detail["unjudged"]
+    assert point.detail["unjudged"] == POSTFLOP_CHECK_REASON == ""
 
 
 def _three_handed_river_hand() -> EnrichedHand:

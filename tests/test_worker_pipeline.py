@@ -65,6 +65,7 @@ from harness.contracts import (
     Zone,
 )
 from harness.engine import enrich
+from harness.explanation import hand_replay
 from harness.memory.models import Job
 from harness.memory.repos import (
     AnalysesRepo,
@@ -90,6 +91,7 @@ from harness.worker.pipeline import (
     _hand_analysis_msg,
     _hand_zone,
     _public_failure_reason,
+    notify_reaped_failures,
     run_job,
 )
 from tests.conftest import FIXTURE_DAILY, requires_fixtures, requires_prompts
@@ -132,6 +134,7 @@ class FakeSender:
         self.sent: list[Msg] = []
         self.edits: list[tuple[int, Msg]] = []
         self.photos: list[Photo] = []
+        self.typings = 0
         self._next_id = 1000
 
     async def send(self, chat_id: int, msg: Msg) -> int:
@@ -146,6 +149,9 @@ class FakeSender:
         self.photos.append(photo)
         self._next_id += 1
         return self._next_id
+
+    async def typing(self, chat_id: int) -> None:
+        self.typings += 1
 
 
 @pytest.fixture
@@ -300,7 +306,7 @@ async def test_hh_scan_end_to_end(db_factory, fake_sender, queue, deps):
     # вердикта больше не получают. Проверяется то, что от состава списка не
     # зависит, — что игроку ушла именно сводка скана с числом в bb; раскладку
     # кнопок под пунктами закрывает `test_presentation`.
-    assert "Скан завершён: 146 рук" in final.text and "bb" in final.text
+    assert "Скан завершён: 146 рук" in final.text and "BB" in final.text
     assert await count(db_factory, "hands") == 146  # артефакты записаны
     assert await count(db_factory, "traces") == 1
     # Контроллерский рулинг задачи 18, п.1: эквити-кэш скана обязан осесть в
@@ -566,6 +572,39 @@ async def test_failure_before_max_attempts_retries_silently(db_factory, fake_sen
     assert not any("Не получилось" in msg.text for msg in fake_sender.sent)
 
 
+async def test_a_job_failed_by_the_reaper_tells_its_player_once(db_factory, fake_sender, queue, deps):
+    """Зависшая задача на последней попытке: `reap()` закрывает её `failed`, и
+    игрок получает `failed_msg` один раз — повторный вызов не шлёт и не правит.
+    Задача, которую `reap()` вернул в очередь, сообщения не получает: провал не
+    окончательный."""
+    exhausted_player, exhausted_session = await _make_scope(db_factory, tg_user_id=91_001)
+    retried_player, retried_session = await _make_scope(db_factory, tg_user_id=91_002)
+    exhausted = await queue.enqueue(
+        type="agent", player_id=exhausted_player, session_id=exhausted_session, payload={}
+    )
+    retried = await queue.enqueue(
+        type="hh_scan", player_id=retried_player, session_id=retried_session, payload={}
+    )
+    assert await queue.claim("w-dead") is not None
+    assert await queue.claim("w-dead") is not None
+    async with db_factory() as session:
+        await session.execute(text("UPDATE jobs SET locked_at = now() - interval '20 minutes'"))
+        await session.commit()
+
+    reaped = await queue.reap(older_than_minutes=10)
+    assert (reaped.failed, reaped.requeued) == ((exhausted,), (retried,))
+
+    await notify_reaped_failures(deps, reaped.failed)
+    await notify_reaped_failures(deps, reaped.failed)
+
+    assert [msg.text for msg in fake_sender.sent] == [
+        "Не получилось ответить на вопрос: внутренняя ошибка сервиса"
+    ]
+    assert fake_sender.edits == []
+    assert (await job_status(db_factory, exhausted)) == "failed"
+    assert (await job_status(db_factory, retried)) == "queued"
+
+
 # --- фенсинг: переигранная попытка не переписывает нового владельца ---------------
 
 
@@ -605,7 +644,7 @@ async def test_stale_worker_cannot_complete_reclaimed_job(db_factory, fake_sende
             {"id": jid},
         )
         await session.commit()
-    assert await queue.reap(older_than_minutes=10) == 1
+    assert (await queue.reap(older_than_minutes=10)).total == 1
 
     new_owner = await queue.claim("w-new")
     assert new_owner is not None
@@ -846,6 +885,27 @@ async def test_hh_scan_closes_transaction_before_executor_call(
 
     assert (await job_status(db_factory, jid)) == "done"
     assert spy_executor.in_transaction_at_submit is False
+
+
+async def test_a_failed_agent_turn_does_not_speak_of_a_hand(
+    db_factory, fake_sender, queue, deps, monkeypatch
+):
+    """Провал хода агента говорит о вопросе, провал разбора — о раздаче."""
+    player_id, session_id = await _make_scope(db_factory)
+    jid = await queue.enqueue(
+        type="agent", player_id=player_id, session_id=session_id, payload={"text": "синт"}
+    )
+
+    async def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("синтетический сбой")
+
+    monkeypatch.setattr(pipeline_module, "_dispatch", _boom)
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    assert (await job_status(db_factory, jid)) == "failed"
+    assert fake_sender.sent[-1].text.startswith("Не получилось ответить на вопрос:")
 
 
 # --- дедлайн задачи: зависшая станция не висит вечно -------------------------------
@@ -1140,7 +1200,9 @@ def test_hand_zone_says_nothing_when_nothing_was_judged():
     """
     result = AnalysisResult(hand_no="TM1", points=[], ranked=[])
     assert _hand_zone(result) is None
-    msg = hand_analysis_msgs(result, _postflop_hand(), 3, None, 1, 5)[0]
+    msg = hand_analysis_msgs(
+        result, _postflop_hand(), 3, None, 1, 5, replay=hand_replay(_postflop_hand())
+    )[0]
     assert "зона:" not in msg.text
     assert "строго" not in msg.text
 
@@ -1156,11 +1218,15 @@ def test_hand_zone_is_the_weakest_of_all_judged_points_not_the_first():
     mixed = AnalysisResult(hand_no="TM1", points=[strict_point, assuming_point], ranked=[0, 1])
     assert _hand_zone(mixed) is Zone.ASSUMING
     hand = _postflop_hand()
-    assert "зона: предполагая" in hand_analysis_msgs(mixed, hand, 1, _hand_zone(mixed), 1, 5)[0].text
+    assert "зона: предполагая" in hand_analysis_msgs(
+        mixed, hand, 1, _hand_zone(mixed), 1, 5, replay=hand_replay(hand)
+    )[0].text
 
     all_strict = AnalysisResult(hand_no="TM1", points=[strict_point], ranked=[0])
     assert _hand_zone(all_strict) is Zone.STRICT
-    assert "зона: строго" in hand_analysis_msgs(all_strict, hand, 1, _hand_zone(all_strict), 1, 5)[0].text
+    assert "зона: строго" in hand_analysis_msgs(
+        all_strict, hand, 1, _hand_zone(all_strict), 1, 5, replay=hand_replay(hand)
+    )[0].text
 
     # Незасуженные точки на зону руки не влияют — судится только `ranked`.
     unranked_assuming = AnalysisResult(
@@ -1200,7 +1266,10 @@ def test_a_proven_river_fold_puts_its_zone_in_the_status_line():
     assert _hand_zone(result) is Zone.STRICT
     assert (
         "зона: строго"
-        in hand_analysis_msgs(result, _postflop_hand(), 1, _hand_zone(result), 1, 5)[0].text
+        in hand_analysis_msgs(
+            result, _postflop_hand(), 1, _hand_zone(result), 1, 5,
+            replay=hand_replay(_postflop_hand()),
+        )[0].text
     )
 
     # Та же точка без доказательства линии не называет — и зоне взяться неоткуда.
@@ -2043,6 +2112,344 @@ async def test_a_question_without_a_calculation_shows_the_refusal_not_the_model(
     assert not [text for text in texts if "25% рук" in text]
 
 
+# --- задача агента ------------------------------------------------------------------
+
+
+async def _seed_two_hands(db_factory, session_id: int) -> None:
+    from tests.test_calcs import _open_from, _store
+
+    async with db_factory() as session:
+        for index in (1, 2):
+            await _store(session, session_id=session_id,
+                         raw=_open_from("CO", tournament_id="T1", hand_no=f"A{index}"))
+        await session.commit()
+
+
+async def test_an_agent_job_answers_journals_and_keeps_the_evening_history(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    """Задача `agent` целиком: ответ игроку, запись хода в журнал, история вечера."""
+    from pydantic_ai.models.function import FunctionModel
+
+    from tests.test_agent import _GOOD, _VPIP, _TurnScript
+
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    player_id, session_id = await _make_scope(db_factory)
+    await _seed_two_hands(db_factory, session_id)
+
+    jid = await queue.enqueue(type="agent", player_id=player_id, session_id=session_id,
+                              payload={"text": "как часто я вхожу в банк"})
+    job = await queue.claim("w1")
+    assert job is not None
+    script = _TurnScript([([_VPIP], _GOOD)])
+    await run_job(job, replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script))))
+
+    assert (await job_status(db_factory, jid)) == "done"
+    assert any(_GOOD in text and "Посчитано:" in text for text in _all_texts(fake_sender))
+    assert fake_sender.typings >= 1
+    async with db_factory() as session:
+        history = (await session.execute(
+            text("select agent_history from sessions where id = :s"), {"s": session_id}
+        )).scalar_one()
+        spans = (await session.execute(
+            text("select spans from traces where job_id = :j"), {"j": jid}
+        )).scalar_one()
+    assert history
+    turn = next(s for s in spans if s["name"] == "agent_turn")
+    assert turn["state"] == "prose" and turn["calls"][0]["calc"] == "hero_frequency"
+    assert turn["calls"][0]["zone"] == "strict" and turn["rewrite"] is False
+
+
+async def _agent_range_turn(db_factory, queue, deps, *, with_analysis: bool):
+    """Задача `agent`, в которой модель зовёт `opponent_range`; вечер с разбором
+    синтетической руки (указатель `last_analysis_id` выставлен) или без него.
+    Возвращает запись хода из журнала и то, что инструмент вернул модели."""
+    from pydantic_ai.models.function import FunctionModel
+
+    from tests.test_agent import _RANGE_CALL, _TurnScript
+    from tests.test_calcs import stored_analysis
+
+    player_id, session_id = await _make_scope(db_factory)
+    if with_analysis:
+        async with db_factory() as session:
+            analysis_id = await stored_analysis(session, session_id=session_id)
+            await SessionsRepo(session).set_last_analysis(session_id, analysis_id)
+            await session.commit()
+    jid = await queue.enqueue(type="agent", player_id=player_id, session_id=session_id,
+                              payload={"text": "какой диапазон у BB"})
+    job = await queue.claim("w1")
+    assert job is not None
+    script = _TurnScript([([_RANGE_CALL], "Ответ без чисел.")])
+    await run_job(job, replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script))))
+    assert (await job_status(db_factory, jid)) == "done"
+    async with db_factory() as session:
+        spans = (await session.execute(
+            text("select spans from traces where job_id = :j"), {"j": jid}
+        )).scalar_one()
+    return next(s for s in spans if s["name"] == "agent_turn"), script.returns
+
+
+async def test_the_agent_job_hands_the_evening_analysis_to_the_range_tool(
+    db_factory, queue, deps, fake_sender, monkeypatch, tmp_path
+):
+    """Воркер передаёт ходу агента указатель разбора вечера: `opponent_range`
+    считается по чарту (зона `strict`), а не отвечает отказом «разбора нет»."""
+    from harness.analysis.charts import lookup
+    from tests.test_opponent_range import defend_file
+
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    turn, returns = await _agent_range_turn(db_factory, queue, deps, with_analysis=True)
+    call = turn["calls"][0]
+    assert call["calc"] == "opponent_range" and call["zone"] == "strict"
+    assert "Источник: чарт защиты BB против BTN" in call["output"]
+    assert not any("Разбора руки в этом вечере нет" in r for r in returns)
+
+
+async def test_the_agent_job_without_an_evening_analysis_gets_the_range_refusal(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    turn, returns = await _agent_range_turn(db_factory, queue, deps, with_analysis=False)
+    assert not [c for c in turn["calls"] if c.get("zone")]
+    assert any("Разбора руки в этом вечере нет" in r for r in returns)
+
+
+async def test_the_agent_job_marks_the_change_of_hand_in_the_evening_history(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    """Воркер берёт руку хода из `sessions.last_analysis_id`: два хода о руке вечера
+    идут без отметки, ход после сброса разбора получает отметку «не о конкретной
+    руке» перед вопросом; в истории вечера реплики помечены рукой, игрок отметку
+    не видит."""
+    from harness.agent.history import HAND_KEY, NO_HAND_MARK
+    from tests.test_agent import _marks, _TurnScript
+    from tests.test_calcs import stored_analysis
+
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    player_id, session_id = await _make_scope(db_factory)
+    async with db_factory() as session:
+        analysis_id = await stored_analysis(session, session_id=session_id)
+        await SessionsRepo(session).set_last_analysis(session_id, analysis_id)
+        await session.commit()
+    marks: list[list[str]] = []
+    for index in range(3):
+        if index == 2:
+            async with db_factory() as session:
+                await SessionsRepo(session).set_last_analysis(session_id, None)
+                await session.commit()
+        script = _TurnScript([([], "Ответ без чисел.")])
+        await queue.enqueue(type="agent", player_id=player_id, session_id=session_id,
+                            payload={"text": f"вопрос {index + 1}"})
+        job = await queue.claim("w1")
+        assert job is not None
+        await run_job(
+            job, replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script)))
+        )
+        marks.append(_marks(script.seen[0][-1]))
+
+    assert marks == [[], [], [NO_HAND_MARK]]
+    assert not any(NO_HAND_MARK in text for text in _all_texts(fake_sender))
+    async with db_factory() as session:
+        history = (await session.execute(
+            text("select agent_history from sessions where id = :s"), {"s": session_id}
+        )).scalar_one()
+    tags = [
+        message["metadata"][HAND_KEY]
+        for message in history
+        if message["kind"] == "request"
+        and any(part["part_kind"] == "user-prompt" for part in message["parts"])
+    ]
+    assert tags == [analysis_id, analysis_id, None]
+
+
+async def test_an_agent_job_stores_only_the_final_answer_and_no_progress_message(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    """Reaper считает задачу с `result_message_id` доставленной: под этим ключом
+    обязан лежать итоговый ответ, а промежуточных сообщений у хода нет вовсе."""
+    from pydantic_ai.models.function import FunctionModel
+
+    from tests.test_agent import _GOOD, _VPIP, _TurnScript
+
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    player_id, session_id = await _make_scope(db_factory)
+    await _seed_two_hands(db_factory, session_id)
+    jid = await queue.enqueue(type="agent", player_id=player_id, session_id=session_id,
+                              payload={"text": "вопрос"})
+    job = await queue.claim("w1")
+    assert job is not None
+    script = _TurnScript([([_VPIP], _GOOD)])
+    await run_job(job, replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script))))
+
+    assert len(fake_sender.sent) == 1 and _GOOD in fake_sender.sent[0].text
+    async with db_factory() as session:
+        payload = (await session.get(Job, jid)).payload  # type: ignore[union-attr]
+    assert payload["result_message_id"] == 1001 and "progress_message_id" not in payload
+
+
+async def test_the_next_agent_job_sees_the_evening_history(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    """Второй ход вечера получает первый из `sessions.agent_history`: число из
+    расчёта первого хода проходит проверку без нового вызова."""
+    from pydantic_ai.models.function import FunctionModel
+
+    from tests.test_agent import _GOOD, _VPIP, _TurnScript
+
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    player_id, session_id = await _make_scope(db_factory)
+    await _seed_two_hands(db_factory, session_id)
+    script = _TurnScript([([_VPIP], _GOOD), ([], "Те же 100.0% (2 из 2).")])
+    llm_deps = replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script)))
+    for question in ("первый", "второй"):
+        await queue.enqueue(type="agent", player_id=player_id, session_id=session_id,
+                            payload={"text": question})
+        job = await queue.claim("w1")
+        assert job is not None
+        await run_job(job, llm_deps)
+
+    assert any(text.startswith("Те же 100.0% (2 из 2).") for text in _all_texts(fake_sender))
+
+
+async def test_after_a_numbers_only_turn_the_next_turn_sees_only_what_the_player_saw(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    """Состояние 2: отвергнутые черновики и просьба переписать в историю вечера не
+    попадают (решение контроллера, вопрос владельца 2), а в журнале остаются
+    (вопрос 3)."""
+    from pydantic_ai.messages import ModelMessagesTypeAdapter
+    from pydantic_ai.models.function import FunctionModel
+
+    from harness.agent.run import REWRITE_HEAD
+    from tests.test_agent import _VPIP, _TurnScript
+
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    player_id, session_id = await _make_scope(db_factory)
+    await _seed_two_hands(db_factory, session_id)
+    bad, worse = "Вы входите в 43.0% раздач.", "Вы входите в 44.0% раздач."
+    script = _TurnScript([([_VPIP], bad), ([], worse), ([], "Те же 100.0% (2 из 2).")])
+    seen_by_model: list[str] = []
+
+    def model(messages, info):
+        seen_by_model.append(ModelMessagesTypeAdapter.dump_json(messages).decode())
+        return script(messages, info)
+
+    llm_deps = replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(model)))
+    jobs = []
+    for question in ("первый", "второй"):
+        jobs.append(await queue.enqueue(type="agent", player_id=player_id, session_id=session_id,
+                                        payload={"text": question}))
+        job = await queue.claim("w1")
+        assert job is not None
+        await run_job(job, llm_deps)
+
+    assert [await job_status(db_factory, jid) for jid in jobs] == ["done", "done"]
+    last_request = seen_by_model[-1]
+    assert bad not in last_request and worse not in last_request
+    assert REWRITE_HEAD not in last_request
+    assert "Посчитано: ваша частота." in last_request
+    async with db_factory() as session:
+        spans = (await session.execute(
+            text("select spans from traces where job_id = :j"), {"j": jobs[0]}
+        )).scalar_one()
+    turn = next(s for s in spans if s["name"] == "agent_turn")
+    assert turn["state"] == "numbers" and turn["drafts"] == [bad, worse]
+
+
+async def test_a_failing_typing_indicator_does_not_fail_the_agent_turn(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    from pydantic_ai.models.function import FunctionModel
+
+    from tests.test_agent import _GOOD, _VPIP, _TurnScript
+
+    async def broken_typing(chat_id: int) -> None:
+        raise RuntimeError("синтетический сбой индикатора")
+
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    monkeypatch.setattr(fake_sender, "typing", broken_typing)
+    player_id, session_id = await _make_scope(db_factory)
+    await _seed_two_hands(db_factory, session_id)
+    jid = await queue.enqueue(type="agent", player_id=player_id, session_id=session_id,
+                              payload={"text": "вопрос"})
+    job = await queue.claim("w1")
+    assert job is not None
+    script = _TurnScript([([_VPIP], _GOOD)])
+    await run_job(job, replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script))))
+
+    assert (await job_status(db_factory, jid)) == "done"
+    assert any(_GOOD in text for text in _all_texts(fake_sender))
+
+
+async def test_a_failed_send_leaves_the_evening_history_unchanged(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    """История вечера пишется только после того, как ответ ушёл игроку (M2):
+    упавшая отправка не оставляет в истории ответа, которого игрок не видел."""
+    from pydantic_ai.models.function import FunctionModel
+
+    from tests.test_agent import _GOOD, _VPIP, _TurnScript
+
+    sent = fake_sender.send
+
+    async def failing_send(chat_id: int, msg: Msg) -> int:
+        if _GOOD in msg.text:
+            raise RuntimeError("синтетический сбой отправки")
+        return await sent(chat_id, msg)
+
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    monkeypatch.setattr(fake_sender, "send", failing_send)
+    player_id, session_id = await _make_scope(db_factory)
+    await _seed_two_hands(db_factory, session_id)
+    jid = await queue.enqueue(type="agent", player_id=player_id, session_id=session_id,
+                              payload={"text": "вопрос"})
+    job = await queue.claim("w1")
+    assert job is not None
+    script = _TurnScript([([_VPIP], _GOOD)])
+    await run_job(job, replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script))))
+
+    assert (await job_status(db_factory, jid)) == "failed"
+    async with db_factory() as session:
+        history = (await session.execute(
+            text("select agent_history from sessions where id = :s"), {"s": session_id}
+        )).scalar_one()
+    assert not history
+
+
+@requires_fixtures
+async def test_a_hand_analysis_becomes_the_agent_context_and_a_new_file_resets_it(
+    db_factory, queue, deps
+):
+    """Разбор руки ставит указатель вечера; новый файл HH его сбрасывает
+    (план агента, отклонение 2): агент не отвечает про старую руку после нового файла."""
+    player_id, session_id = await _make_scope(db_factory)
+    jid, _raw = await _seed_one_hand_deep_dive_job(
+        db_factory, queue, player_id=player_id, session_id=session_id
+    )
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+    assert (await job_status(db_factory, jid)) == "done"
+
+    async def pointer() -> int | None:
+        async with db_factory() as session:
+            return (await session.execute(
+                text("select last_analysis_id from sessions where id = :s"), {"s": session_id}
+            )).scalar_one()
+
+    async with db_factory() as session:
+        analysis_id = (await session.execute(text("select id from analyses"))).scalar_one()
+    assert await pointer() == analysis_id
+
+    scan = await enqueue_hh_scan(queue, FIXTURE_DAILY, player_id=player_id, session_id=session_id)
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+    assert (await job_status(db_factory, scan)) == "done"
+    assert await pointer() is None
+
+
 # --- развилка «Что было»: блок принадлежит разбору раздачи, не скану HH ---------------
 
 
@@ -2122,6 +2529,114 @@ Seat 3: Hero (big blind) folded before Flop
 """
 
 
+_SYNTHETIC_HH_SECOND = """Poker Hand #SYNTH2: Tournament #1, Synthetic Hold'em No Limit - \
+Level5(100/200(20)) - 2026/01/01 00:01:00
+Table 'S1' 3-max Seat #2 is the button
+Seat 1: Alice (2,000 in chips)
+Seat 2: Bob (2,000 in chips)
+Seat 3: Hero (2,000 in chips)
+Alice: posts the ante 20
+Bob: posts the ante 20
+Hero: posts the ante 20
+Hero: posts small blind 100
+Alice: posts big blind 200
+*** HOLE CARDS ***
+Dealt to Alice\x20
+Dealt to Bob\x20
+Dealt to Hero [7h 2c]
+Bob: folds
+Hero: folds
+Uncalled bet (100) returned to Alice
+Alice collected 260 from pot
+*** SUMMARY ***
+Total pot 260 | Rake 0 | Jackpot 0 | Bingo 0 | Fortune 0 | Tax 0
+Seat 1: Alice (big blind) collected (260)
+Seat 2: Bob (button) folded before Flop
+Seat 3: Hero (small blind) folded before Flop
+"""
+"""Вторая раздача того же турнира: Bob пасует. Своя выборка у него — одна рука,
+и VPIP по ней 0%; посчитай разбор SYNTH1 вместе с собой, вышло бы 50%."""
+
+
+async def _deep_dive_text(
+    deps, queue, db_factory, fake_sender, tmp_path, hh: str, hand_no: str
+) -> str:
+    """Скан файла, затем разбор одной его раздачи; текст первого сообщения разбора."""
+    player_id, session_id = await _make_scope(db_factory)
+    source = tmp_path / "hand.txt"
+    source.write_text(hh, encoding="utf-8")
+    await enqueue_hh_scan(queue, source, player_id=player_id, session_id=session_id)
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+    sent_before = len(fake_sender.sent)
+    jid = await enqueue_deep_dive(queue, hand_no, player_id=player_id, session_id=session_id)
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, replace(deps, data_dir=tmp_path))
+    assert (await job_status(db_factory, jid)) == "done"
+    return next(m.text for m in fake_sender.sent[sent_before:] if "Что было:" in m.text)
+
+
+async def test_a_single_hand_file_prints_no_opponent_frequencies(
+    deps, queue, db_factory, fake_sender, tmp_path
+):
+    """Файл из одной раздачи: других рук у соперника нет, и частот нет.
+
+    Прежде в выборку входила сама разбираемая рука, и открывший банк получал
+    «VPIP 100%, PFR 100%» — измерение на той руке, которую оно якобы описывает.
+    Вместо частот у оставшегося в раздаче — его стек до раздачи.
+    """
+    text = await _deep_dive_text(
+        deps, queue, db_factory, fake_sender, tmp_path, _SYNTHETIC_HH, "SYNTH1"
+    )
+    assert "VPIP" not in text and "PFR" not in text
+    assert "SB (10BB) опен 3.0" in text
+
+
+def _copies_of_the_second_hand(n: int) -> str:
+    """`n` синтетических раздач того же турнира с разными номерами: Bob в каждой пасует."""
+    return "\n\n".join(
+        _SYNTHETIC_HH_SECOND.replace("#SYNTH2:", f"#SYNTHX{i}:") for i in range(n)
+    )
+
+
+async def test_opponent_frequencies_come_only_from_other_hands(
+    deps, queue, db_factory, fake_sender, tmp_path
+):
+    """Двадцать других раздач турнира: частоты Bob при разборе SYNTH1 — по ним,
+    разбираемая в выборку не входит (раздач ровно 20, не 21)."""
+    text = await _deep_dive_text(
+        deps,
+        queue,
+        db_factory,
+        fake_sender,
+        tmp_path,
+        _SYNTHETIC_HH + "\n\n" + _copies_of_the_second_hand(20),
+        "SYNTH1",
+    )
+    assert "VPIP 0%, PFR 0%, раздач 20)" in text
+    assert "SB (10BB · " in text
+
+
+async def test_nineteen_other_hands_are_not_enough_for_frequencies(
+    deps, queue, db_factory, fake_sender, tmp_path
+):
+    """Порог 20 на целом пути (`test_frequencies_appear_only_from_twenty_other_hands`
+    — на нём же в реплее): 19 других раздач — в скобке один стек."""
+    text = await _deep_dive_text(
+        deps,
+        queue,
+        db_factory,
+        fake_sender,
+        tmp_path,
+        _SYNTHETIC_HH + "\n\n" + _copies_of_the_second_hand(19),
+        "SYNTH1",
+    )
+    assert "VPIP" not in text
+    assert "SB (10BB) опен 3.0" in text
+
+
 async def test_an_hh_scan_sends_the_summary_and_nothing_else(
     deps, queue, db_factory, fake_sender, tmp_path
 ):
@@ -2150,3 +2665,52 @@ async def test_an_hh_scan_sends_the_summary_and_nothing_else(
         assert row is not None
         assert "report_message_id" not in row.payload
         assert "story_message_id" not in row.payload
+
+
+async def test_the_model_assessment_block_reaches_the_player_journal_and_history(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    """Task 12: прошедший блок «Оценка модели» — под прозой с заголовком, в журнале
+    полем `assumption`, в истории вечера; выброшенный — нигде, кроме черновиков."""
+    from pydantic_ai.messages import ModelMessagesTypeAdapter
+    from pydantic_ai.models.function import FunctionModel
+
+    from tests.test_agent import _BAD_BLOCK, _BLOCK, _GOOD, _VPIP, _TurnScript
+
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    player_id, session_id = await _make_scope(db_factory)
+    await _seed_two_hands(db_factory, session_id)
+    script = _TurnScript(
+        [([_VPIP], _GOOD), ([_VPIP], _GOOD), ([], _GOOD), ([], "Синт-ответ 100.0%.")],
+        assumptions={0: _BLOCK, 1: _BAD_BLOCK, 2: _BAD_BLOCK},
+    )
+    seen_by_model: list[str] = []
+
+    def model(messages, info):
+        seen_by_model.append(ModelMessagesTypeAdapter.dump_json(messages).decode())
+        return script(messages, info)
+
+    llm_deps = replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(model)))
+    jobs = []
+    for question in ("первый", "второй", "третий"):
+        jobs.append(await queue.enqueue(type="agent", player_id=player_id, session_id=session_id,
+                                        payload={"text": question}))
+        job = await queue.claim("w1")
+        assert job is not None
+        await run_job(job, llm_deps)
+
+    first, second = fake_sender.sent[0], fake_sender.sent[1]
+    assert first.parse_mode == "HTML"
+    assert first.text.startswith(f"{_GOOD}\n\n<b>Оценка модели</b>\n{_BLOCK}\n\nПосчитано:")
+    assert second.parse_mode is None and "Оценка модели" not in second.text
+    spans = []
+    async with db_factory() as session:
+        for jid in jobs[:2]:
+            rows = (await session.execute(
+                text("select spans from traces where job_id = :j"), {"j": jid}
+            )).scalar_one()
+            spans.append(next(s for s in rows if s["name"] == "agent_turn"))
+    assert spans[0]["assumption"] == _BLOCK and spans[0]["assumption_dropped"] is False
+    assert spans[1]["assumption"] is None and spans[1]["assumption_dropped"] is True
+    last_request = seen_by_model[-1]
+    assert _BLOCK in last_request and "эквити против них" not in last_request

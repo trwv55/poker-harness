@@ -56,6 +56,15 @@ requires_prompts = pytest.mark.skipif(
     reason="нет промптов моделей (explanation/prompts, parsers/prompts) — закрыты политикой публикации",
 )
 
+PROMPT_AGENT = SRC / "agent" / "prompts" / "system.md"
+# Отдельный маркер, а не пятое условие `PROMPTS_PRESENT`: у владельца промпты
+# изложения есть, а промпт агента появится позже (Task 7 плана агента) — общее
+# условие на это время выключило бы ВСЕ тесты с промптами.
+requires_agent_prompt = pytest.mark.skipif(
+    not PROMPT_AGENT.exists(),
+    reason="нет системного промпта агента (agent/prompts) — закрыт политикой публикации",
+)
+
 
 def alembic_config(sync_dsn: str) -> Config:
     """Конфиг alembic на переданном DSN — тем же путём, что и деплой (задача 20):

@@ -23,7 +23,7 @@
 * Вердиктов словами здесь нет, и **цены решения тоже нет** (решение владельца
   2026-09-12, спека §5.6): она не движение фишек, а расчёт против диапазона, и
   живёт строкой ниже — в разборе точки (`presentation.hand_analysis_msgs`). Блок
-  заканчивается ИСХОДОМ раздачи в фишках (`_outcome_line`). Судить решение блок
+  называет ИСХОД раздачи в фишках (`_outcome_bb`). Судить решение блок
   не берётся вовсе, поэтому правило «против диапазона, а не против вскрытой
   карты» он не нарушает: он говорит только, что было. Точка решения героя при
   этом выделена (`spans`), то есть найти её в потоке можно без единого числа
@@ -33,11 +33,21 @@
   приходит аргументом и потому этому запрету не противоречит — префлоп-частоты
   оппонента (`stats`): они посчитаны снаружи, реплей их только печатает.
 
-**Форма — одна шапка и один абзац** (спека §5.6): позиция, карты и стек строкой,
-дальше ход раздачи прозой — действия через `→`, улицы разделены точкой, борд
-назван в начале своей улицы, банк один раз на улицу. Построчный формат по улицам
-и был причиной, по которой блок прятали под кнопку: рука на шесть-восемь строк
-занимает экран телефона целиком (`test_the_replay_is_a_short_paragraph`).
+**Форма — строка на улицу** (решение владельца 2026-10-07: абзац одной строкой
+не читался). Сверху шапка раздачи — номер, уровень, блайнды, анте, сколько
+игроков; под ней строка героя (позиция, карты, стек), затем по строке на улицу
+(название улицы с двоеточием выделено жирным, банк в скобках после борда),
+конечный банк, деление банка, если оно было, вскрытие, итог раздачи со знаком
+(в строке вскрытия, если на нём был герой, иначе своей строкой) и последней —
+стек героя после раздачи
+(`test_the_block_has_the_owners_layout_line_by_line`,
+`test_every_street_is_its_own_line`).
+
+**Пунктуация одна на весь блок** (решение владельца 2026-10-09): утверждающие
+строки («Вы на …», «Конечный банк: …», «Банк делится на части: …», «Итог: …»,
+«Стек после раздачи: …», «Вы показали …») кончаются точкой; строки-потоки ходов
+(«Префлоп: …», «Флоп: …», «Тёрн: …», «Ривер: …») и «Вскрытие: …» точки не имеют
+(`test_the_block_punctuation_follows_one_rule`).
 
 **Почему `HandReplay`, а не голая строка.** Спека требует выделить точку решения
 героя жирным ПРЯМО в потоке действий, а разметка Телеграма — дело
@@ -48,10 +58,11 @@
 любого канала, где выделять нечем.
 
 **Масти — символом, никогда буквами** (спека §5.6: от скорости чтения
-одномастности зависит оценка дро, и `Qs 8s` её не даёт). За каждым символом
-стоит селектор эмодзи-презентации U+FE0F — им спека и требует цвет; каким
-именно выйдет цвет, решает шрифт клиента, и проверить это отсюда нельзя.
-Тест пришпиливает то, что в нашей власти: селектор стоит, букв нет.
+одномастности зависит оценка дро, и `Qs 8s` её не даёт). Селектора
+эмодзи-презентации U+FE0F за символом нет (решение владельца 2026-10-07: «♥», а
+не «♥️»); каким цветом клиент нарисует голый символ, решает его шрифт, и
+проверить это отсюда нельзя. Тест пришпиливает то, что в нашей власти: букв
+нет, селектора нет (`test_suits_are_symbols_without_the_emoji_selector`).
 """
 
 from __future__ import annotations
@@ -72,23 +83,38 @@ from harness.contracts import (
     went_to_showdown,
 )
 
-__all__ = ["HandReplay", "ReplaySpan", "bb", "chips", "hand_replay"]
+__all__ = [
+    "MIN_OTHER_HANDS_FOR_FREQUENCIES",
+    "HandReplay",
+    "ReplaySpan",
+    "bb",
+    "cards_text",
+    "chips",
+    "hand_replay",
+    "signed_bb",
+]
 
 # Неразрывный пробел разделяет разряды: «31 250» в русском тексте, но перенос
 # строки внутри числа невозможен. Запятая как разделитель разрядов исключена
 # намеренно — «31,250» в русском читается как 31.25.
 _THIN = " "
 
-# Селектор эмодзи-презентации: без него ♥ и ♦ рисуются тем же чёрным глифом, что
-# ♠ и ♣, и требование «символ плюс цвет» выполняется только на бумаге.
-_VS16 = "️"
+_SUIT_SYMBOL: dict[str, str] = {"s": "♠", "h": "♥", "d": "♦", "c": "♣"}
 
-_SUIT_SYMBOL: dict[str, str] = {
-    "s": f"♠{_VS16}",
-    "h": f"♥{_VS16}",
-    "d": f"♦{_VS16}",
-    "c": f"♣{_VS16}",
-}
+# Слово игрока для типа анте. Анте «с каждого» — обычное для MTT и в шапке не
+# называется (решение владельца 2026-10-07: «анте 30 фишек»); тип, которого в
+# словаре нет, печатается как есть в скобках — выдумать вместо него нечего, а
+# спрятать нельзя: анте большого блайнда той же суммой — другая раздача.
+_ANTE_TYPE_WORD: dict[str, str] = {"per_player": ""}
+
+# Порог выборки для частот соперника (решение владельца 2026-10-09). Частоты
+# VPIP/PFR печатаются, только если у места есть не меньше стольких ДРУГИХ раздач
+# турнира; меньше — в скобке один стартовый стек. Считается `PlayerStats.hands`,
+# то есть число раздач, где место есть в списке игроков раздачи
+# (`analysis.player_stats.player_stats_by_label`), — ровно та величина, что
+# печатается рядом с частотами как «раздач N». Граница включающая: 19 — нет, 20 —
+# есть (`test_frequencies_appear_only_from_twenty_other_hands`).
+MIN_OTHER_HANDS_FOR_FREQUENCIES = 20
 
 _STREET_TITLE: dict[Street, str] = {
     Street.PREFLOP: "Префлоп",
@@ -119,10 +145,16 @@ _ACTIONS_WITH_AMOUNT = frozenset({ActionKind.BET, ActionKind.RAISE})
 
 
 class ReplaySpan(BaseModel):
-    """Кусок текста реплея и признак того, что он выделяется (точка решения героя)."""
+    """Кусок текста реплея и признаки выделения.
+
+    `emphasis` — точка решения героя, `title` — название улицы («Флоп:»). Флагов
+    два, потому что это два разных смысла выделения: тот, кто собирает
+    сообщение, может захотеть оформить их порознь; сейчас оба — жирным.
+    """
 
     text: str
     emphasis: bool = False
+    title: bool = False
 
 
 class HandReplay(BaseModel):
@@ -145,20 +177,32 @@ def chips(amount: int) -> str:
     return f"{amount:,}".replace(",", _THIN)
 
 
+def signed_bb(value_bb: float) -> str:
+    """Величина в BB со знаком: типографский минус U+2212 и явный плюс, ноль — «0.0».
+
+    Публична ради второго читателя: `presentation.messages` печатает цену и
+    интервал тем же знаком, и две копии дали бы два вида минуса в соседних
+    строках одного сообщения (`test_the_outcome_sign_is_a_typographic_minus`).
+    """
+    magnitude = round(abs(value_bb), 1)
+    if magnitude == 0.0:
+        return "0.0"
+    return f"{'−' if value_bb < 0 else '+'}{magnitude:.1f}"
+
+
 def bb(value_chips: int, big_blind: int) -> str:
-    """Сумма в ББ, одним знаком — единственный формат величин блока (спека §5.6).
+    """Сумма в BB, одним знаком — единственный формат величин блока (спека §5.6).
     Приблизительности нет: движок считает точно, «~5.5» обещало бы неуверенность."""
     return f"{value_chips / big_blind:.1f}"
 
 
 def _sentence_start(text: str) -> str:
-    """Первая буква предложения — заглавная.
+    """Первая буква строки — заглавная.
 
-    Один способ на весь модуль: так поднимается и первый шаг улицы («вы чек» →
-    «Вы чек»), и самостоятельная строка показа карт
-    (`test_a_street_sentence_starts_with_a_capital_even_when_it_is_you`,
-    `test_a_show_without_a_showdown_is_not_called_a_showdown`). Обращение «вы»
-    попадает в начало предложения в обоих местах, и разъехаться им негде.
+    Один способ на весь модуль: так поднимается и самостоятельная строка показа
+    карт («Вы показали J♥»). Ход улицы стоит после двоеточия и не поднимается:
+    «Флоп: … (банк 5.3): вы чек» —
+    `test_a_show_without_a_showdown_is_not_called_a_showdown`.
     """
     return text[:1].upper() + text[1:]
 
@@ -168,12 +212,22 @@ def _card(card: str) -> str:
 
 
 def _cards(cards: list[str]) -> str:
-    """Карманные карты подряд, без пробелов: `J♥️9♥️` — так одномастность видна разом."""
+    """Карманные карты подряд, без пробелов: `J♥9♥` — так одномастность видна разом."""
     return "".join(_card(card) for card in cards)
 
 
+def cards_text(cards: list[str]) -> str:
+    """Карты подряд, без пробелов, мастями-символами: `5♣3♣`, флоп `Q♥4♦2♦`.
+
+    Публична ради второго читателя — заголовка точки решения в
+    `presentation.messages`: карты там и в блоке «Что было:» обязаны быть записаны
+    одним форматом (`test_the_point_title_writes_cards_like_the_replay_block`).
+    """
+    return _cards(cards)
+
+
 def _board(cards: list[str]) -> str:
-    """Борд — через пробел (`6♠️ J♦️ Q♦️`): это три отдельные карты, а не рука."""
+    """Борд — через пробел (`6♠ J♦ Q♦`): это три отдельные карты, а не рука."""
     return " ".join(_card(card) for card in cards)
 
 
@@ -197,21 +251,47 @@ def _half_up(pct: float) -> int:
     return int(pct + 0.5)
 
 
-def _opponent_mark(label: str, stats: Mapping[str, PlayerStats] | None) -> str:
-    """` (P5, VPIP 25%, PFR 18%)` — или пустая строка.
+def _stack_bb(value_chips: int, big_blind: int) -> str:
+    """Стек оппонента в BB: тот же `bb`, но ровное число без «.0» — «100», не
+    «100.0» (форма владельца 2026-10-07: «UTG+1 (100BB)»;
+    `test_an_opponent_who_stays_in_carries_his_starting_stack`)."""
+    text = bb(value_chips, big_blind)
+    return text.removesuffix(".0")
 
-    `vpip_pct`/`pfr_pct` возвращают `None` при `hands == 0`, и это единственно
-    честное поведение: «VPIP 0%» по нулю раздач никто не измерял. Знаменатель
-    у них общий, поэтому либо обе, либо ни одной; отдельной ветки «одна из
-    двух» нет — её не существует
-    (`test_an_opponent_without_a_sample_carries_no_brackets`).
+
+def _opponent_mark(
+    hand: CanonicalHand, label: str, stats: Mapping[str, PlayerStats] | None
+) -> str:
+    """` (100BB)` или ` (100BB · P5: VPIP 25%, PFR 18%, раздач 40)`.
+
+    Стек — стартовый, до раздачи (`PlayerState.stack`), и стоит всегда: в
+    скобку попадает только тот, кто остался в раздаче отдельным шагом.
+
+    Частоты — только при выборке не меньше `MIN_OTHER_HANDS_FOR_FREQUENCIES`
+    (`test_frequencies_appear_only_from_twenty_other_hands`); при меньшей в
+    скобке один стек (`test_an_opponent_without_a_sample_carries_only_his_stack`).
+    `vpip_pct`/`pfr_pct` возвращают `None` при `hands == 0`; знаменатель у них
+    общий, поэтому либо обе, либо ни одной. Число раздач печатается
+    рядом: доля без знаменателя не говорит, чего она стоит. Что выборка не
+    содержит САМУ разбираемую руку, обеспечивает вызывающий
+    (`worker.pipeline._tournament_stats`).
     """
-    if stats is None or label not in stats:
-        return ""
-    row = stats[label]
-    if row.vpip_pct is None or row.pfr_pct is None:
-        return ""
-    return f" ({label}, VPIP {_half_up(row.vpip_pct)}%, PFR {_half_up(row.pfr_pct)}%)"
+    player = next((p for p in hand.players if p.label == label), None)
+    stack = "" if player is None else f"{_stack_bb(player.stack, hand.bb)}BB"
+    row = None if stats is None else stats.get(label)
+    freq = ""
+    if (
+        row is not None
+        and row.hands >= MIN_OTHER_HANDS_FOR_FREQUENCIES
+        and row.vpip_pct is not None
+        and row.pfr_pct is not None
+    ):
+        freq = (
+            f"{label}: VPIP {_half_up(row.vpip_pct)}%, PFR {_half_up(row.pfr_pct)}%, "
+            f"раздач {row.hands}"
+        )
+    inside = " · ".join(part for part in (stack, freq) if part)
+    return f" ({inside})" if inside else ""
 
 
 def _action_word(action: CanonicalAction, raise_ordinal: int) -> str:
@@ -229,10 +309,10 @@ def _action_text(
     raise_ordinal: int,
     mark: str,
 ) -> str:
-    """Один ход: кто (позицией; герой — «вы»), что сделал и — у ставок — на сколько в ББ.
+    """Один ход: кто (позицией; герой — «вы»), что сделал и — у ставок — на сколько в BB.
 
-    `mark` — готовая скобка с меткой и частотами оппонента (`_opponent_mark`)
-    либо пустая строка; КОМУ и когда она достаётся, решает `_street_flow`:
+    `mark` — готовая скобка со стеком и, если есть выборка, частотами оппонента
+    (`_opponent_mark`) либо пустая строка; КОМУ и когда она достаётся, решает `_street_flow`:
     правило «при первом ходе, дошедшем до потока» неотделимо от слипания
     фолдов, которым владеет он. Здесь скобка только приписывается к тому, кто
     ходит.
@@ -258,13 +338,13 @@ def _street_flow(
     смыслу и занимают место, которого у сообщения нет. Пас героя в слипание не
     попадает: его решение обязано остаться видимым отдельно.
 
-    Здесь же решается, кому достанется метка с частотами: её получает ПЕРВЫЙ
-    ход оппонента, ставший отдельным шагом (`marked` копит уже помеченных,
-    `test_an_opponent_carries_its_label_and_both_frequencies_once`). Правило
-    стоит рядом со слипанием не случайно — оно от него и зависит: слипшийся пас
-    отдельным шагом не становится и метки не несёт, у пасующего сказать нечего
-    (`test_a_folding_opponent_gets_no_label`). У героя метки нет — к нему
-    обращаются «вы».
+    Здесь же решается, кому достанется скобка со стеком (и частотами): её
+    получает ПЕРВЫЙ ход оппонента, ставший отдельным шагом (`marked` копит уже
+    помеченных, `test_an_opponent_carries_its_label_and_both_frequencies_once`).
+    Правило стоит рядом со слипанием не случайно — оно от него и зависит:
+    слипшийся пас отдельным шагом не становится и скобки не несёт, у пасующего
+    сказать нечего (`test_a_folding_opponent_gets_no_label`). У героя скобки
+    нет — к нему обращаются «вы».
 
     `marked` живёт выше по стеку (`hand_replay`), потому что метка ставится
     один раз на раздачу, а не один раз на улицу.
@@ -293,7 +373,7 @@ def _street_flow(
         flush_folds()
         mark = ""
         if not is_hero and action.label not in marked:
-            mark = _opponent_mark(action.label, stats)
+            mark = _opponent_mark(hand, action.label, stats)
             marked.add(action.label)
         step(
             _action_text(hand, action, raises_so_far, mark),
@@ -332,8 +412,7 @@ def _dead_before_deal(hand: CanonicalHand) -> int:
 
     Число не из отчёта движка — и взято оно не как оценка, а как сумма записанных
     постов: то, что лежит в банке ДО первого действия, движок отдельной величиной
-    не публикует (`pot_by_street` — итог улицы). Второе число БАНКА не от движка —
-    банк, ушедший герою (`_outcome_line`): его пишет рум.
+    не публикует (`pot_by_street` — итог улицы).
     """
     return sum(post.amount for post in hand.posts)
 
@@ -349,10 +428,11 @@ def _showdown_line(hand: CanonicalHand) -> str | None:
     что `vs` между ним и вскрывшимися утверждало бы, что он с ними мерился
     (`test_a_card_shown_after_a_fold_is_marked_as_a_show`). Слово «Вскрытие»
     поэтому стоит только там, где вскрытие было: показ без вскрытия печатается
-    сам по себе, с заглавной буквы (`_sentence_start`).
+    сам по себе, с заглавной буквы (`_sentence_start`) и точкой — это
+    утверждающая строка, а «Вскрытие: …» точки не имеет.
 
-    **У героя показ — не пометка, а фраза: «вы показали J♥️»** (решение владельца
-    2026-09-12). Скобка третьего лица у обращения во втором («вы J♥️ (игрок
+    **У героя показ — не пометка, а фраза: «вы показали J♥»** (решение владельца
+    2026-09-12). Скобка третьего лица у обращения во втором («вы J♥ (игрок
     показал)») по-русски не читается, а блок говорит с игроком на «вы» везде
     (`test_a_show_without_a_showdown_is_not_called_a_showdown`,
     `test_a_hero_show_beside_a_real_showdown_stays_inside_the_line`).
@@ -380,77 +460,116 @@ def _showdown_line(hand: CanonicalHand) -> str | None:
     if seen:
         tail = f"; {', '.join(shown)}" if shown else ""
         return f"Вскрытие: {' vs '.join(seen)}{tail}"
-    return _sentence_start(", ".join(shown)) if shown else None
+    return f"{_sentence_start(', '.join(shown))}." if shown else None
 
 
-def _outcome_line(en: EnrichedHand) -> str | None:
-    """Последняя фраза абзаца: исход раздачи в фишках, в ББ её уровня.
+def _outcome_bb(en: EnrichedHand) -> str | None:
+    """Исход раздачи для героя: «−13.6BB» или «+1.8BB» — или `None`, строка молчит.
 
-    Решение владельца 2026-09-12. Раньше абзац заканчивался ценой решения, и она
-    обманывала: на реальной руке расхождение стоило 1.8 ББ по расчёту, а из
-    стека ушло 0.1 ББ — одно анте. Блок «Что было» говорит о ФИШКАХ РАЗДАЧИ;
-    цена решения осталась там, где живёт, — строкой ниже, в разборе точки.
+    Решение владельца 2026-10-09: знак вместо слов «отдаёте/забираете». Число —
+    ЧИСТОЕ изменение стека героя (по стекам движка, см. `_shown_delta_bb`),
+    а не банк целиком: выигрыш пишется тем же «+X», что и проигрыш «−X», без
+    фишек, которые герой положил сам. Раньше при выигрыше печатался весь банк
+    героя из записи рума (`CanonicalHand.collected`); теперь второго источника
+    нет, и запись о выплате на строку не влияет
+    (`test_a_win_is_the_clean_stack_gain_not_the_whole_pot`).
 
-    **Знак берёт изменение стека** (`contracts.hero_stack_delta_bb` — счёт
-    движка), а не наличие записи `collected`: бывает раздача, где герой что-то
-    собрал (сплит, сайд-пот), а стек всё равно уменьшился, и по записи выплаты
-    блок сказал бы «Забираете» на проигранной раздаче
-    (`test_the_sign_comes_from_the_stack_not_from_the_payout_record`). Цена
-    рулинга: на сплите игрок увидит «Отдаёте» там, где часть банка он всё же
-    взял.
+    Раздача, где герой что-то собрал (сплит, сайд-пот), а стек всё равно
+    уменьшился, получает минус: знак берёт стек, не наличие выплаты
+    (`test_the_sign_comes_from_the_stack_not_from_the_payout_record`).
 
-    **Асимметрия названа вслух, потому что она есть.** При выигрыше печатается
-    доля героя в банке ЦЕЛИКОМ — вместе с фишками, которые он положил в неё сам
-    (на сплите и сайд-поте это его доля, а не банк стола); при
-    проигрыше — чистая убыль стека. По скрину владельца это 2.9 ББ банка против
-    2.3 ББ чистого прироста; в синтетике той же раздачи
-    (`_folded_through_shove_hand`, структура постов там своя) — 2.9 против 1.8,
-    и пришпилена тестом ПАРА, а не одно число
-    (`test_a_won_hand_ends_with_the_whole_pot`): иначе асимметрия держалась бы
-    на прозе. Владелец выбрал банк, увидев обе величины. Числа при
-    этом приходят из РАЗНЫХ источников: банк — запись рума (`CanonicalHand.
-    collected`), убыль — счёт движка. Доли героя в банке движок отдельной
-    величиной не публикует, поэтому взять оба числа у него нельзя, не заводя
-    нового поля в `EngineReport`.
-
-    Стек не изменился (округляется до 0.0) — фразы нет вовсе: «Отдаёте 0.0 ББ»
-    не событие раздачи. Её нет и там, где стек вырос, а записи о банке источник
-    не дал: печатать под словом «Забираете» ноль значило бы назвать выигранную
-    раздачу нулевой, а взять туда убыль по стеку — смешать два источника
-    (CLAUDE.md: никогда не выдумывать числа о деньгах).
-
-    **Непроверенный вход молчит целиком** (`Verdict.not_checked` непуст). Сейчас
-    в этом списке бывает ровно одно — шоудаун, решённый на доукомплектованных
-    картах (`engine.validation._fabricated_showdown`): на скрине карта соперника
-    бывает не прочитана, движок добирает её из остатка колоды и разыгрывает
-    вскрытие ею. Там, где банк решался этим вскрытием, стек героя на конец руки
-    — его исход, а не факт раздачи, и «Отдаёте Z ББ» напечатало бы проигрыш,
-    которого могло не быть: пришпилено
-    `test_an_unverified_showdown_leaves_the_outcome_unsaid`.
-    Правило то же, каким `worker.pipeline._hand_zone` понижает зону до
-    «предполагая»: вход, часть которого проверить было нечем, точным числом не
-    подаётся. Проверка стоит по НЕПУСТОМУ списку, а не по имени пометки: новая
-    пометка в `not_checked` — тоже причина промолчать, пока не разобрано, что
-    именно она ставит под сомнение.
-
-    Цена этой ширины названа прямо: пометку ставит и раздача, где выдуманное
-    вскрытие до стека героя не дотянулось вовсе — он спасовал на префлопе, а
-    мерились двое соперников (`_fabricated_showdown` ищет непрочитанного среди
-    НЕ спасовавших, и герой в этот счёт не входит). Там исход его раздачи —
-    честное анте, и блок всё равно промолчит. Молчание не выдумка, а доверие
-    понижено ко всей руке целиком, не к одной её строке.
+    **Строка молчит в двух случаях.** Стек не изменился (округляется до 0.0):
+    «0.0BB» не событие раздачи (`test_an_untouched_stack_ends_the_paragraph_without_an_outcome`).
+    И непроверенный вход (`Verdict.not_checked` непуст): сейчас в списке бывает
+    ровно одно — шоудаун, решённый на доукомплектованных картах
+    (`engine.validation._fabricated_showdown`), и стек героя на конец руки там
+    — исход выдуманного вскрытия, а не факт раздачи
+    (`test_an_unverified_showdown_leaves_the_outcome_unsaid`). Проверка по
+    НЕПУСТОМУ списку, а не по имени пометки: новая пометка — тоже причина
+    промолчать. Цена ширины: пометку ставит и раздача, где выдуманное вскрытие
+    героя не коснулось, — блок промолчит и там; доверие понижено ко всей руке.
     """
     if en.verdict.not_checked:
         return None
-    delta_bb = hero_stack_delta_bb(en)
-    if f"{abs(delta_bb):.1f}" == "0.0":
-        return None
-    if delta_bb < 0:
-        return f"Отдаёте {abs(delta_bb):.1f} ББ."
+    text = signed_bb(_shown_delta_bb(en))
+    return None if text == "0.0" else f"{text}BB"
+
+
+def _shown_delta_bb(en: EnrichedHand) -> float:
+    """Итог как разность стеков В ТОМ ВИДЕ, в каком они напечатаны блоком.
+
+    Решение владельца 2026-10-09: «Вы на …, 13.9BB», «итог −0.1» и «Стек после
+    раздачи: 13.7BB» не сходились на глаз — каждое число верно, но округлено
+    отдельно. Разность округлённых стеков сходится всегда
+    (`test_the_shown_stacks_and_the_outcome_add_up`). От счёта движка
+    (`hero_stack_delta_bb`) она отличается не больше чем на 0.1BB округления.
+    Нет стека на конец руки — берётся счёт движка как есть.
+    """
     hand = en.hand
-    pot = sum(entry.amount for entry in hand.collected if entry.label == hand.hero_label)
-    taken = bb(pot, hand.bb)
-    return None if taken == "0.0" else f"Забираете {taken} ББ."
+    end = en.report.stacks_end.get(hand.hero_label)
+    if end is None:
+        return hero_stack_delta_bb(en)
+    start = _hero(hand).stack
+    return float(bb(end, hand.bb)) - float(bb(start, hand.bb))
+
+
+def _stack_after_line(en: EnrichedHand) -> str | None:
+    """«Стек после раздачи: 23.5BB.» — стек героя на конец руки по счёту движка.
+
+    Молчит, когда нечем: у героя нет записи в `stacks_end`
+    (`test_the_stack_after_the_hand_is_the_last_line_when_it_is_known`), и по
+    той же причине, что исход (`_outcome_bb`), при непустом `not_checked`: стек
+    на конец руки — исход выдуманного вскрытия, а не факт.
+    """
+    if en.verdict.not_checked:
+        return None
+    hand = en.hand
+    end = en.report.stacks_end.get(hand.hero_label)
+    if end is None:
+        return None
+    return f"Стек после раздачи: {bb(end, hand.bb)}BB."
+
+
+def _header(hand: CanonicalHand) -> str:
+    """Шапка раздачи двумя строками: номер, уровень, блайнды, анте; число игроков.
+
+    Блайнды без слова «фишек», анте — с ним и без «(с каждого)» (форма
+    владельца 2026-10-07, `test_the_block_has_the_owners_layout_line_by_line`).
+    """
+    if hand.ante:
+        kind = _ANTE_TYPE_WORD.get(hand.ante_type, hand.ante_type)
+        ante = f"{hand.ante} фишек" + (f" ({kind})" if kind else "")
+    else:
+        ante = "нет"
+    return (
+        f"Рука {hand.hand_no} · уровень {hand.level} · "
+        f"блайнды {hand.sb}/{hand.bb} · анте {ante}\n"
+        f"Игроков в раздаче: {len(hand.players)}."
+    )
+
+
+def _side_pots_line(en: EnrichedHand) -> str | None:
+    """«Банк делится на части: …» — или ничего, если банк не делился.
+
+    Движок кладёт в `side_pots` ВСЕ поты PokerKit, включая главный, поэтому
+    один элемент означает неделёный банк и печатать его нечем
+    (`test_the_hand_with_one_pot_says_nothing_about_side_pots`). Претенденты
+    названы так же, как во всём блоке: позицией, герой — «вы»
+    (`test_a_hand_with_two_pots_names_each_part_and_who_claims_it`).
+    """
+    hand = en.hand
+    pots = en.report.side_pots
+    if len(pots) <= 1:
+        return None
+
+    def who(label: str) -> str:
+        return "вы" if label == hand.hero_label else _position(hand, label)
+
+    parts = " · ".join(
+        f"{bb(pot.amount, hand.bb)}BB (претендуют: {', '.join(who(lb) for lb in pot.eligible)})"
+        for pot in pots
+    )
+    return f"Банк делится на части: {parts}."
 
 
 def hand_replay(
@@ -458,75 +577,82 @@ def hand_replay(
     *,
     stats: Mapping[str, PlayerStats] | None = None,
 ) -> HandReplay:
-    """Реплей одной руки: шапка строкой, ход раздачи прозой одним абзацем.
+    """Блок «Что было» одной руки: шапка, строка героя, по строке на улицу, итог.
 
-    Завершает абзац исход раздачи — сколько фишек герой забрал или отдал
-    (`_outcome_line`). Цены решения в блоке нет: она живёт строкой ниже, в
+    Итог — конечный банк (`EngineReport.final_pot`), деление банка, если оно
+    было, вскрытие с исходом раздачи через ` · `
+    («Вскрытие: … · итог −13.6BB») — если герой на вскрытии был; иначе, как и
+    без вскрытия, исход стоит своей строкой «Итог: −2.6BB.»
+    (`test_a_lost_hand_ends_with_the_chips_that_left_the_stack`,
+    `test_a_showdown_without_the_hero_does_not_carry_his_outcome`). Последней
+    идёт «Стек после раздачи: …». Цены решения в блоке нет: она живёт ниже, в
     разборе точки.
 
     `stats` — статистика мест по ключу `PlayerState.label` (тот же ключ, что у
     `analysis.player_stats.player_stats_by_label`); её добывает вызывающий, и
-    правило зависимостей не нарушается — `explanation` не знает `memory`. У
-    оппонента, чья метка в словаре есть, при первом его ходе печатается скобка
-    с меткой и парой префлоп-частот
-    (`test_an_opponent_carries_its_label_and_both_frequencies_once`).
+    правило зависимостей не нарушается — `explanation` не знает `memory`.
+    Оппонент, ставший отдельным шагом, при первом ходе получает скобку со
+    стартовым стеком, а при выборке не меньше
+    `MIN_OTHER_HANDS_FOR_FREQUENCIES` других рук — и с меткой и парой
+    префлоп-частот (`_opponent_mark`).
 
-    Улица без ходов — прогон борда после олл-ина: печатается только борд, через
-    ` · ` с соседними такими же (`test_a_run_out_street_prints_only_its_board`).
-    Чек — действие движка и печатается как ход, «чек-чек» здесь не выдумывается.
+    Улица без ходов — прогон борда после олл-ина: печатается название и борд
+    (без банка — он не менялся), своей строкой (`test_a_run_out_street_prints_only_its_board`). Чек — действие
+    движка и печатается как ход, «чек-чек» здесь не выдумывается.
     """
     hand = en.hand
     hero = _hero(hand)
-    spans: list[ReplaySpan] = []
+    spans: list[ReplaySpan] = [ReplaySpan(text=f"{_header(hand)}\n\n")]
 
     hero_cards = hand.dealt.get(hand.hero_label, [])
     cards_part = f", {_cards(hero_cards)}" if hero_cards else ""
     spans.append(
-        ReplaySpan(text=f"Вы на {hero.position}{cards_part}, {bb(hero.stack, hand.bb)} ББ.\n")
+        ReplaySpan(text=f"Вы на {hero.position}{cards_part}, {bb(hero.stack, hand.bb)}BB.")
     )
 
     decisions = _hero_decision_indices(en)
     marked: set[str] = set()
     pot_before = _dead_before_deal(hand)
-    quiet: list[str] = []
-    first = True
-
-    def sep() -> str:
-        nonlocal first
-        s = "" if first else " "
-        first = False
-        return s
-
-    def flush_quiet() -> None:
-        if quiet:
-            spans.append(ReplaySpan(text=f"{sep()}{' · '.join(quiet)}."))
-            quiet.clear()
 
     for street in Street:
         actions = _street_actions(hand, street)
         board = hand.boards.get(street, [])
         if not actions:
             if street is not Street.PREFLOP and board:
-                quiet.append(f"{_STREET_TITLE[street]} {_board(board)}")
+                spans.append(ReplaySpan(text="\n"))
+                spans.append(ReplaySpan(text=f"{_STREET_TITLE[street]}:", title=True))
+                spans.append(ReplaySpan(text=f" {_board(board)}"))
             continue
-        flush_quiet()
-        if street is not Street.PREFLOP:
-            head = f"{_STREET_TITLE[street]} {_board(board)}, банк {bb(pot_before, hand.bb)}"
-            spans.append(ReplaySpan(text=f"{sep()}{head}. "))
+        # Название улицы с двоеточием — отдельный кусок: его выделяет тот, кто
+        # собирает сообщение, и экранировать его отдельно не нужно.
+        spans.append(ReplaySpan(text="\n"))
+        spans.append(ReplaySpan(text=f"{_STREET_TITLE[street]}:", title=True))
+        if street is Street.PREFLOP:
+            spans.append(ReplaySpan(text=" "))
         else:
-            spans.append(ReplaySpan(text=sep()))
-        flow = _street_flow(hand, actions, decisions, stats, marked)
-        first_step = flow[0]
-        flow[0] = first_step.model_copy(update={"text": _sentence_start(first_step.text)})
-        spans.extend(flow)
-        spans.append(ReplaySpan(text="."))
+            spans.append(
+                ReplaySpan(text=f" {_board(board)} (банк {bb(pot_before, hand.bb)}): ")
+            )
+        spans.extend(_street_flow(hand, actions, decisions, stats, marked))
         pot_before = en.report.pot_by_street.get(street, pot_before)
-    flush_quiet()
+
+    spans.append(ReplaySpan(text=f"\nКонечный банк: {bb(en.report.final_pot, hand.bb)}BB."))
+    side_pots = _side_pots_line(en)
+    if side_pots is not None:
+        spans.append(ReplaySpan(text=f"\n{side_pots}"))
 
     showdown = _showdown_line(hand)
+    outcome = _outcome_bb(en)
+    # Исход клеится к вскрытию, только если на нём был сам герой: иначе «Вскрытие:
+    # SB … vs BB … · итог −0.1BB» читалось бы как проигрыш на вскрытии, а это
+    # анте спасовавшего (`test_a_showdown_without_the_hero_does_not_carry_his_outcome`).
+    hero_at_showdown = went_to_showdown(hand, hand.hero_label)
+    glued = showdown is not None and outcome is not None and hero_at_showdown
     if showdown is not None:
-        spans.append(ReplaySpan(text=f" {showdown}."))
-    outcome = _outcome_line(en)
-    if outcome is not None:
-        spans.append(ReplaySpan(text=f" {outcome}"))
+        spans.append(ReplaySpan(text=f"\n{showdown}" + (f" · итог {outcome}" if glued else "")))
+    if outcome is not None and not glued:
+        spans.append(ReplaySpan(text=f"\nИтог: {outcome}."))
+    stack_after = _stack_after_line(en)
+    if stack_after is not None:
+        spans.append(ReplaySpan(text=f"\n{stack_after}"))
     return HandReplay(spans=spans)

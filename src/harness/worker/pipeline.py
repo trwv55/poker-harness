@@ -21,9 +21,9 @@
 всё ещё будет работать и в конце попробует закрыть задачу, которая ему уже не
 принадлежит (отсюда и фенсинг `worker_id`, п.2 ниже). `_JOB_DEADLINE_S` — бюджет по
 типу задачи, с запасом меньше 10 минут: `asyncio.wait_for` вокруг работы станций (не
-вокруг трейса/`complete`/`fail` — тем всегда дают дожить до конца). Задача 16 сознательно
-не ограничила длительность самого вызова модели (только ожидание лимитера) и оставила
-общий бюджет здесь: отдельного таймаута на LLM-запрос по-прежнему нет.
+вокруг трейса/`complete`/`fail` — тем всегда дают дожить до конца). У каждого запроса
+к провайдеру свой таймаут (`LLM_REQUEST_TIMEOUT_S`, `platform/llm.py`), бюджет задачи
+остаётся сверху.
 
 **Фенсинг (контроллерский рулинг задачи 18, п.2).** `job.locked_by`, который вернул
 `claim()`, передаётся В КАЖДЫЙ вызов `complete()`/`fail()`/`await_user()` как `worker_id`
@@ -49,6 +49,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Executor
@@ -60,6 +61,8 @@ import structlog
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from harness.agent.history import dump_history, load_history, trim_history
+from harness.agent.run import run_agent_turn
 from harness.analysis import analyze_hand
 from harness.analysis.player_stats import player_stats_by_label
 from harness.analysis.preflop import (
@@ -83,6 +86,7 @@ from harness.contracts import (
 )
 from harness.engine import enrich
 from harness.explanation import hand_replay, render_range_png
+from harness.explanation.agent_checks import AgentContext, agent_context
 from harness.memory.models import Job as JobModel
 from harness.memory.models import Player
 from harness.memory.repos import (
@@ -90,6 +94,7 @@ from harness.memory.repos import (
     CalcCacheRepo,
     HandsRepo,
     QuotaRepo,
+    SessionsRepo,
     TournamentsRepo,
 )
 from harness.normalizer import normalize
@@ -106,6 +111,7 @@ from harness.platform.trace import Clock, Trace
 from harness.presentation import (
     Msg,
     Photo,
+    agent_turn_msg,
     escalation_msg,
     failed_msg,
     hand_analysis_msgs,
@@ -122,13 +128,14 @@ from harness.presentation import (
     vision_gave_up_msg,
 )
 
-__all__ = ["Deps", "Sender", "run_job"]
+__all__ = ["Deps", "Sender", "notify_reaped_failures", "run_job"]
 
 _log = structlog.get_logger(__name__)
 
 # Станции, показываемые игроку прогрессом. Станции `explain` больше нет:
 # формулировать в разборе раздачи нечего, а вопрос игрока проходит станцию `ask`
-# (решение владельца 2026-09-12).
+# (решение владельца 2026-09-12). Ход агента сообщения прогресса не шлёт: вместо
+# него индикатор «печатает» (`_keep_typing`, спека агента №1, §7).
 _Station = Literal["ask", "read", "parse", "validate", "analyze"]
 
 # Бюджет попытки по типу задачи — с запасом меньше десятиминутного окна reap()
@@ -137,9 +144,12 @@ _Station = Literal["ask", "read", "parse", "validate", "analyze"]
 _JOB_DEADLINE_S: dict[str, float] = {
     "hh_scan": 480.0,
     # Вопрос — один вызов фасада с инструментами; обращений к провайдеру внутри
-    # него больше одного (`test_a_tool_call_round_trip_logs_one_row`), а работы
+    # него больше одного (`test_a_tool_call_round_trip_logs_a_row_per_request`), а работы
     # с данными — выборка по готовым колонкам, без пересчёта эквити.
     "question": 120.0,
+    # Ход агента — до 8 расчётов и одна попытка переписать; цель задержки 30 с,
+    # бюджет как у вопроса (спека агента №1, §9).
+    "agent": 120.0,
     "deep_dive": 120.0,
     # Скрин — два вызова модели в худшем случае (каскад) плюс расчёт одной руки.
     "screenshot_analyze": 240.0,
@@ -219,7 +229,7 @@ def _public_failure_reason(exc: BaseException) -> str:
 
 class Sender(Protocol):
     """То, чем `run_job` доставляет сообщения игроку — реализация (Телеграм или
-    тестовый двойник) ему не известна, только эти три метода.
+    тестовый двойник) ему не известна, только эти четыре метода.
 
     `send_photo` — отдельным методом, а не полем `Msg`: картинка уходит своим
     запросом Bot API (`sendPhoto`, multipart), и идемпотентность у неё своя —
@@ -231,6 +241,11 @@ class Sender(Protocol):
     async def edit(self, chat_id: int, message_id: int, msg: Msg) -> None: ...
 
     async def send_photo(self, chat_id: int, photo: Photo) -> int: ...
+
+    async def typing(self, chat_id: int) -> None:
+        """Индикатор «печатает…» — действие в чате, не сообщение: в `payload` не
+        пишется и идемпотентности не требует."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,6 +273,9 @@ class Deps:
     # Флаг, а не имя модели: имя знает только `Config`, а станции нужно ровно
     # одно решение — звать вторую ступень или сразу спрашивать игрока.
     vision_fallback: bool = False
+    # Потолок истории вечера агента в токенах (оценка `agent.history.estimate_tokens`);
+    # значение из `Config.agent_history_max_tokens` (`worker/main.py`).
+    agent_history_max_tokens: int = 30_000
 
 
 def _cache_delta(cache_seed: dict[str, float]) -> dict[str, float]:
@@ -522,7 +540,7 @@ async def _send_analysis(
 
 
 async def _quota_numbers(session: AsyncSession, player_id: int) -> tuple[int, int]:
-    """Числа для строки «разборов X/Y за 24ч» (спека §9: скользящее окно, SQL-счётчик
+    """Числа для строки «запросов X/Y за 24 ч» (спека §9: скользящее окно, SQL-счётчик
     интерактивных задач).
 
     Считает `QuotaRepo` (задача 19) — ТА ЖЕ реализация окна, по которой бот решает,
@@ -577,7 +595,7 @@ def _hand_analysis_msg(
 
 
 async def _tournament_stats(
-    session: AsyncSession, tournament_id: int | None
+    session: AsyncSession, tournament_id: int | None, hand_no: str
 ) -> dict[str, PlayerStats] | None:
     """Частоты соседей по столу — или `None`, если считать их не по чему.
 
@@ -585,10 +603,25 @@ async def _tournament_stats(
     поэтому на HH-входе частоты набираются по рукам турнира, а у скриншота
     `tournament_id` нет — и частот нет. `None`, не пустой словарь: «не считали»
     и «посчитали, вышло пусто» — разные вещи.
+
+    **Разбираемая рука в выборку не входит** (`hand_no`). Прежде входила, и на
+    файле из одной раздачи открывший банк соперник получал «VPIP 100%, PFR 100%»
+    — частоту, измеренную на той самой руке, которую она якобы описывает
+    (`test_a_single_hand_file_prints_no_opponent_frequencies`). Сюда
+    попадают ВСЕ другие руки турнира (и сыгранные после разбираемой тоже —
+    решение владельца 2026-10-09: статы описывают соперника по турниру). Порог выборки применяет
+    реплей: частоты печатаются, только если у места не меньше
+    `explanation.hand_replay.MIN_OTHER_HANDS_FOR_FREQUENCIES` (20) таких рук, и
+    число раздач стоит рядом с ними
+    (`test_frequencies_appear_only_from_twenty_other_hands`).
     """
     if tournament_id is None:
         return None
-    hands = await HandsRepo(session).canonical_by_tournament(tournament_id)
+    hands = [
+        hand
+        for hand in await HandsRepo(session).canonical_by_tournament(tournament_id)
+        if hand.hand_no != hand_no
+    ]
     return player_stats_by_label(hands) if hands else None
 
 
@@ -705,6 +738,9 @@ async def _run_hh_scan(job: JobModel, deps: Deps, trace: Trace) -> None:
             await session.commit()
 
             await tournaments_repo.save_scan_summary(tournament_id, summary)
+            # Новый файл — агент больше не отвечает про старую руку (план агента,
+            # отклонение 2).
+            await SessionsRepo(session).set_last_analysis(job.session_id, None)
             await session.commit()
 
         quota_left, quota_total = await _quota_numbers(session, job.player_id)
@@ -1091,17 +1127,21 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
             existing = await analyses_repo.get_by_hand(hand_id)
             if existing is not None:
                 result = existing.result
+                analysis_id = existing.id
             else:
                 loop = asyncio.get_running_loop()
                 result, _exported = await loop.run_in_executor(
                     deps.process_pool, _analyze_hand_with_cache, enriched, {}
                 )
-                await analyses_repo.save(
+                analysis_id = await analyses_repo.save(
                     hand_id=hand_id,
                     result=result,
                     decision_points=enriched.report.decision_points,
                 )
                 await session.commit()
+            # Указатель вечера для агента — как в `_run_deep_dive`.
+            await SessionsRepo(session).set_last_analysis(job.session_id, analysis_id)
+            await session.commit()
 
             # Та же развилка, что в `_run_deep_dive`: картинки рисует код внутри
             # `analyze`, отдельной станции у них больше нет.
@@ -1159,6 +1199,7 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
             result: AnalysisResult
             if existing is not None:
                 result = existing.result  # чекпоинт: разбор уже посчитан прошлой попыткой
+                analysis_id = existing.id
             else:
                 cache_repo = CalcCacheRepo(session)
                 prefix = f"equity_mc:{equity_cache_fingerprint()}:"
@@ -1172,12 +1213,16 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
                 await cache_repo.upsert_many(prefix, exported)
                 await session.commit()
 
-                await analyses_repo.save(
+                analysis_id = await analyses_repo.save(
                     hand_id=hand.id,
                     result=result,
                     decision_points=hand.enriched.report.decision_points,
                 )
                 await session.commit()
+            # Указатель вечера: агент отвечает про этот разбор, пока игрок не
+            # загрузит новый (спека агента №1, §4). На обоих путях — и на чекпоинте.
+            await SessionsRepo(session).set_last_analysis(job.session_id, analysis_id)
+            await session.commit()
 
             # Картинки диапазонов — выход КОДА, и рисуются они внутри `analyze`:
             # отдельной станции у них больше нет, потому что формулировать в
@@ -1198,7 +1243,7 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
             elapsed_s=round(deps.clock() - started_at),
             quota_left=quota_left,
             quota_total=quota_total,
-            stats=await _tournament_stats(session, hand.tournament_id),
+            stats=await _tournament_stats(session, hand.tournament_id, hand_no),
         )
         await _send_analysis(deps, session, job.id, worker_id, chat_id, msgs)
         await _send_range_photos(
@@ -1250,7 +1295,100 @@ async def _run_question(job: JobModel, deps: Deps, trace: Trace) -> None:
         await session.commit()
 
 
+# Телеграм гасит «печатает…» через ~5 с; обновляем чаще.
+_TYPING_EVERY_S = 4.0
+
+
+async def _keep_typing(sender: Sender, chat_id: int) -> None:
+    """«Печатает…», пока идёт ход агента (спека агента №1, §7). Сбой индикатора
+    хода не роняет."""
+    while True:
+        try:
+            await sender.typing(chat_id)
+        except Exception:  # noqa: BLE001 — индикатор best-effort
+            _log.warning("typing_indicator_failed", exc_info=True)
+        await asyncio.sleep(_TYPING_EVERY_S)
+
+
+async def _agent_context(session: AsyncSession, analysis_id: int | None) -> AgentContext | None:
+    """Сводка разбора, на который указывает вечер; `None` — разбора нет."""
+    if analysis_id is None:
+        return None
+    analysis = await AnalysesRepo(session).get(analysis_id)
+    if analysis is None:
+        return None
+    hand = await HandsRepo(session).get(analysis.hand_id)
+    return None if hand.enriched is None else agent_context(analysis.result, hand.enriched)
+
+
+async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
+    """Ход агента: контекст, история вечера, модель, проверки, журнал, ответ.
+
+    Чекпоинта нет, как у `_run_question`; у задачи `agent` одна попытка
+    (`JobsQueue.enqueue`, `test_an_agent_job_gets_a_single_attempt`), сбой уходит
+    игроку общим путём `failed_msg` — у этой станции своего нет.
+    Под `result_message_id` ложится только итоговый ответ: прогресса у хода нет,
+    «печатает» — действие в чате, не сообщение. История пишется только в
+    открытую сессию (`SessionsRepo.save_agent_history`).
+    """
+    worker_id = job.locked_by
+    async with deps.db_factory() as session:
+        payload: dict[str, Any] = dict(job.payload)
+        chat_id = await _chat_id(session, job.player_id)
+        sessions = SessionsRepo(session)
+        state = await sessions.agent_state(job.session_id)
+        context = await _agent_context(session, state.last_analysis_id)
+        history = trim_history(load_history(state.history), deps.agent_history_max_tokens)
+        await session.commit()
+
+        typing = asyncio.create_task(_keep_typing(deps.sender, chat_id))
+        try:
+            async with trace.span("agent"):
+                turn = await run_agent_turn(
+                    session,
+                    deps.llm,
+                    player_id=job.player_id,
+                    session_id=job.session_id,
+                    text=payload["text"],
+                    trace_id=trace.trace_id,
+                    history=history,
+                    context=context,
+                    # Сводки нет — руки тоже нет: указатель на разбор без руки
+                    # инструментам диапазона не нужен.
+                    analysis_id=state.last_analysis_id if context is not None else None,
+                )
+        finally:
+            typing.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await typing
+
+        trace.record("agent_turn", question=payload["text"], **turn.journal())
+        msg = agent_turn_msg(
+            turn.state,
+            turn.prose,
+            list(turn.results),
+            from_context=turn.from_context,
+            from_history=turn.from_history,
+            job_id=job.id,
+            assumption=turn.assumption,
+        )
+        await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
+        await session.commit()
+        # В историю — только то, что игрок видел (решение контроллера по вопросу
+        # владельца 2): без прозы на месте ответа модели — текст, который ушёл игроку.
+        # И только после отправки: упавшая отправка истории не трогает
+        # (`test_a_failed_send_leaves_the_evening_history_unchanged`).
+        seen = turn.saved_messages(None if turn.state == "prose" else msg.text)
+        await sessions.save_agent_history(
+            job.session_id, dump_history(trim_history(seen, deps.agent_history_max_tokens))
+        )
+        await session.commit()
+
+
 async def _dispatch(job: JobModel, deps: Deps, trace: Trace, started_at: float) -> int | None:
+    if job.type == "agent":
+        await _run_agent(job, deps, trace)
+        return None
     if job.type == "question":
         await _run_question(job, deps, trace)
         return None
@@ -1261,9 +1399,9 @@ async def _dispatch(job: JobModel, deps: Deps, trace: Trace, started_at: float) 
         return await _run_deep_dive(job, deps, trace, started_at)
     if job.type == "screenshot_analyze":
         return await _run_screenshot(job, deps, trace, started_at)
-    # `screenshot_analyze`/`eval_run` существуют в CHECK-констрейнте `jobs.type_allowed`
-    # (задача 15, под будущие задачи 19+/22), но станций для них этот воркер ещё не
-    # знает — явный отказ вместо молчаливого "ничего не произошло".
+    # `eval_run` существует в CHECK-констрейнте `jobs.type_allowed` (задача 15), но
+    # станции для него этот воркер ещё не знает — явный отказ вместо молчаливого
+    # "ничего не произошло".
     raise NotImplementedError(f"воркер не умеет станцию для типа задачи {job.type!r}")
 
 
@@ -1322,12 +1460,51 @@ async def _notify_failure(deps: Deps, job: JobModel, reason: str) -> None:
                 job.locked_by,
                 "result_message_id",
                 chat_id,
-                failed_msg(reason),
+                failed_msg(reason, job.type),
             )
     except Exception:  # noqa: BLE001 — намеренно: сбой уведомления не должен
         # уронить обработку провала задачи (задача уже честно `failed` в БД,
         # доложить о ней — только best-effort поверх этого).
         _log.exception("job_failure_notify_failed", job_id=job.id)
+
+
+async def notify_reaped_failures(deps: Deps, job_ids: Sequence[int]) -> None:
+    """Сообщить игрокам о задачах, которые `JobsQueue.reap()` закрыл `failed`.
+
+    Воркер такой задачи умер, и `failed_msg` из `run_job` до игрока не дошёл:
+    без этого шага провал по reaper'у был бы молчаливым. Причина — общая
+    `_PUBLIC_FAILURE_REASON_DEFAULT`: исключения, которое можно было бы
+    классифицировать, у reaper'а нет.
+
+    Один раз на задачу: отправленное сообщение записывается в
+    `result_message_id`, и задача, у которой он уже есть, пропускается — без
+    повторной отправки и без правки, чтобы не затереть результат, который
+    умерший воркер успел доставить
+    (`test_a_job_failed_by_the_reaper_tells_its_player_once`). Сбой уведомления
+    одной задачи не мешает остальным.
+    """
+    for job_id in job_ids:
+        try:
+            async with deps.db_factory() as session:
+                job = await session.get(JobModel, job_id)
+                if job is None or job.status != "failed":
+                    continue
+                if (job.payload or {}).get("result_message_id") is not None:
+                    continue
+                chat_id = await _chat_id(session, job.player_id)
+                # `worker_id=None`: `reap()` снял `locked_by`, и сверка владельца
+                # в `_send_idempotent` пропускает только задачу без владельца.
+                await _send_idempotent(
+                    deps,
+                    session,
+                    job_id,
+                    None,
+                    "result_message_id",
+                    chat_id,
+                    failed_msg(_PUBLIC_FAILURE_REASON_DEFAULT, job.type),
+                )
+        except Exception:  # noqa: BLE001 — уведомление best-effort, как `_notify_failure`
+            _log.exception("reaped_job_notify_failed", job_id=job_id)
 
 
 async def run_job(job: JobModel, deps: Deps) -> None:

@@ -29,7 +29,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from sqlalchemy import text as sql_text
 
 from harness.calcs.routing import CalcRun, answer_question, tools_for
-from harness.contracts import CalcName, FrequencyResult
+from harness.contracts import AGENT_ONLY_CALCS, CalcName, FrequencyResult
 from harness.explanation.question import QuestionDraft
 from harness.memory.models import Job, Trace
 from harness.memory.repos import PlayersRepo, SessionsRepo
@@ -119,14 +119,17 @@ async def _ask(db_factory, session, script: _Script, *, scope, question="воп�
     )
 
 
-def test_the_tool_set_covers_every_calculation_name_exactly_once():
-    """Набор инструментов и набор имён словаря — один список, а не две копии.
+def test_the_ask_tool_set_covers_every_ask_calculation_exactly_once():
+    """Набор инструментов `/ask` и набор имён словаря без расчётов агента
+    (`AGENT_ONLY_CALCS`) — один список, а не две копии.
 
     Разойтись они могли бы молча: лишний инструмент считал бы то, чего в
     словаре нет, а забытый делал бы имя недостижимым для вопроса.
     """
     tools = tools_for(None, 1, 1, CalcRun())  # type: ignore[arg-type] — база здесь не трогается
-    assert sorted(tool.name for tool in tools) == sorted(name.value for name in CalcName)
+    assert sorted(tool.name for tool in tools) == sorted(
+        n.value for n in set(CalcName) - AGENT_ONLY_CALCS
+    )
 
 
 @requires_prompts
@@ -273,13 +276,10 @@ async def test_the_question_reaches_the_prompt(db_factory):
     assert any("есть ли у меня третий баррель" in text for text in seen)
 
 
-async def test_a_tool_call_round_trip_logs_one_row(db_factory):
-    """Вызов с инструментами — одна строка `llm_calls`, а не по строке на обращение.
-
-    Внутри такого вызова провайдеру уходит два запроса (выбор инструмента и
-    ответ по его выходу), а окно темпа `PgLimiter` считает его за один: цена
-    вопроса в этом счёте занижена, и знать об этом надо до, а не после
-    телеметрии.
+async def test_a_tool_call_round_trip_logs_a_row_per_request(db_factory):
+    """Вызов с инструментами — строка `llm_calls` на каждое обращение к провайдеру:
+    выбор инструмента и ответ по его выходу — два запроса, и окно темпа
+    `PgLimiter` считает оба.
     """
     async with db_factory() as session:
         scope = await _seeded(session, tg_user_id=7008)
@@ -303,18 +303,20 @@ async def test_a_tool_call_round_trip_logs_one_row(db_factory):
             await session.execute(sql_text("select purpose, status from llm_calls order by id"))
         ).all()
     assert script.requests == 2, "сценарий не сделал двух обращений — проверять нечего"
-    assert [tuple(row) for row in rows] == [("question_answer", "ok")]
+    assert [tuple(row) for row in rows] == [("question_answer", "ok"), ("question_answer", "ok")]
     assert run_state.result is not None
 
 
-@pytest.mark.parametrize("name", [name.value for name in CalcName])
+@pytest.mark.parametrize("name", sorted(n.value for n in CalcName))
 def test_every_tool_describes_its_parameters(name: str):
     """У каждого инструмента есть описание и схема параметров.
 
     Без описания модель выбирает по одному имени; схема при этом собирается из
     сигнатуры, и пустая означала бы инструмент, который нечем параметризовать.
+    Набор агента полный, поэтому инструменты берутся из него.
     """
-    tools = {tool.name: tool for tool in tools_for(None, 1, 1, CalcRun())}  # type: ignore[arg-type]
+    run_state = CalcRun(max_calcs=8, sizes_from=frozenset())
+    tools = {tool.name: tool for tool in tools_for(None, 1, 1, run_state)}  # type: ignore[arg-type]
     assert tools[name].description
 
 

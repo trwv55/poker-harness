@@ -15,6 +15,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from harness.analysis import analyze_hand
+from harness.analysis.classifier import POSTFLOP_CHECK_REASON
 from harness.analysis.tools.turn_flop_call import turn_flop_call_requirement
 from harness.analysis.turn_flop import turn_flop_verdict
 from harness.contracts import (
@@ -217,10 +218,14 @@ def test_the_flop_numbers_do_not_move_when_later_cards_change():
 
 
 def test_a_check_on_the_turn_is_not_a_call_decision():
-    """Перед героем нет ставки — коллировать нечего, и числа не считаются."""
+    """Перед героем нет ставки — коллировать нечего, и числа не считаются.
+
+    Причины «вердикта нет» у чека нет вовсе (спека постфлоп-линии, §4.9): пустая
+    строка, а не граница инструмента колла.
+    """
     point = _last_point_on(analyze_hand(_hand(hero_faces_a_bet=False)), Street.TURN)
     assert turn_flop_call_detail(point) is None
-    assert "нет ставки" in point.detail["unjudged"]
+    assert point.detail["unjudged"] == POSTFLOP_CHECK_REASON == ""
 
 
 def test_hero_cards_unknown_leave_the_turn_without_numbers():

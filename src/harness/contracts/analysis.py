@@ -20,6 +20,17 @@ from typing import Any
 
 from pydantic import BaseModel, model_validator
 
+from harness.contracts.postflop import (
+    Backdoor,
+    BetAlternatives,
+    Draw,
+    DrawCall,
+    FoldThreshold,
+    HandStrength,
+    Line,
+    Overcards,
+    ShowdownValue,
+)
 from harness.contracts.ranges import Range
 from harness.contracts.raw import Street
 
@@ -184,6 +195,57 @@ class TurnFlopCallDetail(BaseModel):
         return self
 
 
+# Ключ и тип постфлоп-линии героя (спека `2026-10-09-postflop-line-design.md`,
+# §5) — рядом с соседними деталями и по той же причине: читает их
+# `presentation`. Описание сыгранного, а не вердикт: зоны, цены и лучшего
+# действия здесь нет.
+POSTFLOP_LINE_DETAIL = "postflop_line"
+
+
+class PostflopLineDetail(BaseModel):
+    """Рука, дро, линия и пороги героя в постфлоп-точке (спека, §5.2).
+
+    Считает `analysis.postflop_line`; доли — в долях единицы. Карты героя
+    неизвестны — `hand`, `draw`, `overcards`, `showdown` пусты, `backdoors` —
+    пустой список, у линии нет назначения
+    (`test_unknown_hero_cards_leave_the_cards_empty_and_the_line_without_purpose`).
+    `line` — `None` у чека.
+    """
+
+    hand: HandStrength | None
+    draw: Draw | None
+    draw_missed: bool
+    backdoors: list[Backdoor]
+    overcards: Overcards | None
+    line: Line | None
+    fold_threshold: FoldThreshold | None
+    draw_call: DrawCall | None
+    showdown: ShowdownValue | None
+    # Только у последнего решения героя в раздаче — чека или бета не в олл-ин без
+    # ставки перед ним (решение владельца 2026-10-10). Значение по умолчанию —
+    # чтобы точки, записанные до поля, читались.
+    alternatives: BetAlternatives | None = None
+
+
+# Порог опена первым (решение владельца 2026-10-10, спека постфлоп-линии, §12):
+# рейз в неоткрытый банк печатает его вместо шансов банка колла.
+OPEN_THRESHOLD_DETAIL = "open_threshold"
+
+
+class OpenThreshold(BaseModel):
+    """Сколько фолдов нужно, чтобы опен первым не в олл-ин окупился сразу, в долях
+    единицы; у шова первым порога нет.
+
+    `risk` — сколько рейз добавляет к уже поставленному героем блайнду, не выше
+    стека самого глубокого соперника, который может уравнять (анте не входит: оно
+    уже в банке); `pot` — банк до хода; `fold_share` — `risk / (pot + risk)`.
+    """
+
+    risk: int
+    pot: int
+    fold_share: float
+
+
 class PointVerdict(BaseModel):
     dp_index: int
     street: Street
@@ -262,6 +324,30 @@ def turn_flop_call_detail(point: PointVerdict) -> TurnFlopCallDetail | None:
     if raw is None:
         return None
     return TurnFlopCallDetail.model_validate(raw)
+
+
+def postflop_line_detail(point: PointVerdict) -> PostflopLineDetail | None:
+    """Постфлоп-линия точки из `detail` — или `None`, если её там нет.
+
+    Чужое содержимое под ключом роняет разбор — то же правило, что у
+    `river_call_detail` (`test_a_foreign_shape_under_the_postflop_line_key_is_not_swallowed`).
+    """
+    raw = point.detail.get(POSTFLOP_LINE_DETAIL)
+    if raw is None:
+        return None
+    return PostflopLineDetail.model_validate(raw)
+
+
+def open_threshold_detail(point: PointVerdict) -> OpenThreshold | None:
+    """Порог опена точки из `detail` — или `None`, если его там нет.
+
+    Чужое содержимое под ключом роняет разбор — то же правило, что у
+    `river_call_detail`.
+    """
+    raw = point.detail.get(OPEN_THRESHOLD_DETAIL)
+    if raw is None:
+        return None
+    return OpenThreshold.model_validate(raw)
 
 
 class AnalysisResult(BaseModel):
@@ -396,6 +482,16 @@ class PlayerStats(BaseModel):
     barrel_turn_chances: int = 0
     barrel_river: int = 0
     barrel_river_chances: int = 0
+    # Сдача на второй баррель: знаменатель — встреченные ставки агрессора на тёрне
+    # после своего колла его продолженной ставки, поэтому он не больше числа
+    # коллов продолженной ставки (`cbet_faced - fold_to_cbet`)
+    # (`test_every_numerator_stays_within_its_own_denominator`).
+    fold_to_turn_barrel: int = 0
+    turn_barrel_faced: int = 0
+    # Рейз на продолженную ставку и на второй баррель — зеркала сдач: тот же
+    # знаменатель (`cbet_faced`, `turn_barrel_faced`), в числителе повышение.
+    raise_cbet: int = 0
+    raise_turn_barrel: int = 0
     showdowns: int = 0
     flops_seen: int = 0
 
@@ -430,6 +526,18 @@ class PlayerStats(BaseModel):
     @property
     def barrel_river_pct(self) -> float | None:
         return self._share(self.barrel_river, self.barrel_river_chances)
+
+    @property
+    def fold_to_turn_barrel_pct(self) -> float | None:
+        return self._share(self.fold_to_turn_barrel, self.turn_barrel_faced)
+
+    @property
+    def raise_cbet_pct(self) -> float | None:
+        return self._share(self.raise_cbet, self.cbet_faced)
+
+    @property
+    def raise_turn_barrel_pct(self) -> float | None:
+        return self._share(self.raise_turn_barrel, self.turn_barrel_faced)
 
     @property
     def showdown_pct(self) -> float | None:

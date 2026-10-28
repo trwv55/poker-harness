@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from harness.presentation.keyboards import (
+    AGENT_MISS_PREFIX,
     DISAGREE_PREFIX,
     MAIN_MENU,
     MENU_HELP,
@@ -30,6 +31,7 @@ from harness.presentation.keyboards import (
     SET_NICKNAME_DATA,
     SETTINGS_COLORS_DATA,
     Btn,
+    agent_miss_button,
     deep_dive_button,
     escalation_buttons,
     note_buttons_for_hand,
@@ -39,6 +41,10 @@ from harness.presentation.keyboards import (
 from harness.presentation.messages import (
     Msg,
     Photo,
+    agent_miss_saved_msg,
+    agent_refusal_msg,
+    agent_turn_msg,
+    agent_turn_unavailable_msg,
     alias_bound_msg,
     alias_no_analysis_msg,
     alias_position_unknown_msg,
@@ -49,6 +55,7 @@ from harness.presentation.messages import (
     aliases_msg,
     analysis_unavailable_msg,
     ask_gg_nickname_msg,
+    ask_moved_msg,
     bot_failure_msg,
     disagreement_saved_msg,
     escalation_msg,
@@ -109,6 +116,7 @@ from harness.presentation.messages import (
 )
 
 __all__ = [
+    "AGENT_MISS_PREFIX",
     "DISAGREE_PREFIX",
     "MAIN_MENU",
     "MENU_HELP",
@@ -133,6 +141,11 @@ __all__ = [
     "Btn",
     "Msg",
     "Photo",
+    "agent_miss_button",
+    "agent_miss_saved_msg",
+    "agent_refusal_msg",
+    "agent_turn_msg",
+    "agent_turn_unavailable_msg",
     "alias_bound_msg",
     "alias_no_analysis_msg",
     "alias_position_unknown_msg",
@@ -143,6 +156,7 @@ __all__ = [
     "aliases_msg",
     "analysis_unavailable_msg",
     "ask_gg_nickname_msg",
+    "ask_moved_msg",
     "bot_failure_msg",
     "deep_dive_button",
     "disagreement_saved_msg",

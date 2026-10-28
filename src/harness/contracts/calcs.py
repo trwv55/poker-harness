@@ -22,7 +22,9 @@
 вердикта: постфлопного эталона в проекте нет. Вердикт даёт
 `ThresholdResult`, и порог у него приходит либо арифметикой от размера ставки
 (`BetSizeThreshold`), либо измерением поля (`FieldThreshold`) — третьего
-источника в наборе нет.
+источника в наборе нет. Стартовый диапазон соперника (`OpponentRangeResult`) берётся
+из чарта — эталона владельца; эквити против суженного диапазона
+(`EquityVsRangeResult`) — допущение агента, оценкой не является.
 """
 
 from __future__ import annotations
@@ -38,16 +40,27 @@ from harness.contracts.history import LeakStat
 from harness.contracts.raw import Street
 
 __all__ = [
+    "AGENT_ONLY_CALCS",
     "POSITIONS",
+    "RANGE_CATEGORY_NAMES",
+    "AbsentGroup",
+    "AbsentGroupName",
     "BetSizeThreshold",
     "CalcName",
     "CalcParams",
     "CalcResult",
+    "CategoryClass",
+    "CategoryGroup",
+    "CategoryKept",
+    "CategoryMark",
     "CoverageParams",
     "CoverageResult",
     "DefenseParams",
     "DefenseResult",
+    "EquityVsRangeParams",
+    "EquityVsRangeResult",
     "FieldThreshold",
+    "FoldHint",
     "FrequencyResult",
     "FrequencyStat",
     "HeroFrequencyParams",
@@ -55,7 +68,14 @@ __all__ = [
     "LeaksResult",
     "Measurement",
     "OpponentFrequencyParams",
+    "OpponentRangeParams",
+    "OpponentRangeResult",
     "PointFilter",
+    "RangeCategory",
+    "RangeLine",
+    "RangeNarrowing",
+    "SolverAction",
+    "SolverGuide",
     "Subject",
     "ThresholdOutcome",
     "ThresholdParams",
@@ -75,6 +95,12 @@ POSITIONS: frozenset[str] = frozenset(
     {"BTN", "SB", "BB", "UTG", "UTG+1", "UTG+2", "LJ", "HJ", "CO"}
 )
 
+# Линия соперника до флопа, которую покрывают чарты (спека 2026-10-14, §6.1): опен
+# рейзом или олл-ином и лимп SB — опен-чарт; колл, 3-бет, олл-ин BB против одного опена
+# рейзом и чек BB после лимпа SB — чарт защиты. Остальное — отказ
+# (`analysis.opponent_range.range_spot`).
+RangeLine = Literal["open_raise", "open_allin", "limp", "call", "check", "three_bet", "allin"]
+
 
 class CalcName(StrEnum):
     """Имя расчёта. Закрытый набор: маршрутизация выбирает из него и только из него."""
@@ -85,6 +111,15 @@ class CalcName(StrEnum):
     LEAKS = "leaks"
     DEFENSE_FREQUENCY = "defense_frequency"
     FREQUENCY_VS_THRESHOLD = "frequency_vs_threshold"
+    OPPONENT_RANGE = "opponent_range"
+    EQUITY_VS_RANGE = "equity_vs_range"
+
+
+# Расчёты только агента: им нужна рука разбора вечера и улица точки решения, у
+# `/ask` нет ни того, ни другого (спека 2026-10-14, §6; `/ask` без изменений).
+AGENT_ONLY_CALCS: frozenset[CalcName] = frozenset(
+    {CalcName.OPPONENT_RANGE, CalcName.EQUITY_VS_RANGE}
+)
 
 
 class FrequencyStat(StrEnum):
@@ -104,6 +139,9 @@ class FrequencyStat(StrEnum):
     CBET_FLOP = "cbet_flop"
     BARREL_TURN = "barrel_turn"
     BARREL_RIVER = "barrel_river"
+    FOLD_TO_TURN_BARREL = "fold_to_turn_barrel"
+    RAISE_CBET = "raise_cbet"
+    RAISE_TURN_BARREL = "raise_turn_barrel"
     SHOWDOWN = "showdown"
 
 
@@ -256,11 +294,19 @@ class DefenseResult(BaseModel):
     тем самым вызовом, с приведённым к его виду банком.
 
     `defend_frequency` + `fold_frequency` = 1.
+
+    `pot_before_bb` / `bet_bb` — размеры так, как их передал агент: в BB, как в
+    разборе. Тогда `pot_before` / `bet` — они же в сотых долях BB (масштаб, а не
+    фишки руки), и показываются игроку и модели именно BB
+    (`test_a_pot_from_the_hand_summary_is_computed_and_shown_in_bb`). У `/ask` оба
+    `None`, размеры в фишках.
     """
 
     calc: CalcName
     pot_before: int
     bet: int
+    pot_before_bb: float | None = None
+    bet_bb: float | None = None
     defend_frequency: float
     fold_frequency: float
     required_equity: float
@@ -295,6 +341,224 @@ class ThresholdResult(BaseModel):
     reference: Measurement | None = None
     outcome: ThresholdOutcome
     observations_needed: int | None = None
+
+
+# Заметные группы классов, о которых выход `opponent_range` говорит, что их нет в колл-
+# или чек-диапазоне защиты (план 2026-10-17, п. 8): карманные пары, одномастные и
+# разномастные тузы, бродвеи — две карты от десятки, без туза и не пара.
+AbsentGroupName = Literal["pairs", "suited_aces", "offsuit_aces", "broadways"]
+
+
+class AbsentGroup(BaseModel):
+    """Классы группы, которых нет в колл- (чек-) диапазоне защиты вовсе, но которые
+    чарт той же записи играет рейзом и/или олл-ином (`analysis.opponent_range.absent_groups`).
+
+    `classes` — в порядке `all_classes()`; `whole` — отсутствуют все классы группы;
+    `raised`, `all_in` — хоть один из них чарт играет рейзом, олл-ином."""
+
+    group: AbsentGroupName
+    classes: list[str]
+    whole: bool
+    raised: bool
+    all_in: bool
+
+
+class RangeCategory(StrEnum):
+    """Категория класса на борде (спека 2026-10-24, §4); порядок членов — порядок печати,
+    от сильной к слабой. Готовые руки — по `HandCategory`, дро — по `DrawKind`, когда
+    готовой руки нет или она слабее пары; бэкдоры и оверкарты — по `draws`."""
+
+    FULL_HOUSE_PLUS = "full_house_plus"
+    STRAIGHT_OR_FLUSH = "straight_or_flush"
+    SET = "set"
+    TRIPS = "trips"
+    TWO_PAIR = "two_pair"
+    OVERPAIR = "overpair"
+    TOP_PAIR_STRONG_KICKER = "top_pair_strong_kicker"
+    TOP_PAIR_WEAK_KICKER = "top_pair_weak_kicker"
+    MIDDLE_PAIR = "middle_pair"
+    WEAK_PAIR = "weak_pair"
+    COMBO_DRAW = "combo_draw"
+    FLUSH_DRAW = "flush_draw"
+    OPEN_ENDED = "open_ended"
+    DOUBLE_GUTSHOT = "double_gutshot"
+    GUTSHOT = "gutshot"
+    BACKDOORS_OVERCARDS = "backdoors_overcards"
+    NOTHING = "nothing"
+
+
+# Имя категории — одно на выход `opponent_range` и вход `equity_vs_range` (`hands`):
+# печатает его изложение, разбирает ядро. Без запятых и цифр: запятая делит `hands`,
+# цифра стала бы числом в сверке.
+RANGE_CATEGORY_NAMES: dict[RangeCategory, str] = {
+    RangeCategory.FULL_HOUSE_PLUS: "фулл-хаус и сильнее",
+    RangeCategory.STRAIGHT_OR_FLUSH: "стрит или флеш",
+    RangeCategory.SET: "сет",
+    RangeCategory.TRIPS: "трипс",
+    RangeCategory.TWO_PAIR: "две пары",
+    RangeCategory.OVERPAIR: "оверпара",
+    RangeCategory.TOP_PAIR_STRONG_KICKER: "топ-пара с сильным кикером",
+    RangeCategory.TOP_PAIR_WEAK_KICKER: "топ-пара со слабым кикером",
+    RangeCategory.MIDDLE_PAIR: "средняя пара",
+    RangeCategory.WEAK_PAIR: "слабая пара",
+    RangeCategory.COMBO_DRAW: "комбо-дро",
+    RangeCategory.FLUSH_DRAW: "флеш-дро",
+    RangeCategory.OPEN_ENDED: "двусторонний",
+    RangeCategory.DOUBLE_GUTSHOT: "двойной гатшот",
+    RangeCategory.GUTSHOT: "гатшот",
+    RangeCategory.BACKDOORS_OVERCARDS: "бэкдоры и старшие карты",
+    RangeCategory.NOTHING: "ничего",
+}
+
+
+class CategoryMark(BaseModel):
+    """Пометка класса: категория (дро при готовой руке или другая категория части
+    комбо), которая есть у `combos` из `of` его живых комбо сверх категории класса."""
+
+    category: RangeCategory
+    combos: int
+    of: int
+
+
+class CategoryClass(BaseModel):
+    """Класс в раскладке: доля в диапазоне (`weight`) и живые комбо с этой долей."""
+
+    hand_class: str
+    weight: float
+    combos: float
+    marks: list[CategoryMark] = []
+
+
+class CategoryGroup(BaseModel):
+    """Категория раскладки и её классы в порядке `all_classes()`."""
+
+    category: RangeCategory
+    classes: list[CategoryClass]
+
+    @property
+    def combos(self) -> float:
+        return sum(item.combos for item in self.classes)
+
+
+class SolverAction(BaseModel):
+    """Действие выгрузки-ориентира (`call`, `raise`, `fold`, `allin`) и его классы по
+    категориям на борде выгрузки."""
+
+    action: Literal["call", "raise", "fold", "allin"]
+    layout: list[CategoryGroup]
+
+
+class SolverGuide(BaseModel):
+    """Солверный ориентир на флопе (спека 2026-10-24, §6) — данные владельца, как чарт:
+    ближайшая выгрузка по ключу спота, типу борда и корзине ставки. `board`, `bet_share` —
+    выгрузки, `hand_board`, `hand_bet_share` — руки."""
+
+    board: list[str]
+    bet_share: float
+    hand_board: list[str]
+    hand_bet_share: float
+    actions: list[SolverAction]
+
+
+class CategoryKept(BaseModel):
+    """Что сужение оставило от категории раскладки исходного диапазона (спека 2026-10-24,
+    §5): классов и комбо всего и оставлено, убранные классы."""
+
+    category: RangeCategory
+    classes: int
+    kept_classes: int
+    combos: float
+    kept_combos: float
+    removed: list[str] = []
+
+
+class RangeNarrowing(BaseModel):
+    """Сужение диапазона соперника на улице — классы, переданные в `equity_vs_range`
+    (вместе с добавленными вне чарта). Ключ — разбор руки, позиция соперника,
+    улица (план 2026-10-17, п. 6). `agent_added` — классы вне чарта, добавленные агентом
+    по своей причине (спека 2026-10-24, §7): класс → причина."""
+
+    analysis_id: int
+    opponent_position: str
+    street: Street
+    classes: list[str]
+    agent_added: dict[str, str] = {}
+
+
+class OpponentRangeResult(BaseModel):
+    """Стартовый диапазон соперника по чарту — зона `strict`: диапазон не угадан, а
+    взят из эталона владельца по линии, которую код прочёл в руке.
+
+    `hands_share` — `Range.fraction_of_hands` (от 1326 комбо); `live_combos` —
+    взвешенные комбо без карт героя и борда улицы `street`. `chart_seats` и
+    `table_seats` расходятся на столе 4–7 мест (8-max по позиции от конца — правило).
+    """
+
+    calc: CalcName
+    opponent_position: str
+    street: Street
+    line: RangeLine
+    opener_position: str
+    chart: Literal["open", "defend"]
+    chart_seats: int
+    table_seats: int
+    chart_position: str
+    vs_chart_position: str | None = None
+    chart_depth_bb: float
+    range_text: str
+    hands_share: float
+    live_combos: float
+    # Только у колла и чека защиты; у прочих линий пусто.
+    absent: list[AbsentGroup] = []
+    # Раскладка по категориям на борде улицы (спека 2026-10-24, §4): на флопе — стартового
+    # диапазона, на тёрне — сужения флопа этой руки (`layout_of="flop"`), а без него —
+    # стартового. До флопа и на ривере раскладки нет.
+    layout_of: Literal["start", "flop"] | None = None
+    layout: list[CategoryGroup] = []
+    # Солверный ориентир — только на флопе и только при выгрузке в библиотеке (§6);
+    # `solver_error` — библиотека не прочиталась.
+    solver: SolverGuide | None = None
+    solver_error: str | None = None
+
+
+class FoldHint(BaseModel):
+    """Частота сдачи соперника на ставку героя, которую он в этой руке уравнял (спека
+    2026-10-24, §13): на флопе — `fold_to_cbet`, на тёрне — `fold_to_turn_barrel`.
+    Подлежащее — по правилу `opponent_frequency`: соперник со сшивкой места в этом
+    турнире (`opponent` — его ник), иначе поле."""
+
+    stat: FrequencyStat
+    subject: Subject
+    opponent: str | None = None
+    measurement: Measurement
+
+
+class EquityVsRangeResult(BaseModel):
+    """Эквити героя при вскрытии против диапазона, суженного агентом, — зона
+    `assuming`: сужение — допущение агента, классы — подмножество стартового с
+    долями чарта. `share_of_start` — доля живых комбо суженного от стартового."""
+
+    calc: CalcName
+    opponent_position: str
+    street: Street
+    range_text: str
+    live_combos: float
+    share_of_start: float
+    equity: float
+    # Классы вне чарта (входят и в `range_text`): все добавленные — и игроком, и агентом;
+    # из них агентом по своей причине — `agent_added` (класс → причина, спека 2026-10-24, §7).
+    added: list[str] = []
+    agent_added: dict[str, str] = {}
+    # Сводка по категориям раскладки исходного диапазона на борде (спека 2026-10-24, §5):
+    # исходный — стартовый на флопе, сужение флопа на тёрне; на ривере сводки нет.
+    # `kept_combos` из `source_combos` — без добавленных вне исходного.
+    categories_of: Literal["start", "flop"] | None = None
+    categories: list[CategoryKept] = []
+    source_combos: float | None = None
+    kept_combos: float | None = None
+    # Ориентир к доле оставленного (§13): только если соперник уравнял с-бет или второй
+    # баррель героя хедз-апом; подсказка, сужения не меняет.
+    fold_hint: FoldHint | None = None
 
 
 class HeroFrequencyParams(BaseModel):
@@ -373,16 +637,55 @@ class ThresholdParams(BaseModel):
     threshold: Annotated[BetSizeThreshold | FieldThreshold, Field(discriminator="source")]
 
 
+class OpponentRangeParams(BaseModel):
+    """`analysis_id` подставляет код (указатель разбора вечера), не модель; он же —
+    `prior`, сужение флопа этого соперника в этой руке для раскладки тёрна."""
+
+    calc: Literal[CalcName.OPPONENT_RANGE] = CalcName.OPPONENT_RANGE
+    analysis_id: int
+    opponent_position: str
+    street: Street
+    prior: RangeNarrowing | None = None
+
+
+class EquityVsRangeParams(BaseModel):
+    """`hands` — классы без весов, `added` — классы вне чарта по просьбе игрока или, с
+    `added_reason` (причина одной фразой), по решению модели; все три от модели. `analysis_id`, `prior` (сужение строго предыдущей улицы) и
+    `player_classes` (классы, названные игроком записью в репликах этой руки),
+    `kept_classes` (классы последнего сужения этого соперника в этой руке) и `kept_agent`
+    (добавленные в нём агентом, с причиной) — от кода."""
+
+    calc: Literal[CalcName.EQUITY_VS_RANGE] = CalcName.EQUITY_VS_RANGE
+    analysis_id: int
+    opponent_position: str
+    street: Street
+    hands: str
+    added: str | None = None
+    added_reason: str | None = None
+    prior: RangeNarrowing | None = None
+    player_classes: list[str] = []
+    kept_classes: list[str] = []
+    kept_agent: dict[str, str] = {}
+
+
 CalcParams = Annotated[
     HeroFrequencyParams
     | OpponentFrequencyParams
     | CoverageParams
     | LeaksParams
     | DefenseParams
-    | ThresholdParams,
+    | ThresholdParams
+    | OpponentRangeParams
+    | EquityVsRangeParams,
     Field(discriminator="calc"),
 ]
 
 CalcResult = (
-    FrequencyResult | CoverageResult | LeaksResult | DefenseResult | ThresholdResult
+    FrequencyResult
+    | CoverageResult
+    | LeaksResult
+    | DefenseResult
+    | ThresholdResult
+    | OpponentRangeResult
+    | EquityVsRangeResult
 )

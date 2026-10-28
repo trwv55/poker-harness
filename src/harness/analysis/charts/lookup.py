@@ -1,4 +1,8 @@
-"""Лукап опен-чартов: `(seats, position, ante_type)` и стек → стратегия ближайшей глубины.
+"""Лукап опен-чартов и чартов защиты: ключ без глубины и стек → стратегия ближайшей глубины.
+
+Опен-чарт ищется по `(seats, position, ante_type)`, чарт защиты — по
+`(seats, position, vs_position, vs_action, ante_type)`; глубина у обоих — по одному
+правилу.
 
 Чарт — **эталон**, а не результат обучения на руках игрока: он известен до первой
 загруженной руки, и выводить его из сыгранных рук нельзя (это зафиксировало бы
@@ -19,7 +23,12 @@
 
 **Подстановки соседней позиции, раскладки или типа анте нет и не будет.** Нет
 записи с такими `(seats, position, ante_type)` — `ChartMissing`; вызывающая сторона
-обязана отказаться от вердикта, а не получить «похожий» диапазон.
+обязана отказаться от вердикта, а не получить «похожий» диапазон. Стол на 4–7 мест
+лукап тоже не переносит сам: вызывающая сторона явно спрашивает 8-max ключ позиции с
+тем же числом игроков позади (`chart_table` у опена, `defend_table` у защиты — оба в
+`open_chart`, решение владельца 2026-10-10,
+`test_the_chart_table_counts_the_players_behind`,
+`test_the_defence_maps_the_opener_by_the_same_rule`).
 
 Чартов ниже 15bb нет: там эталон вычисляется равновесием (`analysis.tools.pushfold`).
 Лукап судит стек от `MIN_LOOKUP_DEPTH_BB` (13bb, решение владельца 2026-10-03:
@@ -30,20 +39,36 @@
 2026-10-02). На 15–20bb солвер открывает часть рук мин-рейзом, часть олл-ином, а
 SB вдобавок лимпует; один диапазон «открытия» потерял бы, КАК рука открывается.
 Запись несёт `raise`, `allin` и `limp` в компактной записи; рука, которой нет ни в
-одном, — фолд. Доли одной руки по трём действиям в сумме не больше 1.
+одном, — фолд. Доли одной руки по трём действиям в сумме не больше 1 с точностью
+до округления долей до сотых (`_SUM_TOLERANCE`).
+
+**Чарт защиты — формат владельца** (спека
+`docs/superpowers/specs/2026-10-14-agent-range-slice-design.md`, §4): ключ несёт
+`vs_position` (позицию открывшего; `UTG1` владельца читается как `UTG+1`,
+`test_the_owner_spelling_utg1_is_read_as_utg_plus_one`) и `vs_action` — `raise` по
+умолчанию или `limp`, только против SB (`test_vs_action_is_raise_unless_named`,
+`test_the_raise_and_the_limp_of_the_sb_are_two_keys`). Действия против рейза —
+`call`, `raise` (3-бет), `allin`; против лимпа — `check`, `raise` (изоляция),
+`allin`. Сверки — `*_pct` у каждого действия и `fold_pct` (против лимпа фолд —
+только «0%» или ничего, `test_a_limp_entry_may_declare_zero_fold`). `raise_size_bb`
+хранится в записи и лукапом не читается. Ближайшая глубина — та же функция
+`_nearest_depth`, что у опенов. Файла защиты нет — чартов защиты нет: пустая книга,
+каждый лукап — `ChartMissing` (`test_a_missing_defence_file_means_no_charts`).
 
 Что этот модуль НЕ проверяет: разумность самого чарта. Монотонность по глубине, по
 позиции, ширина диапазона — не его дело: чарты владельца, код их не судит.
 Проверяется только форма: известный ключ, известные классы, вес в [0,1], сумма
-долей руки не больше 1, заявленный `open_pct` совпадает с посчитанным, заполненные
-`source` и `revised_at` — список проверок пинит параметризованный
-`test_malformed_file_is_rejected`.
+долей руки не больше 1 (до округления, `_SUM_TOLERANCE`), заявленные `open_pct` (у защиты — `*_pct` и `fold_pct`)
+совпадают с посчитанными,
+заполненные `source` и `revised_at` — списки проверок пинят параметризованные
+`test_malformed_file_is_rejected` и `test_a_malformed_defence_file_is_rejected`.
 """
 
 from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -64,16 +89,26 @@ from harness.normalizer import POSITIONS_BY_COUNT
 
 SCHEMA_VERSION = 3
 
-# Сумма долей руки по трём действиям допускает округление записи до сотых.
-_SUM_TOLERANCE = 1e-9
+# Сумма долей руки по действиям допускает округление записи до сотых: солвер
+# округляет каждую долю отдельно, и рука может в сумме дать 1.01 (так в чарте защиты
+# владельца). Допуск один у опенов и защиты; 1.02 — уже ошибка. Доли не
+# перенормируются: каждое действие держит свою долю как записана
+# (`test_shares_rounded_to_hundredths_may_sum_to_one_point_zero_one`,
+# `test_defence_shares_follow_the_same_rounding_rule`).
+_SUM_TOLERANCE = 0.01 + 1e-9
 
-# Заявленный `open_pct` сверяется с посчитанной долей «рейз + олл-ин» до десятой
-# процента — так он записан в солвере. Это ловит опечатку при переносе чарта, а не
-# судит сам чарт.
+# Заявленный процент сверяется с посчитанной по диапазонам долей до десятой
+# процента — так он записан в солвере: `open_pct` опен-чарта (рейз + олл-ин) и каждая
+# сверка чарта защиты (`call_pct`, `check_pct`, `raise_pct`, `allin_pct`, `fold_pct`).
+# Это ловит опечатку при переносе чарта, а не судит сам чарт.
 _OPEN_PCT_TOLERANCE = 0.1
 _PERCENT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 
 DEFAULT_CHART_PATH = Path(__file__).parent / "data" / "open_8max.json"
+DEFAULT_DEFEND_PATH = Path(__file__).parent / "data" / "defend_8max.json"
+
+# Написание позиций в файлах владельца → раскладка `POSITIONS_BY_COUNT`.
+_OWNER_POSITIONS = {"UTG1": "UTG+1"}
 
 # Ниже — зона пуш-фолда: эталон там считается равновесием, а не берётся из чарта.
 MIN_CHART_DEPTH_BB: float = 15.0
@@ -113,6 +148,18 @@ class ChartKey(NamedTuple):
     ante_type: str
 
 
+DefendAction = Literal["raise", "limp"]
+
+
+class DefendKey(NamedTuple):
+    seats: int
+    position: str
+    vs_position: str
+    vs_action: DefendAction
+    depth_bb: float
+    ante_type: str
+
+
 @dataclass(frozen=True)
 class OpenStrategy:
     """Эталонная стратегия открытия: доля каждого действия для каждого класса.
@@ -141,6 +188,36 @@ class OpenStrategy:
             self.raise_range.weight(cls) + self.allin_range.weight(cls) + self.limp_range.weight(cls)
         )
         return max(0.0, 1.0 - played)
+
+
+@dataclass(frozen=True)
+class DefendStrategy:
+    """Эталонная защита: против рейза — колл, 3-бет, олл-ин; против лимпа — чек,
+    изоляция, олл-ин; остальное — фолд. Действие чужой линии — пустой диапазон."""
+
+    call_range: Range
+    check_range: Range
+    raise_range: Range
+    allin_range: Range
+
+    def fold_weight(self, cls: str) -> float:
+        """Доля фолда класса: всё, что не колл, не чек, не рейз и не олл-ин."""
+        played = (
+            self.call_range.weight(cls)
+            + self.check_range.weight(cls)
+            + self.raise_range.weight(cls)
+            + self.allin_range.weight(cls)
+        )
+        return max(0.0, 1.0 - played)
+
+
+def _charted_depth(value: float) -> float:
+    if not value >= MIN_CHART_DEPTH_BB:
+        raise ValueError(
+            f"глубина чарта {value}bb ниже {MIN_CHART_DEPTH_BB}bb — там эталон "
+            f"считается равновесием пуш-фолда"
+        )
+    return value
 
 
 class ChartEntry(BaseModel):
@@ -175,13 +252,8 @@ class ChartEntry(BaseModel):
 
     @field_validator("depth_bb")
     @classmethod
-    def _charted_depth(cls, value: float) -> float:
-        if not value >= MIN_CHART_DEPTH_BB:
-            raise ValueError(
-                f"глубина чарта {value}bb ниже {MIN_CHART_DEPTH_BB}bb — там эталон "
-                f"считается равновесием пуш-фолда"
-            )
-        return value
+    def _depth(cls, value: float) -> float:
+        return _charted_depth(value)
 
     @model_validator(mode="after")
     def _check_shape(self) -> ChartEntry:
@@ -209,6 +281,118 @@ class ChartFileModel(BaseModel):
     entries: list[ChartEntry]
 
 
+class DefendEntry(BaseModel):
+    """Запись чарта защиты в формате владельца: ключ с позицией и линией открывшего,
+    провенанс, три действия своей линии и сверки.
+
+    `extra="forbid"`: поле опен-чарта (`limp`, `open_pct`) или `defend_pct` здесь —
+    ошибка загрузки (`test_a_malformed_defence_file_is_rejected`). Действие или
+    сверка чужой линии (`check` против рейза, `call` против лимпа) — тоже.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    seats: int
+    position: str
+    vs_position: str
+    vs_action: DefendAction = "raise"
+    depth_bb: float
+    ante_type: str
+    source: str
+    revised_at: date
+    status: Literal["chart", "example"] = "chart"
+    call: str = ""
+    check: str = ""
+    raise_: str = Field(default="", alias="raise")
+    allin: str = ""
+    call_pct: str | None = None
+    check_pct: str | None = None
+    raise_pct: str | None = None
+    allin_pct: str | None = None
+    fold_pct: str | None = None
+    raise_size_bb: float | None = None
+
+    @field_validator("vs_position", mode="before")
+    @classmethod
+    def _owner_spelling(cls, value: object) -> object:
+        return _OWNER_POSITIONS.get(value, value) if isinstance(value, str) else value
+
+    @field_validator("ante_type", "source")
+    @classmethod
+    def _non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("поле обязательно и не может быть пустым")
+        return value
+
+    @field_validator("depth_bb")
+    @classmethod
+    def _depth(cls, value: float) -> float:
+        return _charted_depth(value)
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> DefendEntry:
+        layout = POSITIONS_BY_COUNT.get(self.seats)
+        if layout is None:
+            raise ValueError(f"нет раскладки позиций для {self.seats} мест")
+        for field, value in (("position", self.position), ("vs_position", self.vs_position)):
+            if value not in layout:
+                raise ValueError(
+                    f"{field} {value!r} не встречается за столом на {self.seats} мест: {layout}"
+                )
+        if self.position == self.vs_position:
+            raise ValueError("защищающийся и открывший — одна позиция")
+        if self.vs_action == "limp" and self.vs_position != "SB":
+            raise ValueError(f"лимп в чарте защиты — только от SB, а не от {self.vs_position}")
+        own, foreign = ("check", "call") if self.vs_action == "limp" else ("call", "check")
+        if getattr(self, foreign).strip() or getattr(self, f"{foreign}_pct") is not None:
+            raise ValueError(
+                f"против {self.vs_action} действия {foreign} нет — есть {own}, raise, allin"
+            )
+        if self.vs_action == "limp" and self.fold_pct is not None:
+            match = _PERCENT.search(self.fold_pct)
+            if match is not None and float(match.group(1)) != 0.0:
+                raise ValueError(f"против лимпа фолда нет, а fold_pct {self.fold_pct!r}")
+        if not (getattr(self, own).strip() or self.raise_.strip() or self.allin.strip()):
+            raise ValueError(f"защиты нет: пусты {own}, raise и allin")
+        return self
+
+    @property
+    def key(self) -> DefendKey:
+        return DefendKey(
+            self.seats,
+            self.position,
+            self.vs_position,
+            self.vs_action,
+            self.depth_bb,
+            self.ante_type,
+        )
+
+
+class DefendFileModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int
+    readme: list[str] = []
+    entries: list[DefendEntry]
+
+
+def _nearest_depth[K: (ChartKey, DefendKey)](
+    candidates: Sequence[K], eff_bb: float, missing: str
+) -> K:
+    """Ключ с глубиной, ближайшей к стеку, среди ключей одной раскладки, позиций и
+    анте; при равном расстоянии — меньшая глубина. Одно правило на опен и защиту
+    (`test_the_nearest_charted_depth_is_taken`,
+    `test_the_defence_takes_the_nearest_depth_like_the_open`)."""
+    if not eff_bb >= MIN_LOOKUP_DEPTH_BB:
+        raise DepthNotCharted(
+            f"{eff_bb}bb ниже {MIN_LOOKUP_DEPTH_BB}bb — это зона пуш-фолда, "
+            f"эталон там считается равновесием (analysis.tools.pushfold), а не чартом"
+        )
+    if not candidates:
+        raise ChartMissing(missing)
+    return min(candidates, key=lambda key: (abs(key.depth_bb - eff_bb), key.depth_bb))
+
+
 class ChartBook:
     """Разобранный файл чартов: точный ключ либо ближайшая снятая глубина."""
 
@@ -225,27 +409,21 @@ class ChartBook:
     def nearest(self, seats: int, position: str, eff_bb: float, ante_type: str) -> ChartKey:
         """Ключ чарта той же раскладки, позиции и анте с глубиной, ближайшей к стеку.
 
-        При равном расстоянии — меньшая глубина. `DepthNotCharted` — стек ниже
+        Правило ближайшей глубины — `_nearest_depth`. `DepthNotCharted` — стек ниже
         `MIN_LOOKUP_DEPTH_BB` (или не число); `ChartMissing` — для такой раскладки,
         позиции и анте нет ни одной глубины.
         """
-        if not eff_bb >= MIN_LOOKUP_DEPTH_BB:
-            raise DepthNotCharted(
-                f"{eff_bb}bb ниже {MIN_LOOKUP_DEPTH_BB}bb — это зона пуш-фолда, "
-                f"эталон там считается равновесием (analysis.tools.pushfold), а не чартом"
-            )
-        candidates = [
-            key
-            for key in self._entries
-            if key.seats == seats and key.position == position and key.ante_type == ante_type
-        ]
-        if not candidates:
-            raise ChartMissing(
-                f"нет ни одного чарта для (seats={seats}, position={position!r}, "
-                f"ante_type={ante_type!r}) в {self.path}; соседняя позиция, раскладка "
-                f"или тип анте не подставляются"
-            )
-        return min(candidates, key=lambda key: (abs(key.depth_bb - eff_bb), key.depth_bb))
+        return _nearest_depth(
+            [
+                key
+                for key in self._entries
+                if key.seats == seats and key.position == position and key.ante_type == ante_type
+            ],
+            eff_bb,
+            f"нет ни одного чарта для (seats={seats}, position={position!r}, "
+            f"ante_type={ante_type!r}) в {self.path}; соседняя позиция, раскладка "
+            f"или тип анте не подставляются",
+        )
 
     def entry(self, key: ChartKey) -> ChartEntry:
         """Запись по ключу — вместе с провенансом. Отказы те же, что у `get`."""
@@ -287,6 +465,62 @@ class ChartBook:
             and k.position == key.position
             and k.ante_type == key.ante_type
         )
+
+
+class DefendBook:
+    """Разобранный файл чартов защиты: точный ключ либо ближайшая снятая глубина."""
+
+    def __init__(
+        self, path: Path, entries: dict[DefendKey, tuple[DefendEntry, DefendStrategy]]
+    ) -> None:
+        self.path = path
+        self._entries = entries
+
+    def all_keys(self) -> list[DefendKey]:
+        return list(self._entries)
+
+    def nearest(
+        self,
+        seats: int,
+        position: str,
+        vs_position: str,
+        eff_bb: float,
+        ante_type: str,
+        vs_action: DefendAction = "raise",
+    ) -> DefendKey:
+        return _nearest_depth(
+            [
+                key
+                for key in self._entries
+                if key.seats == seats
+                and key.position == position
+                and key.vs_position == vs_position
+                and key.vs_action == vs_action
+                and key.ante_type == ante_type
+            ],
+            eff_bb,
+            f"нет чарта защиты {position} против {vs_action} {vs_position} для {seats} "
+            f"мест и анте {ante_type!r} в {self.path}; соседний не подставляется",
+        )
+
+    def entry(self, key: DefendKey) -> DefendEntry:
+        entry, _ = self._require(key)
+        return entry
+
+    def get(self, key: DefendKey) -> DefendStrategy:
+        _, strategy = self._require(key)
+        return strategy
+
+    def _require(self, key: DefendKey) -> tuple[DefendEntry, DefendStrategy]:
+        found = self._entries.get(key)
+        if found is None:
+            raise ChartMissing(f"нет чарта защиты по ключу {tuple(key)} в {self.path}")
+        entry, strategy = found
+        if entry.status == "example":
+            raise ChartPlaceholder(
+                f"запись {tuple(key)} помечена status='example' — образец формата, а не чарт"
+            )
+        return entry, strategy
 
 
 _CACHE: dict[tuple[Path, int, int], ChartBook] = {}
@@ -345,23 +579,100 @@ def open_range(
     return open_strategy(seats, position, eff_bb, ante_type, path=path).opening
 
 
-def _parse_file(path: Path) -> ChartBook:
+_DEFEND_CACHE: dict[tuple[Path, int, int], DefendBook] = {}
+
+
+def load_defend_book(path: Path | None = None) -> DefendBook:
+    """Прочитать и проверить файл чартов защиты; кэш — как у `load_chart_book`.
+
+    Файла нет — чартов защиты нет: пустая книга, и каждый лукап — `ChartMissing`
+    (`test_a_missing_defence_file_means_no_charts`). Испорченный файл —
+    `ChartFileError`, как у опенов.
+    """
+    target = (path or DEFAULT_DEFEND_PATH).resolve()
+    try:
+        stat = target.stat()
+    except FileNotFoundError:
+        return DefendBook(target, {})
+    except OSError as exc:
+        raise ChartFileError(f"файл чартов защиты не читается: {target} ({exc})") from exc
+    cache_key = (target, stat.st_mtime_ns, stat.st_size)
+    cached = _DEFEND_CACHE.get(cache_key)
+    if cached is None:
+        cached = _parse_defend_file(target)
+        _DEFEND_CACHE[cache_key] = cached
+    return cached
+
+
+def defend_strategy(
+    seats: int,
+    position: str,
+    vs_position: str,
+    eff_bb: float,
+    ante_type: str,
+    *,
+    vs_action: DefendAction = "raise",
+    path: Path | None = None,
+) -> DefendStrategy:
+    """Эталонная защита для стека: чарт ближайшей снятой глубины против рейза
+    (по умолчанию) или лимпа открывшего."""
+    book = load_defend_book(path)
+    return book.get(book.nearest(seats, position, vs_position, eff_bb, ante_type, vs_action))
+
+
+def _read_model[M: (ChartFileModel, DefendFileModel)](path: Path, model: type[M]) -> M:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except OSError as exc:
         raise ChartFileError(f"файл чартов не читается: {path} ({exc})") from exc
     except json.JSONDecodeError as exc:
         raise ChartFileError(f"файл чартов не разобран как JSON: {path} ({exc})") from exc
-
     try:
-        model = ChartFileModel.model_validate(payload)
+        parsed = model.model_validate(payload)
     except ValidationError as exc:
         raise ChartFileError(f"файл чартов не прошёл проверку формы: {path}\n{exc}") from exc
-
-    if model.schema_version != SCHEMA_VERSION:
+    if parsed.schema_version != SCHEMA_VERSION:
         raise ChartFileError(
-            f"версия схемы файла {model.schema_version}, код читает {SCHEMA_VERSION}: {path}"
+            f"версия схемы файла {parsed.schema_version}, код читает {SCHEMA_VERSION}: {path}"
         )
+    return parsed
+
+
+def _parse_defend_file(path: Path) -> DefendBook:
+    model = _read_model(path, DefendFileModel)
+    entries: dict[DefendKey, tuple[DefendEntry, DefendStrategy]] = {}
+    for entry in model.entries:
+        if entry.key in entries:
+            raise ChartFileError(f"ключ {tuple(entry.key)} встречается дважды: {path}")
+        where = f"запись {tuple(entry.key)} ({path})"
+        strategy = DefendStrategy(
+            call_range=_range_of(entry.call, "call", where),
+            check_range=_range_of(entry.check, "check", where),
+            raise_range=_range_of(entry.raise_, "raise", where),
+            allin_range=_range_of(entry.allin, "allin", where),
+        )
+        declared = (
+            (entry.call_pct, "call_pct", strategy.call_range),
+            (entry.check_pct, "check_pct", strategy.check_range),
+            (entry.raise_pct, "raise_pct", strategy.raise_range),
+            (entry.allin_pct, "allin_pct", strategy.allin_range),
+        )
+        _check_shares([rng for _, _, rng in declared], where)
+        played = 0.0
+        for pct, field, rng in declared:
+            share = 100.0 * rng.fraction_of_hands()
+            played += share
+            _check_declared(pct, field, share, where)
+        # Фолд — то, что не сыграно ни одним действием, как его считает солвер.
+        _check_declared(entry.fold_pct, "fold_pct", 100.0 - played, where)
+        entries[entry.key] = (entry, strategy)
+    if not entries:
+        raise ChartFileError(f"в файле чартов защиты нет ни одной записи: {path}")
+    return DefendBook(path, entries)
+
+
+def _parse_file(path: Path) -> ChartBook:
+    model = _read_model(path, ChartFileModel)
 
     entries: dict[ChartKey, tuple[ChartEntry, OpenStrategy]] = {}
     for entry in model.entries:
@@ -381,33 +692,39 @@ def _strategy_of(entry: ChartEntry, path: Path) -> OpenStrategy:
         allin_range=_range_of(entry.allin, "allin", where),
         limp_range=_range_of(entry.limp, "limp", where),
     )
+    _check_shares((strategy.raise_range, strategy.allin_range, strategy.limp_range), where)
+    _check_declared(
+        entry.open_pct,
+        "open_pct",
+        100.0
+        * (strategy.raise_range.fraction_of_hands() + strategy.allin_range.fraction_of_hands()),
+        where,
+    )
+    return strategy
+
+
+def _check_shares(ranges: Sequence[Range], where: str) -> None:
+    """Доли одной руки по действиям в сумме не больше 1 с допуском `_SUM_TOLERANCE`."""
+    classes = {cls for rng in ranges for cls in rng.weights}
     over = sorted(
-        cls
-        for cls in {
-            *strategy.raise_range.weights,
-            *strategy.allin_range.weights,
-            *strategy.limp_range.weights,
-        }
-        if strategy.raise_range.weight(cls)
-        + strategy.allin_range.weight(cls)
-        + strategy.limp_range.weight(cls)
-        > 1.0 + _SUM_TOLERANCE
+        cls for cls in classes if sum(rng.weight(cls) for rng in ranges) > 1.0 + _SUM_TOLERANCE
     )
     if over:
         raise ChartFileError(f"{where}: доли действий в сумме больше 1 у {', '.join(over)}")
-    if entry.open_pct is not None:
-        declared = _PERCENT.search(entry.open_pct)
-        if declared is None:
-            raise ChartFileError(f"{where}: open_pct {entry.open_pct!r} не содержит процента")
-        counted = 100.0 * (
-            strategy.raise_range.fraction_of_hands() + strategy.allin_range.fraction_of_hands()
+
+
+def _check_declared(declared: str | None, field: str, counted: float, where: str) -> None:
+    """Заявленный процент совпадает с посчитанным до десятой — ловит опечатку переноса."""
+    if declared is None:
+        return
+    match = _PERCENT.search(declared)
+    if match is None:
+        raise ChartFileError(f"{where}: {field} {declared!r} не содержит процента")
+    if abs(float(match.group(1)) - counted) > _OPEN_PCT_TOLERANCE:
+        raise ChartFileError(
+            f"{where}: заявлено {match.group(1)}% ({field}), по диапазонам выходит "
+            f"{counted:.2f}% — опечатка при переносе?"
         )
-        if abs(float(declared.group(1)) - counted) > _OPEN_PCT_TOLERANCE:
-            raise ChartFileError(
-                f"{where}: заявлено открытие {declared.group(1)}%, по диапазонам "
-                f"raise + allin выходит {counted:.2f}% — опечатка при переносе?"
-            )
-    return strategy
 
 
 def _range_of(text: str, field: str, where: str) -> Range:

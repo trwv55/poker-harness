@@ -17,23 +17,35 @@ from typing import Any, cast
 
 import pytest
 
+import harness.calcs as calcs_module
+from harness.analysis import analyze_hand, solver_guide
+from harness.analysis.charts import lookup, parse_range, to_notation
 from harness.analysis.frequency import wilson_interval
+from harness.analysis.opponent_range import live_combos
+from harness.analysis.tools.equity import equity_vs_range
 from harness.calcs import run
 from harness.contracts import (
     ActionKind,
     AnalysisResult,
     BetSizeThreshold,
+    CalcName,
     CanonicalAction,
     CoverageParams,
     DecisionPoint,
     DefenseParams,
+    EquityVsRangeParams,
     FieldThreshold,
+    FoldHint,
     FrequencyStat,
     HeroFrequencyParams,
     LeaksParams,
+    Measurement,
     OpponentFrequencyParams,
+    OpponentRangeParams,
     PointFilter,
     PointVerdict,
+    RangeCategory,
+    RangeNarrowing,
     SpotKind,
     Street,
     Subject,
@@ -45,13 +57,24 @@ from harness.contracts import (
 )
 from harness.memory.repos import (
     AnalysesRepo,
+    CalcCacheRepo,
     HandsRepo,
     OpponentsRepo,
     PlayersRepo,
     SessionsRepo,
 )
 from harness.normalizer import normalize
+from tests.test_opponent_range import (
+    _BB_DONKS,
+    _DEFEND_CALL,
+    _THROUGH_RIVER,
+    BTN_OPENS_BB_CALLS,
+    _raw,
+    defend_file,
+)
 from tests.test_player_stats import _call, _fold, _raise_to, _raw_hand
+from tests.test_postflop_line import _played_out
+from tests.test_solver_guide import write_dump
 
 
 async def _player_with_session(db, tg_user_id: int) -> tuple[int, int]:
@@ -557,9 +580,271 @@ def test_the_bot_does_not_load_the_dictionary():
     """
     code = (
         "import sys, harness.bot.main;"
-        "print(sorted({m for m in sys.modules} & {'harness.calcs', 'pokerkit', 'eval7'}))"
+        "print(sorted({m for m in sys.modules} & {'harness.calcs', 'harness.agent', 'pokerkit', 'eval7'}))"
     )
     result = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, check=True
     )
     assert result.stdout.strip() == "[]", f"бот загрузил словарь: {result.stdout}"
+
+
+# --- диапазон соперника и эквити против суженного (только агент) -------------------
+
+
+async def stored_analysis(db, *, session_id: int, actions=None) -> int:
+    """Синтетическая рука вечера с разбором: BTN открывает, BB коллирует, флоп."""
+    raw = _raw(actions or BTN_OPENS_BB_CALLS)
+    en = _played_out(raw)
+    hand_id = await HandsRepo(db).save_raw(session_id=session_id, raw=raw)
+    await HandsRepo(db).save_canonical(hand_id, en.hand)
+    await HandsRepo(db).save_enriched(hand_id, en)
+    return await AnalysesRepo(db).save(
+        hand_id=hand_id, result=analyze_hand(en), decision_points=en.report.decision_points
+    )
+
+
+async def test_the_opponent_range_comes_from_the_chart_of_the_analysed_hand(
+    db, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    player_id, session_id = await _player_with_session(db, tg_user_id=9201)
+    analysis_id = await stored_analysis(db, session_id=session_id)
+    result = await run(db, player_id, OpponentRangeParams(
+        analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP,
+    ))
+    assert (result.calc, result.line, result.chart, result.vs_chart_position) == (
+        CalcName.OPPONENT_RANGE, "call", "defend", "BTN",
+    )
+    assert (result.chart_seats, result.table_seats) == (8, 6)
+
+
+async def test_another_players_analysis_is_not_read(db, tmp_path, monkeypatch):
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    _owner, owner_session = await _player_with_session(db, tg_user_id=9202)
+    stranger, _ = await _player_with_session(db, tg_user_id=9203)
+    analysis_id = await stored_analysis(db, session_id=owner_session)
+    with pytest.raises(ValueError, match="разбора этой руки нет"):
+        await run(db, stranger, OpponentRangeParams(
+            analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP,
+        ))
+
+
+async def test_equity_is_deterministic_and_cached(db, tmp_path, monkeypatch):
+    """Тот же вход — то же число, равное прямому расчёту с тем же сидом; второй раз
+    — из `calc_cache`."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 2_000)
+    player_id, session_id = await _player_with_session(db, tg_user_id=9204)
+    analysis_id = await stored_analysis(db, session_id=session_id)
+    params = EquityVsRangeParams(
+        analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP,
+        hands="QQ, 77, 22, AQs",
+    )
+    first = await run(db, player_id, params)
+    prefix, key = calcs_module.equity_cache_prefix(), "KdTc|Qc7d2s|" + to_notation(
+        parse_range("QQ, 77, 22, AQs")
+    )
+    assert await CalcCacheRepo(db).get(prefix, key) == first.equity
+    assert first.equity == equity_vs_range(
+        ("Kd", "Tc"), parse_range("QQ, 77, 22, AQs"), ["Qc", "7d", "2s"], iterations=2_000,
+        seed=42,
+    )
+    assert (await run(db, player_id, params)).equity == first.equity
+    assert first.live_combos == 12.0
+
+
+async def test_a_cached_equity_is_returned_without_counting_again(db, tmp_path, monkeypatch):
+    """Строка кэша с тем же ключом отдаётся как есть: Монте-Карло не зовётся."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    player_id, session_id = await _player_with_session(db, tg_user_id=9206)
+    analysis_id = await stored_analysis(db, session_id=session_id)
+    key = "KdTc|Qc7d2s|" + to_notation(parse_range("QQ, AQs"))
+    await CalcCacheRepo(db).upsert_many(calcs_module.equity_cache_prefix(), {key: 0.25})
+
+    def must_not_run(*_args: object, **_kw: object) -> float:
+        raise AssertionError("эквити посчитано заново при строке в кэше")
+
+    monkeypatch.setattr(calcs_module, "equity_vs_range", must_not_run)
+    result = await run(db, player_id, EquityVsRangeParams(
+        analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP, hands="QQ, AQs",
+    ))
+    assert result.equity == 0.25
+
+
+@pytest.mark.parametrize(
+    ("name", "value"), [("AGENT_EQUITY_ITERATIONS", 1_000), ("AGENT_EQUITY_SEED", 7)]
+)
+async def test_another_iteration_count_or_seed_misses_the_cache(
+    db, tmp_path, monkeypatch, name: str, value: int
+):
+    """Число, посчитанное на других итерациях или с другим сидом, не отдаётся:
+    они входят в префикс ключа `calc_cache`."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    player_id, session_id = await _player_with_session(db, tg_user_id=9207)
+    analysis_id = await stored_analysis(db, session_id=session_id)
+    key = "KdTc|Qc7d2s|" + to_notation(parse_range("QQ, AQs"))
+    await CalcCacheRepo(db).upsert_many(calcs_module.equity_cache_prefix(), {key: 0.25})
+    monkeypatch.setattr(calcs_module, name, value)
+    monkeypatch.setattr(calcs_module, "equity_vs_range", lambda *_a, **_kw: 0.5)
+    result = await run(db, player_id, EquityVsRangeParams(
+        analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP, hands="QQ, AQs",
+    ))
+    assert result.equity == 0.5
+
+
+async def test_a_narrowing_outside_the_start_is_refused_by_the_calculation(
+    db, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    player_id, session_id = await _player_with_session(db, tg_user_id=9205)
+    analysis_id = await stored_analysis(db, session_id=session_id)
+    with pytest.raises(ValueError, match="нет в стартовом диапазоне: AKo"):
+        await run(db, player_id, EquityVsRangeParams(
+            analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP, hands="AKo",
+        ))
+
+
+async def test_the_turn_layout_is_of_the_flop_narrowing_and_without_it_of_the_start(
+    db, tmp_path, monkeypatch
+):
+    """Раскладка по категориям (спека 2026-10-24, §4): флоп — стартового; тёрн — сужения
+    флопа этой руки, без него — стартового; на ривере раскладки нет."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    player_id, session_id = await _player_with_session(db, tg_user_id=9208)
+    analysis_id = await stored_analysis(db, session_id=session_id, actions=_THROUGH_RIVER)
+
+    def params(street: Street, prior: RangeNarrowing | None = None) -> OpponentRangeParams:
+        return OpponentRangeParams(
+            analysis_id=analysis_id, opponent_position="BB", street=street, prior=prior,
+        )
+
+    def classes(result) -> set[str]:
+        return {item.hand_class for group in result.layout for item in group.classes}
+
+    flop = await run(db, player_id, params(Street.FLOP))
+    assert flop.layout_of == "start"
+    assert classes(flop) == set(parse_range(_DEFEND_CALL).weights)
+    assert sum(group.combos for group in flop.layout) == pytest.approx(flop.live_combos)
+    bare_turn = await run(db, player_id, params(Street.TURN))
+    assert bare_turn.layout_of == "start"
+    narrowing = RangeNarrowing(
+        analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP,
+        classes=["QQ", "77", "AQs", "KQo"],
+    )
+    turn = await run(db, player_id, params(Street.TURN, narrowing))
+    assert turn.layout_of == "flop"
+    assert classes(turn) == {"QQ", "77", "AQs", "KQo"}
+    river = await run(db, player_id, params(Street.RIVER))
+    assert (river.layout_of, river.layout) == (None, [])
+
+
+async def test_the_flop_equity_after_a_called_cbet_carries_the_fold_to_cbet_hint(
+    db, tmp_path, monkeypatch
+):
+    """Герой поставил продолженную, BB коллировал: рядом со сводкой — сдача на с-бет.
+    Без сшивки места в этом турнире — поле (как у `opponent_frequency` без ника), со
+    сшивкой — этот соперник с ником; выборка — числитель и знаменатель."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 300)
+    player_id, session_id = await _player_with_session(db, tg_user_id=9211)
+    analysis_id = await stored_analysis(db, session_id=session_id)
+    params = EquityVsRangeParams(
+        analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP, hands="QQ, AQs",
+    )
+    field = await run(db, player_id, params)
+    assert field.fold_hint == FoldHint(
+        stat=FrequencyStat.FOLD_TO_CBET, subject=Subject.FIELD,
+        measurement=Measurement(numerator=0, denominator=1),
+    )
+    opponents = OpponentsRepo(db)
+    opponent_id = await opponents.get_or_create(owner_player_id=player_id, nick="syn_villain")
+    await opponents.link(
+        owner_player_id=player_id, opponent_id=opponent_id, room_tournament_id="TSYN",
+        participant_label="P6",
+    )
+    named = await run(db, player_id, params)
+    assert named.fold_hint == FoldHint(
+        stat=FrequencyStat.FOLD_TO_CBET, subject=Subject.OPPONENT, opponent="syn_villain",
+        measurement=Measurement(numerator=0, denominator=1),
+    )
+
+
+async def test_without_a_called_hero_bet_the_equity_has_no_fold_hint(
+    db, tmp_path, monkeypatch
+):
+    """BB поставил сам (донк), герой коллировал: линию к частоте сдачи не привязать —
+    статистики нет, доля оставленного остаётся."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 300)
+    player_id, session_id = await _player_with_session(db, tg_user_id=9212)
+    analysis_id = await stored_analysis(db, session_id=session_id, actions=_BB_DONKS)
+    result = await run(db, player_id, EquityVsRangeParams(
+        analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP, hands="QQ, AQs",
+    ))
+    assert result.fold_hint is None
+    assert result.kept_combos is not None and result.source_combos is not None
+
+
+async def test_a_narrowing_by_category_counts_what_is_kept(db, tmp_path, monkeypatch):
+    """`hands` с категорией раскладки (спека 2026-10-24, §5): категория разворачивается в
+    классы стартового на борде, «-класс» вычитает; сводка — сколько оставлено из
+    стартового. Тёрн по категории — из сужения флопа, правило подмножества прежнее."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 300)
+    player_id, session_id = await _player_with_session(db, tg_user_id=9209)
+    analysis_id = await stored_analysis(db, session_id=session_id, actions=_THROUGH_RIVER)
+    flop = await run(db, player_id, EquityVsRangeParams(
+        analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP,
+        hands="оверпара -AA, AQs",
+    ))
+    assert flop.range_text == "KK, AQs"
+    assert flop.categories_of == "start"
+    assert flop.source_combos == pytest.approx(
+        live_combos(parse_range(_DEFEND_CALL), ["Kd", "Tc", "Qc", "7d", "2s"])
+    )
+    assert flop.kept_combos == pytest.approx(flop.live_combos)
+    narrowing = RangeNarrowing(
+        analysis_id=analysis_id, opponent_position="BB", street=Street.FLOP,
+        classes=["KK", "AQs"],
+    )
+    turn = await run(db, player_id, EquityVsRangeParams(
+        analysis_id=analysis_id, opponent_position="BB", street=Street.TURN,
+        hands="оверпара", prior=narrowing,
+    ))
+    assert (turn.range_text, turn.categories_of) == ("KK", "flop")
+    with pytest.raises(ValueError, match="в категории «трипс» на этом борде нет"):
+        await run(db, player_id, EquityVsRangeParams(
+            analysis_id=analysis_id, opponent_position="BB", street=Street.TURN,
+            hands="трипс", prior=narrowing,
+        ))
+
+
+async def test_the_flop_output_carries_the_nearest_solver_guide(db, tmp_path, monkeypatch):
+    """Флоп: выгрузка библиотеки того же ключа, текстуры и корзины — ориентир, действия
+    разложены по категориям на борде выгрузки; тёрн ориентира не несёт; пустая
+    библиотека — ориентира нет; нечитаемая — причина в `solver_error`."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    library = tmp_path / "solver"
+    monkeypatch.setattr(solver_guide, "DEFAULT_SOLVER_DIR", library)
+    player_id, session_id = await _player_with_session(db, tg_user_id=9210)
+    analysis_id = await stored_analysis(db, session_id=session_id, actions=_THROUGH_RIVER)
+
+    def params(street: Street) -> OpponentRangeParams:
+        return OpponentRangeParams(analysis_id=analysis_id, opponent_position="BB", street=street)
+
+    empty = await run(db, player_id, params(Street.FLOP))
+    assert (empty.solver, empty.solver_error) == (None, None)
+    hand = _played_out(_raw(_THROUGH_RIVER)).hand
+    write_dump(library, "dry.json", ante_type=hand.ante_type, call="QQ, 77, AKo")
+    flop = await run(db, player_id, params(Street.FLOP))
+    assert flop.solver is not None
+    assert (flop.solver.board, flop.solver.bet_share) == (["Qh", "7c", "2d"], 0.2)
+    assert flop.solver.hand_board == ["Qc", "7d", "2s"]
+    call = next(a for a in flop.solver.actions if a.action == "call")
+    assert [(g.category, [c.hand_class for c in g.classes]) for g in call.layout] == [
+        (RangeCategory.SET, ["QQ", "77"]), (RangeCategory.BACKDOORS_OVERCARDS, ["AKo"]),
+    ]
+    assert (await run(db, player_id, params(Street.TURN))).solver is None
+    (library / "broken.json").write_text("{", encoding="utf-8")
+    broken = await run(db, player_id, params(Street.FLOP))
+    assert broken.solver is None and "broken.json" in (broken.solver_error or "")

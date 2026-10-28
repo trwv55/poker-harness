@@ -1531,7 +1531,7 @@ async def test_the_settings_screen_shows_the_nickname_and_the_quota_left(deps, d
 
     quota = await check_quota(deps, invited)
     assert "screen_nick" in msg.text
-    assert f"разборов {quota.left}/{quota.total} за 24 ч" in msg.text
+    assert f"запросов {quota.left}/{quota.total} за 24 ч" in msg.text
 
 
 async def test_the_nickname_button_in_settings_opens_the_input(deps, db_factory, invited):
@@ -2240,8 +2240,19 @@ async def test_a_screenshot_analysis_has_no_tournament_to_bind_to(deps, db_facto
 # --- вопрос о своей игре (`/ask`) ---------------------------------------------------
 
 
+async def test_ask_of_a_player_with_the_agent_points_to_plain_text(db_factory, deps, invited):
+    """У игрока с агентом `/ask` снят: вопрос пишется текстом, задача `question` не ставится."""
+    from harness.presentation import ask_moved_msg
+
+    await _make_dev(db_factory, invited)
+
+    assert await handle_question_command(deps, _TG_USER_ID, "плюсовой ли я на BB") == ask_moved_msg()
+    assert await fetch_all(db_factory, "select id from jobs") == []
+
+
 async def test_a_question_becomes_a_job_for_the_worker(db_factory, deps, invited):
-    """Бот не считает и не говорит: он ставит задачу, дальше говорит воркер.
+    """У игрока без доступа к агенту бот не считает и не говорит: он ставит задачу,
+    дальше говорит воркер.
 
     Вопрос едет в `payload` целиком — воркер читает его оттуда и отдаёт модели.
     """
@@ -2255,11 +2266,8 @@ async def test_a_question_becomes_a_job_for_the_worker(db_factory, deps, invited
 
 
 async def test_a_question_does_not_spend_the_daily_quota(db_factory, deps, invited):
-    """Счётчик подписан «разборов X/Y» — вопрос с него не списывается.
-
-    Иначе игрок, спросивший про свою игру, платил бы за это разбором, а число
-    рядом со словом «разборов» перестало бы означать написанное.
-    """
+    """Вопрос `/ask` в счётчик не входит — решение принято до агента и планом
+    агента не пересматривается."""
     player_id, _session_id = await _seed_player(db_factory, quota_daily=1)
 
     await handle_question_command(deps, _TG_USER_ID, "есть ли у меня третий баррель")
@@ -2819,3 +2827,137 @@ async def test_unicode_digits_in_button_numbers_break_nothing_and_change_nothing
 
     assert (await fetch_one(db_factory, "select color_id from notes"))["color_id"] is None
     assert [r["id"] for r in await fetch_all(db_factory, "select id from note_colors")] == [red]
+
+
+# --- свободный текст агенту (план агента, Task 5) ----------------------------------------
+
+
+async def _make_dev(db_factory, player_id: int) -> None:
+    async with db_factory() as session:
+        await session.execute(text(f"update players set is_dev = true where id = {player_id}"))
+        await session.commit()
+
+
+async def test_free_text_of_a_dev_becomes_an_agent_job(db_factory, deps, invited):
+    from harness.bot.handlers import handle_text
+
+    await _make_dev(db_factory, invited)
+    assert await handle_text(deps, _TG_USER_ID, "как часто я вхожу в банк") is None
+    job = await fetch_one(db_factory, "select type, payload, priority from jobs")
+    assert (job["type"], job["payload"], job["priority"]) == ("agent", {"text": "как часто я вхожу в банк"}, 100)
+
+
+async def test_a_player_without_access_gets_the_old_answer_and_no_job(db_factory, deps, invited):
+    from harness.bot.handlers import handle_text
+    from harness.presentation import unknown_text_msg
+
+    assert await handle_text(deps, _TG_USER_ID, "как часто я вхожу в банк") == unknown_text_msg()
+    assert await fetch_all(db_factory, "select id from jobs") == []
+
+
+async def test_a_menu_label_opens_its_screen_and_a_question_about_it_goes_to_the_agent(
+    db_factory, deps, invited
+):
+    """Подпись кнопки — экран; вопрос со словами подписи — агенту. Совпадение точное."""
+    from harness.bot.handlers import handle_text
+    from harness.presentation import MENU_LEAKS
+
+    await _make_dev(db_factory, invited)
+    screen = await handle_text(deps, _TG_USER_ID, MENU_LEAKS)
+    assert screen is not None
+    assert await fetch_all(db_factory, "select id from jobs") == []
+    assert await handle_text(deps, _TG_USER_ID, f"{MENU_LEAKS} за вечер — что там?") is None
+    assert (await fetch_one(db_factory, "select type from jobs"))["type"] == "agent"
+
+
+async def test_a_started_input_takes_the_text_before_the_agent(db_factory, deps, invited):
+    from harness.bot.handlers import handle_text
+
+    await _make_dev(db_factory, invited)
+    async with db_factory() as session:
+        await PlayersRepo(session).set_pending_input(invited, {"kind": "gg_nickname"})
+        await session.commit()
+    msg = await handle_text(deps, _TG_USER_ID, "SynthNick")
+    assert msg is not None and "SynthNick" in msg.text
+    assert await fetch_all(db_factory, "select id from jobs") == []
+
+
+async def test_text_while_an_escalation_waits_for_a_number_stays_with_the_escalation(deps, db_factory):
+    """Принятый край (спека §3): вопрос во время ручного ответа получает «не число»."""
+    from harness.bot.handlers import handle_escalation_callback, handle_text
+    from harness.presentation import vision_answer_not_a_number_msg
+
+    job_id, _hand_id = await _awaiting_job(db_factory, deps)
+    player = await fetch_one(db_factory, f"select player_id from jobs where id = {job_id}")
+    await _make_dev(db_factory, player["player_id"])
+    await handle_escalation_callback(deps, _TG_USER_ID, f"escalate:{job_id}:pot:manual")
+    assert await handle_text(deps, _TG_USER_ID, "как часто я вхожу в банк") == vision_answer_not_a_number_msg()
+    assert (await fetch_one(db_factory, "select count(*) as n from jobs where type = 'agent'"))["n"] == 0
+
+
+async def test_an_agent_message_over_the_quota_is_refused(db_factory, deps, invited):
+    from harness.bot.handlers import handle_text
+
+    await _make_dev(db_factory, invited)
+    async with db_factory() as session:
+        await session.execute(text(f"update players set quota_daily = 0 where id = {invited}"))
+        await session.commit()
+    msg = await handle_text(deps, _TG_USER_ID, "как часто я вхожу в банк")
+    assert msg is not None and "запросов" in msg.text.lower()
+    assert await fetch_all(db_factory, "select id from jobs") == []
+
+
+async def test_an_agent_text_longer_than_the_limit_is_refused(db_factory, deps, invited):
+    from harness.bot.handlers import handle_text
+
+    await _make_dev(db_factory, invited)
+    msg = await handle_text(deps, _TG_USER_ID, "а" * (MAX_QUESTION_CHARS + 1))
+    assert msg is not None and str(MAX_QUESTION_CHARS) in msg.text
+    assert await fetch_all(db_factory, "select id from jobs") == []
+
+
+async def test_the_wrong_calculation_button_writes_an_eval_case_without_a_hand(db_factory, deps, invited):
+    from harness.bot.handlers import handle_ui_callback
+    from harness.memory.models import Trace
+    from harness.presentation import AGENT_MISS_PREFIX, agent_miss_saved_msg
+
+    player_id, session_id = await _seed_player(db_factory)
+    async with db_factory() as session:
+        job = Job(type="agent", player_id=player_id, session_id=session_id,
+                  payload={"text": "как часто я вхожу в банк"}, status="done")
+        session.add(job)
+        await session.flush()
+        session.add(Trace(job_id=job.id, spans=[{
+            "name": "agent_turn", "question": "как часто я вхожу в банк", "state": "prose",
+            "answer": "синт", "calls": [{"calc": "hero_frequency"}], "checks": [[]], "rewrite": False,
+            "drafts": ["синт-черновик"],
+        }]))
+        await session.commit()
+        job_id = job.id
+
+    assert await handle_ui_callback(deps, _TG_USER_ID, f"{AGENT_MISS_PREFIX}{job_id}") == agent_miss_saved_msg()
+    case = await fetch_one(db_factory, "select kind, hand_id, source, ground_truth from eval_cases")
+    assert (case["kind"], case["hand_id"], case["source"]) == ("agent_routing", None, "agent_miss_button")
+    assert case["ground_truth"]["question"] == "как часто я вхожу в банк"
+    assert case["ground_truth"]["calls"] == [{"calc": "hero_frequency"}]
+    assert case["ground_truth"]["drafts"] == ["синт-черновик"]
+
+
+async def test_the_wrong_calculation_button_of_another_player_writes_nothing(db_factory, deps, invited):
+    from harness.bot.handlers import handle_ui_callback
+    from harness.memory.models import Trace
+    from harness.presentation import AGENT_MISS_PREFIX, agent_turn_unavailable_msg
+
+    other_id, other_session = await _seed_player(db_factory, tg_user_id=_TG_USER_ID + 1)
+    async with db_factory() as session:
+        job = Job(type="agent", player_id=other_id, session_id=other_session, payload={"text": "x"})
+        session.add(job)
+        await session.flush()
+        # След хода у чужой задачи есть: отказ даёт именно сверка владельца, а не
+        # отсутствие трейса.
+        session.add(Trace(job_id=job.id, spans=[{"name": "agent_turn", "state": "prose", "calls": []}]))
+        await session.commit()
+        job_id = job.id
+    reply = await handle_ui_callback(deps, _TG_USER_ID, f"{AGENT_MISS_PREFIX}{job_id}")
+    assert reply == agent_turn_unavailable_msg()
+    assert await fetch_all(db_factory, "select id from eval_cases") == []

@@ -31,8 +31,12 @@ from pydantic import BaseModel
 from pydantic_ai import BinaryContent
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart, UserPromptPart
+from pydantic_ai.models import Model, infer_model
+from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.tools import Tool
+from pydantic_ai.usage import RequestUsage
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -40,7 +44,13 @@ from harness.memory.models import Job, LlmCall, Trace
 from harness.memory.repos import PlayersRepo, SessionsRepo
 from harness.platform.config import Config, InvalidEnvVar, MissingEnvVar, optional_env
 from harness.platform.limiter import _ADVISORY_LOCK_CLASS, PgLimiter, PgLimiterTimeout, _engine_of
-from harness.platform.llm import LLM, LLMProviderError, LLMSchemaError, _sniff_image_media_type
+from harness.platform.llm import (
+    LLM,
+    LLMProviderError,
+    LLMSchemaError,
+    _build_model,
+    _sniff_image_media_type,
+)
 
 # Строки моделей ниже никогда не резолвятся в реального провайдера — во всех тестах
 # `model_override` подменяет модель тестовым двойником PydanticAI ДО того, как
@@ -55,6 +65,13 @@ cfg = Config(
     database_url="unused-in-tests",
     telegram_token="unused-in-tests",
 )
+
+
+def replace_cfg(**changes: object) -> Config:
+    """Тот же тестовый `Config` с заменёнными полями — `Config` заморожен."""
+    from dataclasses import replace
+
+    return replace(cfg, **changes)  # type: ignore[arg-type]
 
 
 async def _make_trace_scope(session_factory, tg_user_id: int = 1) -> int:
@@ -1044,3 +1061,191 @@ async def test_a_provider_that_reports_no_hoster_leaves_the_column_empty(db_fact
 
     rows = await fetch_all(db_factory, "select served_by from llm_calls")
     assert rows == [(None,)]
+
+
+async def test_a_turn_with_two_tool_calls_logs_three_requests(db_factory):
+    """Ход с двумя вызовами инструмента — три обращения к провайдеру и три строки.
+
+    Окно темпа `PgLimiter` считает по `llm_calls`; одна строка на прогон
+    занижала нагрузку ровно там, где она растёт, — у агента с инструментами.
+    """
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=21)
+    calls = {"n": 0}
+
+    async def echo(value: int) -> str:
+        """Вернуть число строкой."""
+        return str(value)
+
+    def scripted(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return ModelResponse(parts=[ToolCallPart(tool_name="echo", args={"value": calls["n"]})])
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {"text": "ok"})])
+
+    llm = LLM(cfg, db_factory, model_override=FunctionModel(scripted))
+    await llm("verdict_text", Out, prompt="п", tools=[Tool(echo, name="echo")], trace_id=trace_id)
+
+    rows = await fetch_all(db_factory, "select purpose, status from llm_calls order by id")
+    assert calls["n"] == 3
+    assert rows == [("verdict_text", "ok")] * 3
+
+
+async def test_a_hung_provider_request_is_cut_by_the_request_timeout(db_factory):
+    """Зависший запрос снимается своим таймаутом, строка закрыта `error`.
+
+    Прежде запрос ничем не ограничивался (тех-спека §7, «Известный дефект»), и
+    бюджет задачи снимал попытку целиком вместе с уже посчитанным.
+    """
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=22)
+
+    async def hung(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        await asyncio.sleep(10)
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {"text": "ok"})])
+
+    short = replace_cfg(llm_request_timeout_s=1)
+    llm = LLM(short, db_factory, model_override=FunctionModel(hung))
+    started = time.monotonic()
+    with pytest.raises(LLMProviderError):
+        await llm("verdict_text", Out, prompt="п", trace_id=trace_id)
+
+    assert time.monotonic() - started < 5
+    rows = await fetch_all(db_factory, "select status from llm_calls")
+    assert rows == [("error",)]
+
+
+async def test_the_history_reaches_the_model_and_comes_back_with_the_new_turn(db_factory):
+    """`message_history` уходит модели, `CallMeta.messages` — история плюс ход."""
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=23)
+    llm = LLM(cfg, db_factory, model_override=TestModel())
+    _out, first = await llm("verdict_text", Out, prompt="первый", trace_id=trace_id)
+    seen: list[int] = []
+
+    def counting(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        seen.append(len(messages))
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {"text": "ok"})])
+
+    llm2 = LLM(cfg, db_factory, model_override=FunctionModel(counting))
+    _out2, second = await llm2(
+        "verdict_text", Out, prompt="второй", message_history=first.messages, trace_id=trace_id
+    )
+
+    assert seen[0] > 1, "история не дошла до модели"
+    assert len(second.messages) > len(first.messages)
+    assert second.messages[: len(first.messages)] == first.messages
+
+
+async def test_instructions_reach_the_model(db_factory):
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=24)
+    seen: list[str | None] = []
+
+    def peeking(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        seen.append(info.instructions)
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {"text": "ok"})])
+
+    llm = LLM(cfg, db_factory, model_override=FunctionModel(peeking))
+    await llm("verdict_text", Out, prompt="п", instructions="СВОДКА-СИНТ", trace_id=trace_id)
+
+    assert seen and "СВОДКА-СИНТ" in (seen[0] or "")
+
+
+async def test_the_agent_purpose_takes_its_own_model(db_factory):
+    # `PgLimiter.__init__` проверяет движок фабрики, поэтому `None` здесь не годится.
+    llm = LLM(replace_cfg(llm_agent_model="anthropic:agent-test"), db_factory)
+    assert llm._resolve_model("agent") == "anthropic:agent-test"
+
+
+def test_config_reads_the_agent_variables_with_defaults(monkeypatch):
+    for name, value in (
+        ("LLM_VERDICT_MODEL", "anthropic:v"),
+        ("LLM_MAX_CONCURRENCY", "4"),
+        ("LLM_MAX_PER_MINUTE", "20"),
+        ("DATABASE_URL", "postgresql://x"),
+        ("TELEGRAM_TOKEN", "t"),
+    ):
+        monkeypatch.setenv(name, value)
+    for name in ("LLM_AGENT_MODEL", "LLM_REQUEST_TIMEOUT_S", "AGENT_HISTORY_MAX_TOKENS"):
+        monkeypatch.delenv(name, raising=False)
+    loaded = Config.from_env()
+    assert loaded.llm_agent_model == "anthropic:claude-sonnet-5-5"
+    assert loaded.llm_request_timeout_s == 60
+    assert loaded.agent_history_max_tokens == 30_000
+    monkeypatch.setenv("LLM_REQUEST_TIMEOUT_S", "5")
+    assert Config.from_env().llm_request_timeout_s == 5
+
+
+async def test_each_request_row_carries_its_own_cost_estimate(db_factory):
+    """Цена ставится в строку каждого запроса, а не теряется на обёртке.
+
+    Граф агента оценивает цену уже после возврата из `request`; без оценки в
+    самой обёртке колонка `llm_calls.cost` пустела бы у всех строк. Имя модели —
+    из прайс-листа genai-prices, иначе оценки нет вовсе и проверять нечего.
+    Сумма по строкам совпадает с оценкой прогона в `CallMeta.cost_usd`.
+    """
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=25)
+    calls = {"n": 0}
+
+    async def echo(value: int) -> str:
+        """Вернуть число строкой."""
+        return str(value)
+
+    def priced(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        calls["n"] += 1
+        usage = RequestUsage(input_tokens=1000, output_tokens=100)
+        if calls["n"] == 1:
+            return ModelResponse(parts=[ToolCallPart("echo", {"value": 1})], usage=usage)
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {"text": "ok"})], usage=usage)
+
+    model = FunctionModel(priced, model_name="claude-sonnet-4-5")
+    llm = LLM(cfg, db_factory, model_override=model)
+    _out, meta = await llm(
+        "verdict_text", Out, prompt="п", tools=[Tool(echo, name="echo")], trace_id=trace_id
+    )
+
+    rows = await fetch_all(db_factory, "select cost from llm_calls order by id")
+    assert len(rows) == 2
+    assert all(cost is not None and cost > 0 for (cost,) in rows)
+    assert meta.cost_usd is not None
+    assert float(sum(cost for (cost,) in rows)) == pytest.approx(meta.cost_usd)
+
+
+def test_the_agent_model_does_not_force_tool_choice(db_factory, monkeypatch):
+    """`claude-sonnet-5-5` отвечает 400 на принудительный `tool_choice`, а профиль
+    библиотеки этого не знает; модель агента строится с флагом, при котором
+    библиотека шлёт `tool_choice: auto`."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-real")
+    llm = LLM(replace_cfg(llm_agent_model="anthropic:claude-sonnet-5-5"), db_factory)
+    model = _build_model(llm._resolve_model("agent"))
+    assert isinstance(model, Model)
+    assert model.profile.get("anthropic_supports_forced_tool_choice") is False
+
+
+def test_other_anthropic_models_keep_the_library_profile(db_factory, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-real")
+    llm = LLM(replace_cfg(llm_verdict_model="anthropic:claude-opus-5"), db_factory)
+    model = _build_model(llm._resolve_model("verdict_text"))
+    assert model == "anthropic:claude-opus-5"
+    assert infer_model(model).profile.get("anthropic_supports_forced_tool_choice") is True
+
+
+async def test_the_overridden_agent_model_is_still_metered(db_factory, monkeypatch):
+    """Запрос модели с переопределённым профилем проходит через счётчик: строка
+    `llm_calls` на запрос, и до провайдера доходит та же модель с флагом."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-real")
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=41)
+    seen: list[object] = []
+
+    async def fake_request(self, messages, model_settings, params):
+        seen.append(self.profile.get("anthropic_supports_forced_tool_choice"))
+        return ModelResponse(
+            parts=[ToolCallPart(params.output_tools[0].name, {"text": "ok"})],
+            model_name=self.model_name,
+        )
+
+    monkeypatch.setattr(AnthropicModel, "request", fake_request)
+    llm = LLM(replace_cfg(llm_agent_model="anthropic:claude-sonnet-5-5"), db_factory)
+    out, _meta = await llm("agent", Out, prompt="п", trace_id=trace_id)
+
+    assert out == Out(text="ok")
+    assert seen == [False]
+    rows = await fetch_all(db_factory, "select purpose, provider, model, status from llm_calls")
+    assert rows == [("agent", "anthropic", "claude-sonnet-5-5", "ok")]

@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 import pytest
 
 from harness.analysis.player_stats import (
+    bet_reply,
     player_stats,
     player_stats_across_tournaments,
     player_stats_by_label,
@@ -99,6 +100,7 @@ def _raw_hand(
     showdowns: list[ShowdownEntry] | None = None,
     tournament_id: str = "T1",
     hand_no: str = "SYN",
+    stacks: dict[str, int] | None = None,
 ) -> RawHand:
     """Рука 6-max, где место героя занимает метка `Hero`, а остальные названы позицией.
 
@@ -111,7 +113,8 @@ def _raw_hand(
     """
     labels = {pos: ("Hero" if pos == hero_position else pos) for pos in _SIX_MAX}
     seats = [
-        SeatInfo(seat=i + 1, label=labels[pos], stack=_STACK) for i, pos in enumerate(_SIX_MAX)
+        SeatInfo(seat=i + 1, label=labels[pos], stack=(stacks or {}).get(pos, _STACK))
+        for i, pos in enumerate(_SIX_MAX)
     ]
     posts = [
         Post(label=labels["SB"], kind=PostKind.SMALL_BLIND, amount=_SB),
@@ -328,6 +331,128 @@ def _barrel_line(
     )
 
 
+def _turn_barrel_line(
+    *, flop_reply: str = "call", turn: str = "fold", aggressor_checks_turn: bool = False
+) -> CanonicalHand:
+    """CO открывает и ставит на флопе, герой в BB отвечает; тёрн задают аргументы.
+
+    `flop_reply` — ответ героя на продолженную ставку (`call` / `raise`) либо
+    `no_cbet`: CO чекает флоп вслед за героем;
+    `turn` — ответ героя на ставку CO на тёрне (`fold` / `call` / `raise`) либо
+    `donk`: первым на тёрне ставит сам герой, CO повышает, герой пасует.
+    `aggressor_checks_turn` — на тёрне оба чекают, рука доходит до вскрытия.
+    """
+    if flop_reply == "no_cbet":
+        flop_tail = [_check("CO", Street.FLOP)]
+    elif flop_reply == "call":
+        flop_tail = [_bet("CO", 6), _call("Hero", 6, street=Street.FLOP)]
+    else:
+        flop_tail = [
+            _bet("CO", 6),
+            _raise_to("Hero", 20, already=0, street=Street.FLOP),
+            _call("CO", 14, street=Street.FLOP),
+        ]
+    if aggressor_checks_turn:
+        turn_actions = [
+            _check("Hero", Street.TURN),
+            _check("CO", Street.TURN),
+            _check("Hero", Street.RIVER),
+            _check("CO", Street.RIVER),
+        ]
+        boards = _BOARD
+    elif turn == "donk":
+        turn_actions = [
+            _bet("Hero", 20, street=Street.TURN),
+            _raise_to("CO", 60, already=0, street=Street.TURN),
+            _fold("Hero", Street.TURN),
+        ]
+        boards = {Street.FLOP: _FLOP, Street.TURN: _TURN}
+    else:
+        reply = {
+            "fold": [_fold("Hero", Street.TURN)],
+            "call": [
+                _call("Hero", 20, street=Street.TURN),
+                _check("Hero", Street.RIVER),
+                _check("CO", Street.RIVER),
+            ],
+            "raise": [
+                _raise_to("Hero", 60, already=0, street=Street.TURN),
+                _fold("CO", Street.TURN),
+            ],
+        }[turn]
+        turn_actions = [
+            _check("Hero", Street.TURN),
+            _bet("CO", 20, street=Street.TURN),
+            *reply,
+        ]
+        boards = _BOARD if turn == "call" else {Street.FLOP: _FLOP, Street.TURN: _TURN}
+    return _hand(
+        hero_position="BB",
+        actions=[
+            _fold("UTG"),
+            _fold("HJ"),
+            _raise_to("CO", 6, already=0),
+            _fold("BTN"),
+            _fold("SB"),
+            _call("Hero", 4),
+            _check("Hero", Street.FLOP),
+            *flop_tail,
+            *turn_actions,
+        ],
+        boards=boards,
+    )
+
+
+def _turn_barrel_all_in_line(*, barrel_all_in: bool) -> CanonicalHand:
+    """Трое на флопе: CO открывает, BTN и герой в BB уравнивают.
+
+    `barrel_all_in=False`: у героя 50 фишек, продолженную ставку CO на весь его
+    остаток он уравнивает олл-ином и в тёрн входит без действий; BTN уравнивает
+    и пасует на ставку CO на тёрне. `barrel_all_in=True`: стеки равные, CO ставит
+    на тёрне олл-ин, оба пасуют.
+    """
+    if barrel_all_in:
+        return _hand(
+            hero_position="BB",
+            actions=[
+                _fold("UTG"),
+                _fold("HJ"),
+                _raise_to("CO", 6, already=0),
+                _call("BTN", 6),
+                _fold("SB"),
+                _call("Hero", 4),
+                _check("Hero", Street.FLOP),
+                _bet("CO", 6),
+                _call("BTN", 6, street=Street.FLOP),
+                _call("Hero", 6, street=Street.FLOP),
+                _check("Hero", Street.TURN),
+                _act("CO", ActionKind.BET, street=Street.TURN, amount=_STACK - 12, all_in=True),
+                _fold("BTN", Street.TURN),
+                _fold("Hero", Street.TURN),
+            ],
+            boards={Street.FLOP: _FLOP, Street.TURN: _TURN},
+        )
+    return _hand(
+        hero_position="BB",
+        stacks={"BB": 50},
+        actions=[
+            _fold("UTG"),
+            _fold("HJ"),
+            _raise_to("CO", 6, already=0),
+            _call("BTN", 6),
+            _fold("SB"),
+            _call("Hero", 4),
+            _check("Hero", Street.FLOP),
+            _bet("CO", 44),
+            _call("BTN", 44, street=Street.FLOP),
+            _call("Hero", 44, street=Street.FLOP, all_in=True),
+            _bet("CO", 20, street=Street.TURN),
+            _fold("BTN", Street.TURN),
+        ],
+        boards=_BOARD,
+    )
+
+
 def _with_other_labels(hand: CanonicalHand) -> CanonicalHand:
     """Та же раздача с другими метками оппонентов — как другой стол того же турнира.
 
@@ -447,6 +572,168 @@ def test_a_flop_bet_from_a_caller_is_not_a_continuation_bet():
     """
     stats = player_stats([_flop_bet_comes_from_a_caller()])
     assert (stats.cbet_faced, stats.fold_to_cbet) == (0, 0)
+
+
+# --- Сдача на второй баррель -------------------------------------------------------
+
+
+def test_folding_to_the_turn_barrel_is_counted():
+    stats = player_stats([_turn_barrel_line(turn="fold")])
+    assert (stats.turn_barrel_faced, stats.fold_to_turn_barrel) == (1, 1)
+    assert stats.fold_to_turn_barrel_pct == 100.0
+
+
+def test_calling_the_turn_barrel_is_not_a_fold():
+    stats = player_stats([_turn_barrel_line(turn="call")])
+    assert (stats.turn_barrel_faced, stats.fold_to_turn_barrel) == (1, 0)
+    assert stats.fold_to_turn_barrel_pct == 0.0
+
+
+def test_raising_the_turn_barrel_is_not_a_fold():
+    stats = player_stats([_turn_barrel_line(turn="raise")])
+    assert (stats.turn_barrel_faced, stats.fold_to_turn_barrel) == (1, 0)
+
+
+def test_a_turn_check_by_the_aggressor_is_not_a_chance():
+    """Агрессор чекнул тёрн — второго барреля не было, встречать нечего."""
+    stats = player_stats([_turn_barrel_line(aggressor_checks_turn=True)])
+    assert (stats.turn_barrel_faced, stats.fold_to_turn_barrel) == (0, 0)
+    assert stats.fold_to_turn_barrel_pct is None
+
+
+def test_a_turn_bet_from_someone_else_is_not_a_turn_barrel():
+    """Первым на тёрне поставил герой, агрессор повысил — пас героя не сдача на баррель."""
+    stats = player_stats([_turn_barrel_line(turn="donk")])
+    assert (stats.turn_barrel_faced, stats.fold_to_turn_barrel) == (0, 0)
+
+
+def test_raising_the_cbet_is_not_a_turn_barrel_chance():
+    """Герой повысил продолженную ставку — пас на тёрне уже не сдача на второй баррель."""
+    hand = _turn_barrel_line(flop_reply="raise", turn="fold")
+    stats = player_stats([hand])
+    assert (stats.turn_barrel_faced, stats.fold_to_turn_barrel) == (0, 0)
+    # Ставка CO на тёрне при этом есть: возможность отсекло именно повышение на флопе.
+    assert player_stats([hand], "CO").barrel_turn == 1
+
+
+def test_the_aggressor_does_not_face_his_own_barrel():
+    """CO уравнял повышение своей продолженной ставки и спасовал на повышение
+    своего барреля — по форме «колл на флопе, пас на тёрне», но баррель его."""
+    stats = player_stats([_turn_barrel_line(flop_reply="raise", turn="raise")], "CO")
+    assert (stats.turn_barrel_faced, stats.fold_to_turn_barrel) == (0, 0)
+
+
+def test_a_delayed_cbet_on_the_turn_is_not_a_turn_barrel():
+    """Агрессор чекнул флоп и поставил тёрн — первой ставки не было, второй тоже нет."""
+    stats = player_stats([_turn_barrel_line(flop_reply="no_cbet", turn="fold")])
+    assert (stats.turn_barrel_faced, stats.fold_to_turn_barrel) == (0, 0)
+
+
+def test_the_turn_barrel_faced_is_the_aggressors_counted_barrel():
+    """Возможность сдаться есть ровно там, где агрессору засчитан второй баррель."""
+    for hand in (
+        _turn_barrel_line(turn="fold"),
+        _turn_barrel_line(aggressor_checks_turn=True),
+        _turn_barrel_line(turn="donk"),
+        _turn_barrel_line(flop_reply="no_cbet", turn="fold"),
+    ):
+        by_label = player_stats_by_label([hand])
+        assert by_label["Hero"].turn_barrel_faced == by_label["CO"].barrel_turn
+
+
+def test_folding_to_an_all_in_turn_barrel_is_counted():
+    """Олл-ин ставкой на тёрне — тот же второй баррель; сдаются на него оба коллера."""
+    by_label = player_stats_by_label([_turn_barrel_all_in_line(barrel_all_in=True)])
+    for label in ("Hero", "BTN"):
+        assert (by_label[label].turn_barrel_faced, by_label[label].fold_to_turn_barrel) == (1, 1)
+
+
+def test_calling_the_cbet_all_in_leaves_no_turn_barrel_chance():
+    """Герой вошёл в тёрн олл-ином и там не действует; второй коллер ставку встретил."""
+    by_label = player_stats_by_label([_turn_barrel_all_in_line(barrel_all_in=False)])
+    assert (by_label["Hero"].turn_barrel_faced, by_label["Hero"].fold_to_turn_barrel) == (0, 0)
+    assert (by_label["BTN"].turn_barrel_faced, by_label["BTN"].fold_to_turn_barrel) == (1, 1)
+
+
+# --- Рейз на продолженную ставку и на второй баррель -----------------------------
+
+
+def test_raising_the_cbet_is_counted():
+    stats = player_stats([_turn_barrel_line(flop_reply="raise", turn="fold")])
+    assert (stats.cbet_faced, stats.raise_cbet, stats.fold_to_cbet) == (1, 1, 0)
+    assert stats.raise_cbet_pct == 100.0
+
+
+def test_raising_the_cbet_all_in_is_counted():
+    stats = player_stats([_hero_faces_a_cbet(hero_folds=False)])
+    assert (stats.cbet_faced, stats.raise_cbet) == (1, 1)
+
+
+@pytest.mark.parametrize(
+    "hand",
+    [_hero_faces_a_cbet(hero_folds=True), _turn_barrel_line(flop_reply="call", turn="call")],
+    ids=["fold", "call"],
+)
+def test_folding_or_calling_the_cbet_is_not_a_raise(hand: CanonicalHand):
+    stats = player_stats([hand])
+    assert (stats.cbet_faced, stats.raise_cbet) == (1, 0)
+    assert stats.raise_cbet_pct == 0.0
+
+
+def test_the_cbettor_does_not_raise_his_own_cbet():
+    """Герой ставит и пасует на чек-рейз: у него возможности нет, у BB — рейз."""
+    by_label = player_stats_by_label([_hero_is_the_cbettor()])
+    assert (by_label["Hero"].cbet_faced, by_label["Hero"].raise_cbet) == (0, 0)
+    assert (by_label["BB"].cbet_faced, by_label["BB"].raise_cbet) == (1, 1)
+
+
+def test_a_flop_bet_from_a_caller_gives_no_raise_chance():
+    stats = player_stats([_flop_bet_comes_from_a_caller()])
+    assert (stats.cbet_faced, stats.raise_cbet) == (0, 0)
+    assert stats.raise_cbet_pct is None
+
+
+def test_raising_the_turn_barrel_is_counted_as_a_raise():
+    stats = player_stats([_turn_barrel_line(turn="raise")])
+    assert (stats.turn_barrel_faced, stats.raise_turn_barrel, stats.fold_to_turn_barrel) == (
+        1, 1, 0,
+    )
+    assert stats.raise_turn_barrel_pct == 100.0
+
+
+@pytest.mark.parametrize("turn", ["fold", "call"])
+def test_folding_or_calling_the_turn_barrel_is_not_a_raise(turn: str):
+    stats = player_stats([_turn_barrel_line(turn=turn)])
+    assert (stats.turn_barrel_faced, stats.raise_turn_barrel) == (1, 0)
+
+
+@pytest.mark.parametrize(
+    "hand",
+    [
+        _turn_barrel_line(flop_reply="raise", turn="raise"),
+        _turn_barrel_line(turn="donk"),
+        _turn_barrel_line(flop_reply="no_cbet", turn="raise"),
+        _turn_barrel_line(aggressor_checks_turn=True),
+    ],
+    ids=["raised-cbet", "donk", "delayed-cbet", "aggressor-checks"],
+)
+def test_no_turn_barrel_chance_no_raise_on_it(hand: CanonicalHand):
+    """Где нет возможности сдачи на второй баррель, нет и рейза на него: в том числе
+    рейз тёрна после повышения с-бета, после донка и после отложенного с-бета."""
+    stats = player_stats([hand])
+    assert (stats.turn_barrel_faced, stats.raise_turn_barrel) == (0, 0)
+
+
+def test_the_bet_reply_follows_the_stat_opportunity():
+    """Ответ места на с-бет и второй баррель — тот, что считают статы; на ривере и
+    без такой ставки — `None`."""
+    called = _turn_barrel_line(flop_reply="call", turn="raise")
+    assert bet_reply(called, "Hero", Street.FLOP) == ("CO", ActionKind.CALL)
+    assert bet_reply(called, "Hero", Street.TURN) == ("CO", ActionKind.RAISE)
+    assert bet_reply(called, "CO", Street.FLOP) is None
+    assert bet_reply(called, "Hero", Street.RIVER) is None
+    assert bet_reply(_turn_barrel_line(flop_reply="raise", turn="fold"), "Hero", Street.TURN) is None
+    assert bet_reply(_flop_bet_comes_from_a_caller(), "Hero", Street.FLOP) is None
 
 
 # --- Среднее по нескольким турнирам ------------------------------------------------
@@ -650,7 +937,8 @@ def test_showdown_counter_matches_the_cards_the_source_recorded(path):
 @requires_fixtures
 @pytest.mark.parametrize("path", [FIXTURE_DAILY, FIXTURE_PKO])
 def test_every_numerator_stays_within_its_own_denominator(path):
-    """Знаменатели вложены: третий баррель ⊆ второго ⊆ сибета, вскрытие ⊆ флопов."""
+    """Знаменатели вложены: третий баррель ⊆ второго ⊆ сибета, вскрытие ⊆ флопов,
+    встреченный второй баррель ⊆ коллов продолженной ставки."""
     from harness.parsers.hh_parser import parse_file
 
     hands = [
@@ -666,6 +954,10 @@ def test_every_numerator_stays_within_its_own_denominator(path):
         assert stats.barrel_turn <= stats.barrel_turn_chances
         assert stats.barrel_river_chances <= stats.barrel_turn
         assert stats.barrel_river <= stats.barrel_river_chances
+        assert stats.turn_barrel_faced <= stats.cbet_faced - stats.fold_to_cbet
+        assert stats.fold_to_turn_barrel <= stats.turn_barrel_faced
+        assert stats.fold_to_cbet + stats.raise_cbet <= stats.cbet_faced
+        assert stats.fold_to_turn_barrel + stats.raise_turn_barrel <= stats.turn_barrel_faced
         assert stats.showdowns <= stats.flops_seen <= stats.hands
 
 

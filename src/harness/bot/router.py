@@ -283,7 +283,8 @@ def build_router(deps: BotDeps) -> Router:
 
     @router.message(F.text & ~F.text.startswith("/"))
     async def on_text(message: Message, bot: Bot) -> None:
-        """Обычный текст: ник в руме либо число, введённое вручную по эскалации.
+        """Обычный текст: кнопка меню, начатый ввод, число по эскалации или вопрос
+        агенту — решает `handle_text`.
 
         Команды сюда не попадают — их обработчики зарегистрированы выше, а
         фильтр отсекает всё, что начинается со слэша: иначе неизвестная команда
@@ -293,6 +294,9 @@ def build_router(deps: BotDeps) -> Router:
             return
         msg = await handle_text(deps, message.from_user.id, message.text)
         if msg is None:
+            # Задача агента поставлена; дальше говорит воркер. «Печатает…» —
+            # сразу, ещё до того, как воркер возьмёт задачу из очереди.
+            await bot.send_chat_action(message.chat.id, "typing")
             return
         await _deliver(bot, message.chat.id, msg)
 

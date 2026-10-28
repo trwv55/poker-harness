@@ -153,6 +153,20 @@ class Session(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     title: Mapped[str] = mapped_column(String, nullable=False)
+    # История диалога с агентом за вечер: сообщения pydantic-ai,
+    # `ModelMessagesTypeAdapter` (спека агента №1, §8). Уходит с закрытием
+    # сессии (`SessionsRepo.close_active`).
+    agent_history: Mapped[Any | None] = mapped_column(JSONB)
+    # Последний разбор руки этого вечера — о нём отвечает агент. NULL — разбора
+    # нет либо после него пришёл файл HH (`worker.pipeline`, план агента, отклонение 2).
+    # `use_alter=True`: ключ замыкает цикл `sessions` → `analyses` → `hands` →
+    # `sessions`, и без флага `MetaData.sorted_tables` (им чистит базу
+    # `tests/conftest.py::db_factory`) падает `CircularDependencyError`.
+    # `ondelete="SET NULL"`: удалённый разбор обнуляет указатель, а не держит
+    # удаление (`test_a_deleted_analysis_clears_the_pointer_to_it`).
+    last_analysis_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("analyses.id", use_alter=True, ondelete="SET NULL")
+    )
 
 
 class Tournament(Base):
@@ -494,23 +508,24 @@ class OpponentLink(Base):
 
 
 class EvalCase(Base):
-    """Eval-датасет: `eval_cases`. Копится сам — этажи 2 и 4 EVALS.md."""
+    """Eval-датасет: `eval_cases`. Копится сам — этажи 2, 4 и 5 EVALS.md."""
 
     __tablename__ = "eval_cases"
     __table_args__ = (
         CheckConstraint(
-            "kind IN ('vision_field', 'verdict_confirm', 'verdict_dispute')",
+            "kind IN ('vision_field', 'verdict_confirm', 'verdict_dispute', 'agent_routing')",
             name="kind_allowed",
         ),
         CheckConstraint(
-            "source IN ('escalation', 'disagree_button', 'manual')", name="source_allowed"
+            "source IN ('escalation', 'disagree_button', 'manual', 'agent_miss_button')",
+            name="source_allowed",
         ),
         Index("ix_eval_cases_kind", "kind"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
-    hand_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("hands.id"), nullable=False)
+    hand_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("hands.id"))
     field: Mapped[str | None] = mapped_column(String)
     ground_truth: Mapped[Any] = mapped_column(JSONB, nullable=False)
     source: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -537,7 +552,8 @@ class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
         CheckConstraint(
-            "type IN ('screenshot_analyze', 'hh_scan', 'deep_dive', 'eval_run', 'question')",
+            "type IN ('screenshot_analyze', 'hh_scan', 'deep_dive', 'eval_run', 'question', "
+            "'agent')",
             name="type_allowed",
         ),
         CheckConstraint(
@@ -613,8 +629,10 @@ class LlmCall(Base):
             # `tournament_text` — рассказ по турниру (миграция 0010): модель у
             # него та же, что у вердикта, а вход продукта другой, и по одному
             # ключу на два входа себестоимость каждого не посчитать.
+            # `agent` — запросы агента к провайдеру (миграция 0014, спека агента
+            # №1, §9); `question_answer` остаётся, пока жив `/ask`.
             "purpose IN ('vision_extract', 'vision_extract_fallback', 'verdict_text', "
-            "'tournament_text', 'question_answer')",
+            "'tournament_text', 'question_answer', 'agent')",
             name="purpose_allowed",
         ),
         CheckConstraint(

@@ -1,8 +1,10 @@
 """Изложение: покерное содержание разбора — реплей руки, матрица диапазонов, текст.
 
 Три выхода, из них два — чистый код (`hand_replay`, `range_render`) и один
-опирается на модель (`verdict_text`, `tournament_text`). Как это выглядит в
-Телеграме, решает `presentation`; пакет знает только про покер.
+опирается на модель (`verdict_text`, `tournament_text`). Четвёртое — чистый код
+для агента (`agent_checks`): сводка разбора для его контекста и проверки его
+ответа. Как это выглядит в Телеграме, решает `presentation`; пакет знает только
+про покер.
 
 Публичный API реэкспортируется здесь по образцу `harness.contracts` и
 `harness.presentation`: вызывающий (`worker`, `presentation`, eval-раннер)
@@ -11,6 +13,12 @@
 
 from __future__ import annotations
 
+from harness.explanation.agent_checks import (
+    AgentContext,
+    agent_context,
+    check_agent_answer,
+    strip_card_tokens,
+)
 from harness.explanation.faithfulness import (
     error_words_in,
     has_assumption_words,
@@ -40,6 +48,7 @@ from harness.explanation.verdict_text import (
 )
 
 __all__ = [
+    "AgentContext",
     "Digest",
     "HandReplay",
     "PromptUnavailable",
@@ -48,6 +57,8 @@ __all__ = [
     "UnfaithfulText",
     "VerdictDraft",
     "VerdictLLM",
+    "agent_context",
+    "check_agent_answer",
     "error_words_in",
     "hand_replay",
     "has_assumption_words",
@@ -56,6 +67,7 @@ __all__ = [
     "numbers_in",
     "range_svg",
     "render_range_png",
+    "strip_card_tokens",
     "tournament_digest",
     "tournament_draft",
     "tournament_text",
