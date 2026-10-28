@@ -2060,6 +2060,24 @@ class OpponentsRepo:
         )
         return {row[0]: row[1] for row in await self.db.execute(stmt)}
 
+    async def holder(
+        self, owner_player_id: int, room_tournament_id: str, participant_label: str
+    ) -> tuple[int, str] | None:
+        """Оппонент (номер, ник), за которым закреплена пара «турнир + метка»; `None` —
+        пара не привязана (`test_the_flop_equity_after_a_called_cbet_carries_the_fold_to_cbet_hint`)."""
+        row = (
+            await self.db.execute(
+                select(Opponent.id, Opponent.opponent_nick)
+                .join(OpponentLink, OpponentLink.opponent_id == Opponent.id)
+                .where(
+                    OpponentLink.owner_player_id == owner_player_id,
+                    OpponentLink.room_tournament_id == room_tournament_id,
+                    OpponentLink.participant_label == participant_label,
+                )
+            )
+        ).first()
+        return None if row is None else (int(row[0]), str(row[1]))
+
     async def _find_by_nick(self, owner_player_id: int, nick: str) -> int | None:
         return await self.db.scalar(
             select(Opponent.id).where(

@@ -166,6 +166,19 @@ def test_the_fold_to_turn_barrel_is_named_as_such():
     assert "Сдача на второй баррель" in question_msg(result, None).text
 
 
+@pytest.mark.parametrize(
+    ("stat", "brief", "word"),
+    [
+        (FrequencyStat.RAISE_CBET, "рейз на продолженную ставку", "Рейз на продолженную ставку"),
+        (FrequencyStat.RAISE_TURN_BARREL, "рейз на второй баррель", "Рейз на второй баррель"),
+    ],
+)
+def test_the_raise_stats_are_named_as_such(stat: FrequencyStat, brief: str, word: str):
+    result = _threshold(ThresholdOutcome.ABOVE, None).model_copy(update={"stat": stat})
+    assert brief in question_digest(result).text
+    assert word in question_msg(result, None).text
+
+
 def test_a_measurement_without_observations_gets_no_share():
     """«0 из 0» — не ноль процентов: доли у пустого знаменателя не печатается."""
     text = question_digest(_opponent_frequency()).text

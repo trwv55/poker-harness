@@ -58,6 +58,8 @@ from harness.contracts import (
 )
 
 __all__ = [
+    "bet_reply",
+    "hero_bet_called",
     "measurement_of",
     "player_stats",
     "player_stats_across_tournaments",
@@ -73,6 +75,7 @@ _VOLUNTARY = frozenset({ActionKind.CALL, ActionKind.BET, ActionKind.RAISE})
 # (источник может записать шов и так, и рейзом), `RAISE` — повышение поверх
 # чужой ставки.
 _AGGRESSIVE = frozenset({ActionKind.BET, ActionKind.RAISE})
+_HEADS_UP = 2
 
 
 @dataclass(frozen=True)
@@ -231,30 +234,54 @@ def _barrel(view: _HandView, label: str, street: Street, bet_before: bool) -> tu
     return True, first_bet is not None and first_bet.label == label
 
 
-def _fold_to_cbet(view: _HandView, label: str) -> tuple[bool, bool]:
-    """Сдача на продолженную ставку: (была ли она против места, сдалось ли место).
-
-    Против места она есть, если продолженная ставка в раздаче сделана
-    (`_HandView.cbet_index`) не им самим (`test_hero_own_cbet_is_not_a_chance`)
-    и у места есть действие на флопе после этой ставки. Сдачей считается, если
-    это действие — пас.
-    """
-    if view.cbet_index is None:
-        return False, False
-    flop = view.streets[Street.FLOP]
-    if flop[view.cbet_index].label == label:
-        return False, False
-    for action in flop[view.cbet_index + 1 :]:
-        if action.label == label:
-            return True, action.kind is ActionKind.FOLD
-    return False, False
-
-
 def _first_action_after(
     actions: list[CanonicalAction], index: int, label: str
 ) -> CanonicalAction | None:
     """Первое действие места после позиции `index` в списке действий улицы."""
     return next((a for a in actions[index + 1 :] if a.label == label), None)
+
+
+def _cbet_reply(view: _HandView, label: str) -> CanonicalAction | None:
+    """Ответ места на продолженную ставку — его первое действие на флопе после неё;
+    `None` — ставки против места не было.
+
+    Против места она есть, если продолженная ставка в раздаче сделана
+    (`_HandView.cbet_index`) не им самим (`test_hero_own_cbet_is_not_a_chance`)
+    и у места есть действие на флопе после этой ставки.
+    """
+    if view.cbet_index is None:
+        return None
+    flop = view.streets[Street.FLOP]
+    if flop[view.cbet_index].label == label:
+        return None
+    return _first_action_after(flop, view.cbet_index, label)
+
+
+def _fold_to_cbet(view: _HandView, label: str) -> tuple[bool, bool]:
+    """Сдача на продолженную ставку: (была ли она против места, сдалось ли место).
+
+    Возможность — ответ места на неё (`_cbet_reply`). Сдачей считается, если это
+    действие — пас.
+    """
+    reply = _cbet_reply(view, label)
+    if reply is None:
+        return False, False
+    return True, reply.kind is ActionKind.FOLD
+
+
+def _raise_cbet(view: _HandView, label: str) -> tuple[bool, bool]:
+    """Рейз на продолженную ставку: (была ли она против места, повысило ли место).
+
+    Зеркало `_fold_to_cbet` — та же возможность (`_cbet_reply`), в числителе
+    повышение (`test_raising_the_cbet_is_counted`, в том числе олл-ином —
+    `test_raising_the_cbet_all_in_is_counted`); пас и колл — возможность без
+    повышения (`test_folding_or_calling_the_cbet_is_not_a_raise`), своя ставка —
+    не возможность (`test_the_cbettor_does_not_raise_his_own_cbet`).
+    """
+    reply = _cbet_reply(view, label)
+    if reply is None:
+        return False, False
+    return True, reply.kind is ActionKind.RAISE
 
 
 def _fold_to_turn_barrel(view: _HandView, label: str) -> tuple[bool, bool]:
@@ -291,17 +318,79 @@ def _fold_to_turn_barrel(view: _HandView, label: str) -> tuple[bool, bool]:
     в тёрн олл-ином, там не действует и возможности не получает
     (`test_calling_the_cbet_all_in_leaves_no_turn_barrel_chance`).
     """
+    reply = _turn_barrel_reply(view, label)
+    if reply is None:
+        return False, False
+    return True, reply.kind is ActionKind.FOLD
+
+
+def _turn_barrel_reply(view: _HandView, label: str) -> CanonicalAction | None:
+    """Ответ места на второй баррель — его первое действие на тёрне после него;
+    `None` — возможности нет (условия — в `_fold_to_turn_barrel`)."""
     if view.cbet_index is None or view.turn_barrel_index is None:
-        return False, False
+        return None
     if view.aggressor == label:
-        return False, False
+        return None
     flop_reply = _first_action_after(view.streets[Street.FLOP], view.cbet_index, label)
     if flop_reply is None or flop_reply.kind is not ActionKind.CALL:
+        return None
+    return _first_action_after(view.streets[Street.TURN], view.turn_barrel_index, label)
+
+
+def _raise_turn_barrel(view: _HandView, label: str) -> tuple[bool, bool]:
+    """Рейз на второй баррель: (встретило ли место его, повысило ли).
+
+    Зеркало `_fold_to_turn_barrel` — та же возможность (`_turn_barrel_reply`), в
+    числителе повышение (`test_raising_the_turn_barrel_is_counted_as_a_raise`); пас
+    и колл — возможность без повышения
+    (`test_folding_or_calling_the_turn_barrel_is_not_a_raise`); повышение
+    продолженной ставки возможности не даёт
+    (`test_raising_the_cbet_is_not_a_turn_barrel_chance`).
+    """
+    reply = _turn_barrel_reply(view, label)
+    if reply is None:
         return False, False
-    turn_reply = _first_action_after(view.streets[Street.TURN], view.turn_barrel_index, label)
-    if turn_reply is None:
-        return False, False
-    return True, turn_reply.kind is ActionKind.FOLD
+    return True, reply.kind is ActionKind.RAISE
+
+
+def bet_reply(hand: CanonicalHand, label: str, street: Street) -> tuple[str, ActionKind] | None:
+    """Кто сделал продолженную ставку (флоп) или второй баррель (тёрн) против места
+    и чем место ответило — по тем же правилам, что возможность сдачи и рейза на них
+    (`_cbet_reply`, `_turn_barrel_reply`); `None` — такой ставки против места не было,
+    и на других улицах тоже (`test_the_bet_reply_follows_the_stat_opportunity`)."""
+    view = _view(hand)
+    if street is Street.FLOP:
+        reply = _cbet_reply(view, label)
+    elif street is Street.TURN:
+        reply = _turn_barrel_reply(view, label)
+    else:
+        return None
+    if reply is None or view.aggressor is None:
+        return None
+    return view.aggressor, reply.kind
+
+
+def hero_bet_called(hand: CanonicalHand, label: str, street: Street) -> FrequencyStat | None:
+    """Частота сдачи, которую место в этой раздаче миновало коллом ставки героя: на флопе —
+    его продолженная ставка (`FOLD_TO_CBET`), на тёрне — второй баррель
+    (`FOLD_TO_TURN_BARREL`), по тем же правилам возможности (`_cbet_reply`,
+    `_turn_barrel_reply`). `None` — ставил не герой, место ответило не коллом, на ответе
+    места в банке больше двух игроков, другая улица
+    (`test_the_hero_bet_the_opponent_called_names_the_fold_stat`)."""
+    view = _view(hand)
+    if street is Street.FLOP:
+        reply, stat = _cbet_reply(view, label), FrequencyStat.FOLD_TO_CBET
+    elif street is Street.TURN:
+        reply, stat = _turn_barrel_reply(view, label), FrequencyStat.FOLD_TO_TURN_BARREL
+    else:
+        return None
+    if reply is None or reply.kind is not ActionKind.CALL or view.aggressor != hand.hero_label:
+        return None
+    at = next(i for i, action in enumerate(hand.actions) if action is reply)
+    folded = {a.label for a in hand.actions[:at] if a.kind is ActionKind.FOLD}
+    if sum(1 for p in hand.players if p.label not in folded) > _HEADS_UP:
+        return None
+    return stat
 
 
 def _saw_flop(view: _HandView, label: str) -> bool:
@@ -342,6 +431,8 @@ def _accumulate(stats: PlayerStats, view: _HandView, label: str) -> None:
     barrel_faced, barrel_folded = _fold_to_turn_barrel(view, label)
     stats.turn_barrel_faced += barrel_faced
     stats.fold_to_turn_barrel += barrel_folded
+    stats.raise_cbet += _raise_cbet(view, label)[1]
+    stats.raise_turn_barrel += _raise_turn_barrel(view, label)[1]
 
     flop_chance, flop_bet = _cbet_flop(view, label)
     stats.cbet_flop_chances += flop_chance
@@ -496,6 +587,8 @@ _COUNTERS: dict[FrequencyStat, tuple[str, str]] = {
     FrequencyStat.BARREL_TURN: ("barrel_turn", "barrel_turn_chances"),
     FrequencyStat.BARREL_RIVER: ("barrel_river", "barrel_river_chances"),
     FrequencyStat.FOLD_TO_TURN_BARREL: ("fold_to_turn_barrel", "turn_barrel_faced"),
+    FrequencyStat.RAISE_CBET: ("raise_cbet", "cbet_faced"),
+    FrequencyStat.RAISE_TURN_BARREL: ("raise_turn_barrel", "turn_barrel_faced"),
     FrequencyStat.SHOWDOWN: ("showdowns", "flops_seen"),
 }
 

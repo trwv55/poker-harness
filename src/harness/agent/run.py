@@ -34,6 +34,7 @@ from harness.agent.history import (
     seen_history,
     stats_in_history,
     threshold_decided,
+    threshold_numbers_in,
 )
 from harness.analysis.opponent_range import classes_named
 from harness.calcs.routing import CalcRun, tools_for
@@ -226,6 +227,8 @@ def _draft_violations(
         summary_numbers=(
             context.allowed | context.threshold_numbers if context is not None else frozenset()
         ),
+        threshold_numbers=threshold_numbers_in(messages)
+        | (context.threshold_numbers if context is not None else frozenset()),
     ), block
 
 

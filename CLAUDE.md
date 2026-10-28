@@ -34,6 +34,7 @@
 
 - `evals/vision/`, `evals/e2e/`, `evals/agent/` — размеченный eval-датасет (это ров продукта)
 - промпты моделей — vision (`src/harness/parsers/prompts/`) и изложения (`src/harness/explanation/prompts/`) — копируются за вечер
+- `src/harness/analysis/charts/solver/` — библиотека солверных выгрузок владельца (ориентир агента)
 - `.claude/screens/` — скриншоты столов
 - `fixtures/hh/*.txt` — реальные hand history игрока
 - `data/` — том с присланными боту файлами (`DATA_DIR/hh/{hash}.txt`): те же hand history,

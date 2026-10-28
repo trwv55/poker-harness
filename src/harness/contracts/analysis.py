@@ -488,6 +488,10 @@ class PlayerStats(BaseModel):
     # (`test_every_numerator_stays_within_its_own_denominator`).
     fold_to_turn_barrel: int = 0
     turn_barrel_faced: int = 0
+    # Рейз на продолженную ставку и на второй баррель — зеркала сдач: тот же
+    # знаменатель (`cbet_faced`, `turn_barrel_faced`), в числителе повышение.
+    raise_cbet: int = 0
+    raise_turn_barrel: int = 0
     showdowns: int = 0
     flops_seen: int = 0
 
@@ -526,6 +530,14 @@ class PlayerStats(BaseModel):
     @property
     def fold_to_turn_barrel_pct(self) -> float | None:
         return self._share(self.fold_to_turn_barrel, self.turn_barrel_faced)
+
+    @property
+    def raise_cbet_pct(self) -> float | None:
+        return self._share(self.raise_cbet, self.cbet_faced)
+
+    @property
+    def raise_turn_barrel_pct(self) -> float | None:
+        return self._share(self.raise_turn_barrel, self.turn_barrel_faced)
 
     @property
     def showdown_pct(self) -> float | None:

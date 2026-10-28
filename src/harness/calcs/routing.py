@@ -71,6 +71,7 @@ from harness.contracts import (
     Street,
     Subject,
     ThresholdParams,
+    ThresholdResult,
     ThresholdSide,
     Window,
     Zone,
@@ -177,8 +178,8 @@ class CalcRun:
     модели отказом (`test_without_a_hand_analysis_the_range_tool_says_so`).
 
     `narrowings` — сужения `equity_vs_range` из истории вечера, к ним добавляются
-    удачные сужения этого хода; `equity_vs_range` берёт из них сужение ближайшей более
-    ранней улицы (`prior_for`). `player_classes` — классы, которые игрок назвал записью
+    удачные сужения этого хода; `equity_vs_range` берёт из них сужение строго
+    предыдущей улицы (`prior_for`). `player_classes` — классы, которые игрок назвал записью
     в репликах этой руки: только их `equity_vs_range` добавляет вне чарта
     (план 2026-10-17, пп. 6 и 9).
     """
@@ -203,16 +204,21 @@ class CalcRun:
     def prior_for(
         self, analysis_id: int, opponent_position: str, street: Street
     ) -> RangeNarrowing | None:
-        """Последнее сужение того же соперника в той же руке на ближайшей более ранней
-        улице, по которой сужение есть; `None` — сужать от стартового
-        (`test_the_turn_takes_the_flop_narrowing_and_without_it_the_start`)."""
+        """Последнее сужение того же соперника в той же руке строго на предыдущей
+        улице; `None` — его нет
+        (`test_the_prior_is_the_last_narrowing_of_the_previous_street`). Что без него,
+        решает `opponent_range.narrow`: флоп сужается от стартового, тёрн и ривер —
+        отказ."""
         streets = list(Street)
-        for earlier in reversed(streets[: streets.index(street)]):
-            for narrowing in reversed(self.narrowings):
-                if (narrowing.analysis_id, narrowing.opponent_position, narrowing.street) == (
-                    analysis_id, opponent_position, earlier
-                ):
-                    return narrowing
+        index = streets.index(street)
+        if index == 0:
+            return None
+        previous = streets[index - 1]
+        for narrowing in reversed(self.narrowings):
+            if (narrowing.analysis_id, narrowing.opponent_position, narrowing.street) == (
+                analysis_id, opponent_position, previous
+            ):
+                return narrowing
         return None
 
     def last_for(self, analysis_id: int, opponent_position: str) -> RangeNarrowing | None:
@@ -336,7 +342,7 @@ async def _perform(
     `test_the_ask_digest_is_unchanged_by_the_agent_one`).
     Вывод порога (`outcome`) лежит в метаданных: по нему проверка агента
     разрешает «в плюсе» и «в минусе» (`threshold_decided`).
-    Числа `opponent_range` лежат в `chart`, `equity_vs_range` — в `assumed`, и
+    Числа `opponent_range` лежат в `chart`, эквити `equity_vs_range` — в `assumed`, и
     ни те, ни другие не попадают в `frequency`
     (`test_the_agent_reads_the_range_by_the_chart_and_counts_equity_against_its_narrowing`,
     `test_equity_numbers_are_calculation_numbers_and_never_a_measured_frequency`).
@@ -388,21 +394,27 @@ async def _perform(
         frequency = [float(measurement.numerator), float(measurement.denominator)]
         if measurement.share is not None:
             frequency.append(round(100.0 * measurement.share, 1))
+    # Порог `frequency_vs_threshold` в процентах, как его печатает выход: опора арифметики
+    # порога в проверке агента (`history.threshold_numbers_in`).
+    thresholds = (
+        [round(100.0 * result.threshold, 1)] if isinstance(result, ThresholdResult) else []
+    )
     chart: list[float] = []
     assumed: list[float] = []
     narrowed: dict[str, Any] | None = None
     if isinstance(result, OpponentRangeResult):
         chart = [round(100.0 * result.hands_share, 1), float(round(result.live_combos))]
     elif isinstance(result, EquityVsRangeResult) and isinstance(params, EquityVsRangeParams):
-        # Доля от стартового не печатается при добавленных классах — её и не разрешать.
+        # В `assumed` — только эквити: доля от стартового и комбо сужения совпадали бы с
+        # процентами прозы (порогом), метки не требуют и пересказываются в блоке
+        # «Оценка модели» (живой прогон 2026-10-24).
         assumed = [round(100.0 * result.equity, 1)]
-        if not result.added:
-            assumed.append(round(100.0 * result.share_of_start, 1))
         narrowing = RangeNarrowing(
             analysis_id=params.analysis_id,
             opponent_position=params.opponent_position,
             street=params.street,
             classes=list(parse_range(result.range_text).weights),
+            agent_added=result.agent_added,
         )
         run_state.narrowings.append(narrowing)
         narrowed = narrowing.model_dump(mode="json")
@@ -416,6 +428,7 @@ async def _perform(
             "frequency": frequency,
             "chart": chart,
             "assumed": assumed,
+            "threshold": thresholds,
             "narrowed": narrowed,
         },
     )
@@ -694,6 +707,9 @@ def tools_for(
         """Стартовый диапазон соперника по чарту в последней разобранной руке.
 
         Линию соперника до флопа, глубину, число мест и анте код берёт из руки сам.
+        На флопе и тёрне — и раскладка по категориям на борде: на флопе — стартового
+        диапазона, на тёрне — вашего сужения флопа этого соперника (без него —
+        стартового). Имена категорий можно передать в `equity_vs_range`.
 
         Args:
             opponent_position: позиция соперника за столом, как в сводке разбора, например BB.
@@ -707,25 +723,35 @@ def tools_for(
                 analysis_id=run_state.analysis_id,
                 opponent_position=opponent_position,
                 street=street,
+                prior=run_state.prior_for(run_state.analysis_id, opponent_position, street),
             ),
         )
 
     async def equity_vs_range(
-        opponent_position: str, street: Street, hands: str, added: str | None = None
+        opponent_position: str,
+        street: Street,
+        hands: str,
+        added: str | None = None,
+        added_reason: str | None = None,
     ) -> str | ToolReturn:
         """Эквити вашей руки при вскрытии против диапазона соперника, суженного вами.
 
         Классы — только из стартового диапазона `opponent_range` этого соперника и
-        без весов: доли берутся из чарта. Сужение — допущение. Если вы уже сужали
-        диапазон этого соперника на более ранней улице этой руки, классы — только из
-        того сужения.
+        без весов: доли берутся из чарта. Сужение — допущение. Тёрн сужается только из
+        вашего сужения флопа этого соперника в этой руке, ривер — из сужения тёрна:
+        без него — отказ, сначала сузьте предыдущую улицу.
 
         Args:
             opponent_position: позиция соперника за столом, как в сводке разбора.
             street: улица точки решения; борд и ваши карты берутся из руки.
-            hands: классы рук через запятую, например «AA, KQs, 88-66, A5s-A2s».
-            added: классы вне чарта, которые игрок сам назвал в своём сообщении
-                («22-77»), — только по его просьбе; иначе не передавать.
+            hands: классы рук и имена категорий из раскладки `opponent_range` этой улицы
+                (флоп, тёрн) через запятую, вперемешку, например «трипс, гатшот -T7o,
+                AA, A5s-A2s»; «-<класс>» убирает класс из названного.
+            added: классы вне чарта: которые игрок сам назвал в своём сообщении
+                («22-77») — по его просьбе, или ваши — тогда с `added_reason`.
+            added_reason: ваша причина добавить классы `added` вне чарта, одной фразой
+                («на низких лимитах BB часто коллирует пары, которые по GTO 3-бетит»);
+                без неё `added` — только классы, названные игроком.
         """
         if run_state.analysis_id is None:
             return _NO_HAND
@@ -738,9 +764,11 @@ def tools_for(
                 street=street,
                 hands=hands,
                 added=added,
+                added_reason=added_reason,
                 prior=run_state.prior_for(run_state.analysis_id, opponent_position, street),
                 player_classes=sorted(run_state.player_classes),
                 kept_classes=last.classes if last is not None else [],
+                kept_agent=last.agent_added if last is not None else {},
             ),
         )
 

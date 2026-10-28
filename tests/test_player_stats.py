@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 import pytest
 
 from harness.analysis.player_stats import (
+    bet_reply,
     player_stats,
     player_stats_across_tournaments,
     player_stats_by_label,
@@ -654,6 +655,87 @@ def test_calling_the_cbet_all_in_leaves_no_turn_barrel_chance():
     assert (by_label["BTN"].turn_barrel_faced, by_label["BTN"].fold_to_turn_barrel) == (1, 1)
 
 
+# --- Рейз на продолженную ставку и на второй баррель -----------------------------
+
+
+def test_raising_the_cbet_is_counted():
+    stats = player_stats([_turn_barrel_line(flop_reply="raise", turn="fold")])
+    assert (stats.cbet_faced, stats.raise_cbet, stats.fold_to_cbet) == (1, 1, 0)
+    assert stats.raise_cbet_pct == 100.0
+
+
+def test_raising_the_cbet_all_in_is_counted():
+    stats = player_stats([_hero_faces_a_cbet(hero_folds=False)])
+    assert (stats.cbet_faced, stats.raise_cbet) == (1, 1)
+
+
+@pytest.mark.parametrize(
+    "hand",
+    [_hero_faces_a_cbet(hero_folds=True), _turn_barrel_line(flop_reply="call", turn="call")],
+    ids=["fold", "call"],
+)
+def test_folding_or_calling_the_cbet_is_not_a_raise(hand: CanonicalHand):
+    stats = player_stats([hand])
+    assert (stats.cbet_faced, stats.raise_cbet) == (1, 0)
+    assert stats.raise_cbet_pct == 0.0
+
+
+def test_the_cbettor_does_not_raise_his_own_cbet():
+    """Герой ставит и пасует на чек-рейз: у него возможности нет, у BB — рейз."""
+    by_label = player_stats_by_label([_hero_is_the_cbettor()])
+    assert (by_label["Hero"].cbet_faced, by_label["Hero"].raise_cbet) == (0, 0)
+    assert (by_label["BB"].cbet_faced, by_label["BB"].raise_cbet) == (1, 1)
+
+
+def test_a_flop_bet_from_a_caller_gives_no_raise_chance():
+    stats = player_stats([_flop_bet_comes_from_a_caller()])
+    assert (stats.cbet_faced, stats.raise_cbet) == (0, 0)
+    assert stats.raise_cbet_pct is None
+
+
+def test_raising_the_turn_barrel_is_counted_as_a_raise():
+    stats = player_stats([_turn_barrel_line(turn="raise")])
+    assert (stats.turn_barrel_faced, stats.raise_turn_barrel, stats.fold_to_turn_barrel) == (
+        1, 1, 0,
+    )
+    assert stats.raise_turn_barrel_pct == 100.0
+
+
+@pytest.mark.parametrize("turn", ["fold", "call"])
+def test_folding_or_calling_the_turn_barrel_is_not_a_raise(turn: str):
+    stats = player_stats([_turn_barrel_line(turn=turn)])
+    assert (stats.turn_barrel_faced, stats.raise_turn_barrel) == (1, 0)
+
+
+@pytest.mark.parametrize(
+    "hand",
+    [
+        _turn_barrel_line(flop_reply="raise", turn="raise"),
+        _turn_barrel_line(turn="donk"),
+        _turn_barrel_line(flop_reply="no_cbet", turn="raise"),
+        _turn_barrel_line(aggressor_checks_turn=True),
+    ],
+    ids=["raised-cbet", "donk", "delayed-cbet", "aggressor-checks"],
+)
+def test_no_turn_barrel_chance_no_raise_on_it(hand: CanonicalHand):
+    """Где нет возможности сдачи на второй баррель, нет и рейза на него: в том числе
+    рейз тёрна после повышения с-бета, после донка и после отложенного с-бета."""
+    stats = player_stats([hand])
+    assert (stats.turn_barrel_faced, stats.raise_turn_barrel) == (0, 0)
+
+
+def test_the_bet_reply_follows_the_stat_opportunity():
+    """Ответ места на с-бет и второй баррель — тот, что считают статы; на ривере и
+    без такой ставки — `None`."""
+    called = _turn_barrel_line(flop_reply="call", turn="raise")
+    assert bet_reply(called, "Hero", Street.FLOP) == ("CO", ActionKind.CALL)
+    assert bet_reply(called, "Hero", Street.TURN) == ("CO", ActionKind.RAISE)
+    assert bet_reply(called, "CO", Street.FLOP) is None
+    assert bet_reply(called, "Hero", Street.RIVER) is None
+    assert bet_reply(_turn_barrel_line(flop_reply="raise", turn="fold"), "Hero", Street.TURN) is None
+    assert bet_reply(_flop_bet_comes_from_a_caller(), "Hero", Street.FLOP) is None
+
+
 # --- Среднее по нескольким турнирам ------------------------------------------------
 
 
@@ -874,6 +956,8 @@ def test_every_numerator_stays_within_its_own_denominator(path):
         assert stats.barrel_river <= stats.barrel_river_chances
         assert stats.turn_barrel_faced <= stats.cbet_faced - stats.fold_to_cbet
         assert stats.fold_to_turn_barrel <= stats.turn_barrel_faced
+        assert stats.fold_to_cbet + stats.raise_cbet <= stats.cbet_faced
+        assert stats.fold_to_turn_barrel + stats.raise_turn_barrel <= stats.turn_barrel_faced
         assert stats.showdowns <= stats.flops_seen <= stats.hands
 
 

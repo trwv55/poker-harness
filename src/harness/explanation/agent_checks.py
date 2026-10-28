@@ -102,9 +102,33 @@
 (`test_a_share_of_the_summary_that_equals_an_equity_number_needs_no_mark`,
 `test_a_share_only_from_the_equity_output_still_needs_the_mark`,
 `test_a_measured_frequency_or_a_chart_number_does_not_free_the_equity_share`,
-`test_the_summary_numbers_reach_the_check_of_the_equity_share`). Узкие закрытия ложных
+`test_the_summary_numbers_reach_the_check_of_the_equity_share`). Не требует её и порог
+(`threshold_numbers`: порог фолдов сводки и порог выхода `frequency_vs_threshold` — от
+размера ставки, для сдачи или защиты, или поля), стоящий сразу после
+«порог (фолдов) (у него)», «сбрасывает / фолдов чаще|реже» или «хватает фолдов», в
+предложении без «эквити», «диапазон», «рендж», «против»; другая доля рядом с порогом и
+порог не из этих чисел — требуют
+(`test_a_summary_threshold_share_equal_to_an_equity_number_needs_no_mark`,
+`test_an_equity_share_against_the_range_still_needs_the_mark_despite_the_threshold`,
+`test_a_share_beside_the_threshold_but_not_tied_to_it_needs_the_mark`,
+`test_a_threshold_share_not_from_the_thresholds_still_needs_the_mark`), и измеренная
+частота: в части предложения с долей (её делят «,» и «;») действие поля или соперника и
+нет шанса или исхода руки героя, рядом в скобках её выборка («39% (21 из 54)», «21 из 54
+(39%)», пробелы в скобках и вокруг — любые; N и M — из `frequency_numbers`, их доля тоже
+оттуда и округляется до доли текста), в предложении нет тех же слов; чужая выборка, её
+отсутствие, часть без действия или о шансах героя — требуют
+(`test_a_measured_frequency_with_its_own_sample_needs_no_equity_mark`,
+`test_a_frequency_share_allows_spaces_around_its_sample`,
+`test_a_sample_without_a_frequency_sign_in_its_part_needs_the_mark`,
+`test_a_frequency_share_without_its_own_sample_still_needs_the_mark`). Узкие закрытия ложных
 отказов тёрна: «блеф» в части о прибыльности, «порог ниже: N%» перед долей расчёта,
 «порог фолдов» перед долей расчёта, «а не эквити против диапазона» в конце предложения,
+«порог фолдов у него N%» без двоеточия перед порогом из `threshold_numbers`, «как у
+(чистого) блефа» и «считать его (чистым) блефом» в начале придаточного без соперника в
+нём, в предложении с порогом, привязанным к имени
+(`test_the_threshold_name_with_the_opponent_before_its_share_without_a_colon`,
+`test_the_bluff_noun_naming_the_threshold_with_a_threshold_share_is_not_an_action`,
+`test_the_bluff_name_with_the_opponent_in_its_clause_is_still_a_claim`),
 «так часто, как при …» (форма шире живой фразы, «как при прошлых встречах», проходит —
 принятая цена, её ловит судья,
 `test_so_often_as_at_past_meetings_is_an_accepted_cost`) — каждое с соседом,
@@ -283,9 +307,13 @@ _FOLD_NOUN_RE = re.compile(
 # когда за ним через двоеточие или тире стоит доля из расчёта; «Он выше порога
 # фолдов» — как раньше (`_strip_threshold_name`,
 # `test_a_fold_noun_after_the_word_threshold_with_a_calc_share_is_not_an_opponent_action`).
+# Без двоеточия и тире между именем и долей — только «у/для него» или позиция, и доля —
+# из порогов (`threshold_numbers`; «Порог фолдов у него 33%»;
+# `test_the_threshold_name_with_the_opponent_before_its_share_without_a_colon`).
 _THRESHOLD_NAME_RE = re.compile(
-    _W + r"порог[а-яё]*\s+(?:фолд|сброс|защит)[а-яё]*[^,;:—–()]*?"
-    r"(?=\s*[:—–]\s*(?P<n>\d+(?:[.,]\d+)?)\s*%)",
+    _W + r"порог[а-яё]*\s+(?:фолд|сброс|защит)[а-яё]*"
+    r"(?:[^,;:—–()]*?(?=\s*[:—–]\s*(?P<n>\d+(?:[.,]\d+)?)\s*%)"
+    r"|(?:\s+(?:у|для)\s+(?:него|" + _POSITION + r"))?(?=\s+(?P<m>\d+(?:[.,]\d+)?)\s*%))",
     re.IGNORECASE,
 )
 # «Блеф» существительным в обороте «как (чистый) блеф» в части о прибыльности («как
@@ -294,6 +322,18 @@ _THRESHOLD_NAME_RE = re.compile(
 # (`test_a_bluff_noun_in_a_profit_clause_is_not_an_opponent_action`).
 _BLUFF_NOUN_RE = re.compile(r"блеф(?:а|у|ом|е|ы|ов|ам|ами|ах)?", re.IGNORECASE)
 _AS_BLUFF_BEFORE_RE = re.compile(_W + r"как\s+(?:[а-яё]+\s+)?$", re.IGNORECASE)
+# «Как у (чистого) блефа» и «(Если) считать его (чистым) блефом» в начале придаточного —
+# имя порога и вне части о прибыльности, когда в предложении есть порог, привязанный к
+# имени (`_tied_threshold_share_in`), и нет «бы»; соперник в остатке придаточного
+# (кроме «ему нужно» — это о ставке) исключение снимает (`_strip_bluff_name`,
+# `test_the_bluff_noun_naming_the_threshold_with_a_threshold_share_is_not_an_action`,
+# `test_the_bluff_name_with_the_opponent_in_its_clause_is_still_a_claim`).
+_BLUFF_NAME_RE = re.compile(
+    r"\s*(?:как\s+у\s+|(?:если\s+)?счита[а-яё]*\s+(?:его|е[её])\s+)(?:[а-яё]+\s+)?"
+    r"блеф(?:а|у|ом|е|ы|ов|ам|ами|ах)?" + _WE,
+    re.IGNORECASE,
+)
+_BET_NEEDS_RE = re.compile(_W + r"ему\s+(?=(?:нужн|надо|достаточно|хвата))", re.IGNORECASE)
 # Предлог прямо перед существительным или через одно прилагательное.
 _ADJECTIVE = r"[а-яё]+(?:ых|их|ым|им|ыми|ими|ой|ей|ом|ем|ую|юю|ая|яя|ое|ее|ые|ие|ий|ый)"
 _PREPOSITION_BEFORE_RE = re.compile(
@@ -505,14 +545,21 @@ def _strip_not_equity(sentence: str) -> str:
     return rest
 
 
-def _strip_threshold_name(sentence: str, calc_numbers: frozenset[float]) -> str:
-    """Без имени порога «Порог фолдов для него» перед долей расчёта, если до «порог» в
-    той же части нет соперника (`_THRESHOLD_NAME_RE`)."""
+def _strip_threshold_name(
+    sentence: str, calc_numbers: frozenset[float], threshold_numbers: frozenset[float]
+) -> str:
+    """Без имени порога «Порог фолдов для него» перед долей расчёта (без двоеточия и
+    тире — перед порогом из `threshold_numbers`), если до «порог» в той же части нет
+    соперника (`_THRESHOLD_NAME_RE`)."""
 
     def strip(m: re.Match[str]) -> str:
         # «Он выше порога фолдов: 33.3%» — не имя порога.
         before = sentence[_clause_start(sentence, m.start()) : m.start()]
-        if _OPPONENT_RE.search(before) or not _in(m.group("n"), calc_numbers, percent=True):
+        if m.group("n") is not None:
+            backed = _in(m.group("n"), calc_numbers, percent=True)
+        else:
+            backed = _in(m.group("m"), threshold_numbers, percent=True)
+        if _OPPONENT_RE.search(before) or not backed:
             return m.group(0)
         return " "
 
@@ -797,10 +844,109 @@ def _hero_chances_share(
     )
 
 
+# Доля, привязанная к порогу: сразу после «порог (фолдов) (у/для него, позиция)» (через
+# двоеточие или тире — тоже), «сбрасывает / фолдов чаще|реже» или «хватает фолдов (чаще)»
+# (`_threshold_share`, `_tied_threshold_share_in`).
+_TIED_BEFORE_RE = re.compile(
+    r"(?:" + _W + r"порог[а-яё]*(?:\s+(?:фолд|сброс|защит)[а-яё]*)?"
+    r"(?:\s+(?:у|для)\s+(?:него|" + _POSITION + r"))?"
+    r"|(?:сбрас|сда[её]т|сдаю|сдава|фолд)[а-яё]*\s+(?:чаще|реже)"
+    r"|хвата[а-яё]*\s+фолд[а-яё]*(?:\s+(?:чаще|реже))?)"
+    r"\s*(?:[:—–]\s*)?$",
+    re.IGNORECASE,
+)
+_AGAINST_RANGE_RE = re.compile(r"эквити|диапазон|рендж|" + _W + r"против" + _WE, re.IGNORECASE)
+
+
+def _tied(match: re.Match[str], sentence: str, threshold_numbers: frozenset[float]) -> bool:
+    return _in(match.group("pct"), threshold_numbers, percent=True) and bool(
+        _TIED_BEFORE_RE.search(sentence[: match.start()])
+    )
+
+
+def _tied_threshold_share_in(sentence: str, threshold_numbers: frozenset[float]) -> bool:
+    return any(_tied(m, sentence, threshold_numbers) for m in _PCT_RE.finditer(sentence))
+
+
+def _threshold_share(
+    match: re.Match[str], sentence: str, threshold_numbers: frozenset[float]
+) -> bool:
+    """Доля — порог из `threshold_numbers` (как в `_in`, целое — тоже), привязанный к
+    имени порога (`_TIED_BEFORE_RE`); в предложении нет «эквити», «диапазон», «рендж»,
+    «против». Другая доля той же части не освобождается
+    (`test_a_summary_threshold_share_equal_to_an_equity_number_needs_no_mark`,
+    `test_an_equity_share_against_the_range_still_needs_the_mark_despite_the_threshold`,
+    `test_a_share_beside_the_threshold_but_not_tied_to_it_needs_the_mark`,
+    `test_a_threshold_share_not_from_the_thresholds_still_needs_the_mark`)."""
+    return not _AGAINST_RANGE_RE.search(sentence) and _tied(match, sentence, threshold_numbers)
+
+
+# Выборка частоты в скобках рядом с долей: «39% (21 из 54)» или «21 из 54 (39%)», с
+# любыми пробелами внутри и вокруг скобок (`_frequency_share`).
+_SAMPLE_AFTER_RE = re.compile(r"\s*\(\s*(?P<num>\d+)\s+из\s+(?P<den>\d+)\s*\)")
+_SAMPLE_BEFORE_RE = re.compile(r"(?P<num>\d+)\s+из\s+(?P<den>\d+)\s*\(\s*$")
+# Часть предложения с долей для признаков частоты: «,» и «;» её делят, тире и скобки — нет
+# («Измеренная сдача … — 21 из 54 (39%)»).
+_FREQUENCY_PART_SPLIT_RE = re.compile(r"[,;]")
+# Положительный признак частоты — действие поля или соперника (сдача, сброс, фолд, защита,
+# колл, рейз).
+_FREQUENCY_SIGN_RE = re.compile(
+    r"сброс|сбрас|сда[её]т|сдаю|сдава|сдач|фолд|защит|защищ|колл|рейз", re.IGNORECASE
+)
+
+
+def _frequency_share(
+    match: re.Match[str], sentence: str, frequency_numbers: frozenset[float]
+) -> bool:
+    """Доля — измеренная частота: в её части предложения (`_FREQUENCY_PART_SPLIT_RE`)
+    действие поля или соперника (`_FREQUENCY_SIGN_RE`) и нет шанса или исхода руки героя
+    (`_HERO_CHANCES_RE`, `_HERO_OWNER_RE`, `_OUTCOME_RE`); рядом в скобках её выборка «N
+    из M» — после доли или перед ней (`_SAMPLE_AFTER_RE`, `_SAMPLE_BEFORE_RE`); N и M — из
+    `frequency_numbers`, доля N/M тоже оттуда и округляется до доли текста (как в `_in`);
+    в предложении нет «эквити», «диапазон», «рендж», «против»
+    (`test_a_measured_frequency_with_its_own_sample_needs_no_equity_mark`,
+    `test_a_frequency_share_allows_spaces_around_its_sample`,
+    `test_a_sample_without_a_frequency_sign_in_its_part_needs_the_mark`,
+    `test_a_frequency_share_without_its_own_sample_still_needs_the_mark`)."""
+    if _AGAINST_RANGE_RE.search(sentence):
+        return False
+    starts = [m.end() for m in _FREQUENCY_PART_SPLIT_RE.finditer(sentence, 0, match.start())]
+    end = _FREQUENCY_PART_SPLIT_RE.search(sentence, match.end())
+    part = sentence[starts[-1] if starts else 0 : end.start() if end else len(sentence)]
+    if not _FREQUENCY_SIGN_RE.search(part) or any(
+        sign.search(part) for sign in (_HERO_CHANCES_RE, _HERO_OWNER_RE, _OUTCOME_RE)
+    ):
+        return False
+    sample = _SAMPLE_AFTER_RE.match(sentence, match.end()) or _SAMPLE_BEFORE_RE.search(
+        sentence[: match.start()]
+    )
+    if sample is None:
+        return False
+    num, den = float(sample.group("num")), float(sample.group("den"))
+    if den == 0 or num not in frequency_numbers or den not in frequency_numbers:
+        return False
+    share = round(100.0 * num / den, 1)
+    return share in frequency_numbers and _in(match.group("pct"), frozenset({share}), percent=True)
+
+
+def _strip_bluff_name(clause: str) -> str:
+    """Придаточное без имени порога «как у (чистого) блефа» / «считать его блефом» в
+    начале (`_BLUFF_NAME_RE`), если в остатке нет соперника (кроме «ему нужно»)."""
+    match = _BLUFF_NAME_RE.match(clause)
+    if match is None:
+        return clause
+    rest = clause[match.end() :]
+    if _OPPONENT_RE.search(_BET_NEEDS_RE.sub(" ", rest)):
+        return clause
+    return " " + _BET_NEEDS_RE.sub(" ", rest)
+
+
 def _assumed_share_in(
     sentence: str,
     assumed_numbers: frozenset[float],
     summary_numbers: frozenset[float] = frozenset(),
+    threshold_numbers: frozenset[float] = frozenset(),
+    frequency_numbers: frozenset[float] = frozenset(),
 ) -> bool:
     """Доля из выхода `equity_vs_range` в предложении
     (`test_an_equity_against_a_narrowed_range_needs_the_mark`). Метки не требует
@@ -808,7 +954,9 @@ def _assumed_share_in(
     часть — о шансах самой руки героя (`_hero_chances_share`: слово шанса,
     «эквити» и слова соперника в части с долей закреплены порознь)
     (`test_a_share_of_the_summary_that_equals_an_equity_number_needs_no_mark`,
-    `test_a_share_only_from_the_equity_output_still_needs_the_mark`)."""
+    `test_a_share_only_from_the_equity_output_still_needs_the_mark`). Не требует её и
+    порог из `threshold_numbers`, привязанный к имени порога (`_threshold_share`), и
+    измеренная частота со своей выборкой в скобках (`_frequency_share`)."""
 
     def clause_of(m: re.Match[str]) -> str:
         end = _CLAUSE_SPLIT_RE.search(sentence, m.end())
@@ -817,6 +965,8 @@ def _assumed_share_in(
     return any(
         _in(m.group("pct"), assumed_numbers, percent=True)
         and not _hero_chances_share(m.group("pct"), sentence, clause_of(m), summary_numbers)
+        and not _threshold_share(m, sentence, threshold_numbers)
+        and not _frequency_share(m, sentence, frequency_numbers)
         for m in _PCT_RE.finditer(sentence)
     )
 
@@ -826,6 +976,7 @@ def _opponent_claim(
     calc_numbers: frozenset[float],
     frequency_numbers: frozenset[float],
     chart_numbers: frozenset[float] = frozenset(),
+    threshold_numbers: frozenset[float] = frozenset(),
 ) -> bool:
     """Предложение требует «(допущение)»: после опоры на расчёт и метаречи в нём
     осталось слово диапазона («вы держите» — о герое и не в счёт;
@@ -838,7 +989,8 @@ def _opponent_claim(
     (`test_a_chart_fact_does_not_cover_a_prediction_in_the_same_sentence`,
     `test_the_chart_exemption_covers_only_the_clause_that_retells_the_chart`).
     Остальное — судья (спека №2)."""
-    sentence = _strip_threshold_name(_strip_not_equity(sentence), calc_numbers)
+    tied = _tied_threshold_share_in(sentence, threshold_numbers)
+    sentence = _strip_threshold_name(_strip_not_equity(sentence), calc_numbers, threshold_numbers)
     rest = _chart_clauses(
         _strip_backed(sentence, calc_numbers, frequency_numbers), chart_numbers
     )
@@ -849,6 +1001,8 @@ def _opponent_claim(
     noun_locked = hypothetical or bool(_FUTURE_RE.search(rest))
     showdown = not hypothetical
     clauses = _CLAUSE_SPLIT_RE.split(rest)
+    if tied and not noun_locked:
+        clauses = [_strip_bluff_name(clause) for clause in clauses]
     return any(
         _opponent_clause(clause, hypothetical, noun_locked, showdown)
         for i, clause in enumerate(clauses)
@@ -1023,10 +1177,12 @@ TERM_LABELS: dict[str, tuple[re.Pattern[str], frozenset[str]]] = {
     "c-бет": (
         re.compile(r"[cс]-?бет|контбет", re.IGNORECASE),
         # Знаменатель сдачи на второй баррель — колл с-бета: «после колла с-бета» опирается
-        # и на эту частоту (`test_the_fold_to_turn_barrel_stat_grounds_the_cbet_term`).
+        # и на эту частоту (`test_the_fold_to_turn_barrel_stat_grounds_the_cbet_term`);
+        # рейзы на с-бет и на второй баррель — зеркала сдач
+        # (`test_the_raise_stats_ground_the_cbet_and_barrel_terms`).
         frozenset({
             "action:cbet", "action:delayed_cbet", "stat:cbet_flop", "stat:fold_to_cbet",
-            "stat:fold_to_turn_barrel",
+            "stat:fold_to_turn_barrel", "stat:raise_cbet", "stat:raise_turn_barrel",
         }),
     ),
     "донк": (re.compile(r"(?<![а-яё])донк", re.IGNORECASE), frozenset({"action:donk"})),
@@ -1036,9 +1192,10 @@ TERM_LABELS: dict[str, tuple[re.Pattern[str], frozenset[str]]] = {
     ),
     "баррель": (
         re.compile(r"баррел", re.IGNORECASE),
-        frozenset(
-            {"action:barrel", "stat:barrel_turn", "stat:barrel_river", "stat:fold_to_turn_barrel"}
-        ),
+        frozenset({
+            "action:barrel", "stat:barrel_turn", "stat:barrel_river", "stat:fold_to_turn_barrel",
+            "stat:raise_turn_barrel",
+        }),
     ),
     "чек-рейз": (re.compile(r"чек-?рейз", re.IGNORECASE), frozenset({"action:check_raise"})),
     "сет": (
@@ -1351,6 +1508,7 @@ def check_agent_answer(
     chart_numbers: frozenset[float] = frozenset(),
     assumed_numbers: frozenset[float] = frozenset(),
     summary_numbers: frozenset[float] = frozenset(),
+    threshold_numbers: frozenset[float] = frozenset(),
 ) -> list[str]:
     """Нарушения ответа словами; пустой список — ответ прошёл (спека §6).
 
@@ -1373,6 +1531,14 @@ def check_agent_answer(
     совпадает и с ними, и с `assumed_numbers`, в части о шансах самой руки героя
     (слово шанса сводки в той же части, без слова «эквити») метки не требует
     (`test_a_share_of_the_summary_that_equals_an_equity_number_needs_no_mark`).
+    `threshold_numbers` — пороги: фолдов сводки (`AgentContext.threshold_numbers`) и
+    выхода `frequency_vs_threshold` — от размера ставки (для сдачи или защиты) или поля
+    (`test_the_threshold_of_frequency_vs_threshold_reaches_the_check`).
+    Доля из них, привязанная к имени порога, метки эквити не требует, и только они
+    опирают имя порога без двоеточия и «как у чистого блефа»
+    (`test_a_summary_threshold_share_equal_to_an_equity_number_needs_no_mark`). Доля
+    `frequency_numbers` со своей выборкой «N из M» в скобках рядом и действием поля или
+    соперника в той же части метки эквити тоже не требует (`test_a_measured_frequency_with_its_own_sample_needs_no_equity_mark`).
 
     Целый процент («24%») разрешён, если к нему половиной вверх округляется число
     набора (23.9 → 24) — в общей сверке чисел, в опоре арифметики порога, в измеренной
@@ -1393,7 +1559,9 @@ def check_agent_answer(
     for sentence in _SENTENCE_RE.findall(text):
         quoted = sentence.strip()
         if (
-            _opponent_claim(sentence, calc_numbers, frequency_numbers, chart_numbers)
+            _opponent_claim(
+                sentence, calc_numbers, frequency_numbers, chart_numbers, threshold_numbers
+            )
             and ASSUMPTION_MARK not in sentence
         ):
             violations.append(
@@ -1403,7 +1571,9 @@ def check_agent_answer(
         if (
             ASSUMPTION_MARK not in sentence
             and assumed_numbers
-            and _assumed_share_in(sentence, assumed_numbers, summary_numbers)
+            and _assumed_share_in(
+                sentence, assumed_numbers, summary_numbers, threshold_numbers, frequency_numbers
+            )
         ):
             violations.append(
                 f"эквити против суженного диапазона без метки {ASSUMPTION_MARK} — «{quoted}»"

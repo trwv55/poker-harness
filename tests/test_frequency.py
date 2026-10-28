@@ -7,8 +7,11 @@
 
 from __future__ import annotations
 
+import importlib.util
+
 import pytest
 
+import harness.calcs as calcs_module
 from harness.analysis.frequency import (
     compare_to_reference,
     compare_to_threshold,
@@ -32,6 +35,7 @@ from harness.contracts import (
     FrequencyStat,
     Measurement,
     PlayerStats,
+    RangeNarrowing,
     Subject,
     ThresholdOutcome,
     ThresholdSide,
@@ -259,6 +263,8 @@ def test_every_named_frequency_matches_the_share_the_contract_computes():
         barrel_river_chances=4,
         fold_to_turn_barrel=3,
         turn_barrel_faced=7,
+        raise_cbet=2,
+        raise_turn_barrel=1,
         showdowns=6,
         flops_seen=17,
     )
@@ -271,6 +277,8 @@ def test_every_named_frequency_matches_the_share_the_contract_computes():
         FrequencyStat.BARREL_TURN: stats.barrel_turn_pct,
         FrequencyStat.BARREL_RIVER: stats.barrel_river_pct,
         FrequencyStat.FOLD_TO_TURN_BARREL: stats.fold_to_turn_barrel_pct,
+        FrequencyStat.RAISE_CBET: stats.raise_cbet_pct,
+        FrequencyStat.RAISE_TURN_BARREL: stats.raise_turn_barrel_pct,
         FrequencyStat.SHOWDOWN: stats.showdown_pct,
     }
     assert set(shares) == set(FrequencyStat)
@@ -290,6 +298,18 @@ def test_the_dictionary_covers_every_name_exactly_once():
     for name, (params_type, runner) in REGISTRY.items():
         assert params_type.model_fields["calc"].default is name
         assert callable(runner)
+
+
+def test_the_line_range_left_no_trace():
+    """Колл-диапазон по линии снят (спека 2026-10-24, §8): ни имени в наборе, ни ядра,
+    ни кэша порядка рук; частоты рейза на с-бет и на второй баррель остаются."""
+    assert "line_range" not in {name.value for name in CalcName}
+    assert importlib.util.find_spec("harness.analysis.line_range") is None
+    assert not hasattr(calcs_module, "line_order_cache_prefix")
+    assert {FrequencyStat.RAISE_CBET, FrequencyStat.RAISE_TURN_BARREL} <= set(FrequencyStat)
+    old = {"analysis_id": 1, "opponent_position": "BB", "street": "flop", "classes": ["AA"],
+           "by": "line_range"}
+    assert RangeNarrowing.model_validate(old).classes == ["AA"]  # старая история читается
 
 
 # --- выбор мест ---------------------------------------------------------------------

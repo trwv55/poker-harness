@@ -813,6 +813,24 @@ def test_the_fold_to_turn_barrel_stat_grounds_the_cbet_term():
     )
 
 
+@pytest.mark.parametrize(
+    ("stat", "text"),
+    [
+        ("raise_cbet", "BB рейзил с-бет."),
+        ("raise_turn_barrel", "BB рейзил второй баррель после колла с-бета."),
+    ],
+)
+def test_the_raise_stats_ground_the_cbet_and_barrel_terms(stat: str, text: str):
+    """Рейзы на с-бет и на второй баррель — зеркала сдач: опора тех же терминов;
+    рейз на с-бет термин «баррель» не опирает."""
+    assert _check(text, labels=frozenset({STAT_LABEL + stat})) == []
+    assert any("c-бет" in v for v in _check(text))
+    assert any(
+        "баррель" in v
+        for v in _check("Это рейз на второй баррель.", labels=frozenset({STAT_LABEL + "raise_cbet"}))
+    )
+
+
 def test_a_bare_label_without_its_kind_does_not_count():
     """Метки с пространством имён: голое `cbet` — не метка классификатора."""
     assert any("c-бет" in v for v in _check("Ваш c-бет на флопе.", labels=frozenset({"cbet"})))
@@ -1765,6 +1783,249 @@ def test_so_often_as_a_comparison_is_not_a_habit_adverb():
         "BB всегда сбрасывал так часто, как нужно.",
     ):
         assert any(ASSUMPTION_MARK in v for v in _turn_check(text)), text
+
+
+# --- порог сводки, совпавший с эквити (двойное сужение, 2026-10-24) -------------
+
+_THRESHOLDS = frozenset({13.2, 23.9, 33.3})
+_TWO_EQUITIES = frozenset({32.6, 43.2})
+_DOUBLE_NARROWING = {
+    "allowed": _THRESHOLDS | _TWO_EQUITIES | {33.6},
+    "calc_numbers": _THRESHOLDS | _TWO_EQUITIES | {33.6},
+    "assumed_numbers": _TWO_EQUITIES,
+    "summary_numbers": _THRESHOLDS,
+    "threshold_numbers": _THRESHOLDS | {33.6},
+}
+_THRESHOLD_LIVES = (
+    "Порог фолдов у него 33% как у чистого блефа и 13% с учётом аутов.",
+    "Для вашей ставки порог фолдов 33% как у чистого блефа и 13% с учётом аутов.",
+    (
+        "Как у чистого блефа ему нужно, чтобы BB сбрасывал чаще 33%, а с учётом аутов хватает "
+        "фолдов чаще 13%."
+    ),
+    (
+        "Если считать его чистым блефом, он окупается на одних фолдах, когда BB сбрасывает "
+        "чаще 33%."
+    ),
+)
+
+
+@pytest.mark.parametrize("live", _THRESHOLD_LIVES)
+def test_a_summary_threshold_share_equal_to_an_equity_number_needs_no_mark(live: str):
+    """Порог сводки 33.3 → 33% совпал с эквити флопа 32.6 → 33%: доля сразу после имени
+    порога — арифметика порога, а не эквити и не утверждение о сопернике."""
+    assert _check(live, **_DOUBLE_NARROWING) == []
+
+
+def test_the_threshold_of_frequency_vs_threshold_frees_its_share_too():
+    """Порог выхода `frequency_vs_threshold` (33.6 → 34%) — тоже порог."""
+    kw = {**_DOUBLE_NARROWING, "assumed_numbers": frozenset({34.2})}
+    assert _check("Порог: 34%.", **kw) == []
+    assert _check("Порог фолдов у него 34%.", **kw) == []
+    assert any("эквити" in v for v in _check("Порог: 34%.", **{**kw, "threshold_numbers": _THRESHOLDS}))
+
+
+def test_an_equity_share_against_the_range_still_needs_the_mark_despite_the_threshold():
+    kw = {**_DOUBLE_NARROWING, "assumed_numbers": frozenset({32.6})}
+    assert any("эквити" in v for v in _check("Против его диапазона у вас 33%.", **kw))
+    for text in (
+        "У вас 33%, порог фолдов 33%.",
+        "Порог фолдов 33%, эквити у вас тоже 33%.",
+        "Порог фолдов 33% против его колла.",
+        "Порог фолдов 33%, диапазон широкий.",
+        "Порог фолдов 33%, рендж широкий.",
+        "У вас 33%.",
+    ):
+        assert any("эквити" in v for v in _check(text, **_DOUBLE_NARROWING)), text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Порог фолдов — 33%.",
+        "Порог фолдов для BB 33%.",
+        "Ставке хватает фолдов чаще 33%.",
+        "Ставке хватает фолдов 33%.",
+        "Ставка в минусе, если BB сбрасывает реже 33%.",
+        "Ставка окупается, если фолдов чаще 33%.",
+    ],
+)
+def test_each_form_tying_the_share_to_the_threshold_frees_it(text: str):
+    assert _check(text, **_DOUBLE_NARROWING) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Порог фолдов 33% — ваша рука выигрывает в 33% случаев.",
+        "Порог фолдов 33% — а выигрываете вы 33%.",
+        "Порог фолдов 33% при ваших 33% победы.",
+    ],
+)
+def test_a_share_beside_the_threshold_but_not_tied_to_it_needs_the_mark(text: str):
+    """Освобождается только доля сразу после имени порога; вторая 33% — эквити."""
+    assert any("эквити" in v for v in _check(text, **_DOUBLE_NARROWING))
+
+
+def test_a_threshold_share_not_from_the_thresholds_still_needs_the_mark():
+    """Число порога, совпавшее с эквити, но не из порогов, метку не снимает — даже если
+    оно есть в остальной сводке."""
+    kw = {**_DOUBLE_NARROWING, "threshold_numbers": frozenset({13.2})}
+    for live in _THRESHOLD_LIVES:
+        if "33%" in live:
+            assert any("эквити" in v for v in _check(live, **kw)), live
+
+
+def test_the_threshold_name_with_the_opponent_before_its_share_without_a_colon():
+    """«Порог фолдов у него 33%» — имя порога перед порогом и без двоеточия; доля не из
+    порогов и действие рядом — по-прежнему утверждение."""
+    kw = {**_DOUBLE_NARROWING, "assumed_numbers": _NONE, "allowed": _DOUBLE_NARROWING["allowed"] | {41.0}}
+    assert _check("Порог фолдов у него 33%.", **kw) == []
+    assert _check("Порог фолдов для BB 13%.", **kw) == []
+    for text in (
+        "Порог фолдов у него 41%.",
+        "Порог фолдов у него 43%.",
+        "Порог фолдов у него 33%, и он сбросит.",
+        "Порог фолдов у него высокий 33%.",
+        "Он выше порога фолдов 33%.",
+    ):
+        assert any(ASSUMPTION_MARK in v for v in _check(text, **kw)), text
+
+
+def test_the_bluff_noun_naming_the_threshold_with_a_threshold_share_is_not_an_action():
+    """«Как у чистого блефа», «считать его (чистым) блефом» в начале придаточного — имя
+    порога, если в предложении порог привязан к имени; без него, при «бы», в другом
+    обороте и при доле не из порогов — действие соперника."""
+    kw = {**_DOUBLE_NARROWING, "assumed_numbers": _NONE}
+    assert _check("Как у чистого блефа ему нужно, чтобы BB сбрасывал чаще 33%.", **kw) == []
+    assert _check("Если считать его блефом, BB нужно сбрасывать чаще 33%.", **kw) == []
+    for text in (
+        "Он ставит как у чистого блефа.",
+        "Если считать его чистым блефом, он окупается.",
+        "Если бы считать его блефом, порог 33%.",
+        # «Бы» снимает исключение и там, где без него оборот был бы вырезан.
+        "Как у чистого блефа ему нужно было бы, если BB сбрасывает чаще 33%.",
+        "Против блефа BB порог 33%.",
+        "Как у чистого блефа ему нужно, чтобы BB сбрасывал чаще 43%.",
+        "Как у чистого блефа ему нужно, у вас 33%.",
+    ):
+        assert any(ASSUMPTION_MARK in v for v in _check(text, **kw)), text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Ставка BB как у чистого блефа, порог фолдов 33%.",
+        "Его ставка выглядит как у чистого блефа, порог 33%.",
+        "У BB карты как у чистого блефа, 13%.",
+        "У BB как у чистого блефа слабые руки, порог 33%.",
+        "BB ставит как у чистого блефа, порог 33%.",
+        "Как у чистого блефа BB ставит, порог 33%.",
+    ],
+)
+def test_the_bluff_name_with_the_opponent_in_its_clause_is_still_a_claim(text: str):
+    kw = {**_DOUBLE_NARROWING, "assumed_numbers": _NONE}
+    assert any("утверждение" in v for v in _check(text, **kw))
+
+
+# --- измеренная частота с выборкой, совпавшая с эквити (стенд b60cfc0) ----------
+
+_FOLD_TO_CBET = frozenset({21.0, 54.0, 38.9})
+_FREQUENCY_AND_EQUITY = {
+    "allowed": _FOLD_TO_CBET | {29.1, 39.4},
+    "calc_numbers": _FOLD_TO_CBET | {29.1, 39.4},
+    "frequency_numbers": _FOLD_TO_CBET,
+    "assumed_numbers": frozenset({29.1, 39.4}),
+    "labels": frozenset({"stat:fold_to_cbet"}),
+}
+
+
+@pytest.mark.parametrize(
+    "live",
+    [
+        "Поле в BB сбрасывает на с-бет 39% (21 из 54), выборка достаточная.",
+        "Измеренная сдача на с-бет у поля в позиции BB — 21 из 54 (39%), выборка достаточная.",
+    ],
+)
+def test_a_measured_frequency_with_its_own_sample_needs_no_equity_mark(live: str):
+    """Частота 21 из 54 (38.9 → 39%) совпала с эквити 39.4 → 39%: доля с выборкой этой
+    частоты в скобках рядом — частота, а не эквити."""
+    assert _check(live, **_FREQUENCY_AND_EQUITY) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Поле сбрасывает 39% ( 21 из 54 ).",
+        "Поле сбрасывает 39%(21 из 54).",
+        "Противник сбрасывает 39% (21 из 54).",
+        "Поле сбрасывает 21 из 54 (39%.",
+    ],
+)
+def test_a_frequency_share_allows_spaces_around_its_sample(text: str):
+    """Пробелы внутри и вокруг скобок — любые; в форме «N из M (доля)» закрывающая скобка
+    не нужна."""
+    assert _check(text, **_FREQUENCY_AND_EQUITY) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Ваши шансы выиграть 39% (21 из 54).",
+        "Шансы вашей руки 39% (21 из 54).",
+        "Шансы руки 21 из 54 (39%).",
+        "У вас 39% (21 из 54).",
+        "Ваша рука выигрывает 39% (21 из 54) до ривера.",
+        "Вы впереди в 39% (21 из 54) раздач.",
+        "Ваши ауты дают 39% (21 из 54).",
+        "Вы соберёте дро в 39% (21 из 54).",
+        "Вы забираете банк в 39% (21 из 54) случаев.",
+        "Equity 39% (21 из 54).",
+        "Поле сбрасывает, а ваша рука выигрывает 39% (21 из 54).",
+        "Поле сбрасывает, ваш шанс 39% (21 из 54).",
+        "Поле сбрасывает и ваша рука выигрывает 39% (21 из 54).",
+        "При колле ваш шанс 39% (21 из 54).",
+        "При рейзе вы впереди в 39% (21 из 54).",
+        "При колле шанс 39% (21 из 54).",
+        "При колле у вас 39% (21 из 54).",
+    ],
+)
+def test_a_sample_without_a_frequency_sign_in_its_part_needs_the_mark(text: str):
+    """Без действия поля или соперника в части с долей, или с шансом / исходом руки героя
+    там — это не частота, выборка рядом метку не снимает."""
+    assert any("эквити" in v for v in _check(text, **_FREQUENCY_AND_EQUITY))
+
+
+def test_a_frequency_share_without_its_own_sample_still_needs_the_mark():
+    kw = _FREQUENCY_AND_EQUITY
+    for text in (
+        "Против его диапазона у вас 39% (21 из 54).",
+        "Эквити 39% (21 из 54).",
+        "Поле сбрасывает 39% (21 из 54), диапазон широкий.",
+        "Поле сбрасывает 39% (21 из 54), рендж широкий.",
+        "У вас 39%.",
+        "У вас 39%, выборка 21 из 54.",
+    ):
+        assert any("эквити" in v for v in _check(text, **kw)), text
+    # Выборка не той частоты: 21 из 54 при частоте 4 из 8 (50%).
+    other = frozenset({4.0, 8.0, 50.0})
+    kw_other = {**kw, "allowed": kw["allowed"] | other | {21.0, 54.0}, "frequency_numbers": other}
+    assert any("эквити" in v for v in _check("Поле сбрасывает 39% (21 из 54).", **kw_other))
+    # Выборка из частот, но её доля (4 из 8 = 50%) до 39% не округляется.
+    both = _FOLD_TO_CBET | other
+    kw_both = {**kw, "allowed": kw["allowed"] | other, "frequency_numbers": both}
+    assert any("эквити" in v for v in _check("Поле сбрасывает 39% (4 из 8).", **kw_both))
+    # Та же доля 38.9, но у частоты выборка 7 из 18: 21 из 54 — не её выборка.
+    seven = frozenset({7.0, 18.0, 38.9})
+    kw_seven = {**kw, "allowed": kw["allowed"] | seven, "frequency_numbers": seven}
+    assert any("эквити" in v for v in _check("Поле сбрасывает 39% (21 из 54).", **kw_seven))
+    # N и M из разных частот (20 из 50 и 21 из 54): 20 из 54 = 37.0 — не измерено.
+    mixed = _FOLD_TO_CBET | {20.0, 50.0, 40.0}
+    kw_mixed = {
+        **kw, "allowed": kw["allowed"] | mixed | {37.2}, "frequency_numbers": mixed,
+        "assumed_numbers": frozenset({37.2}),
+    }
+    assert any("эквити" in v for v in _check("Поле сбрасывает 37% (20 из 54).", **kw_mixed))
 
 
 # --- ранги аутов словами (А.4) --------------------------------------------------

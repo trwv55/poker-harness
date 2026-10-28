@@ -23,10 +23,12 @@
 
 **Сужение — подмножество, целыми классами** (`narrow`): класс вне стартового или с
 долей 0 — отказ; оставленные классы сохраняют долю чарта, модель весов не задаёт.
-Есть сужение ближайшей более ранней улицы того же соперника в той же руке (`prior`) —
-сужение улицы обязано быть его подмножеством, иначе отказ с убранными классами
-(`test_a_class_removed_on_the_flop_is_refused_on_the_turn_by_name`); без него — от
-стартового (`test_without_an_earlier_narrowing_the_start_is_the_bound`).
+Граница улицы — сужение строго предыдущей улицы того же соперника в той же руке
+(`prior`): сужение улицы обязано быть его подмножеством, иначе отказ с убранными
+классами (`test_a_class_removed_on_the_flop_is_refused_on_the_turn_by_name`). Тёрн без
+сужения флопа и ривер без сужения тёрна — отказ «сначала сузьте …»
+(`test_a_later_street_without_the_previous_narrowing_is_refused`); флоп без него — от
+стартового (решение владельца 2026-10-23).
 
 **Добавление по просьбе игрока** (`added`, план 2026-10-17, п. 9) — единственный путь
 класса вне чарта в диапазон: только класс, которого в стартовом нет, и только если игрок
@@ -46,7 +48,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -63,6 +65,12 @@ from harness.analysis.charts import (
     to_notation,
 )
 from harness.analysis.open_chart import chart_table, defend_table
+from harness.analysis.range_categories import (
+    CategoryError,
+    expand_hands,
+    kept_by_category,
+    layout,
+)
 from harness.analysis.tools.equity import combos_of_class
 from harness.contracts import (
     AbsentGroup,
@@ -70,6 +78,8 @@ from harness.contracts import (
     ActionKind,
     CanonicalAction,
     CanonicalHand,
+    CategoryGroup,
+    CategoryKept,
     Range,
     RangeLine,
     RangeNarrowing,
@@ -91,6 +101,7 @@ __all__ = [
     "live_at",
     "live_combos",
     "narrow",
+    "prior_range",
     "range_spot",
     "start_range",
 ]
@@ -145,6 +156,9 @@ class EquitySpot:
     live_combos: float
     share_of_start: float
     added: tuple[str, ...] = ()
+    agent_added: dict[str, str] | None = None
+    categories_of: Literal["start", "flop"] | None = None
+    categories: tuple[CategoryKept, ...] = ()
 
     @property
     def cache_key(self) -> str:
@@ -391,6 +405,33 @@ _STREET_OF: dict[Street, str] = {
     Street.PREFLOP: "префлопа", Street.FLOP: "флопа", Street.TURN: "тёрна",
     Street.RIVER: "ривера",
 }
+# Улица, сужение которой обязательно до сужения этой, и отказ без него (решение
+# владельца 2026-10-23: прежняя граница «ближайшая более ранняя, иначе стартовый»
+# пускала тёрн шире фактического флопа, срезанного из истории).
+_PREVIOUS_REQUIRED: dict[Street, tuple[Street, str]] = {
+    Street.TURN: (
+        Street.FLOP,
+        (
+            "сначала сузьте флоп: вызовите equity_vs_range для флопа этого соперника, тёрн "
+            "сужается из него"
+        ),
+    ),
+    Street.RIVER: (
+        Street.TURN,
+        (
+            "сначала сузьте тёрн: вызовите equity_vs_range для тёрна этого соперника, ривер "
+            "сужается из него"
+        ),
+    ),
+}
+
+
+def prior_range(start: Range, prior: RangeNarrowing) -> Range:
+    """Диапазон прошлого сужения с долями: класс стартового — с долей чарта, добавленный
+    вне чарта — 1.0, как его записывает `narrow`."""
+    return Range(weights={
+        cls: start.weight(cls) if start.weight(cls) > 0.0 else 1.0 for cls in prior.classes
+    })
 
 
 def _classes(text: str) -> Range:
@@ -411,13 +452,21 @@ def narrow(
     added: str | None = None,
     named: Collection[str] = (),
     kept: Collection[str] = (),
+    reason: str | None = None,
 ) -> Range:
     """Сужение агентом: классы без весов, только из стартового диапазона с ненулевой
-    долей; доли — чарта. С `prior` (сужение более ранней улицы `street` того же
+    долей; доли — чарта. С `prior` (сужение предыдущей улицы `street` того же
     соперника) — только из его классов; добавленные по просьбе игрока классы `prior`
-    (вне чарта) сохраняют долю 1.0. `added` — классы вне чарта, только из `named` или
+    (вне чарта) сохраняют долю 1.0. Тёрн и ривер без `prior` предыдущей улицы — отказ
+    (`_PREVIOUS_REQUIRED`). `added` — классы вне чарта, только из `named` или
     `kept` — классов последнего сужения этого соперника в этой руке
-    (`test_an_added_class_kept_from_the_last_narrowing_needs_no_new_request`)."""
+    (`test_an_added_class_kept_from_the_last_narrowing_needs_no_new_request`); с
+    `reason` (причина модели) — любые классы вне чарта
+    (`test_a_class_added_with_the_model_reason_needs_no_player_record`)."""
+    if street is not None and street in _PREVIOUS_REQUIRED:
+        previous, refusal = _PREVIOUS_REQUIRED[street]
+        if prior is None or prior.street is not previous:
+            raise RangeRefused(refusal)
     asked = _classes(hands)
     if not asked.weights:
         raise RangeRefused("не названо ни одной руки")
@@ -429,12 +478,15 @@ def narrow(
             + " — передайте их в hands, а в added — только классы вне чарта"
         )
     allowed_extra = {*named, *kept}
-    unnamed = [cls for cls in all_classes() if cls in extra.weights and cls not in allowed_extra]
+    unnamed = [
+        cls for cls in all_classes()
+        if cls in extra.weights and cls not in allowed_extra and not reason
+    ]
     if unnamed:
         raise RangeRefused(
             "игрок не назвал эти классы записью: " + ", ".join(unnamed)
-            + " — вне чарта добавляются только классы, которые игрок назвал сам "
-            "(«22-77», «A5s»); уточните у него"
+            + " — вне чарта добавляются классы, которые игрок назвал сам («22-77», «A5s»), "
+            "или ваши с причиной в added_reason; уточните у него"
         )
     earlier = set(prior.classes) if prior is not None else set()
     outside = [
@@ -510,12 +562,19 @@ def equity_spot(
     prior: RangeNarrowing | None = None,
     named: Collection[str] = (),
     kept: Collection[str] = (),
+    reason: str | None = None,
+    kept_agent: Mapping[str, str] | None = None,
     open_path: Path | None = None,
     defend_path: Path | None = None,
 ) -> EquitySpot:
     """Всё, что нужно расчёту эквити, кроме самого Монте-Карло: рука героя, борд
     улицы, стартовый и суженный диапазоны, их живые комбо. `added`, `prior`, `named`,
-    `kept` — как у `narrow`."""
+    `kept`, `reason` — как у `narrow`. Класс вне чарта — агента (`agent_added`, класс →
+    причина), если добавлен в этом вызове с `reason` или был агента в `prior` или
+    `kept_agent` (последнем сужении), иначе — игрока
+    (`test_an_agent_class_is_inherited_by_the_next_street_with_its_reason`). На флопе и тёрне `hands` может называть категории раскладки
+    исходного диапазона (стартового, на тёрне — сужения флопа) — `expand_hands`; сводка
+    по категориям — в `categories`."""
     cards = hero_cards(hand)
     if len(cards) != 2:
         raise RangeRefused("карты героя неизвестны — эквити считать не от чего")
@@ -529,17 +588,41 @@ def equity_spot(
             "на точке решения героя в банке больше двух игроков — мультивей в этом срезе "
             "не считается"
         )
-    narrowed = narrow(start.range, hands, street=street, prior=prior, added=added, named=named,
-                      kept=kept)
     dead = [*cards, *board]
+    categories_of: Literal["start", "flop"] | None = None
+    groups: list[CategoryGroup] | None = None
+    if street in (Street.FLOP, Street.TURN):
+        categories_of, source = "start", start.range
+        if street is Street.TURN and prior is not None and prior.street is Street.FLOP:
+            categories_of, source = "flop", prior_range(start.range, prior)
+        groups = layout(source, board, dead)
+    try:
+        expanded = expand_hands(hands, groups)
+    except CategoryError as exc:
+        raise RangeRefused(str(exc)) from exc
+    reason = reason.strip() if reason and reason.strip() else None
+    narrowed = narrow(start.range, expanded, street=street, prior=prior, added=added,
+                      named=named, kept=kept, reason=reason)
     combos = live_combos(narrowed, dead)
     if combos == 0.0:
         raise RangeRefused("все комбо этих рук заблокированы вашими картами и бордом")
     low, high = sorted(cards)
+    outside = tuple(
+        cls for cls in all_classes() if cls in narrowed.weights and start.range.weight(cls) <= 0.0
+    )
+    this_call = set(_classes(added).weights) if added and added.strip() else set()
+    inherited = {**(kept_agent or {}), **(prior.agent_added if prior is not None else {})}
+    agent_added: dict[str, str] = {}
+    for cls in outside:
+        if reason is not None and cls in this_call:
+            agent_added[cls] = reason
+        elif cls in inherited:
+            agent_added[cls] = inherited[cls]
     return EquitySpot(
         hero=(low, high), board=board, start=start, narrowed=narrowed,
         live_combos=combos, share_of_start=combos / live_combos(start.range, dead),
-        added=tuple(
-            cls for cls in all_classes() if cls in narrowed.weights and start.range.weight(cls) <= 0.0
-        ),
+        added=outside,
+        agent_added=agent_added,
+        categories_of=categories_of,
+        categories=tuple(kept_by_category(groups, narrowed)) if groups is not None else (),
     )

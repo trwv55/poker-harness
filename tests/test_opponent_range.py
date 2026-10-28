@@ -26,7 +26,9 @@ from harness.analysis.opponent_range import (
     range_spot,
     start_range,
 )
+from harness.analysis.player_stats import hero_bet_called
 from harness.contracts import (
+    FrequencyStat,
     Post,
     PostKind,
     Provenance,
@@ -489,12 +491,58 @@ def test_a_class_removed_on_the_flop_is_refused_on_the_turn_by_name(tmp_path: Pa
     )
 
 
-def test_without_an_earlier_narrowing_the_start_is_the_bound(tmp_path: Path):
-    """Без сужения более ранней улицы тёрн сужается от стартового, как флоп."""
+_FIRST_THE_FLOP = (
+    "сначала сузьте флоп: вызовите equity_vs_range для флопа этого соперника, тёрн "
+    "сужается из него"
+)
+_FIRST_THE_TURN = (
+    "сначала сузьте тёрн: вызовите equity_vs_range для тёрна этого соперника, ривер "
+    "сужается из него"
+)
+
+
+@pytest.mark.parametrize(
+    ("street", "prior", "refusal"),
+    [
+        (Street.TURN, None, _FIRST_THE_FLOP),
+        (Street.RIVER, None, _FIRST_THE_TURN),
+        # Ривер с сужением флопа, но без тёрна: граница — строго предыдущая улица.
+        (Street.RIVER, Street.FLOP, _FIRST_THE_TURN),
+        (Street.TURN, Street.TURN, _FIRST_THE_FLOP),
+        (Street.TURN, Street.PREFLOP, _FIRST_THE_FLOP),
+    ],
+)
+def test_a_later_street_without_the_previous_narrowing_is_refused(
+    tmp_path: Path, street: Street, prior: Street | None, refusal: str
+):
+    """Тёрн без сужения флопа и ривер без сужения тёрна — отказ словами модели, даже
+    если классы — из стартового (решение владельца 2026-10-23)."""
+    with pytest.raises(RangeRefused) as refused:
+        equity_spot(
+            _hand(_THROUGH_RIVER), "BB", street, "QQ",
+            prior=_prior(prior, "QQ, A5s") if prior is not None else None,
+            defend_path=defend_file(tmp_path),
+        )
+    assert str(refused.value) == refusal
+
+
+def test_the_flop_without_a_prior_is_narrowed_from_the_start(tmp_path: Path):
     spot = equity_spot(
-        _hand(_THROUGH_RIVER), "BB", Street.TURN, "QQ, A5s", defend_path=defend_file(tmp_path)
+        _hand(_THROUGH_RIVER), "BB", Street.FLOP, "QQ, A5s", defend_path=defend_file(tmp_path)
     )
     assert spot.narrowed == Range(weights={"QQ": 1.0, "A5s": 1.0})
+
+
+def test_the_turn_after_the_flop_and_the_river_after_the_turn_pass(tmp_path: Path):
+    turn = equity_spot(
+        _hand(_THROUGH_RIVER), "BB", Street.TURN, "QQ",
+        prior=_prior(Street.FLOP, "QQ, A5s"), defend_path=defend_file(tmp_path),
+    )
+    river = equity_spot(
+        _hand(_THROUGH_RIVER), "BB", Street.RIVER, "QQ",
+        prior=_prior(Street.TURN, "QQ"), defend_path=defend_file(tmp_path),
+    )
+    assert turn.narrowed == river.narrowed == Range(weights={"QQ": 1.0})
 
 
 def test_a_subset_of_the_earlier_narrowing_keeps_the_chart_weights():
@@ -535,6 +583,38 @@ def test_the_equity_spot_names_the_added_classes(tmp_path: Path):
     )
     assert spot.added == ("KJs",)
     assert spot.narrowed.weight("KJs") == 1.0
+
+
+def test_a_class_added_with_the_model_reason_needs_no_player_record():
+    """С причиной модели (`reason`) класс вне чарта входит без записи игрока, с долей
+    1.0 (спека 2026-10-24, §7); класс чарта в `added` — прежний отказ."""
+    start = parse_range("88+")
+    narrowed = narrow(start, "AA", added="22-33", reason="на этих лимитах коллирует пары")
+    assert narrowed.weights == {"AA": 1.0, "33": 1.0, "22": 1.0}
+    with pytest.raises(RangeRefused, match="передайте их в hands"):
+        narrow(start, "AA", added="99", reason="причина")
+
+
+def test_an_agent_class_is_inherited_by_the_next_street_with_its_reason(tmp_path: Path):
+    """Класс агента с причиной — `agent_added`; на тёрне, переданный в `hands` из сужения
+    флопа, он остаётся классом агента с той же причиной; класс игрока — игрока."""
+    defend = defend_file(tmp_path, call="QQ+, A2s-AQs")
+    flop = equity_spot(
+        _hand(_THROUGH_RIVER), "BB", Street.FLOP, "QQ", added="KJs, 22",
+        reason="  на этих лимитах так коллируют  ", defend_path=defend,
+    )
+    assert flop.added == ("22", "KJs")
+    assert flop.agent_added == {"22": "на этих лимитах так коллируют",
+                                "KJs": "на этих лимитах так коллируют"}
+    prior = _prior(Street.FLOP, "QQ, KJs, 22, 33").model_copy(
+        update={"agent_added": {"KJs": "причина флопа"}}
+    )
+    turn = equity_spot(
+        _hand(_THROUGH_RIVER), "BB", Street.TURN, "QQ, KJs, 33", prior=prior,
+        defend_path=defend,
+    )
+    assert turn.added == ("33", "KJs")
+    assert turn.agent_added == {"KJs": "причина флопа"}
 
 
 def test_a_class_the_player_did_not_name_is_refused():
@@ -664,3 +744,36 @@ def test_the_share_of_the_start_counts_the_added_combos_over_the_start(tmp_path:
         named=frozenset({"KJo", "K9o"}), defend_path=defend_file(tmp_path, call="AA"),
     )
     assert spot.share_of_start > 1.0
+
+
+# --- ставка героя, которую соперник уравнял (ориентир сдачи, спека 2026-10-24, §13) ---
+
+
+_COLD_CALL_FLOP_BOTH_CALL = [
+    *_COLD_CALL, _check(F, "P5"), _check(F, "P6"), _bet(F, "Hero", 300), _call(F, "P5", 300),
+    _call(F, "P6", 300),
+]
+_BB_RAISES_THE_CBET = [
+    *BTN_OPENS_BB_CALLS[:-1], _raise(F, "P6", 480), _call(F, "Hero", 320),
+]
+_BB_DONKS = [*BTN_OPENS_BB_CALLS[:-3], _bet(F, "P6", 160), _call(F, "Hero", 160)]
+
+
+@pytest.mark.parametrize(
+    ("actions", "label", "street", "stat"),
+    [
+        (BTN_OPENS_BB_CALLS, "P6", F, FrequencyStat.FOLD_TO_CBET),
+        (_THROUGH_RIVER, "P6", T, FrequencyStat.FOLD_TO_TURN_BARREL),
+        (_THROUGH_RIVER, "P6", R, None),
+        (_BB_RAISES_THE_CBET, "P6", F, None),
+        (_BB_DONKS, "P6", F, None),
+        (_COLD_CALL_FLOP_BOTH_CALL, "P6", F, None),
+        (_COLD_CALL_FLOP_BOTH_CALL, "P5", F, None),
+    ],
+    ids=["cbet-called", "barrel-called", "river", "cbet-raised", "donk", "multiway-last",
+         "multiway-first"],
+)
+def test_the_hero_bet_the_opponent_called_names_the_fold_stat(actions, label, street, stat):
+    """С-бет героя, уравненный соперником, — `fold_to_cbet`; второй баррель —
+    `fold_to_turn_barrel`; рейз, донк, ривер и больше двух в банке на ответе — `None`."""
+    assert hero_bet_called(_hand(actions), label, street) is stat

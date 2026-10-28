@@ -68,6 +68,7 @@ __all__ = [
     "seen_history",
     "stats_in_history",
     "threshold_decided",
+    "threshold_numbers_in",
     "trim_history",
     "turns",
 ]
@@ -413,17 +414,24 @@ def chart_numbers_in(messages: Sequence[ModelMessage]) -> frozenset[float]:
 
 
 def assumed_numbers_in(messages: Sequence[ModelMessage]) -> frozenset[float]:
-    """Числа выхода `equity_vs_range`: эквити и доля от стартового в процентах —
+    """Числа выхода `equity_vs_range`: эквити в процентах —
     числа расчёта, но не измеренная частота
     (`test_equity_numbers_are_calculation_numbers_and_never_a_measured_frequency`)."""
     return frozenset(float(n) for meta in _metadata(messages) for n in meta.get("assumed", []))
+
+
+def threshold_numbers_in(messages: Sequence[ModelMessage]) -> frozenset[float]:
+    """Порог выхода `frequency_vs_threshold` в процентах
+    (`test_the_threshold_of_frequency_vs_threshold_reaches_the_check`)."""
+    return frozenset(float(n) for meta in _metadata(messages) for n in meta.get("threshold", []))
 
 
 def narrowings_in(messages: Sequence[ModelMessage]) -> list[RangeNarrowing]:
     """Сужения `equity_vs_range` из выходов расчётов, в порядке разговора: по ним
     сужение следующей улицы обязано быть подмножеством прошлой
     (`test_a_turn_in_the_next_turn_is_bound_by_the_flop_of_the_history`). Что ушло из
-    истории обрезкой, границей больше не служит."""
+    истории обрезкой, здесь не возвращается
+    (`test_a_narrowing_trimmed_from_the_history_refuses_the_turn`)."""
     return [
         RangeNarrowing.model_validate(meta["narrowed"])
         for meta in _metadata(messages)

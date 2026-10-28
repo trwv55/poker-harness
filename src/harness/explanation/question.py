@@ -18,16 +18,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 from pydantic import BaseModel
 
 from harness.contracts import (
+    RANGE_CATEGORY_NAMES,
     CalcName,
     CalcResult,
+    CategoryClass,
+    CategoryGroup,
     CoverageResult,
     DefenseResult,
     EquityVsRangeResult,
+    FoldHint,
     FrequencyResult,
     FrequencyStat,
     LeaksResult,
@@ -42,6 +47,7 @@ from harness.contracts import (
 )
 from harness.explanation.digest import NumberBook
 from harness.explanation.faithfulness import error_words_in, unsupported_numbers
+from harness.explanation.hand_replay import cards_text
 from harness.explanation.verdict_text import (
     Digest,
     UnfaithfulText,
@@ -83,6 +89,11 @@ _STAT_BRIEF: dict[FrequencyStat, str] = {
     FrequencyStat.BARREL_RIVER: "ставка на ривере после своей ставки на тёрне",
     FrequencyStat.FOLD_TO_TURN_BARREL: (
         "сдача на второй баррель (из случаев, когда после колла продолженной ставки "
+        "агрессор поставил и на тёрне)"
+    ),
+    FrequencyStat.RAISE_CBET: "рейз на продолженную ставку (из случаев, когда она сделана)",
+    FrequencyStat.RAISE_TURN_BARREL: (
+        "рейз на второй баррель (из случаев, когда после колла продолженной ставки "
         "агрессор поставил и на тёрне)"
     ),
     FrequencyStat.SHOWDOWN: "доход до вскрытия (из сыгранных флопов)",
@@ -447,6 +458,91 @@ def _agent_range_lines(result: OpponentRangeResult, book: NumberBook) -> list[st
     ]
     if result.absent:
         lines.append(_absent_line(result, book))
+    lines += _layout_lines(result, book)
+    return lines
+
+
+_LAYOUT_OF: dict[str, str] = {
+    "start": "стартовый диапазон",
+    "flop": "ваше сужение флопа этого соперника (допущение)",
+}
+
+
+def _classes_word(count: int) -> str:
+    if count % 10 == 1 and count % 100 != 11:
+        return "класс"
+    if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+        return "класса"
+    return "классов"
+
+
+def _layout_class(item: CategoryClass, book: NumberBook) -> str:
+    """Класс раскладки: пара — словами, доля диапазона меньше целой — процентом, пометки
+    категорий — словами, у части комбо — с числом через книгу («+ флеш-дро у 1 из 4
+    комбо»)."""
+    cls = item.hand_class
+    word = f"пара {_PAIR_WORD[cls[0]]}" if len(cls) == 2 else cls
+    notes: list[str] = []
+    if item.weight < 1.0:
+        notes.append(f"{book.pct(100.0 * item.weight, trim=True)}%")
+    notes += [
+        f"+ {RANGE_CATEGORY_NAMES[mark.category]}" + (
+            f" у {book.count(mark.combos)} из {book.count(mark.of)} комбо"
+            if mark.combos < mark.of else ""
+        )
+        for mark in item.marks
+    ]
+    return f"{word} ({'; '.join(notes)})" if notes else word
+
+
+def layout_lines(groups: Sequence[CategoryGroup], book: NumberBook) -> list[str]:
+    """Строки раскладки по категориям: «трипс — 21 класс, 86 комбо: A8s, …» — число
+    классов и комбо через книгу, классы — все, в порядке раскладки
+    (`test_the_layout_lines_name_every_class_with_its_category`)."""
+    lines: list[str] = []
+    for group in groups:
+        count = len(group.classes)
+        classes = ", ".join(_layout_class(item, book) for item in group.classes)
+        lines.append(
+            f"{RANGE_CATEGORY_NAMES[group.category]} — {book.count(count)} "
+            f"{_classes_word(count)}, {book.count(round(group.combos))} комбо: {classes}."
+        )
+    return lines
+
+
+def _layout_lines(result: OpponentRangeResult, book: NumberBook) -> list[str]:
+    if result.layout_of is None or not result.layout:
+        return []
+    head = (
+        f"Раскладка по категориям ({_STREET_WORD[result.street]}; "
+        f"{_LAYOUT_OF[result.layout_of]}; категорию руки на борде определяет код):"
+    )
+    return [head, *layout_lines(result.layout, book), *_solver_lines(result, book)]
+
+
+_SOLVER_ACTION: dict[str, str] = {
+    "call": "колл", "raise": "рейз", "fold": "фолд", "allin": "олл-ин",
+}
+
+
+def _solver_lines(result: OpponentRangeResult, book: NumberBook) -> list[str]:
+    """Строка ориентира солвера (спека 2026-10-24, §6): борд и ставка выгрузки против
+    руки, по действию — категории на борде выгрузки
+    (`test_the_solver_guide_line_names_the_nearest_line_and_its_categories`)."""
+    if result.solver_error is not None:
+        return [f"Ориентир солвера: {result.solver_error} — ориентира нет."]
+    guide = result.solver
+    if guide is None:
+        return []
+    lines = [(
+        f"Ориентир солвера (ближайшая линия: {cards_text(guide.board)}, ставка "
+        f"{book.pct(100.0 * guide.bet_share, trim=True)}%; в руке "
+        f"{cards_text(guide.hand_board)}, {book.pct(100.0 * guide.hand_bet_share, trim=True)}%; "
+        "данные владельца, категории — на борде выгрузки):"
+    )]
+    for action in guide.actions:
+        parts = [line.rstrip(".") for line in layout_lines(action.layout, book)]
+        lines.append(f"{_SOLVER_ACTION[action.action]} — " + "; ".join(parts) + ".")
     return lines
 
 
@@ -482,10 +578,21 @@ def _absent_line(result: OpponentRangeResult, book: NumberBook) -> str:
 
 
 def _agent_equity_lines(result: EquityVsRangeResult, book: NumberBook) -> list[str]:
-    """С добавленными по просьбе игрока классами доли от стартового нет — она может
-    быть больше 100% (`test_the_added_classes_are_a_separate_line_without_the_share`)."""
-    named = _range_text(", ".join(result.added), book)
-    added = [f"Добавлено по вашей просьбе: {named} — по чарту их здесь нет."] if result.added else []
+    """С добавленными вне чарта классами доли от стартового нет — она может
+    быть больше 100% (`test_the_added_classes_are_a_separate_line_without_the_share`).
+    Добавленные агентом — своей строкой с причиной, отдельно от добавленных по просьбе
+    игрока (`test_the_agent_added_classes_are_said_with_the_reason`)."""
+    player = [cls for cls in result.added if cls not in result.agent_added]
+    named = _range_text(", ".join(player), book)
+    added = [f"Добавлено по вашей просьбе: {named} — по чарту их здесь нет."] if player else []
+    by_reason: dict[str, list[str]] = {}
+    for cls in result.added:
+        if cls in result.agent_added:
+            by_reason.setdefault(result.agent_added[cls], []).append(cls)
+    added += [
+        f"Добавлено агентом (допущение): {_range_text(', '.join(classes), book)} — {reason}."
+        for reason, classes in by_reason.items()
+    ]
     return [
         f"Соперник: {result.opponent_position}, улица: {_STREET_WORD[result.street]}.",
         (
@@ -499,7 +606,65 @@ def _agent_equity_lines(result: EquityVsRangeResult, book: NumberBook) -> list[s
             f"{book.pct(100.0 * result.share_of_start, trim=True)}% стартового диапазона."
         ),
         *added,
+        *_kept_lines(result, book),
         f"Эквити вашей руки при вскрытии: {book.pct(100.0 * result.equity, trim=True)}%.",
+    ]
+
+
+_KEPT_OF: dict[str, str] = {"start": "стартовый диапазон", "flop": "ваше сужение флопа"}
+
+
+def _kept_lines(result: EquityVsRangeResult, book: NumberBook) -> list[str]:
+    """Сводка по категориям раскладки исходного диапазона: что оставлено и сколько комбо,
+    итог — доля оставленного от исходного и сданного, с комбо (спека 2026-10-24, §5, §13;
+    `test_the_equity_digest_prints_the_kept_summary`)."""
+    if result.categories_of is None or not result.categories:
+        return []
+    parts: list[str] = []
+    for kept in result.categories:
+        name = RANGE_CATEGORY_NAMES[kept.category]
+        total = book.count(round(kept.combos))
+        if kept.kept_classes == kept.classes:
+            parts.append(f"{name} — целиком, {total} комбо")
+        elif kept.kept_classes == 0:
+            parts.append(f"{name} — убрана целиком ({total} комбо)")
+        else:
+            removed = _range_text(", ".join(kept.removed), book)
+            parts.append(
+                f"{name} — {book.count(round(kept.kept_combos))} комбо из {total}, "
+                f"убраны: {removed}"
+            )
+    lines = [
+        f"По категориям (исходный — {_KEPT_OF[result.categories_of]}): " + "; ".join(parts) + "."
+    ]
+    if result.kept_combos is not None and result.source_combos:
+        kept = round(100.0 * result.kept_combos / result.source_combos, 1)
+        share = book.pct(kept, trim=True)
+        lines.append(
+            f"Оставлено {share}% диапазона на начало улицы "
+            f"({book.count(round(result.kept_combos))} комбо из "
+            f"{book.count(round(result.source_combos))}): соперник продолжает {share}%, "
+            f"сдаёт {book.pct(100.0 - kept, trim=True)}%."
+        )
+        lines += _fold_hint_lines(result.fold_hint, book)
+    return lines
+
+
+def _fold_hint_lines(hint: FoldHint | None, book: NumberBook) -> list[str]:
+    """Частота сдачи соперника на ставку героя, которую он уравнял, — для сверки с долей
+    оставленного (спека 2026-10-24, §13): величина с выборкой, уровень данных, выборка
+    словами (`test_the_fold_hint_names_the_stat_its_sample_and_whose_it_is`); без неё —
+    ни строки (`test_without_a_fold_hint_there_is_no_stat_line`)."""
+    if hint is None:
+        return []
+    phrase = _measurement_phrase(hint.measurement, book, trim=True)
+    return [
+        (
+            f"Для сверки с долей (подсказка, сужение не меняет): {_STAT_BRIEF[hint.stat]} — "
+            f"{phrase}."
+        ),
+        _level_line(hint.subject, None, hint.opponent, book),
+        *_sample_line(hint.measurement, book),
     ]
 
 

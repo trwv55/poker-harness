@@ -2790,6 +2790,8 @@ _STAT_WORD: dict[FrequencyStat, str] = {
     FrequencyStat.BARREL_TURN: "второй баррель (ставка на тёрне)",
     FrequencyStat.BARREL_RIVER: "третий баррель (ставка на ривере)",
     FrequencyStat.FOLD_TO_TURN_BARREL: "сдача на второй баррель",
+    FrequencyStat.RAISE_CBET: "рейз на продолженную ставку",
+    FrequencyStat.RAISE_TURN_BARREL: "рейз на второй баррель",
     FrequencyStat.SHOWDOWN: "доход до вскрытия",
 }
 

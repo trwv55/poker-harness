@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
-from typing import Any, cast, overload
+from typing import Any, Literal, cast, overload
 
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,14 +44,18 @@ from harness.analysis.opponent_range import (
     equity_spot,
     hero_cards,
     live_combos,
+    prior_range,
     range_spot,
     start_range,
 )
 from harness.analysis.player_stats import (
+    hero_bet_called,
     measurement_of,
     player_stats_of_seats,
     seat_position,
 )
+from harness.analysis.range_categories import layout
+from harness.analysis.solver_guide import SolverFileError, hand_bet, load_library, nearest
 from harness.analysis.tools.equity import equity_vs_range
 from harness.contracts import (
     POSITIONS,
@@ -59,12 +63,14 @@ from harness.contracts import (
     CalcParams,
     CalcResult,
     CanonicalHand,
+    CategoryGroup,
     CoverageParams,
     CoverageResult,
     DefenseParams,
     DefenseResult,
     EquityVsRangeParams,
     EquityVsRangeResult,
+    FoldHint,
     FrequencyResult,
     FrequencyStat,
     HeroFrequencyParams,
@@ -75,6 +81,9 @@ from harness.contracts import (
     OpponentRangeParams,
     OpponentRangeResult,
     PointFilter,
+    SolverAction,
+    SolverGuide,
+    Street,
     Subject,
     ThresholdParams,
     ThresholdResult,
@@ -329,14 +338,63 @@ async def _analysed_hand(db: AsyncSession, player_id: int, analysis_id: int) -> 
     return enriched.hand
 
 
+def _solver(
+    hand: CanonicalHand, pot_before_flop: int, label: str, depth_bb: float
+) -> tuple[SolverGuide | None, str | None]:
+    """Ориентир флопа из библиотеки выгрузок: ставка руки, ближайшая выгрузка, её действия
+    по категориям на борде выгрузки (`test_the_flop_output_carries_the_nearest_solver_guide`).
+    Нечем сравнить — `(None, None)`; библиотека не прочиталась — причина вторым."""
+    bet = hand_bet(hand, label, pot_before_flop, depth_bb)
+    if bet is None:
+        return None, None
+    try:
+        library = load_library()
+    except SolverFileError as exc:
+        return None, f"библиотека ориентиров не прочиталась ({exc})"
+    dump = nearest(library, bet.key, bet.board, bet.bet_share)
+    if dump is None:
+        return None, None
+    actions = [
+        SolverAction(action=action, layout=layout(rng, dump.board, dump.board))
+        for action, rng in dump.actions.items()
+    ]
+    return SolverGuide(
+        board=list(dump.board), bet_share=dump.bet_share, hand_board=list(bet.board),
+        hand_bet_share=bet.bet_share, actions=actions,
+    ), None
+
+
 async def _opponent_range(
     db: AsyncSession, player_id: int, params: OpponentRangeParams
 ) -> OpponentRangeResult:
-    """Стартовый диапазон по чарту в руке разбора; отказы ядра — `ValueError` словами."""
+    """Стартовый диапазон по чарту в руке разбора; отказы ядра — `ValueError` словами.
+    На флопе и тёрне — и раскладка по категориям (спека 2026-10-24, §4): на тёрне —
+    сужения флопа этой руки, если оно есть, иначе стартового
+    (`test_the_turn_layout_is_of_the_flop_narrowing_and_without_it_of_the_start`)."""
     _check_position(params.opponent_position)
-    hand = await _analysed_hand(db, player_id, params.analysis_id)
+    enriched = await AnalysesRepo(db).enriched_hand(params.analysis_id, player_id)
+    if enriched is None:
+        raise ValueError("разбора этой руки нет — диапазон соперника считать не по чему")
+    hand = enriched.hand
     start = start_range(range_spot(hand, params.opponent_position))
-    dead = [*hero_cards(hand), *board_at(hand, params.street)]
+    board = board_at(hand, params.street)
+    dead = [*hero_cards(hand), *board]
+    layout_of: Literal["start", "flop"] | None = None
+    groups: list[CategoryGroup] = []
+    if params.street in (Street.FLOP, Street.TURN):
+        layout_of = "start"
+        source = start.range
+        prior = params.prior
+        if params.street is Street.TURN and prior is not None and prior.street is Street.FLOP:
+            layout_of, source = "flop", prior_range(start.range, prior)
+        groups = await asyncio.to_thread(layout, source, board, dead)
+    solver: SolverGuide | None = None
+    solver_error: str | None = None
+    if params.street is Street.FLOP:
+        solver, solver_error = await asyncio.to_thread(
+            _solver, hand, enriched.report.pot_by_street.get(Street.PREFLOP, 0),
+            start.spot.label, start.chart_depth_bb,
+        )
     return OpponentRangeResult(
         calc=params.calc,
         opponent_position=params.opponent_position,
@@ -353,7 +411,31 @@ async def _opponent_range(
         hands_share=start.range.fraction_of_hands(),
         live_combos=live_combos(start.range, dead),
         absent=list(start.absent),
+        layout_of=layout_of,
+        layout=groups,
+        solver=solver,
+        solver_error=solver_error,
     )
+
+
+async def _fold_hint(
+    db: AsyncSession, player_id: int, hand: CanonicalHand, label: str, street: Street
+) -> FoldHint | None:
+    """Частота сдачи соперника на ставку героя, которую он уравнял (спека 2026-10-24, §13;
+    линия — `hero_bet_called`). Подлежащее — правилом `opponent_frequency`: сшивка места в
+    этом турнире — этот соперник, иначе поле
+    (`test_the_flop_equity_after_a_called_cbet_carries_the_fold_to_cbet_hint`)."""
+    stat = hero_bet_called(hand, label, street)
+    if stat is None:
+        return None
+    holder = await OpponentsRepo(db).holder(player_id, hand.tournament_id, label)
+    opponent_id, nick = holder if holder is not None else (None, None)
+    subject = _subject_of(opponent_id)
+    measurement = await _measure(
+        db, player_id, subject=subject, stat=stat, opponent_id=opponent_id, position=None,
+        window=Window(),
+    )
+    return FoldHint(stat=stat, subject=subject, opponent=nick, measurement=measurement)
 
 
 async def _equity_vs_range(
@@ -365,10 +447,10 @@ async def _equity_vs_range(
     Счёт — в потоке, чтобы не держать цикл событий воркера."""
     _check_position(params.opponent_position)
     hand = await _analysed_hand(db, player_id, params.analysis_id)
-    spot = equity_spot(
-        hand, params.opponent_position, params.street, params.hands,
+    spot = await asyncio.to_thread(
+        equity_spot, hand, params.opponent_position, params.street, params.hands,
         added=params.added, prior=params.prior, named=params.player_classes,
-        kept=params.kept_classes,
+        kept=params.kept_classes, reason=params.added_reason, kept_agent=params.kept_agent,
     )
     cache = CalcCacheRepo(db)
     prefix = equity_cache_prefix()
@@ -379,6 +461,9 @@ async def _equity_vs_range(
             iterations=AGENT_EQUITY_ITERATIONS, seed=AGENT_EQUITY_SEED,
         )
         await cache.upsert_many(prefix, {spot.cache_key: equity})
+    hint = None
+    if spot.categories:
+        hint = await _fold_hint(db, player_id, hand, spot.start.spot.label, params.street)
     return EquityVsRangeResult(
         calc=params.calc,
         opponent_position=params.opponent_position,
@@ -388,6 +473,12 @@ async def _equity_vs_range(
         share_of_start=spot.share_of_start,
         equity=equity,
         added=list(spot.added),
+        agent_added=dict(spot.agent_added or {}),
+        categories_of=spot.categories_of,
+        categories=list(spot.categories),
+        source_combos=sum(c.combos for c in spot.categories) if spot.categories else None,
+        kept_combos=sum(c.kept_combos for c in spot.categories) if spot.categories else None,
+        fold_hint=hint,
     )
 
 

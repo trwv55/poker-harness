@@ -855,6 +855,21 @@ async def test_an_undecided_threshold_does_not_allow_a_profit_conclusion(db_fact
     assert any("frequency_vs_threshold" in v for v in turn.violations[0])
 
 
+async def test_the_threshold_of_frequency_vs_threshold_reaches_the_check(db_factory):
+    """Порог выхода (50% от ставки 1 BB в банк 1 BB) лежит в метаданных отдельно и
+    доходит до проверки: «Порог фолдов у BB 50%» — имя порога, а не утверждение."""
+    from harness.agent.history import threshold_numbers_in
+
+    async with db_factory() as session:
+        scope = await _seeded(session, tg_user_id=8146)
+        turn = await _turn(
+            db_factory, session, _TurnScript([([_UNDECIDED], "Порог фолдов у BB 50%.")]),
+            scope=scope, text="банк 1 BB, ставка 1 BB",
+        )
+    assert threshold_numbers_in(turn.messages) == frozenset({50.0})
+    assert turn.state == "prose", turn.violations
+
+
 async def test_the_measured_frequency_is_kept_apart_from_other_calc_numbers(db_factory):
     """Метаданные ответа инструмента несут измеренную частоту отдельно: у защиты её
     нет, у частоты героя — доля, числитель и знаменатель."""
@@ -1008,10 +1023,7 @@ async def test_the_agent_reads_the_range_by_the_chart_and_counts_equity_against_
     assert chart_numbers_in(turn.messages) == frozenset(
         {round(100.0 * range_result.hands_share, 1), float(round(range_result.live_combos))}
     )
-    assumed = frozenset(
-        {round(100.0 * equity_result.equity, 1), round(100.0 * equity_result.share_of_start, 1)}
-    )
-    assert assumed_numbers_in(turn.messages) == assumed
+    assert assumed_numbers_in(turn.messages) == frozenset({round(100.0 * equity_result.equity, 1)})
 
 
 async def test_equity_numbers_are_calculation_numbers_and_never_a_measured_frequency(
@@ -1029,6 +1041,28 @@ async def test_equity_numbers_are_calculation_numbers_and_never_a_measured_frequ
     assert assumed and assumed <= allowed_from_history(turn.messages)
     assert chart_numbers_in(turn.messages) <= allowed_from_history(turn.messages)
     assert frequency_numbers(turn.messages) == frozenset()
+
+
+async def test_the_fold_hint_numbers_are_allowed_but_never_assumed(
+    db_factory, tmp_path, monkeypatch
+):
+    """Ориентир сдачи (доля оставленного, сдача на с-бет с выборкой) — числа выхода:
+    они в `allowed`, но не в `assumed` — там только эквити (2f3d92a, 5394010)."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 500)
+    async with db_factory() as session:
+        scope, analysis_id = await _evening_with_hand(session, tg_user_id=8305)
+        script = _TurnScript([([_EQUITY_CALL], "Ответ без чисел (допущение).")])
+        turn = await _turn(db_factory, session, script, scope=scope, analysis_id=analysis_id)
+    (result,) = turn.results
+    assert isinstance(result, EquityVsRangeResult) and result.fold_hint is not None
+    assert result.kept_combos is not None and result.source_combos is not None
+    kept = round(100.0 * result.kept_combos / result.source_combos, 1)
+    hint = {kept, round(100.0 - kept, 1), 0.0, 1.0}
+    output = turn.calls[0]["output"]
+    assert "сдаёт" in output and "Для сверки с долей" in output
+    assert hint <= allowed_from_history(turn.messages)
+    assert assumed_numbers_in(turn.messages) == frozenset({round(100.0 * result.equity, 1)})
 
 
 async def test_without_a_hand_analysis_the_range_tool_says_so(db_factory):
@@ -1606,9 +1640,10 @@ def _narrowing(street: str, classes: list[str], *, analysis_id: int = 1, positio
     )
 
 
-def test_the_turn_takes_the_flop_narrowing_and_without_it_the_start():
-    """Ключ — разбор, позиция соперника, улица; берётся последнее сужение ближайшей
-    более ранней улицы, по которой оно есть; нет ни одного — `None` (от стартового)."""
+def test_the_prior_is_the_last_narrowing_of_the_previous_street():
+    """Ключ — разбор, позиция соперника, улица; берётся последнее сужение строго
+    предыдущей улицы: у ривера при одном флопе — `None`, флоп другой руки или другого
+    соперника не засчитывается."""
     run_state = CalcRun(max_calcs=8, sizes_from=frozenset(), narrowings=[
         _narrowing("flop", ["AA", "KK"]),
         _narrowing("flop", ["AA"]),
@@ -1616,9 +1651,13 @@ def test_the_turn_takes_the_flop_narrowing_and_without_it_the_start():
         _narrowing("flop", ["JJ"], position="SB"),
     ])
     assert run_state.prior_for(1, "BB", Street.TURN) == _narrowing("flop", ["AA"])
-    assert run_state.prior_for(1, "BB", Street.RIVER) == _narrowing("flop", ["AA"])
+    assert run_state.prior_for(1, "BB", Street.RIVER) is None
     assert run_state.prior_for(1, "BB", Street.FLOP) is None
+    assert run_state.prior_for(1, "BB", Street.PREFLOP) is None
     assert run_state.prior_for(3, "BB", Street.TURN) is None
+    assert run_state.prior_for(2, "BB", Street.TURN) == _narrowing("flop", ["QQ"], analysis_id=2)
+    assert run_state.prior_for(1, "SB", Street.TURN) == _narrowing("flop", ["JJ"], position="SB")
+    assert run_state.prior_for(1, "CO", Street.TURN) is None
     run_state.narrowings.append(_narrowing("turn", ["AA"]))
     assert run_state.prior_for(1, "BB", Street.RIVER) == _narrowing("turn", ["AA"])
 
@@ -1697,6 +1736,37 @@ async def test_the_flop_and_the_turn_narrowed_in_one_answer_chain(
     )
 
 
+@pytest.mark.parametrize(
+    ("flop", "street", "error"),
+    [
+        (None, "turn", (
+            "сначала сузьте флоп: вызовите equity_vs_range для флопа этого соперника, тёрн "
+            "сужается из него"
+        )),
+        (_equity("flop", "QQ"), "river", (
+            "сначала сузьте тёрн: вызовите equity_vs_range для тёрна этого соперника, ривер "
+            "сужается из него"
+        )),
+    ],
+)
+async def test_a_later_street_without_the_previous_narrowing_of_this_opponent_is_refused(
+    db_factory, tmp_path, monkeypatch, flop, street: str, error: str
+):
+    """Тёрн без сужения флопа этого соперника и ривер без сужения тёрна (при сужении
+    флопа в том же ходе) — отказ модели; ключ соперника и руки — в
+    `test_the_prior_is_the_last_narrowing_of_the_previous_street`."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 500)
+    async with db_factory() as session:
+        scope, analysis_id = await _evening_through_the_turn(session, tg_user_id=8404)
+        calls = [*([flop] if flop else []), _equity(street, "QQ")]
+        turn = await _turn(
+            db_factory, session, _TurnScript([(calls, "Ответ без чисел (допущение).")]),
+            scope=scope, analysis_id=analysis_id,
+        )
+    assert turn.calls[-1]["error"] == error
+
+
 async def test_a_turn_in_the_next_turn_is_bound_by_the_flop_of_the_history(
     db_factory, tmp_path, monkeypatch
 ):
@@ -1749,6 +1819,80 @@ async def test_a_class_the_player_named_is_added_and_said_in_its_own_line(
     assert turn.calls[0]["params"]["player_classes"] == sorted(["22", "33", "44", "55", "66", "77"])
     assert "стартового" not in turn.calls[0]["output"]
     assert assumed_numbers_in(turn.messages) == frozenset({round(100.0 * result.equity, 1)})
+
+
+async def test_classes_the_agent_adds_with_a_reason_pass_and_carry_to_the_turn(
+    db_factory, tmp_path, monkeypatch
+):
+    """Классы вне чарта с причиной модели (`added_reason`) проходят без записи игрока;
+    сужение флопа помнит их причину, и тёрн, вызванный в том же ответе, печатает их
+    строкой агента (спека 2026-10-24, §7)."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path, call="88+, AQs"))
+    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 500)
+    reason = "на этих лимитах BB так коллирует"
+    async with db_factory() as session:
+        scope, analysis_id = await _evening_through_the_turn(session, tg_user_id=8417)
+        script = _TurnScript([(
+            [_equity("flop", "QQ, AQs", added="22-33", added_reason=reason),
+             _equity("turn", "QQ, 22, 33")],
+            "Ответ без чисел (допущение).",
+        )])
+        turn = await _turn(
+            db_factory, session, script, scope=scope, analysis_id=analysis_id,
+            text="что у него на флопе?",
+        )
+    assert ["error" in call for call in turn.calls] == [False, False]
+    line = f"Добавлено агентом (допущение): пара троек, пара двоек — {reason}."
+    assert line in turn.calls[0]["output"] and line in turn.calls[1]["output"]
+    assert "по вашей просьбе" not in turn.calls[1]["output"]
+    assert narrowings_in(turn.messages)[0].agent_added == {"33": reason, "22": reason}
+
+
+async def test_an_agent_class_passed_again_in_added_without_a_reason_stays_the_agents(
+    db_factory, tmp_path, monkeypatch
+):
+    """Класс агента из последнего сужения, переданный снова в `added` без причины
+    (`kept_agent`), остаётся «добавлено агентом» с прежней причиной, а не «по вашей
+    просьбе»."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path, call="88+, AQs"))
+    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 500)
+    reason = "на этих лимитах BB так коллирует"
+    async with db_factory() as session:
+        scope, analysis_id = await _evening_through_the_turn(session, tg_user_id=8419)
+        script = _TurnScript([(
+            [_equity("flop", "QQ, AQs", added="22", added_reason=reason),
+             _equity("flop", "QQ", added="22")],
+            "Ответ без чисел (допущение).",
+        )])
+        turn = await _turn(
+            db_factory, session, script, scope=scope, analysis_id=analysis_id,
+            text="что у него на флопе?",
+        )
+    assert ["error" in call for call in turn.calls] == [False, False]
+    second = turn.calls[1]["output"]
+    assert f"Добавлено агентом (допущение): пара двоек — {reason}." in second
+    assert "по вашей просьбе" not in second
+    assert turn.calls[1]["params"]["kept_agent"] == {"22": reason}
+
+
+async def test_the_category_summary_combos_are_not_assumed_numbers(
+    db_factory, tmp_path, monkeypatch
+):
+    """Комбо сводки по категориям — числа выхода (`allowed`), но не `assumed` и не
+    измеренная частота: метки они не требуют."""
+    monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
+    monkeypatch.setattr(calcs_module, "AGENT_EQUITY_ITERATIONS", 500)
+    async with db_factory() as session:
+        scope, analysis_id = await _evening_through_the_turn(session, tg_user_id=8418)
+        script = _TurnScript([([_equity("flop", "оверпара, AQs")], "Ответ без чисел (допущение).")])
+        turn = await _turn(db_factory, session, script, scope=scope, analysis_id=analysis_id)
+    (result,) = turn.results
+    assert isinstance(result, EquityVsRangeResult)
+    assert result.kept_combos is not None and result.source_combos is not None
+    counts = {float(round(result.kept_combos)), float(round(result.source_combos))}
+    assert counts <= allowed_from_history(turn.messages)
+    assert assumed_numbers_in(turn.messages) == frozenset({round(100.0 * result.equity, 1)})
+    assert frequency_numbers(turn.messages) == frozenset()
 
 
 async def test_classes_the_player_did_not_name_are_not_added(db_factory, tmp_path, monkeypatch):
@@ -1819,8 +1963,10 @@ def test_an_added_class_of_one_hand_and_opponent_opens_no_other(analysis_id: int
         narrow(parse_range("88+"), "AA", added="22", kept=other.classes if other else [])
 
 
-def test_a_narrowing_trimmed_from_the_history_is_no_bound():
-    """Ход с сужением ушёл обрезкой — его сужения в истории больше нет."""
+def test_a_narrowing_trimmed_from_the_history_refuses_the_turn():
+    """Ход с сужением флопа ушёл обрезкой — его сужения в истории больше нет, и тёрн
+    этого соперника получает отказ «сначала сузьте флоп» (решение владельца
+    2026-10-23: раньше тёрн сужался от стартового и выходил шире фактического флопа)."""
     narrowed = _narrowing("flop", ["AA"]).model_dump(mode="json")
     old = [
         ModelRequest(parts=[UserPromptPart("старый вопрос")], metadata={HAND_KEY: 1}),
@@ -1836,6 +1982,13 @@ def test_a_narrowing_trimmed_from_the_history_is_no_bound():
     trimmed = trim_history([*old, *new], estimate_tokens(new))
     assert len(trimmed) == len(new)
     assert narrowings_in(trimmed) == []
+    kept = CalcRun(max_calcs=8, sizes_from=frozenset(), narrowings=narrowings_in([*old, *new]))
+    assert narrow(parse_range("AA, KK"), "AA", street=Street.TURN,
+                  prior=kept.prior_for(1, "BB", Street.TURN)).weights == {"AA": 1.0}
+    after_trim = CalcRun(max_calcs=8, sizes_from=frozenset(), narrowings=narrowings_in(trimmed))
+    with pytest.raises(RangeRefused, match="^сначала сузьте флоп"):
+        narrow(parse_range("AA, KK"), "AA", street=Street.TURN,
+               prior=after_trim.prior_for(1, "BB", Street.TURN))
 
 
 def test_the_player_texts_of_the_hand_stop_at_the_last_boundary():
