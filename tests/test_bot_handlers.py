@@ -38,7 +38,6 @@ from sqlalchemy import text, update
 
 import harness.bot.handlers as handlers_module
 from harness.bot.handlers import (
-    MAX_QUESTION_CHARS,
     BotDeps,
     check_quota,
     handle_deep_dive_callback,
@@ -2284,13 +2283,13 @@ async def test_a_question_without_words_explains_how_to_ask(db_factory, deps, in
     assert await fetch_all(db_factory, "select id from jobs") == []
 
 
-async def test_a_question_longer_than_the_limit_is_refused(db_factory, deps, invited):
-    """Предел стоит на том, что игрок печатает руками: вопрос едет в промпт целиком."""
-    msg = await handle_question_command(deps, _TG_USER_ID, "а" * (MAX_QUESTION_CHARS + 1))
+async def test_a_long_question_is_queued_whole(db_factory, deps, invited):
+    """Приложение не обрезает и не отклоняет длинный вопрос из `/ask`."""
+    question = "Разбери подробно:\n" + "а" * 1_000
 
-    assert msg is not None
-    assert str(MAX_QUESTION_CHARS) in msg.text
-    assert await fetch_all(db_factory, "select id from jobs") == []
+    assert await handle_question_command(deps, _TG_USER_ID, question) is None
+    job = await fetch_one(db_factory, "select type, payload from jobs")
+    assert (job["type"], job["payload"]) == ("question", {"question": question})
 
 
 async def test_a_question_is_not_swallowed_by_a_pending_input(db_factory, deps, invited):
@@ -2907,13 +2906,15 @@ async def test_an_agent_message_over_the_quota_is_refused(db_factory, deps, invi
     assert await fetch_all(db_factory, "select id from jobs") == []
 
 
-async def test_an_agent_text_longer_than_the_limit_is_refused(db_factory, deps, invited):
+async def test_a_long_agent_text_is_queued_whole(db_factory, deps, invited):
     from harness.bot.handlers import handle_text
 
     await _make_dev(db_factory, invited)
-    msg = await handle_text(deps, _TG_USER_ID, "а" * (MAX_QUESTION_CHARS + 1))
-    assert msg is not None and str(MAX_QUESTION_CHARS) in msg.text
-    assert await fetch_all(db_factory, "select id from jobs") == []
+    question = "Разбери подробно:\n" + "а" * 1_000
+
+    assert await handle_text(deps, _TG_USER_ID, question) is None
+    job = await fetch_one(db_factory, "select type, payload from jobs")
+    assert (job["type"], job["payload"]) == ("agent", {"text": question})
 
 
 async def test_the_wrong_calculation_button_writes_an_eval_case_without_a_hand(db_factory, deps, invited):

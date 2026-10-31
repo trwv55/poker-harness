@@ -116,7 +116,6 @@ from harness.presentation import (
     note_too_long_msg,
     note_usage_msg,
     owner_admitted_msg,
-    question_too_long_msg,
     question_usage_msg,
     quota_exceeded_msg,
     ranges_msg,
@@ -175,10 +174,6 @@ _INPUT_NOTE_COLOR = "note_color"
 # заменяет: обещанное игроку не меняется у него за спиной.
 _NOTE_APPEND = "append"
 _NOTE_REPLACE = "replace"
-
-# Предел длины вопроса. Он стоит на том, что игрок печатает руками, и защищает
-# не базу (`jobs.payload` — JSONB), а промпт: вопрос едет в него целиком.
-MAX_QUESTION_CHARS = 300
 
 # Ник в руме не длиннее колонки `players.gg_nickname` (`String(64)`). Число здесь
 # не второе определение предела, а ссылка на него: длиннее БД просто не примет.
@@ -727,9 +722,6 @@ async def handle_question_command(deps: BotDeps, tg_user_id: int, args: str = ""
         if not question:
             await db.commit()
             return question_usage_msg()
-        if len(question) > MAX_QUESTION_CHARS:
-            await db.commit()
-            return question_too_long_msg(MAX_QUESTION_CHARS)
         session_id = (await SessionsRepo(db).active_or_create(player_id)).id
         await db.commit()
 
@@ -950,9 +942,6 @@ async def handle_text(deps: BotDeps, tg_user_id: int, text: str) -> Msg | None:
             reply = await _apply_pending_input(db, player, pending, answer)
             await db.commit()
             return reply
-        if len(answer) > MAX_QUESTION_CHARS:
-            await db.commit()
-            return question_too_long_msg(MAX_QUESTION_CHARS)
         player_id = player.id
         await db.commit()
 

@@ -224,7 +224,6 @@ __all__ = [
     "progress_text",
     "question_msg",
     "question_refusal_msg",
-    "question_too_long_msg",
     "question_usage_msg",
     "quota_exceeded_msg",
     "range_image_title",
@@ -3154,10 +3153,6 @@ def question_refusal_msg() -> Msg:
 def ask_moved_msg() -> Msg:
     """`/ask` у игрока с агентом: вопрос пишется просто текстом (спека агента №1, §10)."""
     return Msg(text="Команда больше не нужна — спрашивайте просто текстом.")
-
-
-def question_too_long_msg(limit: int) -> Msg:
-    return Msg(text=f"Вопрос длиннее {limit} символов — сократите его.")
 
 
 # Список того, что продукт умеет считать. У `/ask` — один на отказ и на подсказку
