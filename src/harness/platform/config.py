@@ -18,6 +18,11 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Literal
+
+ProviderSort = Literal["price", "throughput", "latency"]
+
+DEFAULT_AGENT_MODEL = "openrouter:qwen/qwen3.8-flash"
 
 
 class EnvVarError(Exception):
@@ -125,6 +130,23 @@ def optional_int_or_none(name: str) -> int | None:
     return _parse_int(name, raw)
 
 
+def _openrouter_sort() -> ProviderSort:
+    value = optional_env("LLM_OPENROUTER_PROVIDER_SORT", "throughput").strip()
+    if value not in ("price", "throughput", "latency"):
+        raise InvalidEnvVar(
+            "LLM_OPENROUTER_PROVIDER_SORT: ожидается price, throughput или latency"
+        )
+    return value
+
+
+def _openrouter_order() -> tuple[str, ...]:
+    value = optional_env("LLM_OPENROUTER_PROVIDER_ORDER", "")
+    providers = tuple(part.strip() for part in value.split(",") if part.strip())
+    if value.strip() and not providers:
+        raise InvalidEnvVar("LLM_OPENROUTER_PROVIDER_ORDER: укажите имена провайдеров")
+    return providers
+
+
 @dataclass(frozen=True, slots=True)
 class Config:
     """Снимок конфигурации на момент запуска процесса — сам окружение не читает
@@ -156,9 +178,13 @@ class Config:
     llm_max_per_minute: int
     database_url: str
     telegram_token: str
-    # Модель агента (спека агента №1, §9). Необязательна: умолчание — Sonnet 5.5.
+    # Модель агента. Меняется через env, умолчание — Qwen3.8 Flash через OpenRouter.
     # Строка — тот же формат `"<provider>:<model>"`, что у остальных.
-    llm_agent_model: str = "anthropic:claude-sonnet-5-5"
+    llm_agent_model: str = DEFAULT_AGENT_MODEL
+    # Только для openrouter: сортировка хостеров и необязательный приоритет endpoint'ов.
+    # Остальные провайдеры эти настройки не используют.
+    llm_openrouter_provider_sort: ProviderSort = "throughput"
+    llm_openrouter_provider_order: tuple[str, ...] = ()
     # Таймаут ОДНОГО запроса к провайдеру, в секундах. До него запрос ничем не
     # ограничивался (тех-спека §7, «Известный дефект»).
     llm_request_timeout_s: int = 60
@@ -175,7 +201,9 @@ class Config:
             llm_max_per_minute=_require_int("LLM_MAX_PER_MINUTE"),
             database_url=_require("DATABASE_URL"),
             telegram_token=_require("TELEGRAM_TOKEN"),
-            llm_agent_model=optional_env("LLM_AGENT_MODEL", "anthropic:claude-sonnet-5-5"),
+            llm_agent_model=optional_env("LLM_AGENT_MODEL", DEFAULT_AGENT_MODEL),
+            llm_openrouter_provider_sort=_openrouter_sort(),
+            llm_openrouter_provider_order=_openrouter_order(),
             llm_request_timeout_s=optional_int("LLM_REQUEST_TIMEOUT_S", 60),
             agent_history_max_tokens=optional_int("AGENT_HISTORY_MAX_TOKENS", 30_000),
         )

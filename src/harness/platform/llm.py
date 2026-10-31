@@ -45,6 +45,11 @@ from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextContent
 from pydantic_ai.models import Model, ModelRequestParameters
 from pydantic_ai.models.anthropic import AnthropicModel
+from pydantic_ai.models.openrouter import (
+    OpenRouterModel,
+    OpenRouterModelSettings,
+    OpenRouterProviderConfig,
+)
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.profiles.anthropic import AnthropicModelProfile
 from pydantic_ai.settings import ModelSettings
@@ -54,7 +59,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from harness.memory.models import LlmCall
 from harness.platform import limiter as _limiter_module
-from harness.platform.config import Config
+from harness.platform.config import Config, ProviderSort
 from harness.platform.limiter import PgLimiter
 
 # Модульная косвенность вместо прямых вызовов `asyncio.sleep` (fix round 1, small
@@ -201,12 +206,30 @@ def _describe_model(model: Model | str) -> tuple[str, str]:
 _REJECTS_FORCED_TOOL_CHOICE = ("claude-sonnet-5-5",)
 
 
-def _build_model(model: str) -> Model | str:
-    """Строка конфига — как есть, кроме моделей из `_REJECTS_FORCED_TOOL_CHOICE`:
+def _build_model(
+    model: str,
+    *,
+    provider_sort: ProviderSort = "throughput",
+    provider_order: tuple[str, ...] = (),
+) -> Model | str:
+    """OpenRouter получает маршрут хостеров
+    (`test_openrouter_route_reaches_every_provider_request`); остальные строки — как есть, кроме
+    моделей из `_REJECTS_FORCED_TOOL_CHOICE`:
     им `AnthropicModel` с профилем без принудительного `tool_choice`
     (`test_the_agent_model_does_not_force_tool_choice`,
     `test_other_anthropic_models_keep_the_library_profile`)."""
     provider, sep, name = model.partition(":")
+    if sep and provider == "openrouter":
+        route: OpenRouterProviderConfig = {
+            "sort": provider_sort,
+            "require_parameters": True,
+            "allow_fallbacks": True,
+        }
+        if provider_order:
+            route["order"] = list(provider_order)
+        return OpenRouterModel(
+            name, settings=OpenRouterModelSettings(openrouter_provider=route)
+        )
     if sep and provider == "anthropic" and name.startswith(_REJECTS_FORCED_TOOL_CHOICE):
         return AnthropicModel(
             name, profile=AnthropicModelProfile(anthropic_supports_forced_tool_choice=False)
@@ -351,7 +374,11 @@ class LLM:
         )
         provider, model_name = _describe_model(model)
         if isinstance(model, str):
-            model = _build_model(model)
+            model = _build_model(
+                model,
+                provider_sort=self._cfg.llm_openrouter_provider_sort,
+                provider_order=self._cfg.llm_openrouter_provider_order,
+            )
         user_prompt: list[str | TextContent | BinaryContent] = [
             *preface,
             prompt,

@@ -21,11 +21,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import re
 import time
 from contextlib import asynccontextmanager
 
+import httpx2 as httpx
 import pytest
 from pydantic import BaseModel
 from pydantic_ai import BinaryContent
@@ -34,7 +36,9 @@ from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCall
 from pydantic_ai.models import Model, infer_model
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.tools import Tool
 from pydantic_ai.usage import RequestUsage
 from sqlalchemy import text
@@ -52,10 +56,9 @@ from harness.platform.llm import (
     _sniff_image_media_type,
 )
 
-# Строки моделей ниже никогда не резолвятся в реального провайдера — во всех тестах
-# `model_override` подменяет модель тестовым двойником PydanticAI ДО того, как
-# `LLM` попытался бы построить `Agent` с ней; значения существуют только чтобы
-# `Config` был валиден по форме (спека §7: `"<provider>:<model>"`).
+# Обычно `model_override` подменяет модель двойником PydanticAI до построения
+# `Agent`; строки нужны для формы конфига. Тест маршрута OpenRouter использует
+# настоящий адаптер с MockTransport — запросы наружу не отправляются.
 cfg = Config(
     llm_vision_model="anthropic:claude-sonnet-test",
     llm_vision_fallback_model="anthropic:claude-opus-test",
@@ -1163,14 +1166,97 @@ def test_config_reads_the_agent_variables_with_defaults(monkeypatch):
         ("TELEGRAM_TOKEN", "t"),
     ):
         monkeypatch.setenv(name, value)
-    for name in ("LLM_AGENT_MODEL", "LLM_REQUEST_TIMEOUT_S", "AGENT_HISTORY_MAX_TOKENS"):
+    for name in (
+        "LLM_AGENT_MODEL", "LLM_REQUEST_TIMEOUT_S", "AGENT_HISTORY_MAX_TOKENS",
+        "LLM_OPENROUTER_PROVIDER_SORT", "LLM_OPENROUTER_PROVIDER_ORDER",
+    ):
         monkeypatch.delenv(name, raising=False)
     loaded = Config.from_env()
-    assert loaded.llm_agent_model == "anthropic:claude-sonnet-5-5"
+    assert loaded.llm_agent_model == "openrouter:qwen/qwen3.8-flash"
+    assert loaded.llm_openrouter_provider_sort == "throughput"
+    assert loaded.llm_openrouter_provider_order == ()
     assert loaded.llm_request_timeout_s == 60
     assert loaded.agent_history_max_tokens == 30_000
     monkeypatch.setenv("LLM_REQUEST_TIMEOUT_S", "5")
     assert Config.from_env().llm_request_timeout_s == 5
+
+
+def test_openrouter_route_config_accepts_endpoints_and_rejects_invalid_sort(monkeypatch):
+    for name, value in (
+        ("LLM_VERDICT_MODEL", "openrouter:qwen/qwen3.8-flash"),
+        ("LLM_MAX_CONCURRENCY", "2"), ("LLM_MAX_PER_MINUTE", "30"),
+        ("DATABASE_URL", "postgresql://x"), ("TELEGRAM_TOKEN", "test"),
+    ):
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("LLM_OPENROUTER_PROVIDER_SORT", "latency")
+    monkeypatch.setenv("LLM_OPENROUTER_PROVIDER_ORDER", " alibaba/us-east-1, alibaba ")
+    loaded = Config.from_env()
+    assert loaded.llm_openrouter_provider_sort == "latency"
+    assert loaded.llm_openrouter_provider_order == ("alibaba/us-east-1", "alibaba")
+    monkeypatch.setenv("LLM_OPENROUTER_PROVIDER_SORT", "fastest")
+    with pytest.raises(InvalidEnvVar, match="LLM_OPENROUTER_PROVIDER_SORT"):
+        Config.from_env()
+    monkeypatch.setenv("LLM_OPENROUTER_PROVIDER_SORT", "")
+    monkeypatch.setenv("LLM_OPENROUTER_PROVIDER_ORDER", ", ,")
+    with pytest.raises(InvalidEnvVar, match="LLM_OPENROUTER_PROVIDER_ORDER"):
+        Config.from_env()
+
+
+async def test_openrouter_route_reaches_every_provider_request(db_factory, monkeypatch):
+    """Настройки маршрута уходят в HTTP и после вызова инструмента; сеть подставная."""
+    requests = []
+
+    def get_value() -> int:
+        """Вернуть число для синтетического примера."""
+        return 7
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        name = "get_value" if len(requests) == 1 else next(
+            tool["function"]["name"] for tool in body["tools"]
+            if tool["function"]["name"] != "get_value"
+        )
+        arguments = {} if len(requests) == 1 else {"text": "готово"}
+        return httpx.Response(200, json={
+            "id": "synthetic-response", "object": "chat.completion", "created": 1,
+            "model": "qwen/qwen3.8-flash", "provider": "Alibaba",
+            "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                "role": "assistant", "content": None, "tool_calls": [{
+                    "id": f"synthetic-call-{len(requests)}", "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(arguments)},
+                }],
+            }}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7},
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        def model_with_transport(name, *, settings):
+            return OpenRouterModel(
+                name, provider=OpenRouterProvider(api_key="test", http_client=client),
+                settings=settings,
+            )
+
+        monkeypatch.setattr("harness.platform.llm.OpenRouterModel", model_with_transport)
+        trace_id = await _make_trace_scope(db_factory)
+        llm = LLM(replace_cfg(
+            llm_agent_model="openrouter:qwen/qwen3.8-flash",
+            llm_openrouter_provider_sort="throughput",
+            llm_openrouter_provider_order=("alibaba/us-east-1",),
+        ), db_factory)
+        result, _ = await llm(
+            "agent", Out, prompt="Синтетический вопрос", tools=[Tool(get_value)],
+            trace_id=trace_id,
+        )
+    assert result.text == "готово"
+    assert len(requests) == 2
+    for request in requests:
+        assert request["model"] == "qwen/qwen3.8-flash"
+        assert request["provider"] == {
+            "sort": "throughput", "order": ["alibaba/us-east-1"],
+            "allow_fallbacks": True, "require_parameters": True,
+        }
+    assert await fetch_all(db_factory, "select count(*) from llm_calls") == [(2,)]
 
 
 async def test_each_request_row_carries_its_own_cost_estimate(db_factory):
