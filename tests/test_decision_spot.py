@@ -228,13 +228,25 @@ async def test_long_clarification_reaches_extractor_and_keeps_full_evidence() ->
 
         async def __call__(self, purpose, response_type, **kwargs):
             self.prompt = kwargs["prompt"]
-            return SpotExtraction(is_spot=True, spot=sample()), None
+            return SpotExtraction(is_spot=True, spot=RawDecisionSpot()), None
 
     llm = FakeLLM()
     raw = await extract_decision_spot(llm, source, 1)  # type: ignore[arg-type]
     assert "latest answer stack 28000 before ante" in llm.prompt
     assert len(llm.prompt) <= 4010
     assert raw is not None and raw.source_text == source
+
+
+@pytest.mark.asyncio
+async def test_extractor_rejects_known_fact_without_literal_evidence() -> None:
+    source = "За столом 8 игроков, блины 400/800"
+
+    class FakeLLM:
+        async def __call__(self, purpose, response_type, **kwargs):
+            raw = RawDecisionSpot(table_size=fact("8','quote':'8", ""))
+            return SpotExtraction(is_spot=True, spot=raw), None
+
+    assert await extract_decision_spot(FakeLLM(), source, 1) is None  # type: ignore[arg-type]
 
 
 def test_heads_up_fold_ends_hand_before_hero_decision() -> None:

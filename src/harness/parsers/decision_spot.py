@@ -48,7 +48,7 @@ source_text оставь пустым: исходное сообщение по�
 async def extract_decision_spot(llm: LLM, text: str, trace_id: int) -> RawDecisionSpot | None:
     """Run one extraction call on candidate text; its output is untrusted."""
     result, _ = await llm(
-        "agent",
+        "spot_extract",
         SpotExtraction,
         prompt=(
             text if len(text) <= MAX_SPOT_TEXT else
@@ -59,4 +59,17 @@ async def extract_decision_spot(llm: LLM, text: str, trace_id: int) -> RawDecisi
     )
     if not result.is_spot or result.spot is None:
         return None
-    return result.spot.model_copy(update={"source_text": text})
+    spot = result.spot.model_copy(update={"source_text": text})
+    facts = [
+        spot.table_size, spot.sb, spot.bb, spot.ante, spot.hero_position, spot.hero_cards,
+        *(player.stack for player in spot.players),
+        *(action.amount for action in spot.actions),
+    ]
+    if any(
+        fact.status == "known" and (
+            not fact.value or not fact.quote or fact.quote.casefold() not in text.casefold()
+        )
+        for fact in facts
+    ):
+        return None
+    return spot

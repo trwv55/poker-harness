@@ -305,6 +305,7 @@ class LLM:
             "tournament_text",
             "question_answer",
             "agent",
+            "spot_extract",
         ],
         schema: type[T],
         *,
@@ -450,6 +451,8 @@ class LLM:
             return self._cfg.llm_vision_fallback_model
         if purpose == "agent":
             return self._cfg.llm_agent_model
+        if purpose == "spot_extract":
+            return self._cfg.llm_verdict_model
         return self._cfg.llm_verdict_model
 
     async def _attempt(
@@ -530,14 +533,13 @@ class LLM:
 
 class _MeteredModel(WrapperModel):
     """Модель, у которой КАЖДЫЙ запрос к провайдеру — свой слот лимитера, своя
-    строка `llm_calls`, свой таймаут и свои HTTP-ретраи. Для агента
-    таймаут отдельного запроса отключён: его ограничивает бюджет задачи.
+    строка `llm_calls`, свой таймаут и свои HTTP-ретраи. Для агента и извлечения
+    текстового спота лимит одного запроса не меньше 120 с.
 
     Прогон агента с инструментами — несколько запросов; считать его одним значило
     занижать окно темпа `PgLimiter` ровно там, где нагрузка растёт
     (`test_a_turn_with_two_tool_calls_logs_three_requests`). Таймаут
-    (`Config.llm_request_timeout_s`) обёрнут вокруг одного запроса, а не прогона
-    для всех назначений, кроме агента:
+    (`Config.llm_request_timeout_s`) обёрнут вокруг одного запроса, а не прогона:
     зависший запрос снимается сам, строка закрывается `error`, наружу —
     `LLMProviderError` (`test_a_hung_provider_request_is_cut_by_the_request_timeout`).
 
@@ -627,7 +629,11 @@ class _MeteredModel(WrapperModel):
         model_request_parameters: ModelRequestParameters,
     ) -> ModelResponse:
         llm = self._meter_llm
-        timeout_s = None if self._meter_purpose == "agent" else llm._cfg.llm_request_timeout_s
+        timeout_s = (
+            max(120, llm._cfg.llm_request_timeout_s)
+            if self._meter_purpose in ("agent", "spot_extract")
+            else llm._cfg.llm_request_timeout_s
+        )
         last_http_error: ModelHTTPError | None = None
         for http_attempt in range(_MAX_HTTP_ATTEMPTS):
             async with llm._limiter.slot(deadline=self._meter_deadline):

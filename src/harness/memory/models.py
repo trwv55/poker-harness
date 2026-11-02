@@ -655,7 +655,7 @@ class LlmCall(Base):
             # `agent` — запросы агента к провайдеру (миграция 0014, спека агента
             # №1, §9); `question_answer` остаётся, пока жив `/ask`.
             "purpose IN ('vision_extract', 'vision_extract_fallback', 'verdict_text', "
-            "'tournament_text', 'question_answer', 'agent')",
+            "'tournament_text', 'question_answer', 'agent', 'spot_extract')",
             name="purpose_allowed",
         ),
         CheckConstraint(

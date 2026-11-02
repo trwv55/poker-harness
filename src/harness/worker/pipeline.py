@@ -116,7 +116,7 @@ from harness.parsers.vision_adapter import (
     can_apply_vision_answer,
     vision_extract,
 )
-from harness.platform.llm import LLM
+from harness.platform.llm import LLM, LLMProviderError, LLMSchemaError
 from harness.platform.queue import JobPreconditionFailed, JobsQueue
 from harness.platform.trace import Clock, Trace
 from harness.presentation import (
@@ -227,6 +227,8 @@ _PUBLIC_FAILURE_REASONS: tuple[tuple[type[BaseException], str], ...] = (
     (ScreenshotUnreadable, "скриншот не прочитать"),
     (VisionReadFailed, "не удалось прочитать скриншот"),
     (HandDataMissing, "не нашли нужные данные по этой раздаче"),
+    (LLMProviderError, "модель не ответила вовремя — попробуйте ещё раз"),
+    (LLMSchemaError, "модель не смогла разобрать сообщение — попробуйте ещё раз"),
     (TimeoutError, "расчёт не уложился в отведённое время"),
 )
 

@@ -1116,8 +1116,8 @@ async def test_a_hung_provider_request_is_cut_by_the_request_timeout(db_factory)
     assert rows == [("error",)]
 
 
-async def test_agent_request_can_outlast_provider_timeout(db_factory):
-    """Агент ждёт ответ дольше общего лимита запроса; бюджет задачи остаётся снаружи."""
+async def test_agent_request_can_outlast_default_provider_timeout(db_factory):
+    """У агента есть дополнительное время на ответ, даже при коротком общем лимите."""
     trace_id = await _make_trace_scope(db_factory, tg_user_id=222)
 
     async def slow(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -1170,6 +1170,17 @@ async def test_the_agent_purpose_takes_its_own_model(db_factory):
     # `PgLimiter.__init__` проверяет движок фабрики, поэтому `None` здесь не годится.
     llm = LLM(replace_cfg(llm_agent_model="anthropic:agent-test"), db_factory)
     assert llm._resolve_model("agent") == "anthropic:agent-test"
+
+
+async def test_spot_extraction_uses_the_configured_flash_model(db_factory):
+    llm = LLM(
+        replace_cfg(
+            llm_agent_model="openrouter:moonshotai/kimi-k2.6",
+            llm_verdict_model="openrouter:qwen/qwen3.8-flash",
+        ),
+        db_factory,
+    )
+    assert llm._resolve_model("spot_extract") == "openrouter:qwen/qwen3.8-flash"
 
 
 def test_config_reads_the_agent_variables_with_defaults(monkeypatch):
