@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Executor
@@ -89,7 +90,9 @@ from harness.contracts import (
 from harness.contracts.decision_spot import (
     CanonicalDecisionSpot,
     DecisionSnapshot,
+    RawDecisionSpot,
     SpotCallScenario,
+    SpotFact,
 )
 from harness.engine import enrich
 from harness.engine.decision_spot import InvalidDecisionSpot, replay_until_decision
@@ -1360,6 +1363,21 @@ def _spot_history(history: list[ModelMessage]) -> list[ModelMessage]:
     ]
 
 
+def _apply_size_clarification(
+    raw: RawDecisionSpot, previous: RawDecisionSpot, answer: str
+) -> RawDecisionSpot:
+    """A bare digit answers the table-size question only when that fact was unverified."""
+    size = answer.strip()
+    if (
+        re.fullmatch(r"[2-9]", size)
+        and (previous.table_size.status != "known" or not previous.table_size.quote)
+    ):
+        return raw.model_copy(update={
+            "table_size": SpotFact(value=size, quote="Уточнение: " + answer, status="known")
+        })
+    return raw
+
+
 
 async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
     """Ход агента: контекст, история вечера, модель, проверки, журнал, ответ.
@@ -1391,13 +1409,28 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
             candidate = looks_like_decision_spot(payload["text"])
             continuing = active is not None and active.status == "draft" and not candidate
             if candidate or continuing:
-                source = (
-                    active.source_text + "\nУточнение: " + payload["text"]
-                    if continuing and active is not None
-                    else payload["text"]
+                repeated_clarification = (
+                    continuing
+                    and active is not None
+                    and active.source_text.endswith("\nУточнение: " + payload["text"])
                 )
-                async with trace.span("spot_extract"):
-                    raw = await extract_decision_spot(deps.llm, source, trace.trace_id)
+                if continuing and active is not None:
+                    source = active.source_text
+                    if not repeated_clarification:
+                        source += "\nУточнение: " + payload["text"]
+                else:
+                    source = payload["text"]
+                if repeated_clarification and active is not None:
+                    raw = RawDecisionSpot.model_validate(active.raw).model_copy(
+                        update={"source_text": source}
+                    )
+                else:
+                    async with trace.span("spot_extract"):
+                        raw = await extract_decision_spot(deps.llm, source, trace.trace_id)
+                if raw is not None and continuing and active is not None:
+                    raw = _apply_size_clarification(
+                        raw, RawDecisionSpot.model_validate(active.raw), payload["text"]
+                    )
                 if raw is not None:
                     canonical, questions = normalize_decision_spot(raw)
                     snapshot = None
@@ -1406,17 +1439,20 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
                             snapshot = replay_until_decision(canonical)
                         except InvalidDecisionSpot as exc:
                             questions = [str(exc)]
-                    row = await spots.save(
-                        player_id=job.player_id,
-                        session_id=job.session_id,
-                        source_text=source,
-                        raw=raw.model_dump(mode="json"),
-                        canonical=canonical.model_dump(mode="json")
-                        if snapshot and canonical
-                        else None,
-                        snapshot=snapshot.model_dump(mode="json") if snapshot else None,
-                        prior_id=active.id if continuing and active is not None else None,
-                    )
+                    if repeated_clarification and active is not None and snapshot is None:
+                        row = active
+                    else:
+                        row = await spots.save(
+                            player_id=job.player_id,
+                            session_id=job.session_id,
+                            source_text=source,
+                            raw=raw.model_dump(mode="json"),
+                            canonical=canonical.model_dump(mode="json")
+                            if snapshot and canonical
+                            else None,
+                            snapshot=snapshot.model_dump(mode="json") if snapshot else None,
+                            prior_id=active.id if continuing and active is not None else None,
+                        )
                     await session.commit()
                     trace.record(
                         "spot_extraction",

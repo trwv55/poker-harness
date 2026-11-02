@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 SpotStatus = Literal["known", "missing", "ambiguous"]
 SpotActionKind = Literal["fold", "check", "call", "raise", "all_in"]
@@ -53,6 +54,14 @@ class RawDecisionSpot(BaseModel):
 class SpotExtraction(BaseModel):
     is_spot: bool
     spot: RawDecisionSpot | None = None
+
+    @field_validator("spot", mode="before")
+    @classmethod
+    def parse_stringified_spot(cls, value: object) -> object:
+        """Some tool providers stringify nested JSON; validate it normally after parsing."""
+        if isinstance(value, str) and len(value) <= 20_000:
+            return json.loads(value)
+        return value
 
 
 class SpotPlayer(BaseModel):

@@ -15,6 +15,7 @@ from harness.contracts.decision_spot import (
 from harness.normalizer.normalize import POSITIONS_BY_COUNT
 
 _CARD = re.compile(r"[2-9TJQKA][shdc]", re.IGNORECASE)
+_SUITS = str.maketrans({"♠": "s", "♥": "h", "♦": "d", "♣": "c"})
 _CLASS = re.compile(r"(?:[2-9TJQKA]){2}[so]?", re.IGNORECASE)
 _NUMBER = re.compile(r"\d+(?:[.,]\d+)?")
 _BLIND_PAIR = re.compile(
@@ -71,6 +72,8 @@ def _position_in_quote(position: str, quote: str) -> bool:
 
 
 def _cards_after_position(position: str, cards: str, source: str) -> bool:
+    cards = cards.translate(_SUITS)
+    source = source.translate(_SUITS)
     aliases = [
         r"(?<!\w)" + re.escape(word) + r"(?!\w)"
         for word in _POSITION_WORDS.get(position, (position.lower(),))
@@ -170,10 +173,11 @@ def _cards(raw: RawDecisionSpot) -> tuple[tuple[str, str] | None, str | None]:
     fact = raw.hero_cards
     if not _evidenced(fact, raw.source_text):
         return None, None
-    value = (fact.value or "").replace(" ", "")
+    value = (fact.value or "").translate(_SUITS).replace(" ", "")
+    quote = fact.quote.translate(_SUITS)
     cards = _CARD.findall(value)
     if len(cards) == 2 and "".join(cards).lower() == value.lower():
-        if any(card.lower() not in fact.quote.lower() for card in cards):
+        if any(card.lower() not in quote.lower() for card in cards):
             return None, None
         return (
             cards[0][0].upper() + cards[0][1].lower(),
@@ -182,7 +186,7 @@ def _cards(raw: RawDecisionSpot) -> tuple[tuple[str, str] | None, str | None]:
     hand_class = _CLASS.fullmatch(value)
     if hand_class:
         value = hand_class.group()
-        if value.lower() not in fact.quote.lower():
+        if value.lower() not in quote.lower():
             return None, None
         return None, value[:2].upper() + value[2:].lower()
     return None, None
@@ -203,7 +207,7 @@ def normalize_decision_spot(raw: RawDecisionSpot) -> tuple[CanonicalDecisionSpot
         questions.append("Укажите малый и большой блайнды в фишках.")
     hero = (raw.hero_position.value or "").upper() if _evidenced(raw.hero_position, source) else ""
     explicit_hero = re.search(
-        r"геро|у меня|\bя\b|hero", raw.hero_position.quote, re.IGNORECASE
+        r"геро|у меня|\bя\b|\bты\b|hero", raw.hero_position.quote, re.IGNORECASE
     )
     implicit_hero = (
         re.search(r"что делать|как сыграть|какое решение", source, re.IGNORECASE)
@@ -217,7 +221,9 @@ def normalize_decision_spot(raw: RawDecisionSpot) -> tuple[CanonicalDecisionSpot
     cards, hand_class = _cards(raw)
     if cards is None and hand_class is None:
         questions.append("Какие две карты у героя? Можно указать класс руки, например 99.")
-    if raw.ante_type == "unknown" or not _evidenced(raw.ante, source):
+    if raw.ante_type == "unknown" and _evidenced(raw.ante, source):
+        questions.append("Кто платил анте: каждый игрок или только BB?")
+    elif raw.ante_type == "unknown" or not _evidenced(raw.ante, source):
         questions.append("Было ли анте? Если да, укажите размер и кто его ставил.")
     if questions:
         return None, questions[:2]

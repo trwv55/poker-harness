@@ -1,5 +1,6 @@
 """A text description stops at the hero's decision and cannot become a played hand."""
 
+import json
 from typing import Any, cast
 
 import pytest
@@ -29,11 +30,33 @@ from harness.memory.repos import DecisionSpotsRepo, PlayersRepo, SessionsRepo
 from harness.normalizer.decision_spot import _position_in_quote, normalize_decision_spot
 from harness.parsers.decision_spot import extract_decision_spot, looks_like_decision_spot
 from harness.presentation.messages import spot_scenario_msg
-from harness.worker.pipeline import _non_spot_history, _only_context, _other_contexts, _spot_history
+from harness.worker.pipeline import (
+    _apply_size_clarification,
+    _non_spot_history,
+    _only_context,
+    _other_contexts,
+    _spot_history,
+)
 
 
 def fact(value: str, quote: str) -> SpotFact:
     return SpotFact(value=value, quote=quote, status="known")
+
+
+def test_stringified_nested_spot_still_passes_full_validation() -> None:
+    source = sample()
+    decoded = SpotExtraction.model_validate(
+        {"is_spot": True, "spot": json.dumps(source.model_dump(mode="json"))}
+    )
+    assert decoded.spot == source
+
+
+def test_numeric_reply_corrects_only_unverified_table_size() -> None:
+    previous = RawDecisionSpot(table_size=SpotFact(value="8','quote':'8", quote="", status="known"))
+    extracted = RawDecisionSpot(table_size=fact("8", "8 игроков"))
+    corrected = _apply_size_clarification(extracted, previous, "5")
+    assert corrected.table_size == fact("5", "Уточнение: 5")
+    assert _apply_size_clarification(extracted, extracted, "5").table_size == extracted.table_size
 
 
 def sample() -> RawDecisionSpot:
@@ -113,11 +136,22 @@ def test_prefix_stops_before_hero_and_keeps_co_to_act() -> None:
 def test_unknown_ante_and_ambiguous_all_in_request_facts() -> None:
     raw = sample()
     raw.ante_type = "unknown"
-    assert normalize_decision_spot(raw)[0] is None
+    spot, questions = normalize_decision_spot(raw)
+    assert spot is None and questions == ["Кто платил анте: каждый игрок или только BB?"]
     raw = sample()
     raw.actions[5].amount_kind = "unspecified"
     spot, questions = normalize_decision_spot(raw)
     assert spot is None and "доплата" in questions[0]
+
+
+def test_russian_hero_and_unicode_suits_are_evidenced() -> None:
+    raw = sample()
+    raw.source_text = raw.source_text.replace("Hero BB 9h9d", "Ты — BB с 9♠9♣")
+    raw.hero_position = fact("BB", "Ты — BB")
+    raw.hero_cards = fact("9♠9♣", "9♠9♣")
+    spot, questions = normalize_decision_spot(raw)
+    assert not questions and spot is not None
+    assert spot.hero_cards == ("9s", "9c")
 
 
 def test_hallucinated_size_and_missing_action_cannot_replay() -> None:

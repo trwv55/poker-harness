@@ -2199,6 +2199,44 @@ async def test_a_text_spot_job_stops_before_hero_and_stays_out_of_hands(
     assert hand_count == 0
 
 
+async def test_replaying_saved_clarification_does_not_call_model_again(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    from harness.contracts.decision_spot import RawDecisionSpot, SpotFact
+    from harness.memory.repos import DecisionSpotsRepo
+
+    async def forbidden_extract(*args, **kwargs):
+        raise AssertionError("saved clarification must not call model again")
+
+    monkeypatch.setattr(pipeline_module, "extract_decision_spot", forbidden_extract)
+    player_id, session_id = await _make_scope(db_factory)
+    source = "Старый спот\nУточнение: 5"
+    raw = RawDecisionSpot(
+        source_text=source,
+        table_size=SpotFact(value="5", quote="Уточнение: 5", status="known"),
+    )
+    async with db_factory() as session:
+        await DecisionSpotsRepo(session).save(
+            player_id=player_id, session_id=session_id,
+            source_text=source, raw=raw.model_dump(mode="json"),
+            canonical=None, snapshot=None,
+        )
+        await session.commit()
+    jid = await queue.enqueue(
+        type="agent", player_id=player_id, session_id=session_id,
+        payload={"text": "5"},
+    )
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    assert await job_status(db_factory, jid) == "done"
+    async with db_factory() as session:
+        count = (await session.execute(text("select count(*) from decision_spots"))).scalar_one()
+    assert count == 1
+    assert any("блайнды" in message for message in _all_texts(fake_sender))
+
+
 async def _agent_range_turn(db_factory, queue, deps, *, with_analysis: bool):
     """Задача `agent`, в которой модель зовёт `opponent_range`; вечер с разбором
     синтетической руки (указатель `last_analysis_id` выставлен) или без него.
