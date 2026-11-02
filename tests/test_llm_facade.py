@@ -1188,6 +1188,9 @@ def test_qwen_flash_uses_auto_tool_choice_on_openrouter(monkeypatch):
     model = _build_model("openrouter:qwen/qwen3.8-flash")
     assert isinstance(model, Model)
     assert model.profile.get("openai_supports_tool_choice_required") is False
+    assert model.settings is not None
+    assert model.settings.get("max_tokens") == 2048
+    assert model.settings.get("openrouter_reasoning") == {"enabled": False}
 
 
 def test_config_reads_the_agent_variables_with_defaults(monkeypatch):
