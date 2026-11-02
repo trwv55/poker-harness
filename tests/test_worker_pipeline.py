@@ -2199,6 +2199,47 @@ async def test_a_text_spot_job_stops_before_hero_and_stays_out_of_hands(
     assert hand_count == 0
 
 
+async def test_full_spot_after_draft_replaces_source_instead_of_appending(
+    db_factory, queue, deps, monkeypatch
+):
+    from harness.contracts.decision_spot import RawDecisionSpot
+    from harness.memory.repos import DecisionSpotsRepo
+    from tests.test_agent import _TurnScript
+    from tests.test_decision_spot import sample
+
+    raw = sample()
+    seen: list[str] = []
+
+    async def extracted(_llm, source, _trace_id):
+        seen.append(source)
+        return raw
+
+    monkeypatch.setattr(pipeline_module, "extract_decision_spot", extracted)
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    player_id, session_id = await _make_scope(db_factory)
+    async with db_factory() as session:
+        await DecisionSpotsRepo(session).save(
+            player_id=player_id, session_id=session_id,
+            source_text="Старый черновик", raw=RawDecisionSpot().model_dump(mode="json"),
+            canonical=None, snapshot=None,
+        )
+        await session.commit()
+    await queue.enqueue(
+        type="agent", player_id=player_id, session_id=session_id,
+        payload={"text": raw.source_text},
+    )
+    job = await queue.claim("w1")
+    assert job is not None
+    script = _TurnScript([([], "Это новый спот.")])
+    await run_job(job, replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script))))
+    assert seen == [raw.source_text]
+    async with db_factory() as session:
+        sources = (await session.execute(text(
+            "select source_text from decision_spots where session_id = :session_id order by id"
+        ), {"session_id": session_id})).scalars().all()
+    assert sources == ["Старый черновик", raw.source_text]
+
+
 async def test_replaying_saved_clarification_does_not_call_model_again(
     db_factory, queue, deps, fake_sender, monkeypatch
 ):
@@ -2234,10 +2275,10 @@ async def test_replaying_saved_clarification_does_not_call_model_again(
     async with db_factory() as session:
         count = (await session.execute(text("select count(*) from decision_spots"))).scalar_one()
     assert count == 1
-    assert any("блайнды" in message for message in _all_texts(fake_sender))
+    assert any("целиком одним сообщением" in message for message in _all_texts(fake_sender))
 
 
-async def test_short_ante_payer_reply_uses_saved_spot_without_model(
+async def test_short_ante_reply_does_not_mutate_saved_spot_or_call_model(
     db_factory, queue, deps, monkeypatch
 ):
     from harness.contracts.decision_spot import RawDecisionSpot, SpotFact
@@ -2274,7 +2315,7 @@ async def test_short_ante_payer_reply_uses_saved_spot_without_model(
         latest = (await session.execute(text(
             "select raw from decision_spots where session_id = :session_id order by id desc limit 1"
         ), {"session_id": session_id})).scalar_one()
-    assert latest["ante_type"] == "per_player"
+    assert latest["ante_type"] == "unknown"
 
 
 async def _agent_range_turn(db_factory, queue, deps, *, with_analysis: bool):

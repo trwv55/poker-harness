@@ -14,7 +14,7 @@ from pydantic_ai.messages import (
 )
 from sqlalchemy import text
 
-from harness.agent.decision_spot import MAX_SPOT_SCENARIOS_PER_TURN, spot_tools
+from harness.agent.decision_spot import MAX_SPOT_SCENARIOS_PER_TURN, spot_agent_context, spot_tools
 from harness.agent.history import seen_history
 from harness.agent.run import _SPOT_ADVICE_RE
 from harness.analysis.decision_spot import spot_call_scenario
@@ -29,10 +29,8 @@ from harness.engine.decision_spot import InvalidDecisionSpot, replay_until_decis
 from harness.memory.repos import DecisionSpotsRepo, PlayersRepo, SessionsRepo
 from harness.normalizer.decision_spot import _position_in_quote, normalize_decision_spot
 from harness.parsers.decision_spot import extract_decision_spot, looks_like_decision_spot
-from harness.presentation.messages import spot_scenario_msg
+from harness.presentation.messages import spot_question_msg, spot_scenario_msg
 from harness.worker.pipeline import (
-    _ante_payer_reply,
-    _apply_size_clarification,
     _non_spot_history,
     _only_context,
     _other_contexts,
@@ -52,32 +50,20 @@ def test_stringified_nested_spot_still_passes_full_validation() -> None:
     assert decoded.spot == source
 
 
-def test_numeric_reply_corrects_only_unverified_table_size() -> None:
-    previous = RawDecisionSpot(table_size=SpotFact(value="8','quote':'8", quote="", status="known"))
-    extracted = RawDecisionSpot(table_size=fact("8", "8 игроков"))
-    corrected = _apply_size_clarification(extracted, previous, "5")
-    assert corrected.table_size == fact("5", "Уточнение: 5")
-    assert _apply_size_clarification(extracted, extracted, "5").table_size == extracted.table_size
-
-
-def test_short_ante_reply_is_evidence_without_repeating_amount() -> None:
+def test_ante_payer_defaults_without_reply() -> None:
     raw = sample()
     raw.ante.quote = "ante 100"
-    raw.source_text += "\nУточнение: каждый"
     spot, questions = normalize_decision_spot(raw)
     assert not questions and spot is not None and spot.ante_type == "per_player"
-    assert _ante_payer_reply("каждый") == "per_player"
-    assert _ante_payer_reply("только BB") == "big_blind"
-    assert _ante_payer_reply("какой диапазон?") is None
 
 
 def sample() -> RawDecisionSpot:
     text = (
         "8 players, blinds 500/1000, ante 100 each. "
-        "Hero BB 9h9d stack 30000 before ante. "
+        "Hero BB 9h9d stack 30000 after posts. "
         "UTG folds, UTG+1 folds, LJ folds, HJ folds. "
-        "CO opens to 2500, stack 50000 before ante. "
-        "BTN all-in to 28000, stack 28100 before ante. SB folds. Hero to act."
+        "CO opens to 2500, stack 50000 after posts. "
+        "BTN all-in to 28000, stack 28000 after posts. SB folds. Hero to act."
     )
     return RawDecisionSpot(
         source_text=text,
@@ -91,18 +77,15 @@ def sample() -> RawDecisionSpot:
         players=[
             RawSpotPlayer(
                 position="BB",
-                stack=fact("30000", "stack 30000 before ante"),
-                stack_moment="before_ante",
+                stack=fact("30000", "stack 30000 after posts"),
             ),
             RawSpotPlayer(
                 position="CO",
-                stack=fact("50000", "stack 50000 before ante"),
-                stack_moment="before_ante",
+                stack=fact("50000", "stack 50000 after posts"),
             ),
             RawSpotPlayer(
                 position="BTN",
-                stack=fact("28100", "stack 28100 before ante"),
-                stack_moment="before_ante",
+                stack=fact("28000", "stack 28000 after posts"),
             ),
         ],
         actions=[
@@ -145,15 +128,87 @@ def test_prefix_stops_before_hero_and_keeps_co_to_act() -> None:
     assert scenario.condition == "если CO сбросят"
 
 
-def test_unknown_ante_and_ambiguous_all_in_request_facts() -> None:
+def test_compact_description_assumes_early_folds_for_scenario() -> None:
+    raw = sample()
+    raw.actions = [a for a in raw.actions if a.position not in {"UTG", "UTG+1", "LJ", "HJ"}]
+    spot, questions = normalize_decision_spot(raw)
+    assert spot is not None and not questions
+    snapshot = replay_until_decision(spot)
+    assert snapshot.assumed_folds == ["UTG", "UTG+1", "LJ", "HJ"]
+    assert snapshot.positions_still_to_act == ["CO"]
+    scenario = spot_call_scenario(7, spot, snapshot, fold_after_hero=("CO",))
+    assert scenario.equity_threshold == 27000 / (32800 + 27000)
+
+
+def test_approximate_stacks_allow_only_conditional_pot_odds() -> None:
+    raw = sample()
+    raw.source_text = raw.source_text.replace("stack 30000 after posts", "stack ~30000 after posts")
+    raw.players[0].stack.quote = "stack ~30000 after posts"
+    spot, questions = normalize_decision_spot(raw)
+    assert spot is not None and not questions
+    assert next(p for p in spot.players if p.position == "BB").stack is None
+    assert next(p for p in spot.players if p.position == "BB").approx_stack_behind == 30000
+    snapshot = replay_until_decision(spot)
+    assert "BB ~30BB" in spot_agent_context(spot, snapshot).text
+    scenario = spot_call_scenario(7, spot, snapshot, fold_after_hero=("CO",))
+    assert scenario.equity_threshold == 27000 / (32800 + 27000)
+    assert scenario.eligible_pot is None
+    assert "хватает фишек" in scenario.condition
+
+
+def test_missing_participant_stack_gets_one_full_description_guide() -> None:
+    raw = sample()
+    raw.players.pop(2)
+    spot, questions = normalize_decision_spot(raw)
+    assert spot is None and "BTN" in questions[0]
+    message = spot_question_msg(questions).text
+    assert "целиком одним сообщением" in message
+    assert "ICM" in message and "KO/PKO" in message
+    assert "Анте платят все" in message
+    assert "после анте и блайндов" in message
+    assert "кто платил анте" not in message.lower()
+
+
+def test_literal_blind_pair_recovers_bad_model_split() -> None:
+    raw = sample()
+    raw.sb = SpotFact()
+    raw.bb = fact("500/1000", "blinds 500/1000")
+    spot, questions = normalize_decision_spot(raw)
+    assert spot is not None and not questions
+    assert (spot.sb, spot.bb) == (500, 1000)
+
+
+def test_attached_bb_unit_in_amount_and_stack() -> None:
+    raw = sample()
+    raw.source_text = raw.source_text.replace("stack 30000 after posts", "stack ~30BB after posts")
+    raw.players[0].stack = fact("~30BB", "stack ~30BB after posts")
+    raw.source_text = raw.source_text.replace("CO opens to 2500", "CO opens to 2.5BB")
+    raw.actions[4].quote = "CO opens to 2.5BB"
+    raw.actions[4].amount = fact("2.5BB", "CO opens to 2.5BB")
+    spot, questions = normalize_decision_spot(raw)
+    assert spot is not None and not questions
+    assert spot.actions[4].committed_after == 2500
+    assert next(p for p in spot.players if p.position == "BB").approx_stack_behind == 30000
+
+
+def test_hero_stack_field_fills_missing_player_entry() -> None:
+    raw = sample()
+    raw.players = [p for p in raw.players if p.position != "BB"]
+    raw.hero_stack = fact("30000", "stack 30000 after posts")
+    spot, questions = normalize_decision_spot(raw)
+    assert spot is not None and not questions
+    assert next(p for p in spot.players if p.position == "BB").stack == 31100
+
+
+def test_unknown_ante_payer_defaults_and_ambiguous_all_in_size_uses_total() -> None:
     raw = sample()
     raw.ante_type = "unknown"
     spot, questions = normalize_decision_spot(raw)
-    assert spot is None and questions == ["Кто платил анте: каждый игрок или только BB?"]
+    assert spot is not None and not questions and spot.ante_type == "per_player"
     raw = sample()
     raw.actions[5].amount_kind = "unspecified"
     spot, questions = normalize_decision_spot(raw)
-    assert spot is None and "доплата" in questions[0]
+    assert spot is not None and not questions
 
 
 def test_russian_hero_and_unicode_suits_are_evidenced() -> None:
@@ -166,7 +221,7 @@ def test_russian_hero_and_unicode_suits_are_evidenced() -> None:
     assert spot.hero_cards == ("9s", "9c")
 
 
-def test_hallucinated_size_and_missing_action_cannot_replay() -> None:
+def test_hallucinated_size_is_rejected_and_missing_fold_is_inferred() -> None:
     raw = sample()
     raw.actions[4].amount.value = "3500"
     assert normalize_decision_spot(raw)[0] is None
@@ -174,16 +229,13 @@ def test_hallucinated_size_and_missing_action_cannot_replay() -> None:
     raw.actions.pop(0)
     spot, _ = normalize_decision_spot(raw)
     assert spot is not None
-    try:
-        replay_until_decision(spot)
-    except InvalidDecisionSpot as exc:
-        assert "UTG" in str(exc)
-    else:
-        raise AssertionError("missing action must be rejected")
+    snapshot = replay_until_decision(spot)
+    assert any("UTG" in note for note in snapshot.not_checked)
 
 
 def test_simple_question_does_not_spend_an_extraction_call() -> None:
     assert not looks_like_decision_spot("Каков мой VPIP за неделю?")
+    assert looks_like_decision_spot("Разбери эту руку")
     assert looks_like_decision_spot("Я на BB с 99, CO открыл, BTN пушит. Разбери руку.")
     assert looks_like_decision_spot("BB 99, CO открыл, BTN пуш. Что делать?")
     assert looks_like_decision_spot("на большом блайнде 99, CO открыл, BTN пуш. Что делать?")
@@ -245,13 +297,14 @@ def test_semantics_must_match_cited_words() -> None:
     assert normalize_decision_spot(raw)[0] is None
     raw = sample()
     raw.ante_type = "big_blind"
-    assert normalize_decision_spot(raw)[0] is None
+    spot, _ = normalize_decision_spot(raw)
+    assert spot is not None and spot.ante_type == "per_player"
     raw = sample()
     raw.actions[4].amount_kind = "additional"
     assert normalize_decision_spot(raw)[0] is None
     raw = sample()
     raw.players[0].stack_moment = "behind"
-    assert normalize_decision_spot(raw)[0] is None
+    assert normalize_decision_spot(raw)[0] is not None
 
 
 def test_bet_and_blind_numbers_must_match_their_roles_in_the_quote() -> None:
@@ -260,8 +313,8 @@ def test_bet_and_blind_numbers_must_match_their_roles_in_the_quote() -> None:
     assert normalize_decision_spot(raw)[0] is None
 
     raw = sample()
-    raw.actions[4].amount = fact("50000", "CO opens to 2500, stack 50000 before ante")
-    raw.actions[4].quote = "CO opens to 2500, stack 50000 before ante"
+    raw.actions[4].amount = fact("50000", "CO opens to 2500, stack 50000 after posts")
+    raw.actions[4].quote = "CO opens to 2500, stack 50000 after posts"
     assert normalize_decision_spot(raw)[0] is None
 
 
@@ -327,8 +380,8 @@ def test_short_all_in_raise_is_explicitly_refused() -> None:
     raw.source_text = raw.source_text.replace("BTN all-in to 28000", "BTN all-in to 3500")
     raw.actions[5].amount = fact("3500", "BTN all-in to 3500")
     raw.actions[5].quote = "BTN all-in to 3500"
-    raw.players[2].stack = fact("3600", "stack 3600 before ante")
-    raw.source_text = raw.source_text.replace("stack 28100 before ante", "stack 3600 before ante")
+    raw.players[2].stack = fact("3600", "stack 3600 after posts")
+    raw.source_text = raw.source_text.replace("stack 28000 after posts", "stack 3600 after posts")
     spot, questions = normalize_decision_spot(raw)
     assert not questions and spot is not None
     try:
@@ -353,19 +406,17 @@ def test_explicit_no_ante_is_zero_without_inventing_a_number() -> None:
     raw.source_text = raw.source_text.replace("ante 100 each", "No ante")
     raw.ante = fact("0", "No ante")
     raw.ante_type = "none"
-    raw.source_text = raw.source_text.replace("stack 28100 before ante", "stack 28000 before ante")
-    raw.players[2].stack = fact("28000", "stack 28000 before ante")
     spot, questions = normalize_decision_spot(raw)
     assert not questions and spot is not None and spot.ante == 0
     assert replay_until_decision(spot).pot_before == 32000
 
 
-def test_unknown_folded_stacks_require_full_ante_evidence() -> None:
+def test_unknown_folded_stacks_use_every_player_ante_default() -> None:
     raw = sample()
     raw.source_text = raw.source_text.replace("ante 100 each", "ante 100")
     raw.ante.quote = "ante 100"
     spot, questions = normalize_decision_spot(raw)
-    assert spot is None and "Анте платил" in questions[0]
+    assert spot is not None and not questions and spot.ante_type == "per_player"
 
 
 def test_spot_tool_survives_saved_history_and_contexts_are_isolated() -> None:

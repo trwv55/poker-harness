@@ -45,10 +45,14 @@ class RawDecisionSpot(BaseModel):
     ante_type: Literal["per_player", "big_blind", "none", "unknown"] = "unknown"
     hero_position: SpotFact = Field(default_factory=SpotFact)
     hero_cards: SpotFact = Field(default_factory=SpotFact)
+    hero_stack: SpotFact = Field(default_factory=SpotFact)
     players: list[RawSpotPlayer] = []
     actions: list[RawSpotAction] = []
     unknown_lines: list[str] = Field(default_factory=list)
     question: str | None = None
+    tournament_context: SpotFact = Field(default_factory=SpotFact)
+    icm_context: SpotFact = Field(default_factory=SpotFact)
+    ko_context: SpotFact = Field(default_factory=SpotFact)
 
 
 class SpotExtraction(BaseModel):
@@ -67,6 +71,7 @@ class SpotExtraction(BaseModel):
 class SpotPlayer(BaseModel):
     position: str
     stack: int | None = None  # initial stack, not chips behind
+    approx_stack_behind: int | None = None
     folded: bool = False
 
 
@@ -92,6 +97,9 @@ class CanonicalDecisionSpot(BaseModel):
     actions: list[SpotAction]
     hero_to_act: bool = True
     not_checked: list[str] = Field(default_factory=list)
+    tournament_context: str | None = None
+    icm_context: str | None = None
+    ko_context: str | None = None
 
 
 class DecisionSnapshot(BaseModel):
@@ -103,6 +111,7 @@ class DecisionSnapshot(BaseModel):
     effective_stack: int | None
     possible_side_pots: bool
     not_checked: list[str]
+    assumed_folds: list[str] = Field(default_factory=list)
 
 
 class SpotCallScenario(BaseModel):

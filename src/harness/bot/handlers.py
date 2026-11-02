@@ -955,9 +955,9 @@ async def handle_text(deps: BotDeps, tg_user_id: int, text: str) -> Msg | None:
             if active is not None and active.active_spot_id is not None
             else None
         )
-        spot_clarification = (
-            prior is not None and prior.status == "draft" and not looks_like_decision_spot(answer)
-        )
+        # A full replacement description belongs to the pending draft and
+        # remains free, just like the short replies that used to clarify it.
+        spot_clarification = prior is not None and prior.status == "draft"
         await db.commit()
 
     # Квота — до заведения сессии и с той же оговоркой о мягком пределе, что у

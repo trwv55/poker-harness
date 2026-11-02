@@ -50,7 +50,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import re
 import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Executor
@@ -90,9 +89,7 @@ from harness.contracts import (
 from harness.contracts.decision_spot import (
     CanonicalDecisionSpot,
     DecisionSnapshot,
-    RawDecisionSpot,
     SpotCallScenario,
-    SpotFact,
 )
 from harness.engine import enrich
 from harness.engine.decision_spot import InvalidDecisionSpot, replay_until_decision
@@ -139,6 +136,7 @@ from harness.presentation import (
     range_photos,
     scan_summary_msg,
     send_as_file_msg,
+    spot_followup_msg,
     spot_question_msg,
     spot_scenario_msg,
     vision_gave_up_msg,
@@ -1363,35 +1361,6 @@ def _spot_history(history: list[ModelMessage]) -> list[ModelMessage]:
     ]
 
 
-def _apply_size_clarification(
-    raw: RawDecisionSpot, previous: RawDecisionSpot, answer: str
-) -> RawDecisionSpot:
-    """A bare digit answers the table-size question only when that fact was unverified."""
-    size = answer.strip()
-    if (
-        re.fullmatch(r"[2-9]", size)
-        and (previous.table_size.status != "known" or not previous.table_size.quote)
-    ):
-        return raw.model_copy(update={
-            "table_size": SpotFact(value=size, quote="Уточнение: " + answer, status="known")
-        })
-    return raw
-
-
-def _ante_payer_reply(answer: str) -> Literal["per_player", "big_blind"] | None:
-    reply = answer.strip()
-    if re.fullmatch(r"(?:кажд\w*|с\s+кажд\w*|все(?:\s+игроки)?)", reply, re.IGNORECASE):
-        return "per_player"
-    if re.fullmatch(
-        r"(?:(?:только\s+)?(?:BB|ББ)(?:\s+анте)?|большой\s+блайнд)",
-        reply,
-        re.IGNORECASE,
-    ):
-        return "big_blind"
-    return None
-
-
-
 async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
     """Ход агента: контекст, история вечера, модель, проверки, журнал, ответ.
 
@@ -1421,33 +1390,17 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
         try:
             candidate = looks_like_decision_spot(payload["text"])
             continuing = active is not None and active.status == "draft" and not candidate
-            if candidate or continuing:
-                repeated_clarification = (
-                    continuing
-                    and active is not None
-                    and active.source_text.endswith("\nУточнение: " + payload["text"])
+            if continuing:
+                msg = spot_followup_msg()
+                await _send_idempotent(
+                    deps, session, job.id, worker_id, "result_message_id", chat_id, msg
                 )
-                ante_payer = _ante_payer_reply(payload["text"]) if continuing else None
-                if continuing and active is not None:
-                    source = active.source_text
-                    if not repeated_clarification:
-                        source += "\nУточнение: " + payload["text"]
-                else:
-                    source = payload["text"]
-                if (repeated_clarification or ante_payer) and active is not None:
-                    raw = RawDecisionSpot.model_validate(active.raw).model_copy(
-                        deep=True,
-                        update={"source_text": source}
-                    )
-                    if ante_payer is not None:
-                        raw.ante_type = ante_payer
-                else:
-                    async with trace.span("spot_extract"):
-                        raw = await extract_decision_spot(deps.llm, source, trace.trace_id)
-                if raw is not None and continuing and active is not None:
-                    raw = _apply_size_clarification(
-                        raw, RawDecisionSpot.model_validate(active.raw), payload["text"]
-                    )
+                await session.commit()
+                return
+            if candidate:
+                source = payload["text"]
+                async with trace.span("spot_extract"):
+                    raw = await extract_decision_spot(deps.llm, source, trace.trace_id)
                 if raw is not None:
                     canonical, questions = normalize_decision_spot(raw)
                     snapshot = None
@@ -1456,20 +1409,17 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
                             snapshot = replay_until_decision(canonical)
                         except InvalidDecisionSpot as exc:
                             questions = [str(exc)]
-                    if repeated_clarification and active is not None and snapshot is None:
-                        row = active
-                    else:
-                        row = await spots.save(
-                            player_id=job.player_id,
-                            session_id=job.session_id,
-                            source_text=source,
-                            raw=raw.model_dump(mode="json"),
-                            canonical=canonical.model_dump(mode="json")
-                            if snapshot and canonical
-                            else None,
-                            snapshot=snapshot.model_dump(mode="json") if snapshot else None,
-                            prior_id=active.id if continuing and active is not None else None,
-                        )
+                    row = await spots.save(
+                        player_id=job.player_id,
+                        session_id=job.session_id,
+                        source_text=source,
+                        raw=raw.model_dump(mode="json"),
+                        canonical=canonical.model_dump(mode="json")
+                        if snapshot and canonical
+                        else None,
+                        snapshot=snapshot.model_dump(mode="json") if snapshot else None,
+                        prior_id=active.id if active is not None and active.status == "draft" else None,
+                    )
                     await session.commit()
                     trace.record(
                         "spot_extraction",
@@ -1486,13 +1436,6 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
                         await session.commit()
                         return
                     active = row
-                elif continuing:
-                    msg = spot_question_msg(["Уточните недостающий факт в описании руки."])
-                    await _send_idempotent(
-                        deps, session, job.id, worker_id, "result_message_id", chat_id, msg
-                    )
-                    await session.commit()
-                    return
                 else:
                     # A new hand-like text was rejected by extraction. Do not answer
                     # from an older verified spot or HH context in this turn.

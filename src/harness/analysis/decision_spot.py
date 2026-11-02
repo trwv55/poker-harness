@@ -25,7 +25,7 @@ def spot_call_scenario(
     waiting = set(snapshot.positions_still_to_act)
     if set(fold_after_hero) != waiting or len(fold_after_hero) != len(waiting):
         raise ValueError("Укажите, что именно сделают все игроки после героя.")
-    folded = {a.position for a in spot.actions if a.kind == "fold"} | waiting
+    folded = {a.position for a in spot.actions if a.kind == "fold"} | waiting | set(snapshot.assumed_folds)
     live = [
         p.position
         for p in spot.players
@@ -49,7 +49,7 @@ def spot_call_scenario(
             explanation="После условия остаётся не один оппонент; нужен отдельный мультивей-сценарий.",
         )
     hero_stack = next(p.stack for p in spot.players if p.position == spot.hero_position)
-    if hero_stack is None or snapshot.committed[spot.hero_position] + snapshot.to_call > hero_stack:
+    if hero_stack is not None and snapshot.committed[spot.hero_position] + snapshot.to_call > hero_stack:
         return SpotCallScenario(
             spot_id=spot_id,
             condition=condition,
@@ -57,7 +57,7 @@ def spot_call_scenario(
             to_call=snapshot.to_call,
             eligible_pot=None,
             equity_threshold=None,
-            explanation="Нужен подтверждённый стек героя и возможный сайд-пот.",
+            explanation="Стек героя меньше полной доплаты; нужен отдельный расчёт короткого олл-ина.",
         )
     cap = min(
         snapshot.committed[spot.hero_position] + snapshot.to_call, snapshot.committed[live[0]]
@@ -73,14 +73,20 @@ def spot_call_scenario(
             explanation="Возможен побочный банк; простой порог колла здесь неверен.",
         )
     threshold = required_equity(snapshot.to_call, snapshot.pot_before)
+    if hero_stack is None:
+        condition += ", и у героя хватает фишек на полную доплату"
     scenario = SpotCallScenario(
         spot_id=spot_id,
         condition=condition,
         pot_before=snapshot.pot_before,
         to_call=snapshot.to_call,
-        eligible_pot=snapshot.pot_before + snapshot.to_call,
+        eligible_pot=snapshot.pot_before + snapshot.to_call if hero_stack is not None else None,
         equity_threshold=threshold,
-        explanation="Порог условный; без диапазона оппонента вывода о колле нет.",
+        explanation=(
+            "Порог условный: стек героя не подтверждён; без диапазона оппонента вывода о колле нет."
+            if hero_stack is None else
+            "Порог условный; без диапазона оппонента вывода о колле нет."
+        ),
     )
     if opponent_range is None:
         return scenario

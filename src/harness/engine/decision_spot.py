@@ -40,7 +40,13 @@ def replay_until_decision(spot: CanonicalDecisionSpot) -> DecisionSnapshot:
     min_raise = spot.bb
     folded: set[str] = set()
     all_in: set[str] = set()
+    inferred_folds: list[str] = []
     for action in spot.actions:
+        # A compact description may omit folds, but never another kind of action.
+        while queue and action.position != queue[0] and queue[0] != spot.hero_position:
+            pos = queue.pop(0)
+            folded.add(pos)
+            inferred_folds.append(pos)
         if not queue or action.position != queue[0]:
             expected = queue[0] if queue else "никто"
             raise InvalidDecisionSpot(f"Перед {action.position} должен действовать {expected}.")
@@ -87,7 +93,11 @@ def replay_until_decision(spot: CanonicalDecisionSpot) -> DecisionSnapshot:
         if kind == "all_in" and stack is not None and committed[pos] + ante_paid[pos] != stack:
             raise InvalidDecisionSpot(f"Олл-ин {pos} не совпадает с известным стеком.")
 
-    if not queue or queue[0] != spot.hero_position:
+    while queue and queue[0] != spot.hero_position:
+        pos = queue.pop(0)
+        folded.add(pos)
+        inferred_folds.append(pos)
+    if not queue:
         expected = queue[0] if queue else "никто"
         raise InvalidDecisionSpot(f"Перед героем ещё должен действовать {expected}.")
     if all(p == spot.hero_position or p in folded for p in positions):
@@ -106,6 +116,8 @@ def replay_until_decision(spot: CanonicalDecisionSpot) -> DecisionSnapshot:
         known_stacks and len(known_stacks) == len(active_stacks)
     ) else None
     not_checked = spot.not_checked.copy()
+    if inferred_folds:
+        not_checked.append("неназванные пасы предполагаются: " + ", ".join(inferred_folds))
     if effective is None:
         not_checked.append("эффективный стек: не все стеки подтверждены")
     if len(queue) > 1:
@@ -124,4 +136,5 @@ def replay_until_decision(spot: CanonicalDecisionSpot) -> DecisionSnapshot:
         effective_stack=effective,
         possible_side_pots=possible_side_pots,
         not_checked=not_checked,
+        assumed_folds=inferred_folds,
     )

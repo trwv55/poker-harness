@@ -1827,8 +1827,31 @@ def spot_description_file_msg() -> Msg:
 
 
 def spot_question_msg(questions: Sequence[str]) -> Msg:
-    listed = "\n".join(f"• {question}" for question in questions[:2])
-    return Msg(text="Для разбора точки до вашего действия уточните:\n" + listed)
+    # One reusable guide: the next input is a complete description, not a
+    # fragment appended to the draft. Never expose ante-payer/stack-moment asks.
+    relevant = [q for q in questions if not any(word in q.lower() for word in (
+        "кто платил анте", "анте платил", "когда измерен стек", "до анте или",
+    ))]
+    missing = "".join(f"• {q}\n" for q in relevant[:3])
+    return Msg(text=(
+        ("Не хватает данных:\n" + missing + "\n" if missing else "")
+        + "Пришлите раздачу целиком одним сообщением:\n"
+        "• Сколько игроков, блайнды и размер анте (или «без анте»).\n"
+        "• Ваша позиция, карты и примерный стек в BB; позиции и примерные стеки участников банка.\n"
+        "• Действия до вашего решения по порядку, с размерами ставок. Ранние пасы можно пропустить.\n"
+        "• Ваш вопрос. Стадия турнира и влияние ICM, обычный/KO/PKO формат — если знаете; можно написать «не знаю».\n\n"
+        "Стеки считаю после анте и блайндов, до действий. Анте платят все; рейз — итог на улице.\n\n"
+        "Пример: 8 игроков, 400/800, анте 100. Я BB, 9♠9♣, ~30BB. "
+        "CO ~40BB открыл до 2,5BB, BTN ~28BB пуш до 28BB, SB пас. "
+        "Что делать? До денег далеко, без KO, ICM не знаю."
+    ))
+
+
+def spot_followup_msg() -> Msg:
+    return Msg(text=(
+        "Чтобы не потерять детали, пришлите раздачу целиком одним сообщением "
+        "по шаблону выше. Короткие ответы отдельно не добавляю."
+    ))
 
 
 def spot_scenario_msg(condition: str, pot: int, to_call: int, threshold: float | None,

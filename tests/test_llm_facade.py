@@ -1267,10 +1267,10 @@ async def test_openrouter_route_reaches_every_provider_request(db_factory, monke
         })
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        def model_with_transport(name, *, settings):
+        def model_with_transport(name, *, profile, settings):
             return OpenRouterModel(
                 name, provider=OpenRouterProvider(api_key="test", http_client=client),
-                settings=settings,
+                profile=profile, settings=settings,
             )
 
         monkeypatch.setattr("harness.platform.llm.OpenRouterModel", model_with_transport)

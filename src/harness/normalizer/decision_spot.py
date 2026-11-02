@@ -8,6 +8,7 @@ from decimal import Decimal, InvalidOperation
 from harness.contracts.decision_spot import (
     CanonicalDecisionSpot,
     RawDecisionSpot,
+    RawSpotPlayer,
     SpotAction,
     SpotFact,
     SpotPlayer,
@@ -22,9 +23,6 @@ _BLIND_PAIR = re.compile(
     r"(?:blinds?|блайнд\w*)\s+(\d+(?:[.,]\d+)?)\s*[/:-]\s*(\d+(?:[.,]\d+)?)",
     re.IGNORECASE,
 )
-_ANTE_EACH = re.compile(r"кажд|все|each|per.?player|all players|everyone", re.IGNORECASE)
-_ANTE_BB = re.compile(r"\bBB\s+ante\b|big.?blind\s+ante|анте\s+(?:с\s+)?(?:большого\s+блайнда|бб)|бб\s+анте", re.IGNORECASE)
-_ANTE_BB_REPLY = re.compile(r"(?:(?:только\s+)?(?:BB|ББ)(?:\s+анте)?|большой\s+блайнд)", re.IGNORECASE)
 _ANTE_NONE = re.compile(r"без анте|no ante", re.IGNORECASE)
 _ACTION_WORDS = {
     "fold": re.compile(r"fold|фолд|пас|сброс|скин", re.IGNORECASE),
@@ -36,12 +34,6 @@ _ACTION_WORDS = {
 _TOTAL = re.compile(r"\bto\b|\btotal\b|до\s+\d|итого|всего|общая ставка", re.IGNORECASE)
 _ADDITIONAL = re.compile(r"доплат|добав|ещ[её]|\bmore\b|\badditional\b", re.IGNORECASE)
 _BEHIND = re.compile(r"за спиной|behind|остал", re.IGNORECASE)
-_STACK_MOMENTS = {
-    "before_ante": re.compile(r"до анте|before ante|до начала раздачи|starting stack", re.IGNORECASE),
-    "after_ante": re.compile(r"после анте|after ante", re.IGNORECASE),
-    "after_post": re.compile(r"после (?:поста|блайнд)|after (?:posting|post|blind)", re.IGNORECASE),
-    "behind": _BEHIND,
-}
 _POSITION_WORDS = {
     "BTN": ("btn", "баттон", "кнопк"),
     "SB": ("sb", "малый блайнд", "мб"),
@@ -98,6 +90,8 @@ def _amount_kind_in_quote(kind: str, quote: str) -> bool:
         "additional": bool(_ADDITIONAL.search(quote)),
         "behind": bool(_BEHIND.search(quote)),
     }
+    if kind == "total" and not any(observed.values()):
+        return True  # A bare raise size is the total on this street.
     return observed.get(kind, False) and sum(observed.values()) == 1
 
 
@@ -124,6 +118,20 @@ def _blinds_match_quotes(raw: RawDecisionSpot, sb: int, bb: int) -> bool:
     )
 
 
+def _blinds_from_source(source: str) -> tuple[int, int] | None:
+    """Recover one literal blind pair when extraction splits it incorrectly."""
+    pairs = {
+        (Decimal(match.group(1).replace(",", ".")), Decimal(match.group(2).replace(",", ".")))
+        for match in _BLIND_PAIR.finditer(source)
+    }
+    if len(pairs) != 1:
+        return None
+    small, big = pairs.pop()
+    if small != int(small) or big != int(big):
+        return None
+    return int(small), int(big)
+
+
 def _action_amount_matches_quote(amount: SpotFact, kind: str, quote: str) -> bool:
     token = _NUMBER.search(amount.value or "")
     if token is None:
@@ -135,7 +143,10 @@ def _action_amount_matches_quote(amount: SpotFact, kind: str, quote: str) -> boo
         else r"(?:доплат\w*|добав\w*|ещ[её]|\bmore\b|\badditional\b)"
     )
     pattern = re.compile(lead + r"\s*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
-    return any(match.group(1).replace(",", ".") == number for match in pattern.finditer(quote))
+    if any(match.group(1).replace(",", ".") == number for match in pattern.finditer(quote)):
+        return True
+    numbers = [match.group().replace(",", ".") for match in _NUMBER.finditer(quote)]
+    return kind == "total" and numbers == [number]
 
 
 def _evidenced(fact: SpotFact, text: str) -> bool:
@@ -159,8 +170,9 @@ def _chips(fact: SpotFact, text: str, bb: int | None = None) -> int | None:
     except InvalidOperation:
         return None
     unit = (fact.value or "").lower()
-    if re.search(r"\bbb\b|бб|блайнд", unit):
-        if not re.search(r"\bbb\b|бб|блайнд", fact.quote.lower()):
+    bb_unit = r"(?<![a-z])bb\b|бб|блайнд"
+    if re.search(bb_unit, unit):
+        if not re.search(bb_unit, fact.quote.lower()):
             return None
         if bb is None:
             return None
@@ -204,6 +216,12 @@ def normalize_decision_spot(raw: RawDecisionSpot) -> tuple[CanonicalDecisionSpot
     positions = POSITIONS_BY_COUNT[size]
     sb = _chips(raw.sb, source)
     bb = _chips(raw.bb, source)
+    pair = _blinds_from_source(source)
+    if pair is not None:
+        if sb is None:
+            sb = pair[0]
+        if bb is None or "/" in (raw.bb.value or ""):
+            bb = pair[1]
     if sb is None or bb is None or sb <= 0 or bb <= sb:
         questions.append("Укажите малый и большой блайнды в фишках.")
     hero = (raw.hero_position.value or "").upper() if _evidenced(raw.hero_position, source) else ""
@@ -222,43 +240,22 @@ def normalize_decision_spot(raw: RawDecisionSpot) -> tuple[CanonicalDecisionSpot
     cards, hand_class = _cards(raw)
     if cards is None and hand_class is None:
         questions.append("Какие две карты у героя? Можно указать класс руки, например 99.")
-    if raw.ante_type == "unknown" and _evidenced(raw.ante, source):
-        questions.append("Кто платил анте: каждый игрок или только BB?")
-    elif raw.ante_type == "unknown" or not _evidenced(raw.ante, source):
-        questions.append("Было ли анте? Если да, укажите размер и кто его ставил.")
+    if not _evidenced(raw.ante, source):
+        questions.append("Укажите размер анте или напишите «без анте».")
     if questions:
         return None, questions[:2]
     assert sb is not None and bb is not None
     assert hero in positions
-    assert raw.ante_type != "unknown"
-    if not _blinds_match_quotes(raw, sb, bb):
+    if not (pair == (sb, bb) or _blinds_match_quotes(raw, sb, bb)):
         return None, ["Уточните, какая сумма относится к малому и большому блайнду."]
     ante_quote = raw.ante.quote
-    clarification = source.rsplit("\nУточнение: ", 1)[-1] if "\nУточнение: " in source else ""
-    each_evidenced = bool(_ANTE_EACH.search(ante_quote) or _ANTE_EACH.search(clarification))
-    bb_evidenced = bool(_ANTE_BB.search(ante_quote) or _ANTE_BB_REPLY.fullmatch(clarification))
-    if raw.ante_type == "none" and _ANTE_NONE.search(ante_quote):
+    if _ANTE_NONE.search(ante_quote):
         ante = 0
     else:
         ante = _chips(raw.ante, source, bb)
-    if ante is None or (raw.ante_type == "none" and ante != 0):
-        return None, ["Уточните точный размер и тип анте в фишках."]
-    if (
-        raw.ante_type == "per_player"
-        and ante > 0
-        and (not each_evidenced or bb_evidenced)
-        or raw.ante_type == "big_blind"
-        and ante > 0
-        and (not bb_evidenced or each_evidenced)
-        or raw.ante_type == "none"
-        and not _ANTE_NONE.search(ante_quote)
-    ):
-        return None, ["Анте платил каждый игрок, только большой блайнд или анте не было?"]
-    known_stacks = {p.position.upper() for p in raw.players if p.stack.status == "known"}
-    if ante > 0 and raw.ante_type == "per_player" and any(
-        position not in known_stacks for position in positions
-    ) and not each_evidenced:
-        return None, ["Все игроки внесли полное анте, без короткого олл-ин анте?"]
+    if ante is None:
+        return None, ["Укажите размер анте в фишках или напишите «без анте»."]
+    ante_type = "per_player" if ante > 0 else "none"
     if cards is not None and (
         cards[0] == cards[1]
         or any(c[0] not in "23456789TJQKA" or c[1] not in "shdc" for c in cards)
@@ -267,7 +264,14 @@ def normalize_decision_spot(raw: RawDecisionSpot) -> tuple[CanonicalDecisionSpot
 
     players = [SpotPlayer(position=p) for p in positions]
     by_pos = {p.position: p for p in players}
-    for entry in raw.players:
+    entries = [entry.model_copy(deep=True) for entry in raw.players]
+    if _evidenced(raw.hero_stack, source):
+        hero_entry = next((entry for entry in entries if entry.position.upper() == hero), None)
+        if hero_entry is None:
+            entries.append(RawSpotPlayer(position=hero, stack=raw.hero_stack))
+        elif not _evidenced(hero_entry.stack, source):
+            hero_entry.stack = raw.hero_stack
+    for entry in entries:
         pos = entry.position.upper()
         if pos not in by_pos:
             return None, [f"Позиция {pos} не соответствует столу на {size} игроков."]
@@ -276,28 +280,17 @@ def normalize_decision_spot(raw: RawDecisionSpot) -> tuple[CanonicalDecisionSpot
         stack = _chips(entry.stack, source, bb)
         if stack is None:
             return None, [f"Уточните стек {pos} и единицы измерения."]
-        moment = _STACK_MOMENTS.get(entry.stack_moment)
-        observed_moments = {
-            name for name, pattern in _STACK_MOMENTS.items() if pattern.search(entry.stack.quote)
-        }
-        if moment is None or observed_moments != {entry.stack_moment}:
-            return None, [f"Когда измерен стек {pos}: до анте или за спиной?"]
-        if entry.stack_moment == "before_ante":
-            initial = stack
-        elif entry.stack_moment in ("after_ante", "after_post", "behind"):
-            # This conversion is safe only before voluntary action.
-            if any(a.position.upper() == pos for a in raw.actions):
-                return None, [f"Стек {pos} указан после действия; нужен стек до раздачи."]
-            initial = stack + (ante if raw.ante_type == "per_player" else 0)
-            if raw.ante_type == "big_blind" and pos == "BB":
-                initial += ante
-            if entry.stack_moment in ("after_post", "behind"):
-                initial += (
-                    sb if pos in ("BTN" if size == 2 else "SB",) else bb if pos == "BB" else 0
-                )
-        else:
-            return None, [f"Когда измерен стек {pos}: до анте или за спиной?"]
-        by_pos[pos].stack = initial
+        # Described stacks are chips behind after forced posts, before voluntary
+        # actions. A "behind" quote for someone who already acted is ambiguous.
+        if entry.stack_moment == "behind" and any(
+            a.position.upper() == pos for a in raw.actions
+        ):
+            continue
+        if re.search(r"~|≈|около|примерно|приблизительно|\babout\b", entry.stack.quote, re.IGNORECASE):
+            by_pos[pos].approx_stack_behind = stack
+            continue
+        blind = sb if pos == ("BTN" if size == 2 else "SB") else bb if pos == "BB" else 0
+        by_pos[pos].stack = stack + ante + blind
 
     committed = {p: 0 for p in positions}
     committed["BTN" if size == 2 else "SB"] = sb
@@ -319,15 +312,14 @@ def normalize_decision_spot(raw: RawDecisionSpot) -> tuple[CanonicalDecisionSpot
             amount = _chips(action.amount, source, bb)
             if amount is None:
                 return None, [f"Уточните размер действия {pos} в фишках."]
-            if action.amount_kind == "unspecified" or (
-                action.kind in ("raise", "all_in") and action.amount_kind == "behind"
-            ):
-                return None, [f"Сумма действия {pos} — доплата или итоговая ставка?"]
-            if not _amount_kind_in_quote(action.amount_kind, action.quote):
+            amount_kind = "total" if action.amount_kind == "unspecified" else action.amount_kind
+            if action.kind in ("raise", "all_in") and amount_kind == "behind":
+                return None, [f"Укажите итоговую ставку {pos} на улице."]
+            if not _amount_kind_in_quote(amount_kind, action.quote):
                 return None, [f"Сумма действия {pos} указана как доплата или как итог на улице?"]
-            if not _action_amount_matches_quote(action.amount, action.amount_kind, action.quote):
+            if not _action_amount_matches_quote(action.amount, amount_kind, action.quote):
                 return None, [f"Уточните сумму действия {pos}: число не связано с действием."]
-            if action.amount_kind == "additional":
+            if amount_kind == "additional":
                 amount += committed[pos]
             if amount < committed[pos]:
                 return None, [f"Сумма действия {pos} меньше уже внесённого."]
@@ -341,17 +333,37 @@ def normalize_decision_spot(raw: RawDecisionSpot) -> tuple[CanonicalDecisionSpot
                 quote=action.quote,
             )
         )
-    if raw.unknown_lines:
-        return None, ["Не понял часть описания: " + raw.unknown_lines[0][:100]]
+    supplied_stacks = {
+        entry.position.upper() for entry in entries
+        if _evidenced(entry.stack, source)
+    }
+    required_stacks = {hero} | {
+        action.position.upper() for action in raw.actions if action.kind not in {"fold", "check"}
+    }
+    missing_stacks = sorted(required_stacks - supplied_stacks)
+    if missing_stacks:
+        return None, ["Укажите примерные стеки до действий: " + ", ".join(missing_stacks) + "."]
+    unknown_action = next(
+        (line for line in raw.unknown_lines if re.search(
+            r"лимп|бет|ставк|рейз|колл|пас|фолд|пуш|олл.?ин|raise|call|fold|shove|check",
+            line, re.IGNORECASE,
+        )),
+        None,
+    )
+    if unknown_action:
+        return None, ["Не понял действие в описании: " + unknown_action[:100]]
     return CanonicalDecisionSpot(
         table_size=size,
         sb=sb,
         bb=bb,
         ante=ante,
-        ante_type=raw.ante_type,
+        ante_type=ante_type,
         hero_position=hero,
         hero_cards=cards,
         hero_class=hand_class,
         players=players,
         actions=actions,
+        tournament_context=raw.tournament_context.quote if _evidenced(raw.tournament_context, source) else None,
+        icm_context=raw.icm_context.quote if _evidenced(raw.icm_context, source) else None,
+        ko_context=raw.ko_context.quote if _evidenced(raw.ko_context, source) else None,
     ), []

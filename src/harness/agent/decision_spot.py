@@ -21,6 +21,15 @@ def spot_agent_context(spot: CanonicalDecisionSpot, snapshot: DecisionSnapshot) 
         "Текстовый спот: слова игрока, не сыгранная HH-раздача. Префлоп, до действия героя.",
         f"Герой {spot.hero_position}, карты {cards}.",
         f"Блайнды {spot.sb}/{spot.bb}, анте {spot.ante} ({spot.ante_type}).",
+        "Контекст турнира: " + (spot.tournament_context or "неизвестен"),
+        "ICM: " + (spot.icm_context or "неизвестно"),
+        "KO/PKO: " + (spot.ko_context or "неизвестно"),
+        "Примерные стеки после обязательных взносов: " + (
+            "; ".join(
+                f"{p.position} ~{p.approx_stack_behind / spot.bb:g}BB"
+                for p in spot.players if p.approx_stack_behind is not None
+            ) or "нет"
+        ),
         f"Подтверждённый банк до героя {snapshot.pot_before} фишек; доплата {snapshot.to_call} фишек.",
         "Действия до героя: "
         + "; ".join(
@@ -33,7 +42,8 @@ def spot_agent_context(spot: CanonicalDecisionSpot, snapshot: DecisionSnapshot) 
             "Не называй вердикт о сыгранном: действие героя неизвестно. Не используй HH-чарты "
             "для линии, которую они не покрывают. Для порога колла сначала вызови "
             "spot_call_scenario с явным условием о всех игроках после героя. "
-            "Без диапазона оппонента не советуй колл или фолд."
+            "Без диапазона оппонента не советуй колл или фолд. "
+            "Без выплат и баунти не называй численный ICM/KO EV."
         ),
     ]
     numbers = {
@@ -43,6 +53,7 @@ def spot_agent_context(spot: CanonicalDecisionSpot, snapshot: DecisionSnapshot) 
         float(snapshot.pot_before),
         float(snapshot.to_call),
         *(float(v) for v in snapshot.committed.values()),
+        *(float(p.approx_stack_behind / spot.bb) for p in spot.players if p.approx_stack_behind is not None),
     }
     return AgentContext(
         text="\n".join(lines),
