@@ -58,10 +58,12 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 import structlog
+from pydantic_ai.messages import ModelMessage, ModelRequest
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from harness.agent.history import dump_history, load_history, trim_history
+from harness.agent.decision_spot import spot_agent_context, spot_tools
+from harness.agent.history import HAND_KEY, dump_history, load_history, trim_history, turns
 from harness.agent.run import run_agent_turn
 from harness.analysis import analyze_hand
 from harness.analysis.player_stats import player_stats_by_label
@@ -84,7 +86,13 @@ from harness.contracts import (
     Zone,
     is_judged,
 )
+from harness.contracts.decision_spot import (
+    CanonicalDecisionSpot,
+    DecisionSnapshot,
+    SpotCallScenario,
+)
 from harness.engine import enrich
+from harness.engine.decision_spot import InvalidDecisionSpot, replay_until_decision
 from harness.explanation import hand_replay, render_range_png
 from harness.explanation.agent_checks import AgentContext, agent_context
 from harness.memory.models import Job as JobModel
@@ -92,13 +100,16 @@ from harness.memory.models import Player
 from harness.memory.repos import (
     AnalysesRepo,
     CalcCacheRepo,
+    DecisionSpotsRepo,
     HandsRepo,
     QuotaRepo,
     SessionsRepo,
     TournamentsRepo,
 )
 from harness.normalizer import normalize
+from harness.normalizer.decision_spot import normalize_decision_spot
 from harness.parsers import hh_parser
+from harness.parsers.decision_spot import extract_decision_spot, looks_like_decision_spot
 from harness.parsers.vision_adapter import (
     VisionOutcome,
     VisionReadFailed,
@@ -125,6 +136,8 @@ from harness.presentation import (
     range_photos,
     scan_summary_msg,
     send_as_file_msg,
+    spot_question_msg,
+    spot_scenario_msg,
     vision_gave_up_msg,
 )
 
@@ -1320,6 +1333,31 @@ async def _agent_context(session: AsyncSession, analysis_id: int | None) -> Agen
     hand = await HandsRepo(session).get(analysis.hand_id)
     return None if hand.enriched is None else agent_context(analysis.result, hand.enriched)
 
+def _marker_of(turn: list[ModelMessage]) -> int | None:
+    for message in turn:
+        if isinstance(message, ModelRequest) and isinstance(message.metadata, dict):
+            return message.metadata.get(HAND_KEY)
+    return None
+
+
+def _only_context(history: list[ModelMessage], marker: int | None) -> list[ModelMessage]:
+    return [message for group in turns(history) if _marker_of(group) == marker for message in group]
+
+
+def _other_contexts(history: list[ModelMessage], marker: int | None) -> list[ModelMessage]:
+    return [message for group in turns(history) if _marker_of(group) != marker for message in group]
+
+
+def _non_spot_history(history: list[ModelMessage], analysis_id: int | None = None) -> list[ModelMessage]:
+    return _only_context(history, analysis_id)
+
+
+def _spot_history(history: list[ModelMessage]) -> list[ModelMessage]:
+    return [
+        message for group in turns(history) if (_marker_of(group) or 0) < 0 for message in group
+    ]
+
+
 
 async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
     """Ход агента: контекст, история вечера, модель, проверки, журнал, ответ.
@@ -1337,12 +1375,107 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
         chat_id = await _chat_id(session, job.player_id)
         sessions = SessionsRepo(session)
         state = await sessions.agent_state(job.session_id)
-        context = await _agent_context(session, state.last_analysis_id)
+        spots = DecisionSpotsRepo(session)
+        active = (
+            await spots.get(state.active_spot_id, job.player_id, job.session_id)
+            if state.active_spot_id is not None
+            else None
+        )
         history = trim_history(load_history(state.history), deps.agent_history_max_tokens)
         await session.commit()
 
         typing = asyncio.create_task(_keep_typing(deps.sender, chat_id))
         try:
+            candidate = looks_like_decision_spot(payload["text"])
+            continuing = active is not None and active.status == "draft" and not candidate
+            if candidate or continuing:
+                source = (
+                    active.source_text + "\nУточнение: " + payload["text"]
+                    if continuing and active is not None
+                    else payload["text"]
+                )
+                async with trace.span("spot_extract"):
+                    raw = await extract_decision_spot(deps.llm, source, trace.trace_id)
+                if raw is not None:
+                    canonical, questions = normalize_decision_spot(raw)
+                    snapshot = None
+                    if canonical is not None:
+                        try:
+                            snapshot = replay_until_decision(canonical)
+                        except InvalidDecisionSpot as exc:
+                            questions = [str(exc)]
+                    row = await spots.save(
+                        player_id=job.player_id,
+                        session_id=job.session_id,
+                        source_text=source,
+                        raw=raw.model_dump(mode="json"),
+                        canonical=canonical.model_dump(mode="json")
+                        if snapshot and canonical
+                        else None,
+                        snapshot=snapshot.model_dump(mode="json") if snapshot else None,
+                        prior_id=active.id if continuing and active is not None else None,
+                    )
+                    await session.commit()
+                    trace.record(
+                        "spot_extraction",
+                        spot_id=row.id,
+                        version=row.version,
+                        verified=snapshot is not None,
+                        missing_count=len(questions),
+                    )
+                    if snapshot is None:
+                        msg = spot_question_msg(questions)
+                        await _send_idempotent(
+                            deps, session, job.id, worker_id, "result_message_id", chat_id, msg
+                        )
+                        await session.commit()
+                        return
+                    active = row
+                elif continuing:
+                    msg = spot_question_msg(["Уточните недостающий факт в описании руки."])
+                    await _send_idempotent(
+                        deps, session, job.id, worker_id, "result_message_id", chat_id, msg
+                    )
+                    await session.commit()
+                    return
+                else:
+                    # A new hand-like text was rejected by extraction. Do not answer
+                    # from an older verified spot or HH context in this turn.
+                    msg = spot_question_msg(
+                        [
+                            (
+                                "Не удалось прочитать точку решения. Опишите одну префлоп-раздачу "
+                                "до вашего действия текстом."
+                            )
+                        ]
+                    )
+                    await _send_idempotent(
+                        deps, session, job.id, worker_id, "result_message_id", chat_id, msg
+                    )
+                    await session.commit()
+                    return
+
+            spot = None
+            snapshot = None
+            marker = None
+            extra_calls: list[dict[str, Any]] = []
+            if (
+                active is not None
+                and active.status == "verified"
+                and active.canonical
+                and active.snapshot
+            ):
+                spot = CanonicalDecisionSpot.model_validate(active.canonical)
+                snapshot = DecisionSnapshot.model_validate(active.snapshot)
+                marker = -active.id
+                context = spot_agent_context(spot, snapshot)
+                turn_history = _only_context(history, marker)
+                extra_tools = spot_tools(active.id, spot, snapshot, extra_calls)
+            else:
+                context = await _agent_context(session, state.last_analysis_id)
+                marker = state.last_analysis_id if context is not None else None
+                turn_history = _non_spot_history(history, marker)
+                extra_tools = []
             async with trace.span("agent"):
                 turn = await run_agent_turn(
                     session,
@@ -1351,27 +1484,46 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
                     session_id=job.session_id,
                     text=payload["text"],
                     trace_id=trace.trace_id,
-                    history=history,
+                    history=turn_history,
                     context=context,
                     # Сводки нет — руки тоже нет: указатель на разбор без руки
                     # инструментам диапазона не нужен.
-                    analysis_id=state.last_analysis_id if context is not None else None,
+                    analysis_id=marker if marker is not None and marker > 0 else None,
+                    context_marker=marker,
+                    extra_tools=extra_tools,
+                    extra_calls=extra_calls,
+                    boundary_history=history,
                 )
         finally:
             typing.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await typing
 
-        trace.record("agent_turn", question=payload["text"], **turn.journal())
-        msg = agent_turn_msg(
-            turn.state,
-            turn.prose,
-            list(turn.results),
-            from_context=turn.from_context,
-            from_history=turn.from_history,
-            job_id=job.id,
-            assumption=turn.assumption,
-        )
+        if marker is None or marker > 0:
+            trace.record("agent_turn", question=payload["text"], **turn.journal())
+        else:
+            trace.record(
+                "agent_turn", spot_id=active.id if active is not None else None, **turn.journal()
+            )
+        last_scenario = next((call["output"] for call in reversed(extra_calls)
+                              if "output" in call), None)
+        if marker is not None and marker < 0 and turn.state == "numbers" and last_scenario is not None:
+            scenario = SpotCallScenario.model_validate(last_scenario)
+            msg = spot_scenario_msg(
+                scenario.condition, scenario.pot_before, scenario.to_call,
+                scenario.equity_threshold, scenario.equity, scenario.explanation,
+            )
+        else:
+            msg = agent_turn_msg(
+                turn.state,
+                turn.prose,
+                list(turn.results),
+                from_context=turn.from_context,
+                from_history=turn.from_history,
+                job_id=job.id,
+                context_source="текстовый спот" if marker is not None and marker < 0 else "разбор раздачи",
+                assumption=turn.assumption,
+            )
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
         await session.commit()
         # В историю — только то, что игрок видел (решение контроллера по вопросу
@@ -1379,6 +1531,7 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
         # И только после отправки: упавшая отправка истории не трогает
         # (`test_a_failed_send_leaves_the_evening_history_unchanged`).
         seen = turn.saved_messages(None if turn.state == "prose" else msg.text)
+        seen = [*_other_contexts(history, marker), *seen]
         await sessions.save_agent_history(
             job.session_id, dump_history(trim_history(seen, deps.agent_history_max_tokens))
         )

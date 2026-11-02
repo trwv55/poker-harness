@@ -1820,6 +1820,29 @@ def unsupported_document_msg() -> Msg:
         )
     )
 
+def spot_description_file_msg() -> Msg:
+    return Msg(
+        text="Описание раздачи пришлите обычным текстовым сообщением. Файл .txt нужен для hand history из покеррума."
+    )
+
+
+def spot_question_msg(questions: Sequence[str]) -> Msg:
+    listed = "\n".join(f"• {question}" for question in questions[:2])
+    return Msg(text="Для разбора точки до вашего действия уточните:\n" + listed)
+
+
+def spot_scenario_msg(condition: str, pot: int, to_call: int, threshold: float | None,
+                      equity: float | None, explanation: str) -> Msg:
+    lines = [f"По вашему описанию, {condition}:",
+             f"банк до вашего хода {pot} фишек; доплата {to_call} фишек."]
+    if threshold is not None:
+        lines.append(f"Колл требует не меньше {round(threshold * 100)}% эквити.")
+    if equity is not None:
+        lines.append(f"Эквити против указанного диапазона: {round(equity * 100)}%.")
+    lines.append(explanation)
+    return Msg(text="\n".join(lines))
+
+
 
 def screenshots_not_supported_msg() -> Msg:
     """Экран стола прислан — разбора не будет, и причина названа вслух.
@@ -3023,6 +3046,7 @@ def agent_turn_msg(
     from_context: bool,
     from_history: bool = False,
     job_id: int,
+    context_source: str = "разбор раздачи",
     assumption: str | None = None,
 ) -> Msg:
     """Ответ агента — одно из трёх состояний (спека агента, §7).
@@ -3074,7 +3098,7 @@ def agent_turn_msg(
         sources = [
             word
             for word, present in (
-                ("разбор раздачи", from_context),
+                (context_source, from_context),
                 ("расчёты выше в этом разговоре", from_history),
             )
             if present

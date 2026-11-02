@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import delete, exists, func, literal, select, text, update
+from sqlalchemy import delete, exists, func, literal, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -53,6 +53,7 @@ from harness.memory.models import (
     Analysis,
     CalcCache,
     DecisionPointRow,
+    DecisionSpot,
     EvalCase,
     Hand,
     Invite,
@@ -233,6 +234,7 @@ class AgentState:
 
     history: list[dict[str, Any]] | None
     last_analysis_id: int | None
+    active_spot_id: int | None = None
 
 
 class SessionsRepo:
@@ -243,6 +245,14 @@ class SessionsRepo:
 
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
+    async def active(self, player_id: int) -> SessionRow | None:
+        return await self.db.scalar(
+            select(SessionRow)
+            .where(SessionRow.player_id == player_id, SessionRow.closed_at.is_(None))
+            .order_by(SessionRow.started_at.desc())
+            .limit(1)
+        )
+
 
     async def active_or_create(self, player_id: int) -> SessionRow:
         """Активная сессия игрока или новая. Сериализовано по игроку (fix round 1).
@@ -410,12 +420,16 @@ class SessionsRepo:
     async def agent_state(self, session_id: int) -> AgentState:
         row = (
             await self.db.execute(
-                select(SessionRow.agent_history, SessionRow.last_analysis_id).where(
-                    SessionRow.id == session_id
-                )
+                select(
+                    SessionRow.agent_history, SessionRow.last_analysis_id, SessionRow.active_spot_id
+                ).where(SessionRow.id == session_id)
             )
         ).one()
-        return AgentState(history=row.agent_history, last_analysis_id=row.last_analysis_id)
+        return AgentState(
+            history=row.agent_history,
+            last_analysis_id=row.last_analysis_id,
+            active_spot_id=row.active_spot_id,
+        )
 
     async def save_agent_history(self, session_id: int, history: list[dict[str, Any]]) -> bool:
         """Записать историю, только пока сессия открыта.
@@ -437,9 +451,65 @@ class SessionsRepo:
         await self.db.execute(
             update(SessionRow)
             .where(SessionRow.id == session_id)
-            .values(last_analysis_id=analysis_id)
+            .values(last_analysis_id=analysis_id, active_spot_id=None)
             .execution_options(synchronize_session=False)
         )
+
+class DecisionSpotsRepo:
+    """Session-owned text spots; no row is inserted into hands or analyses."""
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def get(self, spot_id: int, player_id: int, session_id: int) -> DecisionSpot | None:
+        return await self.db.scalar(
+            select(DecisionSpot).where(
+                DecisionSpot.id == spot_id,
+                DecisionSpot.player_id == player_id,
+                DecisionSpot.session_id == session_id,
+            )
+        )
+
+    async def save(
+        self,
+        *,
+        player_id: int,
+        session_id: int,
+        source_text: str,
+        raw: dict[str, Any],
+        canonical: dict[str, Any] | None,
+        snapshot: dict[str, Any] | None,
+        prior_id: int | None = None,
+    ) -> DecisionSpot:
+        session = await self.db.scalar(
+            select(SessionRow)
+            .where(
+                SessionRow.id == session_id,
+                SessionRow.player_id == player_id,
+                SessionRow.closed_at.is_(None),
+            )
+            .with_for_update()
+        )
+        if session is None:
+            raise ValueError("сессия уже закрыта")
+        prior = None
+        if prior_id is not None and session.active_spot_id == prior_id:
+            prior = await self.get(prior_id, player_id, session_id)
+        row = DecisionSpot(
+            session_id=session_id, player_id=player_id,
+            version=prior.version + 1 if prior is not None else 1,
+            status="draft", source_text=source_text, raw=raw,
+        )
+        self.db.add(row)
+        await self.db.flush()
+        row.canonical = canonical
+        row.snapshot = snapshot
+        row.status = "verified" if canonical is not None and snapshot is not None else "draft"
+        session.active_spot_id = row.id
+        session.last_analysis_id = None
+        await self.db.flush()
+        return row
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -1273,6 +1343,10 @@ class QuotaRepo:
         """
         return (
             Job.player_id == player_id,
+            or_(
+                Job.type != "agent",
+                Job.payload["spot_clarification"].astext.is_distinct_from("true"),
+            ),
             Job.type.in_(QUOTA_INTERACTIVE_JOB_TYPES),
             Job.status != "failed",
             Job.created_at > since,

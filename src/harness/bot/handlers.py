@@ -48,6 +48,7 @@ from harness.contracts import (
 from harness.memory.models import Job, Player
 from harness.memory.repos import (
     AnalysesRepo,
+    DecisionSpotsRepo,
     EvalCasesRepo,
     HandsRepo,
     InvitesRepo,
@@ -61,6 +62,7 @@ from harness.memory.repos import (
     SessionsRepo,
     TournamentsRepo,
 )
+from harness.parsers.decision_spot import looks_like_decision_spot
 from harness.parsers.vision_adapter import apply_vision_answer
 from harness.platform.queue import JobsQueue
 from harness.presentation import (
@@ -121,6 +123,7 @@ from harness.presentation import (
     ranges_msg,
     screenshots_not_supported_msg,
     session_unavailable_msg,
+    spot_description_file_msg,
     start_msg,
     unknown_text_msg,
     unsupported_document_msg,
@@ -593,6 +596,9 @@ async def handle_document(
         if player is None:
             await db.commit()
             return invite_required_msg()
+        if looks_like_decision_spot(file_bytes[:4000].decode("utf-8", errors="ignore")):
+            await db.commit()
+            return spot_description_file_msg()
         # Байты ложатся на диск ТОЛЬКО за проверкой инвайта. Телеграм отдаёт
         # документы до 20 МБ, и запись до неё складывала в общий том файлы
         # любого, кто нашёл бота
@@ -943,18 +949,31 @@ async def handle_text(deps: BotDeps, tg_user_id: int, text: str) -> Msg | None:
             await db.commit()
             return reply
         player_id = player.id
+        active = await SessionsRepo(db).active(player_id)
+        prior = (
+            await DecisionSpotsRepo(db).get(active.active_spot_id, player_id, active.id)
+            if active is not None and active.active_spot_id is not None
+            else None
+        )
+        spot_clarification = (
+            prior is not None and prior.status == "draft" and not looks_like_decision_spot(answer)
+        )
         await db.commit()
 
     # Квота — до заведения сессии и с той же оговоркой о мягком пределе, что у
     # `handle_deep_dive_callback`.
-    quota = await check_quota(deps, player_id)
-    if not quota.allowed:
-        return quota_exceeded_msg(quota.hours_to_free)
+    if not spot_clarification:
+        quota = await check_quota(deps, player_id)
+        if not quota.allowed:
+            return quota_exceeded_msg(quota.hours_to_free)
     async with deps.db_factory() as db:
         session_id = (await SessionsRepo(db).active_or_create(player_id)).id
         await db.commit()
     await deps.queue.enqueue(
-        type="agent", player_id=player_id, session_id=session_id, payload={"text": answer}
+        type="agent",
+        player_id=player_id,
+        session_id=session_id,
+        payload={"text": answer, **({"spot_clarification": True} if spot_clarification else {})},
     )
     return None
 

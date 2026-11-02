@@ -16,6 +16,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 from pydantic_ai import ModelRetry
 from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
+from pydantic_ai.tools import Tool
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from harness.agent import prompt as _prompt
@@ -63,6 +64,13 @@ REWRITE_HEAD = "Ответ не прошёл проверку:"
 # (`test_a_markdown_separator_also_splits_the_text`).
 _ASSUMPTION_SEPARATOR_RE = re.compile(
     r"^[ \t\u00a0*_#>]*оценка модели[*_]*:[*_]*", re.IGNORECASE | re.MULTILINE
+)
+_SPOT_ADVICE_RE = re.compile(
+    r"\b(?:рекомендую|советую|надо|нужно|стоит|лучше|есть)\s+"
+    r"(?:делать\s+)?(?:колл|коллировать|фолд|пас|сброс|пуш)|"
+    r"\b(?:коллируйте|сбрасывайте|пушьте)\b|"
+    r"\b(?:колл|фолд)\s+есть\b|\bя\s+бы\s+(?:коллировал|сбросил|пасовал)\b",
+    re.IGNORECASE
 )
 
 
@@ -269,6 +277,10 @@ async def run_agent_turn(
     history: Sequence[ModelMessage],
     context: AgentContext | None,
     system_prompt: str | None = None,
+    context_marker: int | None = None,
+    extra_tools: Sequence[Tool[None]] = (),
+    extra_calls: list[dict[str, Any]] | None = None,
+    boundary_history: Sequence[ModelMessage] | None = None,
     analysis_id: int | None = None,
 ) -> AgentTurn:
     """Ход: вызов модели, проверки, не более одной попытки переписать.
@@ -295,7 +307,10 @@ async def run_agent_turn(
     `test_classes_named_earlier_in_the_same_hand_are_added_and_after_a_new_hand_not`).
     """
     system = system_prompt if system_prompt is not None else _prompt.load_system_prompt()
-    instructions = _prompt.instructions_for(system, context)
+    if context_marker is not None and context_marker < 0 and context is not None:
+        instructions = f"{system}\n\nТекстовый спот, проверенный снимок до действия героя:\n{context.text}"
+    else:
+        instructions = _prompt.instructions_for(system, context)
     board = context.board_ranks if context is not None else ()
     # Числа игрока (решение R1): его реплики в истории вечера и текущая, без
     # обозначений карт. Не из `messages`: после попытки переписать там и просьба
@@ -319,10 +334,11 @@ async def run_agent_turn(
         max_calcs=MAX_CALCS_PER_TURN, sizes_from=sizes_from, analysis_id=analysis_id,
         narrowings=narrowings_in(history), player_classes=named,
     )
-    tools = tools_for(db, player_id, session_id, run_state)
+    tools = [*tools_for(db, player_id, session_id, run_state), *extra_tools]
     # Другая рука, чем у прошлого хода вечера, — отметка перед вопросом (решение
     # владельца 2026-10-15); она в реплике хода и уйдёт с ней в историю.
-    boundary = hand_boundary(history, analysis_id)
+    marker = context_marker if context_marker is not None else analysis_id
+    boundary = hand_boundary(boundary_history if boundary_history is not None else history, marker)
 
     draft, meta = await llm(
         "agent", AgentDraft, prompt=text, preface=() if boundary is None else (boundary,),
@@ -333,6 +349,8 @@ async def run_agent_turn(
     messages = meta.messages
     grounded = context is not None or bool(calcs_in_history(messages))
     answer_found, block_found = _draft_violations(draft, messages, context, said)
+    if context_marker is not None and context_marker < 0 and _SPOT_ADVICE_RE.search(draft.answer):
+        answer_found.append("По текстовому споту нельзя давать прямой совет колл/фолд.")
     found = answer_found + block_found
     violations: list[tuple[str, ...]] = [tuple(found)]
     prose: str | None = draft.answer.strip() if not found else None
@@ -360,6 +378,8 @@ async def run_agent_turn(
         messages = meta.messages
         rewrite_at = _rewrite_index(messages, first_len - 1, request)
         answer_found, block_found = _draft_violations(draft, messages, context, said)
+        if context_marker is not None and context_marker < 0 and _SPOT_ADVICE_RE.search(draft.answer):
+            answer_found.append("По текстовому споту нельзя давать прямой совет колл/фолд.")
         second = answer_found + block_found
         violations.append(tuple(second))
         prose = draft.answer.strip() if not answer_found else first_answer
@@ -387,11 +407,11 @@ async def run_agent_turn(
         from_history=bool(calcs_in_history(history)) and not run_state.results,
         messages=tuple(messages),
         violations=tuple(violations),
-        calls=tuple(run_state.calls),
+        calls=(*run_state.calls, *(extra_calls or [])),
         drafts=tuple(drafts),
         history_len=start,
         rewrite_at=rewrite_at,
-        analysis_id=analysis_id,
+        analysis_id=marker,
         assumption=assumption,
         assumption_dropped=fell_back
         or (grounded and block_text is not None and assumption is None),

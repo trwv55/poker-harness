@@ -80,7 +80,7 @@ __all__ = [
 # срабатывает раньше, а не позже.
 _BYTES_PER_TOKEN = 3
 
-_CALC_TOOLS = frozenset(name.value for name in CalcName)
+_CALC_TOOLS = frozenset(name.value for name in CalcName) | {"spot_call_scenario"}
 
 # Ключ метаданных запроса с репликой игрока: указатель разбора её хода (`None` —
 # ход без разбора).
@@ -276,7 +276,7 @@ def trim_history(messages: Sequence[ModelMessage], max_tokens: int) -> list[Mode
 
 def _is_output_call(part: object) -> bool:
     """Вызов вывода (`final_result`), а не расчёта: инструменты агента — ровно
-    имена `CalcName` (`test_the_agent_tool_set_covers_every_calculation_name_exactly_once`)."""
+    имена `CalcName` и условный расчёт текстового спота."""
     return isinstance(part, ToolCallPart) and part.tool_name not in _CALC_TOOLS
 
 

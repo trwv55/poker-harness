@@ -62,6 +62,7 @@ from harness.presentation import (
     new_session_msg,
     owner_admitted_msg,
     quota_exceeded_msg,
+    spot_description_file_msg,
     start_msg,
     unknown_button_msg,
     unsupported_document_msg,
@@ -486,6 +487,19 @@ async def test_non_txt_document_refused_without_side_effects(db_factory, deps, t
     )
 
     assert msg == unsupported_document_msg()
+    assert await fetch_all(db_factory, "select * from jobs") == []
+    assert await fetch_all(db_factory, "select * from sessions") == []
+    assert not (tmp_path / "hh").exists()
+
+
+async def test_text_spot_file_asks_for_a_message_without_starting_hh_scan(
+    db_factory, deps, tmp_path: Path, invited
+):
+    description = "BB 99, CO открыл 2.5 bb, BTN пушит. Что делать?"
+    msg = await handle_document(
+        deps, tg_user_id=_TG_USER_ID, file_bytes=description.encode(), filename="spot.txt"
+    )
+    assert msg == spot_description_file_msg()
     assert await fetch_all(db_factory, "select * from jobs") == []
     assert await fetch_all(db_factory, "select * from sessions") == []
     assert not (tmp_path / "hh").exists()
@@ -2844,6 +2858,30 @@ async def test_free_text_of_a_dev_becomes_an_agent_job(db_factory, deps, invited
     assert await handle_text(deps, _TG_USER_ID, "как часто я вхожу в банк") is None
     job = await fetch_one(db_factory, "select type, payload, priority from jobs")
     assert (job["type"], job["payload"], job["priority"]) == ("agent", {"text": "как часто я вхожу в банк"}, 100)
+
+
+async def test_a_spot_clarification_is_queued_without_spending_another_quota_unit(
+    db_factory, deps, invited
+):
+    from harness.bot.handlers import handle_text
+    from harness.memory.repos import DecisionSpotsRepo
+
+    await _make_dev(db_factory, invited)
+    async with db_factory() as db:
+        session = await SessionsRepo(db).active_or_create(invited)
+        await DecisionSpotsRepo(db).save(
+            player_id=invited, session_id=session.id, source_text="BB 99, что делать?",
+            raw={}, canonical=None, snapshot=None,
+        )
+        await db.commit()
+
+    before = await check_quota(deps, invited)
+    assert await handle_text(deps, _TG_USER_ID, "анте 100 каждый") is None
+    job = await fetch_one(db_factory, "select type, payload from jobs")
+    assert job["type"] == "agent"
+    assert job["payload"] == {"text": "анте 100 каждый", "spot_clarification": True}
+    after = await check_quota(deps, invited)
+    assert after.left == before.left
 
 
 async def test_a_player_without_access_gets_the_old_answer_and_no_job(db_factory, deps, invited):

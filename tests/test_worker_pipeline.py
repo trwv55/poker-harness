@@ -2160,6 +2160,45 @@ async def test_an_agent_job_answers_journals_and_keeps_the_evening_history(
     assert turn["calls"][0]["zone"] == "strict" and turn["rewrite"] is False
 
 
+async def test_a_text_spot_job_stops_before_hero_and_stays_out_of_hands(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    from tests.test_agent import _TurnScript
+    from tests.test_decision_spot import sample
+
+    raw = sample()
+
+    async def extracted(_llm, _text, _trace_id):
+        return raw
+
+    monkeypatch.setattr(pipeline_module, "extract_decision_spot", extracted)
+    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    player_id, session_id = await _make_scope(db_factory)
+    jid = await queue.enqueue(
+        type="agent", player_id=player_id, session_id=session_id,
+        payload={"text": raw.source_text},
+    )
+    job = await queue.claim("w1")
+    assert job is not None
+    script = _TurnScript([([], "Это условный спот до действия героя.")])
+    await run_job(
+        job, replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script)))
+    )
+
+    assert await job_status(db_factory, jid) == "done"
+    assert any("условный спот" in message for message in _all_texts(fake_sender))
+    async with db_factory() as session:
+        state = await SessionsRepo(session).agent_state(session_id)
+        rows = (await session.execute(text(
+            "select id, status, snapshot from decision_spots where session_id = :session_id"
+        ), {"session_id": session_id})).all()
+        hand_count = (await session.execute(text("select count(*) from hands"))).scalar_one()
+    assert len(rows) == 1 and rows[0].status == "verified"
+    assert rows[0].snapshot["positions_still_to_act"] == ["CO"]
+    assert state.active_spot_id == rows[0].id and state.last_analysis_id is None
+    assert hand_count == 0
+
+
 async def _agent_range_turn(db_factory, queue, deps, *, with_analysis: bool):
     """Задача `agent`, в которой модель зовёт `opponent_range`; вечер с разбором
     синтетической руки (указатель `last_analysis_id` выставлен) или без него.
