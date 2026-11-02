@@ -1116,6 +1116,21 @@ async def test_a_hung_provider_request_is_cut_by_the_request_timeout(db_factory)
     assert rows == [("error",)]
 
 
+async def test_agent_request_can_outlast_provider_timeout(db_factory):
+    """Агент ждёт ответ дольше общего лимита запроса; бюджет задачи остаётся снаружи."""
+    trace_id = await _make_trace_scope(db_factory, tg_user_id=222)
+
+    async def slow(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        await asyncio.sleep(1.1)
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {"text": "ok"})])
+
+    llm = LLM(replace_cfg(llm_request_timeout_s=1), db_factory, model_override=FunctionModel(slow))
+    result, _ = await asyncio.wait_for(llm("agent", Out, prompt="п", trace_id=trace_id), 5)
+
+    assert result.text == "ok"
+    assert await fetch_all(db_factory, "select status from llm_calls") == [("ok",)]
+
+
 async def test_the_history_reaches_the_model_and_comes_back_with_the_new_turn(db_factory):
     """`message_history` уходит модели, `CallMeta.messages` — история плюс ход."""
     trace_id = await _make_trace_scope(db_factory, tg_user_id=23)

@@ -530,12 +530,14 @@ class LLM:
 
 class _MeteredModel(WrapperModel):
     """Модель, у которой КАЖДЫЙ запрос к провайдеру — свой слот лимитера, своя
-    строка `llm_calls`, свой таймаут и свои HTTP-ретраи.
+    строка `llm_calls`, свой таймаут и свои HTTP-ретраи. Для агента
+    таймаут отдельного запроса отключён: его ограничивает бюджет задачи.
 
     Прогон агента с инструментами — несколько запросов; считать его одним значило
     занижать окно темпа `PgLimiter` ровно там, где нагрузка растёт
     (`test_a_turn_with_two_tool_calls_logs_three_requests`). Таймаут
-    (`Config.llm_request_timeout_s`) обёрнут вокруг одного запроса, а не прогона:
+    (`Config.llm_request_timeout_s`) обёрнут вокруг одного запроса, а не прогона
+    для всех назначений, кроме агента:
     зависший запрос снимается сам, строка закрывается `error`, наружу —
     `LLMProviderError` (`test_a_hung_provider_request_is_cut_by_the_request_timeout`).
 
@@ -625,7 +627,7 @@ class _MeteredModel(WrapperModel):
         model_request_parameters: ModelRequestParameters,
     ) -> ModelResponse:
         llm = self._meter_llm
-        timeout_s = llm._cfg.llm_request_timeout_s
+        timeout_s = None if self._meter_purpose == "agent" else llm._cfg.llm_request_timeout_s
         last_http_error: ModelHTTPError | None = None
         for http_attempt in range(_MAX_HTTP_ATTEMPTS):
             async with llm._limiter.slot(deadline=self._meter_deadline):
