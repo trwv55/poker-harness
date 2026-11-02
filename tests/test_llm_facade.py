@@ -1183,6 +1183,13 @@ async def test_spot_extraction_uses_the_configured_flash_model(db_factory):
     assert llm._resolve_model("spot_extract") == "openrouter:qwen/qwen3.8-flash"
 
 
+def test_qwen_flash_uses_auto_tool_choice_on_openrouter(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key-not-real")
+    model = _build_model("openrouter:qwen/qwen3.8-flash")
+    assert isinstance(model, Model)
+    assert model.profile.get("openai_supports_tool_choice_required") is False
+
+
 def test_config_reads_the_agent_variables_with_defaults(monkeypatch):
     for name, value in (
         ("LLM_VERDICT_MODEL", "anthropic:v"),

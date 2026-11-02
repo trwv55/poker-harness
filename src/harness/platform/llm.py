@@ -52,6 +52,7 @@ from pydantic_ai.models.openrouter import (
 )
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.profiles.anthropic import AnthropicModelProfile
+from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import Tool
 from sqlalchemy import update
@@ -227,8 +228,13 @@ def _build_model(
         }
         if provider_order:
             route["order"] = list(provider_order)
+        profile = (
+            OpenAIModelProfile(openai_supports_tool_choice_required=False)
+            if name == "qwen/qwen3.8-flash"
+            else None
+        )
         return OpenRouterModel(
-            name, settings=OpenRouterModelSettings(openrouter_provider=route)
+            name, profile=profile, settings=OpenRouterModelSettings(openrouter_provider=route)
         )
     if sep and provider == "anthropic" and name.startswith(_REJECTS_FORCED_TOOL_CHOICE):
         return AnthropicModel(
