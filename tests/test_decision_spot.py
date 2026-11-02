@@ -272,7 +272,7 @@ async def test_long_clarification_reaches_extractor_and_keeps_full_evidence() ->
 
 
 @pytest.mark.asyncio
-async def test_extractor_rejects_known_fact_without_literal_evidence() -> None:
+async def test_extractor_downgrades_known_fact_without_literal_evidence() -> None:
     source = "За столом 8 игроков, блины 400/800"
 
     class FakeLLM:
@@ -280,7 +280,8 @@ async def test_extractor_rejects_known_fact_without_literal_evidence() -> None:
             raw = RawDecisionSpot(table_size=fact("8','quote':'8", ""))
             return SpotExtraction(is_spot=True, spot=raw), None
 
-    assert await extract_decision_spot(FakeLLM(), source, 1) is None  # type: ignore[arg-type]
+    extracted = await extract_decision_spot(FakeLLM(), source, 1)  # type: ignore[arg-type]
+    assert extracted is not None and extracted.table_size.status == "missing"
 
 
 def test_heads_up_fold_ends_hand_before_hero_decision() -> None:

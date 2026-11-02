@@ -59,17 +59,19 @@ async def extract_decision_spot(llm: LLM, text: str, trace_id: int) -> RawDecisi
     )
     if not result.is_spot or result.spot is None:
         return None
-    spot = result.spot.model_copy(update={"source_text": text})
+    spot = result.spot.model_copy(deep=True, update={"source_text": text})
     facts = [
         spot.table_size, spot.sb, spot.bb, spot.ante, spot.hero_position, spot.hero_cards,
         *(player.stack for player in spot.players),
         *(action.amount for action in spot.actions),
     ]
-    if any(
-        fact.status == "known" and (
+    for fact in facts:
+        if fact.status == "known" and (
             not fact.value or not fact.quote or fact.quote.casefold() not in text.casefold()
-        )
-        for fact in facts
-    ):
-        return None
+        ):
+            # Keep the usable parts of a partial extraction; the normalizer will
+            # ask for this fact instead of discarding the entire hand description.
+            fact.status = "missing"
+            fact.value = None
+            fact.quote = ""
     return spot
