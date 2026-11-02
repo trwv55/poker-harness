@@ -2237,6 +2237,46 @@ async def test_replaying_saved_clarification_does_not_call_model_again(
     assert any("блайнды" in message for message in _all_texts(fake_sender))
 
 
+async def test_short_ante_payer_reply_uses_saved_spot_without_model(
+    db_factory, queue, deps, monkeypatch
+):
+    from harness.contracts.decision_spot import RawDecisionSpot, SpotFact
+    from harness.memory.repos import DecisionSpotsRepo
+
+    async def forbidden_extract(*args, **kwargs):
+        raise AssertionError("ante payer reply must not call model")
+
+    monkeypatch.setattr(pipeline_module, "extract_decision_spot", forbidden_extract)
+    player_id, session_id = await _make_scope(db_factory)
+    source = "5 игроков, анте 100"
+    raw = RawDecisionSpot(
+        source_text=source,
+        table_size=SpotFact(value="5", quote="5 игроков", status="known"),
+        ante=SpotFact(value="100", quote="анте 100", status="known"),
+    )
+    async with db_factory() as session:
+        await DecisionSpotsRepo(session).save(
+            player_id=player_id, session_id=session_id,
+            source_text=source, raw=raw.model_dump(mode="json"),
+            canonical=None, snapshot=None,
+        )
+        await session.commit()
+    jid = await queue.enqueue(
+        type="agent", player_id=player_id, session_id=session_id,
+        payload={"text": "каждый"},
+    )
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    assert await job_status(db_factory, jid) == "done"
+    async with db_factory() as session:
+        latest = (await session.execute(text(
+            "select raw from decision_spots where session_id = :session_id order by id desc limit 1"
+        ), {"session_id": session_id})).scalar_one()
+    assert latest["ante_type"] == "per_player"
+
+
 async def _agent_range_turn(db_factory, queue, deps, *, with_analysis: bool):
     """Задача `agent`, в которой модель зовёт `opponent_range`; вечер с разбором
     синтетической руки (указатель `last_analysis_id` выставлен) или без него.

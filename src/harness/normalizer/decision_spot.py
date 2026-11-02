@@ -24,6 +24,7 @@ _BLIND_PAIR = re.compile(
 )
 _ANTE_EACH = re.compile(r"кажд|все|each|per.?player|all players|everyone", re.IGNORECASE)
 _ANTE_BB = re.compile(r"\bBB\s+ante\b|big.?blind\s+ante|анте\s+(?:с\s+)?(?:большого\s+блайнда|бб)|бб\s+анте", re.IGNORECASE)
+_ANTE_BB_REPLY = re.compile(r"(?:(?:только\s+)?(?:BB|ББ)(?:\s+анте)?|большой\s+блайнд)", re.IGNORECASE)
 _ANTE_NONE = re.compile(r"без анте|no ante", re.IGNORECASE)
 _ACTION_WORDS = {
     "fold": re.compile(r"fold|фолд|пас|сброс|скин", re.IGNORECASE),
@@ -233,6 +234,9 @@ def normalize_decision_spot(raw: RawDecisionSpot) -> tuple[CanonicalDecisionSpot
     if not _blinds_match_quotes(raw, sb, bb):
         return None, ["Уточните, какая сумма относится к малому и большому блайнду."]
     ante_quote = raw.ante.quote
+    clarification = source.rsplit("\nУточнение: ", 1)[-1] if "\nУточнение: " in source else ""
+    each_evidenced = bool(_ANTE_EACH.search(ante_quote) or _ANTE_EACH.search(clarification))
+    bb_evidenced = bool(_ANTE_BB.search(ante_quote) or _ANTE_BB_REPLY.fullmatch(clarification))
     if raw.ante_type == "none" and _ANTE_NONE.search(ante_quote):
         ante = 0
     else:
@@ -242,10 +246,10 @@ def normalize_decision_spot(raw: RawDecisionSpot) -> tuple[CanonicalDecisionSpot
     if (
         raw.ante_type == "per_player"
         and ante > 0
-        and (not _ANTE_EACH.search(ante_quote) or _ANTE_BB.search(ante_quote))
+        and (not each_evidenced or bb_evidenced)
         or raw.ante_type == "big_blind"
         and ante > 0
-        and (not _ANTE_BB.search(ante_quote) or _ANTE_EACH.search(ante_quote))
+        and (not bb_evidenced or each_evidenced)
         or raw.ante_type == "none"
         and not _ANTE_NONE.search(ante_quote)
     ):
@@ -253,7 +257,7 @@ def normalize_decision_spot(raw: RawDecisionSpot) -> tuple[CanonicalDecisionSpot
     known_stacks = {p.position.upper() for p in raw.players if p.stack.status == "known"}
     if ante > 0 and raw.ante_type == "per_player" and any(
         position not in known_stacks for position in positions
-    ) and not _ANTE_EACH.search(ante_quote):
+    ) and not each_evidenced:
         return None, ["Все игроки внесли полное анте, без короткого олл-ин анте?"]
     if cards is not None and (
         cards[0] == cards[1]

@@ -31,6 +31,7 @@ from harness.normalizer.decision_spot import _position_in_quote, normalize_decis
 from harness.parsers.decision_spot import extract_decision_spot, looks_like_decision_spot
 from harness.presentation.messages import spot_scenario_msg
 from harness.worker.pipeline import (
+    _ante_payer_reply,
     _apply_size_clarification,
     _non_spot_history,
     _only_context,
@@ -57,6 +58,17 @@ def test_numeric_reply_corrects_only_unverified_table_size() -> None:
     corrected = _apply_size_clarification(extracted, previous, "5")
     assert corrected.table_size == fact("5", "Уточнение: 5")
     assert _apply_size_clarification(extracted, extracted, "5").table_size == extracted.table_size
+
+
+def test_short_ante_reply_is_evidence_without_repeating_amount() -> None:
+    raw = sample()
+    raw.ante.quote = "ante 100"
+    raw.source_text += "\nУточнение: каждый"
+    spot, questions = normalize_decision_spot(raw)
+    assert not questions and spot is not None and spot.ante_type == "per_player"
+    assert _ante_payer_reply("каждый") == "per_player"
+    assert _ante_payer_reply("только BB") == "big_blind"
+    assert _ante_payer_reply("какой диапазон?") is None
 
 
 def sample() -> RawDecisionSpot:

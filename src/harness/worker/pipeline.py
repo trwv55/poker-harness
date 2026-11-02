@@ -1378,6 +1378,19 @@ def _apply_size_clarification(
     return raw
 
 
+def _ante_payer_reply(answer: str) -> Literal["per_player", "big_blind"] | None:
+    reply = answer.strip()
+    if re.fullmatch(r"(?:кажд\w*|с\s+кажд\w*|все(?:\s+игроки)?)", reply, re.IGNORECASE):
+        return "per_player"
+    if re.fullmatch(
+        r"(?:(?:только\s+)?(?:BB|ББ)(?:\s+анте)?|большой\s+блайнд)",
+        reply,
+        re.IGNORECASE,
+    ):
+        return "big_blind"
+    return None
+
+
 
 async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
     """Ход агента: контекст, история вечера, модель, проверки, журнал, ответ.
@@ -1414,16 +1427,20 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
                     and active is not None
                     and active.source_text.endswith("\nУточнение: " + payload["text"])
                 )
+                ante_payer = _ante_payer_reply(payload["text"]) if continuing else None
                 if continuing and active is not None:
                     source = active.source_text
                     if not repeated_clarification:
                         source += "\nУточнение: " + payload["text"]
                 else:
                     source = payload["text"]
-                if repeated_clarification and active is not None:
+                if (repeated_clarification or ante_payer) and active is not None:
                     raw = RawDecisionSpot.model_validate(active.raw).model_copy(
+                        deep=True,
                         update={"source_text": source}
                     )
+                    if ante_payer is not None:
+                        raw.ante_type = ante_payer
                 else:
                     async with trace.span("spot_extract"):
                         raw = await extract_decision_spot(deps.llm, source, trace.trace_id)
