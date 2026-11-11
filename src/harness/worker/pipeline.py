@@ -64,8 +64,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from harness.agent.decision_spot import spot_agent_context, spot_tools
 from harness.agent.history import HAND_KEY, dump_history, load_history, trim_history, turns
+from harness.agent.natural_hand import natural_opinion
 from harness.agent.run import run_agent_turn
 from harness.analysis import analyze_hand
+from harness.analysis.natural_hand import conditional_equity
 from harness.analysis.player_stats import player_stats_by_label
 from harness.analysis.preflop import (
     equity_cache_export,
@@ -91,8 +93,10 @@ from harness.contracts.decision_spot import (
     DecisionSnapshot,
     SpotCallScenario,
 )
+from harness.contracts.natural_hand import NaturalHand
 from harness.engine import enrich
 from harness.engine.decision_spot import InvalidDecisionSpot, replay_until_decision
+from harness.engine.natural_hand import InvalidScenario, replay_natural_hand
 from harness.explanation import hand_replay, render_range_png
 from harness.explanation.agent_checks import AgentContext, agent_context
 from harness.memory.models import Job as JobModel
@@ -108,8 +112,15 @@ from harness.memory.repos import (
 )
 from harness.normalizer import normalize
 from harness.normalizer.decision_spot import normalize_decision_spot
+from harness.normalizer.natural_hand import InvalidNaturalHand, normalize_natural_hand
 from harness.parsers import hh_parser
 from harness.parsers.decision_spot import extract_decision_spot, looks_like_decision_spot
+from harness.parsers.natural_hand import (
+    InvalidNaturalReading,
+    apply_natural_correction,
+    may_describe_hand,
+    read_natural_hand,
+)
 from harness.parsers.vision_adapter import (
     VisionOutcome,
     VisionReadFailed,
@@ -140,6 +151,11 @@ from harness.presentation import (
     spot_question_msg,
     spot_scenario_msg,
     vision_gave_up_msg,
+)
+from harness.presentation.natural_hand import (
+    natural_invalid_msg,
+    natural_read_unavailable_msg,
+    natural_scenario_msg,
 )
 
 __all__ = ["Deps", "Sender", "notify_reaped_failures", "run_job"]
@@ -1388,7 +1404,99 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
 
         typing = asyncio.create_task(_keep_typing(deps.sender, chat_id))
         try:
-            candidate = looks_like_decision_spot(payload["text"])
+            natural_active = (
+                NaturalHand.model_validate(active.raw)
+                if active is not None and active.raw.get("schema_version") == 2
+                else None
+            )
+            natural_candidate = may_describe_hand(
+                payload["text"], has_active=natural_active is not None
+            ) or natural_active is not None
+            if natural_candidate:
+                try:
+                    async with trace.span("natural_hand_extract"):
+                        reading = await read_natural_hand(
+                            deps.llm, payload["text"], trace.trace_id,
+                            active=natural_active,
+                        )
+                except (LLMProviderError, LLMSchemaError):
+                    trace.record("natural_hand_extract_unavailable")
+                    await _send_idempotent(
+                        deps, session, job.id, worker_id, "result_message_id", chat_id,
+                        natural_read_unavailable_msg(),
+                    )
+                    await session.commit()
+                    return
+                except InvalidNaturalReading as exc:
+                    await _send_idempotent(
+                        deps, session, job.id, worker_id, "result_message_id", chat_id,
+                        natural_invalid_msg(str(exc)),
+                    )
+                    await session.commit()
+                    return
+                if reading.intent != "other" and reading.hand is not None:
+                    source = (
+                        apply_natural_correction(natural_active, reading.hand)
+                        if reading.intent == "correction" and natural_active is not None
+                        else reading.hand
+                    )
+                    failure = None
+                    canonical = None
+                    snapshot = None
+                    try:
+                        canonical = normalize_natural_hand(source)
+                        snapshot = replay_natural_hand(canonical)
+                    except (InvalidNaturalHand, InvalidScenario) as exc:
+                        failure = str(exc)
+                    row = await spots.save(
+                        player_id=job.player_id, session_id=job.session_id,
+                        source_text=source.source_text,
+                        raw=source.model_dump(mode="json"),
+                        canonical=canonical.model_dump(mode="json")
+                        if canonical is not None and snapshot is not None else None,
+                        snapshot=snapshot.model_dump(mode="json") if snapshot else None,
+                        prior_id=active.id if active is not None else None,
+                    )
+                    await session.commit()
+                    trace.record("natural_hand", spot_id=row.id, version=row.version,
+                                 verified=snapshot is not None, reason=failure)
+                    if canonical is not None and snapshot is not None:
+                        opinion = None
+                        try:
+                            async with trace.span("natural_hand_opinion"):
+                                opinion = await natural_opinion(
+                                    deps.llm, canonical, snapshot, trace.trace_id
+                                )
+                        except (LLMProviderError, LLMSchemaError):
+                            trace.record("natural_hand_opinion_unavailable", spot_id=row.id)
+                        equity = (
+                            conditional_equity(canonical, snapshot, opinion.opponent_range)
+                            if opinion is not None and opinion.opponent_range else None
+                        )
+                        msg = natural_scenario_msg(
+                            canonical, snapshot,
+                            opinion=opinion.explanation if opinion is not None else "",
+                            opponent_range=opinion.opponent_range if opinion is not None else None,
+                            equity=equity,
+                        )
+                    else:
+                        msg = natural_invalid_msg(
+                            failure or "Не смог восстановить точку решения."
+                        )
+                    await _send_idempotent(
+                        deps, session, job.id, worker_id, "result_message_id", chat_id, msg
+                    )
+                    await session.commit()
+                    return
+                if natural_active is not None:
+                    # A non-hand question must not be parsed as the old spot schema.
+                    active = None
+            # Legacy drafts remain readable during migration; a newly described
+            # hand never enters the old preflop-only intake path.
+            candidate = (
+                not natural_candidate and active is not None and natural_active is None
+                and looks_like_decision_spot(payload["text"])
+            )
             continuing = active is not None and active.status == "draft" and not candidate
             if continuing:
                 msg = spot_followup_msg()

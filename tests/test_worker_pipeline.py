@@ -2163,30 +2163,36 @@ async def test_an_agent_job_answers_journals_and_keeps_the_evening_history(
 async def test_a_text_spot_job_stops_before_hero_and_stays_out_of_hands(
     db_factory, queue, deps, fake_sender, monkeypatch
 ):
-    from tests.test_agent import _TurnScript
-    from tests.test_decision_spot import sample
+    from harness.contracts.natural_hand import NaturalAction, NaturalHand, NaturalRead
 
-    raw = sample()
+    source = "8 игроков, BB 99, CO открыл 2 BB, BTN пуш до 28 BB, SB пас. Есть колл?"
+    raw = NaturalHand(
+        table_size=8, hero_position="BB", hero_cards="99", source_text=source,
+        actions=[
+            NaturalAction(position="CO", kind="raise", amount="2", quote="CO открыл 2 BB"),
+            NaturalAction(position="BTN", kind="all_in", amount="28", quote="BTN пуш до 28 BB"),
+            NaturalAction(position="SB", kind="fold", quote="SB пас"),
+        ],
+    )
 
-    async def extracted(_llm, _text, _trace_id):
-        return raw
+    async def extracted(_llm, _text, _trace_id, *, active=None):
+        return NaturalRead(intent="new_hand", hand=raw)
 
-    monkeypatch.setattr(pipeline_module, "extract_decision_spot", extracted)
-    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    monkeypatch.setattr(pipeline_module, "read_natural_hand", extracted)
+    async def no_opinion(*args, **kwargs):
+        return None
+    monkeypatch.setattr(pipeline_module, "natural_opinion", no_opinion)
     player_id, session_id = await _make_scope(db_factory)
     jid = await queue.enqueue(
         type="agent", player_id=player_id, session_id=session_id,
-        payload={"text": raw.source_text},
+        payload={"text": source},
     )
     job = await queue.claim("w1")
     assert job is not None
-    script = _TurnScript([([], "Это условный спот до действия героя.")])
-    await run_job(
-        job, replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script)))
-    )
+    await run_job(job, deps)
 
     assert await job_status(db_factory, jid) == "done"
-    assert any("условный спот" in message for message in _all_texts(fake_sender))
+    assert any("Если CO сбросят" in message for message in _all_texts(fake_sender))
     async with db_factory() as session:
         state = await SessionsRepo(session).agent_state(session_id)
         rows = (await session.execute(text(
@@ -2194,7 +2200,7 @@ async def test_a_text_spot_job_stops_before_hero_and_stays_out_of_hands(
         ), {"session_id": session_id})).all()
         hand_count = (await session.execute(text("select count(*) from hands"))).scalar_one()
     assert len(rows) == 1 and rows[0].status == "verified"
-    assert rows[0].snapshot["positions_still_to_act"] == ["CO"]
+    assert rows[0].snapshot["positions_after_hero"] == ["CO"]
     assert state.active_spot_id == rows[0].id and state.last_analysis_id is None
     assert hand_count == 0
 
@@ -2203,19 +2209,27 @@ async def test_full_spot_after_draft_replaces_source_instead_of_appending(
     db_factory, queue, deps, monkeypatch
 ):
     from harness.contracts.decision_spot import RawDecisionSpot
+    from harness.contracts.natural_hand import NaturalAction, NaturalHand, NaturalRead
     from harness.memory.repos import DecisionSpotsRepo
-    from tests.test_agent import _TurnScript
-    from tests.test_decision_spot import sample
-
-    raw = sample()
+    source = "BTN открыл, я 3-бет с AKs на SB, BTN колл. Флоп K72. Что делать?"
+    raw = NaturalHand(
+        hero_position="SB", hero_cards="AKs", flop="K72", source_text=source,
+        actions=[
+            NaturalAction(position="BTN", kind="raise", quote="BTN открыл"),
+            NaturalAction(position="SB", kind="raise", quote="я 3-бет с AKs на SB"),
+            NaturalAction(position="BTN", kind="call", quote="BTN колл"),
+        ],
+    )
     seen: list[str] = []
 
-    async def extracted(_llm, source, _trace_id):
-        seen.append(source)
-        return raw
+    async def extracted(_llm, message, _trace_id, *, active=None):
+        seen.append(message)
+        return NaturalRead(intent="new_hand", hand=raw)
 
-    monkeypatch.setattr(pipeline_module, "extract_decision_spot", extracted)
-    monkeypatch.setattr("harness.agent.prompt.load_system_prompt", lambda: "СИНТ")
+    monkeypatch.setattr(pipeline_module, "read_natural_hand", extracted)
+    async def no_opinion(*args, **kwargs):
+        return None
+    monkeypatch.setattr(pipeline_module, "natural_opinion", no_opinion)
     player_id, session_id = await _make_scope(db_factory)
     async with db_factory() as session:
         await DecisionSpotsRepo(session).save(
@@ -2226,18 +2240,96 @@ async def test_full_spot_after_draft_replaces_source_instead_of_appending(
         await session.commit()
     await queue.enqueue(
         type="agent", player_id=player_id, session_id=session_id,
-        payload={"text": raw.source_text},
+        payload={"text": source},
     )
     job = await queue.claim("w1")
     assert job is not None
-    script = _TurnScript([([], "Это новый спот.")])
-    await run_job(job, replace(deps, llm=LLM(_TEST_CFG, db_factory, model_override=FunctionModel(script))))
-    assert seen == [raw.source_text]
+    await run_job(job, deps)
+    assert seen == [source]
     async with db_factory() as session:
         sources = (await session.execute(text(
             "select source_text from decision_spots where session_id = :session_id order by id"
         ), {"session_id": session_id})).scalars().all()
-    assert sources == ["Старый черновик", raw.source_text]
+    assert sources == ["Старый черновик", source]
+
+
+async def test_short_text_correction_replays_current_scenario(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    from harness.contracts.natural_hand import (
+        NaturalAction,
+        NaturalHand,
+        NaturalPlayer,
+        NaturalRead,
+    )
+
+    original_text = "BTN открыл, я 3-бет с AKs на SB, BTN колл. Флоп K72. Что делать?"
+    original = NaturalHand(
+        hero_position="SB", hero_cards="AKs", flop="K72", source_text=original_text,
+        actions=[
+            NaturalAction(position="BTN", kind="raise", quote="BTN открыл"),
+            NaturalAction(position="SB", kind="raise", quote="я 3-бет с AKs на SB"),
+            NaturalAction(position="BTN", kind="call", quote="BTN колл"),
+        ],
+    )
+    correction = NaturalHand(
+        players=[NaturalPlayer(position="BTN", stack_bb="18", quote="у BTN было 18 BB")],
+        source_text="у BTN было 18 BB",
+    )
+    seen_active: list[bool] = []
+
+    async def extracted(_llm, message, _trace_id, *, active=None):
+        seen_active.append(active is not None)
+        if message == original_text:
+            return NaturalRead(intent="new_hand", hand=original)
+        return NaturalRead(intent="correction", hand=correction)
+
+    monkeypatch.setattr(pipeline_module, "read_natural_hand", extracted)
+    async def no_opinion(*args, **kwargs):
+        return None
+    monkeypatch.setattr(pipeline_module, "natural_opinion", no_opinion)
+    player_id, session_id = await _make_scope(db_factory)
+    for message in (original_text, "у BTN было 18 BB"):
+        await queue.enqueue(
+            type="agent", player_id=player_id, session_id=session_id,
+            payload={"text": message},
+        )
+        job = await queue.claim("w1")
+        assert job is not None
+        await run_job(job, deps)
+    assert seen_active == [False, True]
+    async with db_factory() as session:
+        rows = (await session.execute(text(
+            "select version, status, canonical from decision_spots "
+            "where session_id = :session_id order by id"
+        ), {"session_id": session_id})).all()
+    assert [row.version for row in rows] == [1, 2]
+    assert all(row.status == "verified" for row in rows)
+    assert rows[0].canonical["stacks_behind_bb"]["BTN"]["value"] == "40"
+    assert rows[1].canonical["stacks_behind_bb"]["BTN"]["value"] == "18"
+    assert "BTN стек 40 BB" not in _all_texts(fake_sender)[-1]
+
+
+async def test_natural_extract_schema_failure_gets_a_specific_reply(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    from harness.platform.llm import LLMSchemaError
+
+    async def unreadable(*args, **kwargs):
+        raise LLMSchemaError("synthetic invalid output")
+
+    monkeypatch.setattr(pipeline_module, "read_natural_hand", unreadable)
+    player_id, session_id = await _make_scope(db_factory)
+    jid = await queue.enqueue(
+        type="agent", player_id=player_id, session_id=session_id,
+        payload={"text": "Я BB с 99, BTN пуш. Есть колл?"},
+    )
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+    assert await job_status(db_factory, jid) == "done"
+    assert any("не получилось прочитать описание раздачи" in message
+               for message in _all_texts(fake_sender))
 
 
 async def test_replaying_saved_clarification_does_not_call_model_again(

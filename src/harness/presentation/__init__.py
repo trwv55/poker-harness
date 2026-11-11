@@ -117,6 +117,7 @@ from harness.presentation.messages import (
     vision_gave_up_msg,
     vision_manual_entry_msg,
 )
+from harness.presentation.natural_hand import natural_scenario_msg
 
 __all__ = [
     "AGENT_MISS_PREFIX",
@@ -178,6 +179,7 @@ __all__ = [
     "invite_created_msg",
     "invite_required_msg",
     "leaks_msg",
+    "natural_scenario_msg",
     "new_session_msg",
     "not_a_hand_msg",
     "note_appended_msg",
