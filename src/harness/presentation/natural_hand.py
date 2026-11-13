@@ -48,12 +48,6 @@ def natural_scenario_msg(
                 lines.append("Это порог по фишкам; вывод о колле зависит от диапазона соперника.")
             else:
                 lines.append("Банк может стать мультивей: простой порог колла здесь недостаточен.")
-    else:
-        lines.append("Вы можете чекнуть без доплаты.")
-        if snapshot.street != "preflop":
-            bet = snapshot.pot_before_bb * Decimal("0.33")
-            lines.append("Если решите поставить 33% банка, размер ставки — "
-                         + _fmt(bet) + " BB. Выбор линии зависит от диапазона соперника.")
     if opponent_range and equity is not None and snapshot.to_call_bb > 0:
         threshold = snapshot.to_call_bb / (snapshot.pot_before_bb + snapshot.to_call_bb)
         gap = Decimal(str(equity)) - threshold

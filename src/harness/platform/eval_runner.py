@@ -1,9 +1,12 @@
 """Прогон evals по настоящей модели — руками, не в наборе тестов.
 
-Три подкоманды, по одной на каждый вход модели в системе плюс зрение:
+Подкоманды для модельных входов и зрения:
 `verdict` — текст разбора одной раздачи, `tournament --hh FILE` — рассказ по
 турниру, `vision --cases DIR` — чтение скриншотов (этаж 2 EVALS.md, самый
-важный и дорогой). Вторая появилась по ревью: у второго входа модели eval не
+важный и дорогой), `natural-hand` — извлечение и пересчёт свободного описания
+руки с короткими поправками. `natural-hand --validate-only` проверяет приватные
+кейсы без API; `--with-opinion` дополнительно вызывает модель пояснения.
+Вторая появилась по ревью: у второго входа модели eval не
 было вовсе, а именно там модель написала игроку про «раздачи без явных ошибок»
 — утверждение о том, чего расчёт не судил.
 
@@ -56,7 +59,9 @@ from typing import Any
 
 from sqlalchemy import select
 
+from harness.agent.natural_hand import natural_opinion
 from harness.analysis import analyze_hand
+from harness.analysis.natural_hand import conditional_equity
 from harness.analysis.scan import scan_tournament
 from harness.analysis.tournament import tournament_report
 from harness.contracts import (
@@ -69,15 +74,23 @@ from harness.contracts import (
     VisionReading,
 )
 from harness.engine import enrich
+from harness.engine.natural_hand import replay_natural_hand
 from harness.explanation.tournament_text import tournament_draft
 from harness.explanation.verdict_text import verdict_draft
 from harness.memory.models import Job, LlmCall, Trace, async_session_factory
 from harness.memory.repos import PlayersRepo, SessionsRepo
 from harness.normalizer import normalize
+from harness.normalizer.natural_hand import normalize_natural_hand
 from harness.parsers.hh_parser import parse_file
+from harness.parsers.natural_hand import (
+    apply_natural_correction,
+    may_describe_hand,
+    read_natural_hand,
+)
 from harness.parsers.vision_adapter import vision_extract
 from harness.platform.config import Config
 from harness.platform.llm import LLM
+from harness.presentation.natural_hand import natural_scenario_msg
 
 __all__ = ["main"]
 
@@ -85,6 +98,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_CASES = _REPO_ROOT / "evals" / "verdict" / "cases"
 _CHECKS_PATH = _REPO_ROOT / "evals" / "verdict" / "checks.py"
 _DEFAULT_VISION_CASES = _REPO_ROOT / "evals" / "vision" / "cases"
+_DEFAULT_NATURAL_CASES = _REPO_ROOT / "evals" / "agent" / "natural_hand"
 
 # Допуск сверки сумм в больших блайндах: экран печатает два знака и ОБРЕЗАЕТ,
 # и на восьмерых накопленная обрезка не выходит за сотые доли ББ.
@@ -391,7 +405,7 @@ def _truth_by_hand_no(source: Path, hand_no: str) -> CanonicalHand | None:
     return None
 
 
-async def _eval_trace(session_factory) -> int:
+async def _eval_trace(session_factory, *, kind: str = "verdict") -> int:
     """Служебная цепочка FK для `llm_calls.trace_id` — см. модульный докстринг."""
     async with session_factory() as session:
         player = await PlayersRepo(session).get_or_create(tg_user_id=_EVAL_TG_USER_ID)
@@ -400,7 +414,7 @@ async def _eval_trace(session_factory) -> int:
             type="eval_run",
             player_id=player.id,
             session_id=player_session.id,
-            payload={"kind": "verdict"},
+            payload={"kind": kind},
         )
         session.add(job)
         await session.flush()
@@ -425,11 +439,11 @@ async def _call_costs(session_factory, trace_id: int) -> list[tuple[str, int, in
         return [tuple(row) for row in rows.all()]
 
 
-async def _open_llm(cfg: Config) -> tuple[LLM, int, Any]:
+async def _open_llm(cfg: Config, *, kind: str = "verdict") -> tuple[LLM, int, Any]:
     """Фасад модели, служебный трейс и фабрика сессий — общее начало обоих прогонов."""
     session_factory = async_session_factory(cfg.database_url)
     llm = LLM(cfg, session_factory)
-    trace_id = await _eval_trace(session_factory)
+    trace_id = await _eval_trace(session_factory, kind=kind)
     return llm, trace_id, session_factory
 
 
@@ -723,6 +737,144 @@ async def _run_vision(args: argparse.Namespace) -> int:
     return 0
 
 
+def _natural_cases(directory: Path) -> list[dict[str, Any]]:
+    """Load private, multi-turn text-hand evals without contacting the model."""
+    if not directory.is_dir():
+        raise SystemExit(f"нет каталога natural-hand evals: {directory}")
+    cases = []
+    for path in sorted(directory.glob("*.json")):
+        case = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(case, dict) or not case.get("id") or not case.get("variants"):
+            raise SystemExit(f"неполный natural-hand eval: {path}")
+        for variant in case["variants"]:
+            if not variant.get("name") or not variant.get("steps"):
+                raise SystemExit(f"нет варианта или шагов: {path}")
+            for step in variant["steps"]:
+                if not isinstance(step.get("message"), str) or not isinstance(
+                    step.get("expected"), dict
+                ):
+                    raise SystemExit(f"неполный шаг natural-hand eval: {path}")
+        cases.append(case)
+    if not cases:
+        raise SystemExit(f"нет natural-hand evals в {directory}")
+    return cases
+
+
+def _natural_mismatches(expected: dict[str, Any], hand: Any, snapshot: Any,
+                        reply: str) -> list[str]:
+    """Check observable facts, not wording of the model's opinion."""
+    actual = {
+        "street": snapshot.street,
+        "hero_position": hand.hero_position,
+        "table_size": int(hand.table_size.value),
+        "ante_bb": hand.ante_bb.value,
+        "pot_before_bb": snapshot.pot_before_bb,
+        "to_call_bb": snapshot.to_call_bb,
+        "positions_after_hero": snapshot.positions_after_hero,
+        "board_ranks": "".join(card[0] for card in hand.board),
+        "hero_cards": list(hand.hero_cards) if hand.hero_cards else None,
+        "actions": [
+            [a.street, a.position, a.kind, a.committed_after] for a in hand.actions
+        ],
+    }
+    errors = []
+    numeric = {"ante_bb", "pot_before_bb", "to_call_bb"}
+    for key in ("street", "hero_position", "table_size", "ante_bb", "pot_before_bb",
+                "to_call_bb", "positions_after_hero", "board_ranks", "hero_cards"):
+        if key not in expected:
+            continue
+        want = Decimal(str(expected[key])) if key in numeric else expected[key]
+        if actual[key] != want:
+            errors.append(f"{key}: {actual[key]!r} != {want!r}")
+    if "actions" in expected:
+        want_actions = [
+            [street, position, kind, Decimal(str(amount))]
+            for street, position, kind, amount in expected["actions"]
+        ]
+        if actual["actions"] != want_actions:
+            errors.append(f"actions: {actual['actions']!r} != {want_actions!r}")
+    for key, values in (("stacks", hand.stacks_behind_bb),
+                        ("remaining", snapshot.remaining_bb)):
+        for position, wanted in expected.get(key, {}).items():
+            value = values[position].value if key == "stacks" else values[position]
+            if value != Decimal(str(wanted)):
+                errors.append(f"{key}.{position}: {value} != {wanted}")
+    for fragment in expected.get("assumptions_contain", []):
+        if not any(fragment in assumption for assumption in hand.assumptions):
+            errors.append(f"нет допущения {fragment!r}")
+    for fragment in expected.get("reply_contains", []):
+        if fragment not in reply:
+            errors.append(f"в ответе нет {fragment!r}")
+    for fragment in expected.get("reply_forbidden", []):
+        if fragment in reply:
+            errors.append(f"запрещённый фрагмент ответа {fragment!r}")
+    return errors
+
+
+async def _run_natural(args: argparse.Namespace) -> int:
+    cases = _natural_cases(Path(args.cases))
+    if args.case:
+        cases = [case for case in cases if case["id"] == args.case]
+    if args.variant:
+        cases = [
+            {**case, "variants": [v for v in case["variants"] if v["name"] == args.variant]}
+            for case in cases
+        ]
+        cases = [case for case in cases if case["variants"]]
+    if not cases:
+        raise SystemExit("нет natural-hand evals с такими --case/--variant")
+    steps = sum(len(v["steps"]) for c in cases for v in c["variants"])
+    if args.validate_only:
+        print(f"Natural-hand evals: {len(cases)} кейса, {steps} шагов; JSON проверен без API.")
+        return 0
+    cfg = Config.from_env()
+    llm, trace_id, session_factory = await _open_llm(cfg, kind="natural_hand")
+    failed = 0
+    for case in cases:
+        for variant in case["variants"]:
+            active = None
+            for index, step in enumerate(variant["steps"], start=1):
+                name = f"{case['id']}/{variant['name']}/{index}"
+                try:
+                    message = step["message"]
+                    if not may_describe_hand(message, has_active=active is not None):
+                        raise ValueError("сообщение не дошло до natural-hand извлечения")
+                    reading = await read_natural_hand(llm, message, trace_id, active=active)
+                    if reading.hand is None or reading.intent != step["expected"].get("intent"):
+                        raise ValueError(f"intent={reading.intent}, hand={reading.hand is not None}")
+                    source = (
+                        apply_natural_correction(active, reading.hand)
+                        if reading.intent == "correction" and active is not None
+                        else reading.hand
+                    )
+                    hand = normalize_natural_hand(source)
+                    snapshot = replay_natural_hand(hand)
+                    opinion = None
+                    if args.with_opinion:
+                        opinion = await natural_opinion(llm, hand, snapshot, trace_id)
+                    equity = (
+                        conditional_equity(hand, snapshot, opinion.opponent_range)
+                        if opinion is not None and opinion.opponent_range else None
+                    )
+                    reply = natural_scenario_msg(
+                        hand, snapshot,
+                        opinion=opinion.explanation if opinion is not None else "",
+                        opponent_range=opinion.opponent_range if opinion is not None else None,
+                        equity=equity,
+                    ).text
+                    problems = _natural_mismatches(step["expected"], hand, snapshot, reply)
+                    active = source
+                except Exception as exc:  # noqa: BLE001 — один сбой не прерывает остальные eval-шаги
+                    problems = [f"{type(exc).__name__}: {exc}"]
+                print(f"{'FAIL' if problems else 'PASS'} {name}")
+                for problem in problems:
+                    print(f"  {problem}")
+                failed += bool(problems)
+    await _print_costs(session_factory, trace_id)
+    print(f"Провалено шагов: {failed} из {steps}.")
+    return 1 if failed else 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="eval_runner", description="прогон evals по модели")
     sub = parser.add_subparsers(dest="suite", required=True)
@@ -737,11 +889,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     vision.add_argument("--nickname", default="", help="ник игрока в руме (в промпт НЕ идёт)")
     vision.add_argument("--limit", type=int, default=0, help="взять только первые N кейсов")
     vision.add_argument("--out", default=None, help="куда записать подробный отчёт (JSON)")
+    natural = sub.add_parser("natural-hand", help="вход агента из сообщения и короткие поправки")
+    natural.add_argument("--cases", default=str(_DEFAULT_NATURAL_CASES))
+    natural.add_argument("--case", default=None, help="один id кейса для экономного прогона")
+    natural.add_argument("--variant", default=None, help="один вариант диалога")
+    natural.add_argument("--validate-only", action="store_true", help="проверить JSON без API")
+    natural.add_argument("--with-opinion", action="store_true", help="вызвать и модель ответа")
     args = parser.parse_args(argv)
     if args.suite == "tournament":
         return asyncio.run(_run_tournament(args))
     if args.suite == "vision":
         return asyncio.run(_run_vision(args))
+    if args.suite == "natural-hand":
+        return asyncio.run(_run_natural(args))
     return asyncio.run(_run_verdict(args))
 
 

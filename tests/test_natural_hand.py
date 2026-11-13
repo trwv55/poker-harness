@@ -69,6 +69,15 @@ def test_defaulted_three_bet_reaches_flop_before_sb_decision() -> None:
     assert snapshot.live_positions == ["SB", "BTN"]
     assert len(set(spot.board + list(spot.hero_cards or ()))) == 5
     assert {card[1] for card in spot.board} == {"s", "h", "d"}
+    opinion = "На сухом борде можно поставить для ценности."
+    text = natural_scenario_msg(spot, snapshot, opinion=opinion).text
+    assert "Банк перед вашим ходом: 14 BB." in text
+    assert "Оценка модели: " + opinion in text
+    assert "Подставил: " in text
+    assert "Неназванные пасы: " in text
+    assert "Вы можете чекнуть без доплаты." not in text
+    assert "Если решите поставить 33% банка" not in text
+    assert "Выбор линии зависит от диапазона соперника." not in text
 
 
 def test_default_postflop_bet_is_33_percent_of_current_pot() -> None:
@@ -88,6 +97,9 @@ def test_default_postflop_bet_is_33_percent_of_current_pot() -> None:
     assert snapshot.pot_before_bb == Decimal("18.62")
     assert snapshot.to_call_bb == Decimal("4.62")
     assert "BTN ставка 33% банка" in spot.assumptions
+    text = natural_scenario_msg(spot, snapshot).text
+    assert "Для колла нужно добавить 4,62 BB." in text
+    assert "для колла нужно не меньше" in text
 
 
 def test_stack_left_after_flop_bet_includes_both_streets() -> None:
