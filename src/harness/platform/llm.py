@@ -45,8 +45,14 @@ from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextContent
 from pydantic_ai.models import Model, ModelRequestParameters
 from pydantic_ai.models.anthropic import AnthropicModel
+from pydantic_ai.models.openrouter import (
+    OpenRouterModel,
+    OpenRouterModelSettings,
+    OpenRouterProviderConfig,
+)
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.profiles.anthropic import AnthropicModelProfile
+from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import Tool
 from sqlalchemy import update
@@ -54,7 +60,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from harness.memory.models import LlmCall
 from harness.platform import limiter as _limiter_module
-from harness.platform.config import Config
+from harness.platform.config import Config, ProviderSort
 from harness.platform.limiter import PgLimiter
 
 # Модульная косвенность вместо прямых вызовов `asyncio.sleep` (fix round 1, small
@@ -201,12 +207,41 @@ def _describe_model(model: Model | str) -> tuple[str, str]:
 _REJECTS_FORCED_TOOL_CHOICE = ("claude-sonnet-5-5",)
 
 
-def _build_model(model: str) -> Model | str:
-    """Строка конфига — как есть, кроме моделей из `_REJECTS_FORCED_TOOL_CHOICE`:
+def _build_model(
+    model: str,
+    *,
+    provider_sort: ProviderSort = "throughput",
+    provider_order: tuple[str, ...] = (),
+) -> Model | str:
+    """OpenRouter получает маршрут хостеров
+    (`test_openrouter_route_reaches_every_provider_request`); остальные строки — как есть, кроме
+    моделей из `_REJECTS_FORCED_TOOL_CHOICE`:
     им `AnthropicModel` с профилем без принудительного `tool_choice`
     (`test_the_agent_model_does_not_force_tool_choice`,
     `test_other_anthropic_models_keep_the_library_profile`)."""
     provider, sep, name = model.partition(":")
+    if sep and provider == "openrouter":
+        route: OpenRouterProviderConfig = {
+            "sort": provider_sort,
+            "require_parameters": True,
+            "allow_fallbacks": True,
+        }
+        if provider_order:
+            route["order"] = list(provider_order)
+        flash_extract = name == "qwen/qwen3.8-flash"
+        profile = (
+            OpenAIModelProfile(openai_supports_tool_choice_required=False)
+            if flash_extract
+            else None
+        )
+        settings = OpenRouterModelSettings(openrouter_provider=route)
+        if flash_extract:
+            # Extraction needs a compact JSON tool call, not a long reasoning trace.
+            settings["max_tokens"] = 2048
+            settings["openrouter_reasoning"] = {"enabled": False}
+        return OpenRouterModel(
+            name, profile=profile, settings=settings
+        )
     if sep and provider == "anthropic" and name.startswith(_REJECTS_FORCED_TOOL_CHOICE):
         return AnthropicModel(
             name, profile=AnthropicModelProfile(anthropic_supports_forced_tool_choice=False)
@@ -282,6 +317,7 @@ class LLM:
             "tournament_text",
             "question_answer",
             "agent",
+            "spot_extract",
         ],
         schema: type[T],
         *,
@@ -351,7 +387,11 @@ class LLM:
         )
         provider, model_name = _describe_model(model)
         if isinstance(model, str):
-            model = _build_model(model)
+            model = _build_model(
+                model,
+                provider_sort=self._cfg.llm_openrouter_provider_sort,
+                provider_order=self._cfg.llm_openrouter_provider_order,
+            )
         user_prompt: list[str | TextContent | BinaryContent] = [
             *preface,
             prompt,
@@ -423,6 +463,8 @@ class LLM:
             return self._cfg.llm_vision_fallback_model
         if purpose == "agent":
             return self._cfg.llm_agent_model
+        if purpose == "spot_extract":
+            return self._cfg.llm_verdict_model
         return self._cfg.llm_verdict_model
 
     async def _attempt(
@@ -503,7 +545,8 @@ class LLM:
 
 class _MeteredModel(WrapperModel):
     """Модель, у которой КАЖДЫЙ запрос к провайдеру — свой слот лимитера, своя
-    строка `llm_calls`, свой таймаут и свои HTTP-ретраи.
+    строка `llm_calls`, свой таймаут и свои HTTP-ретраи. Для агента и извлечения
+    текстового спота лимит одного запроса не меньше 120 с.
 
     Прогон агента с инструментами — несколько запросов; считать его одним значило
     занижать окно темпа `PgLimiter` ровно там, где нагрузка растёт
@@ -598,7 +641,11 @@ class _MeteredModel(WrapperModel):
         model_request_parameters: ModelRequestParameters,
     ) -> ModelResponse:
         llm = self._meter_llm
-        timeout_s = llm._cfg.llm_request_timeout_s
+        timeout_s = (
+            max(120, llm._cfg.llm_request_timeout_s)
+            if self._meter_purpose in ("agent", "spot_extract")
+            else llm._cfg.llm_request_timeout_s
+        )
         last_http_error: ModelHTTPError | None = None
         for http_attempt in range(_MAX_HTTP_ATTEMPTS):
             async with llm._limiter.slot(deadline=self._meter_deadline):

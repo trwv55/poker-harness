@@ -58,8 +58,6 @@ from harness.contracts import (
 )
 
 __all__ = [
-    "bet_reply",
-    "hero_bet_called",
     "measurement_of",
     "player_stats",
     "player_stats_across_tournaments",
@@ -75,7 +73,6 @@ _VOLUNTARY = frozenset({ActionKind.CALL, ActionKind.BET, ActionKind.RAISE})
 # (источник может записать шов и так, и рейзом), `RAISE` — повышение поверх
 # чужой ставки.
 _AGGRESSIVE = frozenset({ActionKind.BET, ActionKind.RAISE})
-_HEADS_UP = 2
 
 
 @dataclass(frozen=True)
@@ -351,46 +348,6 @@ def _raise_turn_barrel(view: _HandView, label: str) -> tuple[bool, bool]:
     if reply is None:
         return False, False
     return True, reply.kind is ActionKind.RAISE
-
-
-def bet_reply(hand: CanonicalHand, label: str, street: Street) -> tuple[str, ActionKind] | None:
-    """Кто сделал продолженную ставку (флоп) или второй баррель (тёрн) против места
-    и чем место ответило — по тем же правилам, что возможность сдачи и рейза на них
-    (`_cbet_reply`, `_turn_barrel_reply`); `None` — такой ставки против места не было,
-    и на других улицах тоже (`test_the_bet_reply_follows_the_stat_opportunity`)."""
-    view = _view(hand)
-    if street is Street.FLOP:
-        reply = _cbet_reply(view, label)
-    elif street is Street.TURN:
-        reply = _turn_barrel_reply(view, label)
-    else:
-        return None
-    if reply is None or view.aggressor is None:
-        return None
-    return view.aggressor, reply.kind
-
-
-def hero_bet_called(hand: CanonicalHand, label: str, street: Street) -> FrequencyStat | None:
-    """Частота сдачи, которую место в этой раздаче миновало коллом ставки героя: на флопе —
-    его продолженная ставка (`FOLD_TO_CBET`), на тёрне — второй баррель
-    (`FOLD_TO_TURN_BARREL`), по тем же правилам возможности (`_cbet_reply`,
-    `_turn_barrel_reply`). `None` — ставил не герой, место ответило не коллом, на ответе
-    места в банке больше двух игроков, другая улица
-    (`test_the_hero_bet_the_opponent_called_names_the_fold_stat`)."""
-    view = _view(hand)
-    if street is Street.FLOP:
-        reply, stat = _cbet_reply(view, label), FrequencyStat.FOLD_TO_CBET
-    elif street is Street.TURN:
-        reply, stat = _turn_barrel_reply(view, label), FrequencyStat.FOLD_TO_TURN_BARREL
-    else:
-        return None
-    if reply is None or reply.kind is not ActionKind.CALL or view.aggressor != hand.hero_label:
-        return None
-    at = next(i for i, action in enumerate(hand.actions) if action is reply)
-    folded = {a.label for a in hand.actions[:at] if a.kind is ActionKind.FOLD}
-    if sum(1 for p in hand.players if p.label not in folded) > _HEADS_UP:
-        return None
-    return stat
 
 
 def _saw_flop(view: _HandView, label: str) -> bool:

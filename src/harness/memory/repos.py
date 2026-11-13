@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import delete, exists, func, literal, select, text, update
+from sqlalchemy import delete, exists, func, literal, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -53,6 +53,7 @@ from harness.memory.models import (
     Analysis,
     CalcCache,
     DecisionPointRow,
+    DecisionSpot,
     EvalCase,
     Hand,
     Invite,
@@ -233,6 +234,7 @@ class AgentState:
 
     history: list[dict[str, Any]] | None
     last_analysis_id: int | None
+    active_spot_id: int | None = None
 
 
 class SessionsRepo:
@@ -243,6 +245,14 @@ class SessionsRepo:
 
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
+    async def active(self, player_id: int) -> SessionRow | None:
+        return await self.db.scalar(
+            select(SessionRow)
+            .where(SessionRow.player_id == player_id, SessionRow.closed_at.is_(None))
+            .order_by(SessionRow.started_at.desc())
+            .limit(1)
+        )
+
 
     async def active_or_create(self, player_id: int) -> SessionRow:
         """Активная сессия игрока или новая. Сериализовано по игроку (fix round 1).
@@ -410,12 +420,16 @@ class SessionsRepo:
     async def agent_state(self, session_id: int) -> AgentState:
         row = (
             await self.db.execute(
-                select(SessionRow.agent_history, SessionRow.last_analysis_id).where(
-                    SessionRow.id == session_id
-                )
+                select(
+                    SessionRow.agent_history, SessionRow.last_analysis_id, SessionRow.active_spot_id
+                ).where(SessionRow.id == session_id)
             )
         ).one()
-        return AgentState(history=row.agent_history, last_analysis_id=row.last_analysis_id)
+        return AgentState(
+            history=row.agent_history,
+            last_analysis_id=row.last_analysis_id,
+            active_spot_id=row.active_spot_id,
+        )
 
     async def save_agent_history(self, session_id: int, history: list[dict[str, Any]]) -> bool:
         """Записать историю, только пока сессия открыта.
@@ -437,9 +451,65 @@ class SessionsRepo:
         await self.db.execute(
             update(SessionRow)
             .where(SessionRow.id == session_id)
-            .values(last_analysis_id=analysis_id)
+            .values(last_analysis_id=analysis_id, active_spot_id=None)
             .execution_options(synchronize_session=False)
         )
+
+class DecisionSpotsRepo:
+    """Session-owned text spots; no row is inserted into hands or analyses."""
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def get(self, spot_id: int, player_id: int, session_id: int) -> DecisionSpot | None:
+        return await self.db.scalar(
+            select(DecisionSpot).where(
+                DecisionSpot.id == spot_id,
+                DecisionSpot.player_id == player_id,
+                DecisionSpot.session_id == session_id,
+            )
+        )
+
+    async def save(
+        self,
+        *,
+        player_id: int,
+        session_id: int,
+        source_text: str,
+        raw: dict[str, Any],
+        canonical: dict[str, Any] | None,
+        snapshot: dict[str, Any] | None,
+        prior_id: int | None = None,
+    ) -> DecisionSpot:
+        session = await self.db.scalar(
+            select(SessionRow)
+            .where(
+                SessionRow.id == session_id,
+                SessionRow.player_id == player_id,
+                SessionRow.closed_at.is_(None),
+            )
+            .with_for_update()
+        )
+        if session is None:
+            raise ValueError("сессия уже закрыта")
+        prior = None
+        if prior_id is not None and session.active_spot_id == prior_id:
+            prior = await self.get(prior_id, player_id, session_id)
+        row = DecisionSpot(
+            session_id=session_id, player_id=player_id,
+            version=prior.version + 1 if prior is not None else 1,
+            status="draft", source_text=source_text, raw=raw,
+        )
+        self.db.add(row)
+        await self.db.flush()
+        row.canonical = canonical
+        row.snapshot = snapshot
+        row.status = "verified" if canonical is not None and snapshot is not None else "draft"
+        session.active_spot_id = row.id
+        session.last_analysis_id = None
+        await self.db.flush()
+        return row
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -1143,6 +1213,17 @@ class CalcCacheRepo:
         )
         return None if value is None else float(value)
 
+    async def get_many(self, prefix: str, keys: Sequence[str]) -> dict[str, float]:
+        """Значения по ключам `prefix + key` одним запросом: ключ — без префикса; ключей,
+        которых в кэше нет, в ответе нет (`test_get_many_returns_only_the_stored_keys`)."""
+        if not keys:
+            return {}
+        stmt = select(CalcCache.key, CalcCache.value).where(
+            CalcCache.key.in_([f"{prefix}{key}" for key in keys])
+        )
+        rows = (await self.db.execute(stmt)).all()
+        return {key[len(prefix) :]: float(value) for key, value in rows}
+
     async def upsert_many(self, prefix: str, entries: Mapping[str, float]) -> None:
         """Записать пачку значений, разбивая её на куски по `_UPSERT_CHUNK` строк.
 
@@ -1262,6 +1343,10 @@ class QuotaRepo:
         """
         return (
             Job.player_id == player_id,
+            or_(
+                Job.type != "agent",
+                Job.payload["spot_clarification"].astext.is_distinct_from("true"),
+            ),
             Job.type.in_(QUOTA_INTERACTIVE_JOB_TYPES),
             Job.status != "failed",
             Job.created_at > since,
@@ -2059,24 +2144,6 @@ class OpponentsRepo:
             OpponentLink.owner_player_id == owner_player_id,
         )
         return {row[0]: row[1] for row in await self.db.execute(stmt)}
-
-    async def holder(
-        self, owner_player_id: int, room_tournament_id: str, participant_label: str
-    ) -> tuple[int, str] | None:
-        """Оппонент (номер, ник), за которым закреплена пара «турнир + метка»; `None` —
-        пара не привязана (`test_the_flop_equity_after_a_called_cbet_carries_the_fold_to_cbet_hint`)."""
-        row = (
-            await self.db.execute(
-                select(Opponent.id, Opponent.opponent_nick)
-                .join(OpponentLink, OpponentLink.opponent_id == Opponent.id)
-                .where(
-                    OpponentLink.owner_player_id == owner_player_id,
-                    OpponentLink.room_tournament_id == room_tournament_id,
-                    OpponentLink.participant_label == participant_label,
-                )
-            )
-        ).first()
-        return None if row is None else (int(row[0]), str(row[1]))
 
     async def _find_by_nick(self, owner_player_id: int, nick: str) -> int | None:
         return await self.db.scalar(

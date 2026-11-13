@@ -167,6 +167,29 @@ class Session(Base):
     last_analysis_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("analyses.id", use_alter=True, ondelete="SET NULL")
     )
+    active_spot_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("decision_spots.id", use_alter=True, ondelete="SET NULL")
+    )
+
+
+class DecisionSpot(Base):
+    """Partial text decision, deliberately separate from hands and analyses."""
+
+    __tablename__ = "decision_spots"
+    __table_args__ = (
+        CheckConstraint("status IN ('draft', 'verified')", name="status_allowed"),
+        Index("ix_decision_spots_session_id", "session_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    session_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("sessions.id"), nullable=False)
+    player_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("players.id"), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    source_text: Mapped[str] = mapped_column(Text, nullable=False)
+    raw: Mapped[Any] = mapped_column(JSONB, nullable=False)
+    canonical: Mapped[Any | None] = mapped_column(JSONB)
+    snapshot: Mapped[Any | None] = mapped_column(JSONB)
 
 
 class Tournament(Base):
@@ -632,7 +655,7 @@ class LlmCall(Base):
             # `agent` — запросы агента к провайдеру (миграция 0014, спека агента
             # №1, §9); `question_answer` остаётся, пока жив `/ask`.
             "purpose IN ('vision_extract', 'vision_extract_fallback', 'verdict_text', "
-            "'tournament_text', 'question_answer', 'agent')",
+            "'tournament_text', 'question_answer', 'agent', 'spot_extract')",
             name="purpose_allowed",
         ),
         CheckConstraint(

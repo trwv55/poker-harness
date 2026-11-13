@@ -52,10 +52,10 @@ __all__ = [
     "NEW_HAND_MARK",
     "NO_HAND_MARK",
     "allowed_from_history",
-    "assumed_numbers_in",
     "calcs_in_history",
     "chart_numbers_in",
     "dump_history",
+    "equity_numbers_in",
     "estimate_tokens",
     "frequency_numbers",
     "hand_boundary",
@@ -63,8 +63,10 @@ __all__ = [
     "load_history",
     "merged_requests",
     "narrowings_in",
+    "non_equity_numbers_in",
     "player_numbers",
     "player_text_numbers",
+    "preflop_equity_numbers_in",
     "seen_history",
     "stats_in_history",
     "threshold_decided",
@@ -78,7 +80,7 @@ __all__ = [
 # срабатывает раньше, а не позже.
 _BYTES_PER_TOKEN = 3
 
-_CALC_TOOLS = frozenset(name.value for name in CalcName)
+_CALC_TOOLS = frozenset(name.value for name in CalcName) | {"spot_call_scenario"}
 
 # Ключ метаданных запроса с репликой игрока: указатель разбора её хода (`None` —
 # ход без разбора).
@@ -274,7 +276,7 @@ def trim_history(messages: Sequence[ModelMessage], max_tokens: int) -> list[Mode
 
 def _is_output_call(part: object) -> bool:
     """Вызов вывода (`final_result`), а не расчёта: инструменты агента — ровно
-    имена `CalcName` (`test_the_agent_tool_set_covers_every_calculation_name_exactly_once`)."""
+    имена `CalcName` и условный расчёт текстового спота."""
     return isinstance(part, ToolCallPart) and part.tool_name not in _CALC_TOOLS
 
 
@@ -413,11 +415,29 @@ def chart_numbers_in(messages: Sequence[ModelMessage]) -> frozenset[float]:
     return frozenset(float(n) for meta in _metadata(messages) for n in meta.get("chart", []))
 
 
-def assumed_numbers_in(messages: Sequence[ModelMessage]) -> frozenset[float]:
-    """Числа выхода `equity_vs_range`: эквити в процентах —
-    числа расчёта, но не измеренная частота
-    (`test_equity_numbers_are_calculation_numbers_and_never_a_measured_frequency`)."""
-    return frozenset(float(n) for meta in _metadata(messages) for n in meta.get("assumed", []))
+def equity_numbers_in(messages: Sequence[ModelMessage]) -> frozenset[float]:
+    """Эквити по категориям из выходов `opponent_range` и `equity_vs_range`, в процентах
+    (`test_the_turn_checks_read_chart_and_equity_numbers_from_history`)."""
+    return frozenset(float(n) for meta in _metadata(messages) for n in meta.get("equity", []))
+
+
+def preflop_equity_numbers_in(messages: Sequence[ModelMessage]) -> frozenset[float]:
+    """Одно эквити против суженного до флопа из выходов `equity_vs_range`."""
+    return frozenset(
+        float(n) for meta in _metadata(messages) for n in meta.get("preflop_equity", [])
+    )
+
+
+def non_equity_numbers_in(messages: Sequence[ModelMessage]) -> frozenset[float]:
+    """Числа выходов расчётов, кроме эквити (`equity`, `preflop_equity`): с ними
+    совпавшая доля под правило эквити не подпадает (§14.11)."""
+    return frozenset(
+        float(n)
+        for meta in _metadata(messages)
+        for n in set(meta.get("allowed", []))
+        - set(meta.get("equity", []))
+        - set(meta.get("preflop_equity", []))
+    )
 
 
 def threshold_numbers_in(messages: Sequence[ModelMessage]) -> frozenset[float]:

@@ -505,6 +505,16 @@ async def test_calc_cache_upsert_survives_more_rows_than_one_statement_allows(db
     assert _UPSERT_CHUNK * 2 <= 32_767  # кусок обязан помещаться в предел протокола
 
 
+async def test_get_many_returns_only_the_stored_keys(db):
+    """Ключи — без префикса; ключа, которого нет, нет и в ответе; чужой префикс не
+    читается."""
+    repo = CalcCacheRepo(db)
+    await repo.upsert_many("eqc:test:", {"a": 0.25, "b": 0.5})
+    await repo.upsert_many("other:", {"c": 1.0})
+    assert await repo.get_many("eqc:test:", ["a", "c", "missing"]) == {"a": 0.25}
+    assert await repo.get_many("eqc:test:", []) == {}
+
+
 # --- история игрока для отчёта по турниру (задача 23) ------------------------------
 
 

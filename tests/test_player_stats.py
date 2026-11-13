@@ -14,7 +14,6 @@ from datetime import UTC, datetime
 import pytest
 
 from harness.analysis.player_stats import (
-    bet_reply,
     player_stats,
     player_stats_across_tournaments,
     player_stats_by_label,
@@ -722,18 +721,6 @@ def test_no_turn_barrel_chance_no_raise_on_it(hand: CanonicalHand):
     рейз тёрна после повышения с-бета, после донка и после отложенного с-бета."""
     stats = player_stats([hand])
     assert (stats.turn_barrel_faced, stats.raise_turn_barrel) == (0, 0)
-
-
-def test_the_bet_reply_follows_the_stat_opportunity():
-    """Ответ места на с-бет и второй баррель — тот, что считают статы; на ривере и
-    без такой ставки — `None`."""
-    called = _turn_barrel_line(flop_reply="call", turn="raise")
-    assert bet_reply(called, "Hero", Street.FLOP) == ("CO", ActionKind.CALL)
-    assert bet_reply(called, "Hero", Street.TURN) == ("CO", ActionKind.RAISE)
-    assert bet_reply(called, "CO", Street.FLOP) is None
-    assert bet_reply(called, "Hero", Street.RIVER) is None
-    assert bet_reply(_turn_barrel_line(flop_reply="raise", turn="fold"), "Hero", Street.TURN) is None
-    assert bet_reply(_flop_bet_comes_from_a_caller(), "Hero", Street.FLOP) is None
 
 
 # --- Среднее по нескольким турнирам ------------------------------------------------

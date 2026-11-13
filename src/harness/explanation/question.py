@@ -32,7 +32,6 @@ from harness.contracts import (
     CoverageResult,
     DefenseResult,
     EquityVsRangeResult,
-    FoldHint,
     FrequencyResult,
     FrequencyStat,
     LeaksResult,
@@ -74,7 +73,7 @@ _CALC_BRIEF: dict[CalcName, str] = {
     CalcName.DEFENSE_FREQUENCY: "требуемая частота защиты от размера ставки",
     CalcName.FREQUENCY_VS_THRESHOLD: "частота против порога",
     CalcName.OPPONENT_RANGE: "стартовый диапазон соперника по чарту",
-    CalcName.EQUITY_VS_RANGE: "эквити против диапазона, суженного агентом",
+    CalcName.EQUITY_VS_RANGE: "сужение диапазона агентом и эквити по его категориям",
 }
 
 # Подписи величин повторяют то, что считает `analysis/player_stats.py`: у
@@ -465,6 +464,8 @@ def _agent_range_lines(result: OpponentRangeResult, book: NumberBook) -> list[st
 _LAYOUT_OF: dict[str, str] = {
     "start": "стартовый диапазон",
     "flop": "ваше сужение флопа этого соперника (допущение)",
+    "turn": "ваше сужение тёрна этого соперника (допущение)",
+    "flop_turn_checked": "ваше сужение флопа этого соперника; на тёрне ставок не было (допущение)",
 }
 
 
@@ -496,26 +497,43 @@ def _layout_class(item: CategoryClass, book: NumberBook) -> str:
 
 
 def layout_lines(groups: Sequence[CategoryGroup], book: NumberBook) -> list[str]:
-    """Строки раскладки по категориям: «трипс — 21 класс, 86 комбо: A8s, …» — число
-    классов и комбо через книгу, классы — все, в порядке раскладки
-    (`test_the_layout_lines_name_every_class_with_its_category`)."""
+    """Строки раскладки по категориям: «трипс — 21 класс, 86 комбо, эквити вашей руки
+    против неё — 22%: A8s, …» — число классов, комбо и эквити через книгу, классы — все,
+    в порядке раскладки (`test_the_layout_lines_name_every_class_with_its_category`). У
+    категории без эквити (ориентир солвера — на борде выгрузки) эквити нет и в строке
+    (`test_the_solver_guide_line_names_the_nearest_line_and_its_categories`)."""
     lines: list[str] = []
     for group in groups:
         count = len(group.classes)
         classes = ", ".join(_layout_class(item, book) for item in group.classes)
+        equity = (
+            f", эквити вашей руки против неё — {book.pct(100.0 * group.equity, trim=True)}%"
+            if group.equity is not None else ""
+        )
         lines.append(
             f"{RANGE_CATEGORY_NAMES[group.category]} — {book.count(count)} "
-            f"{_classes_word(count)}, {book.count(round(group.combos))} комбо: {classes}."
+            f"{_classes_word(count)}, {book.count(round(group.combos))} комбо{equity}: "
+            f"{classes}."
         )
     return lines
 
 
 def _layout_lines(result: OpponentRangeResult, book: NumberBook) -> list[str]:
+    """Раскладка с эквити; без исходного сужения — строка «сначала сузьте …» вместо неё
+    (`test_without_the_previous_narrowing_the_layout_is_a_refusal_line`). Заголовок
+    обещает эквити, только если оно есть (карты героя известны;
+    `test_the_layout_head_promises_no_equity_without_it`)."""
+    if result.layout_refusal is not None:
+        return [f"Раскладки по категориям нет: {result.layout_refusal}."]
     if result.layout_of is None or not result.layout:
         return []
+    equity = (
+        "; эквити — против каждой категории отдельно, а не всего диапазона"
+        if any(group.equity is not None for group in result.layout) else ""
+    )
     head = (
         f"Раскладка по категориям ({_STREET_WORD[result.street]}; "
-        f"{_LAYOUT_OF[result.layout_of]}; категорию руки на борде определяет код):"
+        f"{_LAYOUT_OF[result.layout_of]}; категорию руки на борде определяет код{equity}):"
     )
     return [head, *layout_lines(result.layout, book), *_solver_lines(result, book)]
 
@@ -578,10 +596,13 @@ def _absent_line(result: OpponentRangeResult, book: NumberBook) -> str:
 
 
 def _agent_equity_lines(result: EquityVsRangeResult, book: NumberBook) -> list[str]:
-    """С добавленными вне чарта классами доли от стартового нет — она может
-    быть больше 100% (`test_the_added_classes_are_a_separate_line_without_the_share`).
-    Добавленные агентом — своей строкой с причиной, отдельно от добавленных по просьбе
-    игрока (`test_the_agent_added_classes_are_said_with_the_reason`)."""
+    """Добавленные вне чарта классы — отдельной строкой; доли от стартового нет ни с
+    ними, ни без них (`test_the_added_classes_are_a_separate_line_without_the_share`,
+    `test_the_equity_output_says_the_narrowing_is_an_assumption`). Добавленные агентом
+    — своей строкой с причиной, отдельно от добавленных по просьбе игрока
+    (`test_the_agent_added_classes_are_said_with_the_reason`). После флопа одного общего
+    эквити нет: эквити — по категориям суженного (`_equity_lines`); до флопа — одно число
+    (`test_the_preflop_equity_digest_prints_one_number`)."""
     player = [cls for cls in result.added if cls not in result.agent_added]
     named = _range_text(", ".join(player), book)
     added = [f"Добавлено по вашей просьбе: {named} — по чарту их здесь нет."] if player else []
@@ -599,24 +620,32 @@ def _agent_equity_lines(result: EquityVsRangeResult, book: NumberBook) -> list[s
             f"Диапазон, суженный агентом: {_range_text(result.range_text, book)}. "
             "Диапазон сужен агентом — это допущение."
         ),
-        (
-            f"Комбо: {book.count(round(result.live_combos))}."
-            if result.added
-            else f"Комбо: {book.count(round(result.live_combos))} — "
-            f"{book.pct(100.0 * result.share_of_start, trim=True)}% стартового диапазона."
-        ),
+        f"Комбо: {book.count(round(result.live_combos))}.",
         *added,
         *_kept_lines(result, book),
-        f"Эквити вашей руки при вскрытии: {book.pct(100.0 * result.equity, trim=True)}%.",
+        *_equity_lines(result, book),
+        *_preflop_lines(result, book),
     ]
 
 
-_KEPT_OF: dict[str, str] = {"start": "стартовый диапазон", "flop": "ваше сужение флопа"}
+def _preflop_lines(result: EquityVsRangeResult, book: NumberBook) -> list[str]:
+    if result.preflop_equity is None:
+        return []
+    share = book.pct(100.0 * result.preflop_equity, trim=True)
+    return [f"Эквити вашей руки при вскрытии (до флопа категорий нет): {share}%."]
+
+
+_KEPT_OF: dict[str, str] = {
+    "start": "стартовый диапазон",
+    "flop": "ваше сужение флопа",
+    "turn": "ваше сужение тёрна",
+    "flop_turn_checked": "ваше сужение флопа; на тёрне ставок не было",
+}
 
 
 def _kept_lines(result: EquityVsRangeResult, book: NumberBook) -> list[str]:
     """Сводка по категориям раскладки исходного диапазона: что оставлено и сколько комбо,
-    итог — доля оставленного от исходного и сданного, с комбо (спека 2026-10-24, §5, §13;
+    итог — «Оставлено N комбо из M» (спека 2026-10-24, §5, §14.4;
     `test_the_equity_digest_prints_the_kept_summary`)."""
     if result.categories_of is None or not result.categories:
         return []
@@ -638,33 +667,28 @@ def _kept_lines(result: EquityVsRangeResult, book: NumberBook) -> list[str]:
         f"По категориям (исходный — {_KEPT_OF[result.categories_of]}): " + "; ".join(parts) + "."
     ]
     if result.kept_combos is not None and result.source_combos:
-        kept = round(100.0 * result.kept_combos / result.source_combos, 1)
-        share = book.pct(kept, trim=True)
         lines.append(
-            f"Оставлено {share}% диапазона на начало улицы "
-            f"({book.count(round(result.kept_combos))} комбо из "
-            f"{book.count(round(result.source_combos))}): соперник продолжает {share}%, "
-            f"сдаёт {book.pct(100.0 - kept, trim=True)}%."
+            f"Оставлено {book.count(round(result.kept_combos))} комбо из "
+            f"{book.count(round(result.source_combos))}."
         )
-        lines += _fold_hint_lines(result.fold_hint, book)
     return lines
 
 
-def _fold_hint_lines(hint: FoldHint | None, book: NumberBook) -> list[str]:
-    """Частота сдачи соперника на ставку героя, которую он уравнял, — для сверки с долей
-    оставленного (спека 2026-10-24, §13): величина с выборкой, уровень данных, выборка
-    словами (`test_the_fold_hint_names_the_stat_its_sample_and_whose_it_is`); без неё —
-    ни строки (`test_without_a_fold_hint_there_is_no_stat_line`)."""
-    if hint is None:
+def _equity_lines(result: EquityVsRangeResult, book: NumberBook) -> list[str]:
+    """Эквити по категориям суженного — у каждой свои комбо и эквити, общего числа нет
+    (спека 2026-10-24, §14.6;
+    `test_the_equity_digest_has_an_equity_per_category_and_no_total`)."""
+    parts = [
+        f"{RANGE_CATEGORY_NAMES[group.category]} — {book.count(round(group.combos))} комбо, "
+        f"{book.pct(100.0 * group.equity, trim=True)}%"
+        for group in result.layout
+        if group.equity is not None
+    ]
+    if not parts:
         return []
-    phrase = _measurement_phrase(hint.measurement, book, trim=True)
     return [
-        (
-            f"Для сверки с долей (подсказка, сужение не меняет): {_STAT_BRIEF[hint.stat]} — "
-            f"{phrase}."
-        ),
-        _level_line(hint.subject, None, hint.opponent, book),
-        *_sample_line(hint.measurement, book),
+        "Эквити вашей руки по категориям суженного (каждое — против этой категории, а не "
+        "всего диапазона): " + "; ".join(parts) + "."
     ]
 
 

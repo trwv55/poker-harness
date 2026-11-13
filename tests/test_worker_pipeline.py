@@ -2160,6 +2160,256 @@ async def test_an_agent_job_answers_journals_and_keeps_the_evening_history(
     assert turn["calls"][0]["zone"] == "strict" and turn["rewrite"] is False
 
 
+async def test_a_text_spot_job_stops_before_hero_and_stays_out_of_hands(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    from harness.contracts.natural_hand import NaturalAction, NaturalHand, NaturalRead
+
+    source = "8 игроков, BB 99, CO открыл 2 BB, BTN пуш до 28 BB, SB пас. Есть колл?"
+    raw = NaturalHand(
+        table_size=8, hero_position="BB", hero_cards="99", source_text=source,
+        actions=[
+            NaturalAction(position="CO", kind="raise", amount="2", quote="CO открыл 2 BB"),
+            NaturalAction(position="BTN", kind="all_in", amount="28", quote="BTN пуш до 28 BB"),
+            NaturalAction(position="SB", kind="fold", quote="SB пас"),
+        ],
+    )
+
+    async def extracted(_llm, _text, _trace_id, *, active=None):
+        return NaturalRead(intent="new_hand", hand=raw)
+
+    monkeypatch.setattr(pipeline_module, "read_natural_hand", extracted)
+    async def no_opinion(*args, **kwargs):
+        return None
+    monkeypatch.setattr(pipeline_module, "natural_opinion", no_opinion)
+    player_id, session_id = await _make_scope(db_factory)
+    jid = await queue.enqueue(
+        type="agent", player_id=player_id, session_id=session_id,
+        payload={"text": source},
+    )
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    assert await job_status(db_factory, jid) == "done"
+    assert any("Если CO сбросят" in message for message in _all_texts(fake_sender))
+    async with db_factory() as session:
+        state = await SessionsRepo(session).agent_state(session_id)
+        rows = (await session.execute(text(
+            "select id, status, snapshot from decision_spots where session_id = :session_id"
+        ), {"session_id": session_id})).all()
+        hand_count = (await session.execute(text("select count(*) from hands"))).scalar_one()
+    assert len(rows) == 1 and rows[0].status == "verified"
+    assert rows[0].snapshot["positions_after_hero"] == ["CO"]
+    assert state.active_spot_id == rows[0].id and state.last_analysis_id is None
+    assert hand_count == 0
+
+
+async def test_full_spot_after_draft_replaces_source_instead_of_appending(
+    db_factory, queue, deps, monkeypatch
+):
+    from harness.contracts.decision_spot import RawDecisionSpot
+    from harness.contracts.natural_hand import NaturalAction, NaturalHand, NaturalRead
+    from harness.memory.repos import DecisionSpotsRepo
+    source = "BTN открыл, я 3-бет с AKs на SB, BTN колл. Флоп K72. Что делать?"
+    raw = NaturalHand(
+        hero_position="SB", hero_cards="AKs", flop="K72", source_text=source,
+        actions=[
+            NaturalAction(position="BTN", kind="raise", quote="BTN открыл"),
+            NaturalAction(position="SB", kind="raise", quote="я 3-бет с AKs на SB"),
+            NaturalAction(position="BTN", kind="call", quote="BTN колл"),
+        ],
+    )
+    seen: list[str] = []
+
+    async def extracted(_llm, message, _trace_id, *, active=None):
+        seen.append(message)
+        return NaturalRead(intent="new_hand", hand=raw)
+
+    monkeypatch.setattr(pipeline_module, "read_natural_hand", extracted)
+    async def no_opinion(*args, **kwargs):
+        return None
+    monkeypatch.setattr(pipeline_module, "natural_opinion", no_opinion)
+    player_id, session_id = await _make_scope(db_factory)
+    async with db_factory() as session:
+        await DecisionSpotsRepo(session).save(
+            player_id=player_id, session_id=session_id,
+            source_text="Старый черновик", raw=RawDecisionSpot().model_dump(mode="json"),
+            canonical=None, snapshot=None,
+        )
+        await session.commit()
+    await queue.enqueue(
+        type="agent", player_id=player_id, session_id=session_id,
+        payload={"text": source},
+    )
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+    assert seen == [source]
+    async with db_factory() as session:
+        sources = (await session.execute(text(
+            "select source_text from decision_spots where session_id = :session_id order by id"
+        ), {"session_id": session_id})).scalars().all()
+    assert sources == ["Старый черновик", source]
+
+
+async def test_short_text_correction_replays_current_scenario(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    from harness.contracts.natural_hand import (
+        NaturalAction,
+        NaturalHand,
+        NaturalPlayer,
+        NaturalRead,
+    )
+
+    original_text = "BTN открыл, я 3-бет с AKs на SB, BTN колл. Флоп K72. Что делать?"
+    original = NaturalHand(
+        hero_position="SB", hero_cards="AKs", flop="K72", source_text=original_text,
+        actions=[
+            NaturalAction(position="BTN", kind="raise", quote="BTN открыл"),
+            NaturalAction(position="SB", kind="raise", quote="я 3-бет с AKs на SB"),
+            NaturalAction(position="BTN", kind="call", quote="BTN колл"),
+        ],
+    )
+    correction = NaturalHand(
+        players=[NaturalPlayer(position="BTN", stack_bb="18", quote="у BTN было 18 BB")],
+        source_text="у BTN было 18 BB",
+    )
+    seen_active: list[bool] = []
+
+    async def extracted(_llm, message, _trace_id, *, active=None):
+        seen_active.append(active is not None)
+        if message == original_text:
+            return NaturalRead(intent="new_hand", hand=original)
+        return NaturalRead(intent="correction", hand=correction)
+
+    monkeypatch.setattr(pipeline_module, "read_natural_hand", extracted)
+    async def no_opinion(*args, **kwargs):
+        return None
+    monkeypatch.setattr(pipeline_module, "natural_opinion", no_opinion)
+    player_id, session_id = await _make_scope(db_factory)
+    for message in (original_text, "у BTN было 18 BB"):
+        await queue.enqueue(
+            type="agent", player_id=player_id, session_id=session_id,
+            payload={"text": message},
+        )
+        job = await queue.claim("w1")
+        assert job is not None
+        await run_job(job, deps)
+    assert seen_active == [False, True]
+    async with db_factory() as session:
+        rows = (await session.execute(text(
+            "select version, status, canonical from decision_spots "
+            "where session_id = :session_id order by id"
+        ), {"session_id": session_id})).all()
+    assert [row.version for row in rows] == [1, 2]
+    assert all(row.status == "verified" for row in rows)
+    assert rows[0].canonical["stacks_behind_bb"]["BTN"]["value"] == "40"
+    assert rows[1].canonical["stacks_behind_bb"]["BTN"]["value"] == "18"
+    assert "BTN стек 40 BB" not in _all_texts(fake_sender)[-1]
+
+
+async def test_natural_extract_schema_failure_gets_a_specific_reply(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    from harness.platform.llm import LLMSchemaError
+
+    async def unreadable(*args, **kwargs):
+        raise LLMSchemaError("synthetic invalid output")
+
+    monkeypatch.setattr(pipeline_module, "read_natural_hand", unreadable)
+    player_id, session_id = await _make_scope(db_factory)
+    jid = await queue.enqueue(
+        type="agent", player_id=player_id, session_id=session_id,
+        payload={"text": "Я BB с 99, BTN пуш. Есть колл?"},
+    )
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+    assert await job_status(db_factory, jid) == "done"
+    assert any("не получилось прочитать описание раздачи" in message
+               for message in _all_texts(fake_sender))
+
+
+async def test_replaying_saved_clarification_does_not_call_model_again(
+    db_factory, queue, deps, fake_sender, monkeypatch
+):
+    from harness.contracts.decision_spot import RawDecisionSpot, SpotFact
+    from harness.memory.repos import DecisionSpotsRepo
+
+    async def forbidden_extract(*args, **kwargs):
+        raise AssertionError("saved clarification must not call model again")
+
+    monkeypatch.setattr(pipeline_module, "extract_decision_spot", forbidden_extract)
+    player_id, session_id = await _make_scope(db_factory)
+    source = "Старый спот\nУточнение: 5"
+    raw = RawDecisionSpot(
+        source_text=source,
+        table_size=SpotFact(value="5", quote="Уточнение: 5", status="known"),
+    )
+    async with db_factory() as session:
+        await DecisionSpotsRepo(session).save(
+            player_id=player_id, session_id=session_id,
+            source_text=source, raw=raw.model_dump(mode="json"),
+            canonical=None, snapshot=None,
+        )
+        await session.commit()
+    jid = await queue.enqueue(
+        type="agent", player_id=player_id, session_id=session_id,
+        payload={"text": "5"},
+    )
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    assert await job_status(db_factory, jid) == "done"
+    async with db_factory() as session:
+        count = (await session.execute(text("select count(*) from decision_spots"))).scalar_one()
+    assert count == 1
+    assert any("целиком одним сообщением" in message for message in _all_texts(fake_sender))
+
+
+async def test_short_ante_reply_does_not_mutate_saved_spot_or_call_model(
+    db_factory, queue, deps, monkeypatch
+):
+    from harness.contracts.decision_spot import RawDecisionSpot, SpotFact
+    from harness.memory.repos import DecisionSpotsRepo
+
+    async def forbidden_extract(*args, **kwargs):
+        raise AssertionError("ante payer reply must not call model")
+
+    monkeypatch.setattr(pipeline_module, "extract_decision_spot", forbidden_extract)
+    player_id, session_id = await _make_scope(db_factory)
+    source = "5 игроков, анте 100"
+    raw = RawDecisionSpot(
+        source_text=source,
+        table_size=SpotFact(value="5", quote="5 игроков", status="known"),
+        ante=SpotFact(value="100", quote="анте 100", status="known"),
+    )
+    async with db_factory() as session:
+        await DecisionSpotsRepo(session).save(
+            player_id=player_id, session_id=session_id,
+            source_text=source, raw=raw.model_dump(mode="json"),
+            canonical=None, snapshot=None,
+        )
+        await session.commit()
+    jid = await queue.enqueue(
+        type="agent", player_id=player_id, session_id=session_id,
+        payload={"text": "каждый"},
+    )
+    job = await queue.claim("w1")
+    assert job is not None
+    await run_job(job, deps)
+
+    assert await job_status(db_factory, jid) == "done"
+    async with db_factory() as session:
+        latest = (await session.execute(text(
+            "select raw from decision_spots where session_id = :session_id order by id desc limit 1"
+        ), {"session_id": session_id})).scalar_one()
+    assert latest["ante_type"] == "unknown"
+
+
 async def _agent_range_turn(db_factory, queue, deps, *, with_analysis: bool):
     """Задача `agent`, в которой модель зовёт `opponent_range`; вечер с разбором
     синтетической руки (указатель `last_analysis_id` выставлен) или без него.

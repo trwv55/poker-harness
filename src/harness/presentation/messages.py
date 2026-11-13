@@ -118,6 +118,7 @@ from harness.contracts.analysis import (
     turn_flop_call_detail,
 )
 from harness.contracts.calcs import (
+    RANGE_CATEGORY_NAMES,
     CalcName,
     CalcResult,
     CoverageResult,
@@ -223,7 +224,6 @@ __all__ = [
     "progress_text",
     "question_msg",
     "question_refusal_msg",
-    "question_too_long_msg",
     "question_usage_msg",
     "quota_exceeded_msg",
     "range_image_title",
@@ -1820,6 +1820,52 @@ def unsupported_document_msg() -> Msg:
         )
     )
 
+def spot_description_file_msg() -> Msg:
+    return Msg(
+        text="Описание раздачи пришлите обычным текстовым сообщением. Файл .txt нужен для hand history из покеррума."
+    )
+
+
+def spot_question_msg(questions: Sequence[str]) -> Msg:
+    # One reusable guide: the next input is a complete description, not a
+    # fragment appended to the draft. Never expose ante-payer/stack-moment asks.
+    relevant = [q for q in questions if not any(word in q.lower() for word in (
+        "кто платил анте", "анте платил", "когда измерен стек", "до анте или",
+    ))]
+    missing = "".join(f"• {q}\n" for q in relevant[:3])
+    return Msg(text=(
+        ("Не хватает данных:\n" + missing + "\n" if missing else "")
+        + "Пришлите раздачу целиком одним сообщением:\n"
+        "• Сколько игроков, блайнды и размер анте (или «без анте»).\n"
+        "• Ваша позиция, карты и примерный стек в BB; позиции и примерные стеки участников банка.\n"
+        "• Действия до вашего решения по порядку, с размерами ставок. Ранние пасы можно пропустить.\n"
+        "• Ваш вопрос. Стадия турнира и влияние ICM, обычный/KO/PKO формат — если знаете; можно написать «не знаю».\n\n"
+        "Стеки считаю после анте и блайндов, до действий. Анте платят все; рейз — итог на улице.\n\n"
+        "Пример: 8 игроков, 400/800, анте 100. Я BB, 9♠9♣, ~30BB. "
+        "CO ~40BB открыл до 2,5BB, BTN ~28BB пуш до 28BB, SB пас. "
+        "Что делать? До денег далеко, без KO, ICM не знаю."
+    ))
+
+
+def spot_followup_msg() -> Msg:
+    return Msg(text=(
+        "Чтобы не потерять детали, пришлите раздачу целиком одним сообщением "
+        "по шаблону выше. Короткие ответы отдельно не добавляю."
+    ))
+
+
+def spot_scenario_msg(condition: str, pot: int, to_call: int, threshold: float | None,
+                      equity: float | None, explanation: str) -> Msg:
+    lines = [f"По вашему описанию, {condition}:",
+             f"банк до вашего хода {pot} фишек; доплата {to_call} фишек."]
+    if threshold is not None:
+        lines.append(f"Колл требует не меньше {round(threshold * 100)}% эквити.")
+    if equity is not None:
+        lines.append(f"Эквити против указанного диапазона: {round(equity * 100)}%.")
+    lines.append(explanation)
+    return Msg(text="\n".join(lines))
+
+
 
 def screenshots_not_supported_msg() -> Msg:
     """Экран стола прислан — разбора не будет, и причина названа вслух.
@@ -2778,7 +2824,7 @@ _CALC_WORD: dict[CalcName, str] = {
     CalcName.DEFENSE_FREQUENCY: "требуемая частота защиты",
     CalcName.FREQUENCY_VS_THRESHOLD: "частота против порога",
     CalcName.OPPONENT_RANGE: "диапазон соперника по чарту",
-    CalcName.EQUITY_VS_RANGE: "эквити против суженного диапазона",
+    CalcName.EQUITY_VS_RANGE: "эквити по категориям суженного диапазона",
 }
 
 _STAT_WORD: dict[FrequencyStat, str] = {
@@ -2952,14 +2998,28 @@ def _opponent_range_answer(result: OpponentRangeResult, trim: bool = False) -> l
 
 
 def _equity_answer(result: EquityVsRangeResult, trim: bool = False) -> list[str]:
-    return [
-        (
-            f"Эквити против диапазона {result.opponent_position}, суженного по линии "
-            f"(допущение): {_calc_pct(100.0 * result.equity, trim)} — "
-            f"{round(result.live_combos)} комбо, "
-            f"{_calc_pct(100.0 * result.share_of_start, trim)} стартового."
-        )
+    """Сужение и эквити по его категориям — одного общего числа нет (спека 2026-10-24,
+    §14.4; `test_agent_numbers_print_the_chart_range_and_the_equity_by_category`); до флопа
+    — одно эквити с «(допущение)» (§14.11; `test_agent_numbers_print_the_preflop_equity`)."""
+    parts = [
+        f"{RANGE_CATEGORY_NAMES[group.category]} — {round(group.combos)} комбо, "
+        f"{_calc_pct(100.0 * group.equity, trim)}"
+        for group in result.layout
+        if group.equity is not None
     ]
+    if result.preflop_equity is not None:
+        return [(
+            f"Эквити против диапазона {result.opponent_position}, суженного по линии "
+            f"(допущение): {_calc_pct(100.0 * result.preflop_equity, trim)} — "
+            f"{round(result.live_combos)} комбо."
+        )]
+    head = (
+        f"Диапазон {result.opponent_position}, суженный по линии (допущение): "
+        f"{round(result.live_combos)} комбо."
+    )
+    if not parts:
+        return [head]
+    return [head, "Эквити вашей руки против каждой категории: " + "; ".join(parts) + "."]
 
 
 def question_msg(result: CalcResult, prose: str | None) -> Msg:
@@ -3009,6 +3069,7 @@ def agent_turn_msg(
     from_context: bool,
     from_history: bool = False,
     job_id: int,
+    context_source: str = "разбор раздачи",
     assumption: str | None = None,
 ) -> Msg:
     """Ответ агента — одно из трёх состояний (спека агента, §7).
@@ -3060,7 +3121,7 @@ def agent_turn_msg(
         sources = [
             word
             for word, present in (
-                ("разбор раздачи", from_context),
+                (context_source, from_context),
                 ("расчёты выше в этом разговоре", from_history),
             )
             if present
@@ -3141,10 +3202,6 @@ def ask_moved_msg() -> Msg:
     return Msg(text="Команда больше не нужна — спрашивайте просто текстом.")
 
 
-def question_too_long_msg(limit: int) -> Msg:
-    return Msg(text=f"Вопрос длиннее {limit} символов — сократите его.")
-
-
 # Список того, что продукт умеет считать. У `/ask` — один на отказ и на подсказку
 # команды; у агента — тот же список плюс расчёты по разобранной руке, которых у
 # `/ask` нет (`test_the_agent_list_names_the_range_calculations_and_ask_does_not`).
@@ -3163,8 +3220,8 @@ _COUNTED_ITEMS: tuple[str, ...] = (
 )
 _AGENT_ONLY_ITEMS: tuple[str, ...] = (
     (
-        "в разобранной руке — стартовый диапазон соперника по чарту и эквити вашей руки "
-        "против него, суженного по линии (допущение)"
+        "в разобранной руке — стартовый диапазон соперника по чарту и его сужение по линии "
+        "(допущение) с эквити вашей руки против каждой категории"
     ),
 )
 

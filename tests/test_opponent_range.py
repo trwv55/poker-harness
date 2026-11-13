@@ -25,14 +25,14 @@ from harness.analysis.opponent_range import (
     narrow,
     range_spot,
     start_range,
+    turn_checked_through,
 )
-from harness.analysis.player_stats import hero_bet_called
 from harness.contracts import (
-    FrequencyStat,
     Post,
     PostKind,
     Provenance,
     Range,
+    RangeCategory,
     RangeNarrowing,
     RawHand,
     SeatInfo,
@@ -262,15 +262,13 @@ def test_the_board_is_the_board_of_the_street():
     assert board_at(hand, Street.TURN) == ["Qc", "7d", "2s", "5h"]
 
 
-def test_the_equity_spot_takes_the_street_board_and_the_share_of_the_start(tmp_path: Path):
+def test_the_equity_spot_takes_the_street_board(tmp_path: Path):
     spot = equity_spot(
         _hand(BTN_OPENS_BB_CALLS), "BB", Street.FLOP, "QQ, 77, 22, AQs",
         defend_path=defend_file(tmp_path),
     )
     assert spot.hero == ("Kd", "Tc") and spot.board == ["Qc", "7d", "2s"]
     assert spot.live_combos == 12.0  # по 3 у каждой пары с картой на борде, AQs без Qc — 3
-    dead = ("Kd", "Tc", "Qc", "7d", "2s")
-    assert spot.share_of_start == pytest.approx(12.0 / live_combos(parse_range(_DEFEND_CALL), dead))
 
 
 def test_a_fully_blocked_range_is_refused_not_zero(tmp_path: Path):
@@ -468,6 +466,18 @@ _THROUGH_RIVER = [
     *BTN_OPENS_BB_CALLS,
     _check(T, "P6"), _bet(T, "Hero", 400), _call(T, "P6", 400),
     _check(R, "P6"), _bet(R, "Hero", 900), _call(R, "P6", 900),
+]
+
+
+_TURN_CHECKED = [
+    *BTN_OPENS_BB_CALLS,
+    _check(T, "P6"), _check(T, "Hero"),
+    _check(R, "P6"), _bet(R, "Hero", 900), _call(R, "P6", 900),
+]
+# BB 3-бетит опен героя, герой коллирует: на его решении до флопа банк хедз-ап.
+_BB_THREE_BETS = [
+    _fold(P, "P1"), _fold(P, "P2"), _fold(P, "P3"), _raise(P, "Hero", 250), _fold(P, "P5"),
+    _raise(P, "P6", 800), _call(P, "Hero", 550), _check(F, "P6"), _check(F, "Hero"),
 ]
 
 
@@ -737,43 +747,109 @@ def test_the_opener_range_has_no_absent_groups():
     assert start_range(range_spot(_hand(actions, button="P2"), "BTN")).absent == ()
 
 
-def test_the_share_of_the_start_counts_the_added_combos_over_the_start(tmp_path: Path):
-    """Добавленные комбо считаются сверх стартового: доля может быть больше единицы."""
-    spot = equity_spot(
-        _hand(BTN_OPENS_BB_CALLS), "BB", Street.FLOP, "AA", added="KJo, K9o",
-        named=frozenset({"KJo", "K9o"}), defend_path=defend_file(tmp_path, call="AA"),
+def test_a_river_narrowing_takes_categories_of_the_turn_narrowing(tmp_path: Path):
+    """Ривер (спека 2026-10-24, §14): категория — из раскладки сужения тёрна на полном
+    борде; сводка и раскладка суженного есть, как на флопе и тёрне."""
+    river = equity_spot(
+        _hand(_THROUGH_RIVER), "BB", Street.RIVER, "сет",
+        prior=_prior(Street.TURN, "QQ, 77, AKs"), defend_path=defend_file(tmp_path),
     )
-    assert spot.share_of_start > 1.0
+    assert river.narrowed == Range(weights={"QQ": 1.0, "77": 1.0})
+    assert river.categories_of == "turn"
+    assert [group.category for group in river.narrowed_layout] == [RangeCategory.SET]
+    # Без сужения тёрна — отказ о нём, а не о категории, которой нет в стартовом.
+    with pytest.raises(RangeRefused) as refused:
+        equity_spot(
+            _hand(_THROUGH_RIVER), "BB", Street.RIVER, "трипс", defend_path=defend_file(tmp_path)
+        )
+    assert str(refused.value) == _FIRST_THE_TURN
 
 
-# --- ставка героя, которую соперник уравнял (ориентир сдачи, спека 2026-10-24, §13) ---
-
-
-_COLD_CALL_FLOP_BOTH_CALL = [
-    *_COLD_CALL, _check(F, "P5"), _check(F, "P6"), _bet(F, "Hero", 300), _call(F, "P5", 300),
-    _call(F, "P6", 300),
-]
-_BB_RAISES_THE_CBET = [
-    *BTN_OPENS_BB_CALLS[:-1], _raise(F, "P6", 480), _call(F, "Hero", 320),
-]
-_BB_DONKS = [*BTN_OPENS_BB_CALLS[:-3], _bet(F, "P6", 160), _call(F, "Hero", 160)]
-
-
-@pytest.mark.parametrize(
-    ("actions", "label", "street", "stat"),
-    [
-        (BTN_OPENS_BB_CALLS, "P6", F, FrequencyStat.FOLD_TO_CBET),
-        (_THROUGH_RIVER, "P6", T, FrequencyStat.FOLD_TO_TURN_BARREL),
-        (_THROUGH_RIVER, "P6", R, None),
-        (_BB_RAISES_THE_CBET, "P6", F, None),
-        (_BB_DONKS, "P6", F, None),
-        (_COLD_CALL_FLOP_BOTH_CALL, "P6", F, None),
-        (_COLD_CALL_FLOP_BOTH_CALL, "P5", F, None),
-    ],
-    ids=["cbet-called", "barrel-called", "river", "cbet-raised", "donk", "multiway-last",
-         "multiway-first"],
+_FIRST_THE_FLOP_TURN_CHECKED = (
+    "сначала сузьте флоп: вызовите equity_vs_range для флопа этого соперника — на тёрне "
+    "ставок не было, ривер сужается из сужения флопа"
 )
-def test_the_hero_bet_the_opponent_called_names_the_fold_stat(actions, label, street, stat):
-    """С-бет героя, уравненный соперником, — `fold_to_cbet`; второй баррель —
-    `fold_to_turn_barrel`; рейз, донк, ривер и больше двух в банке на ответе — `None`."""
-    assert hero_bet_called(_hand(actions), label, street) is stat
+
+
+def test_a_checked_through_turn_lets_the_river_narrow_from_the_flop(tmp_path: Path):
+    """Тёрн прошёл чек-чек (решение владельца 2026-10-28): ривер сужается из сужения флопа
+    без сужения тёрна, подмножество — от него; без сужения флопа — отказ. Ставка на
+    тёрне была — ривер по-прежнему требует сужения тёрна."""
+    checked = _hand(_TURN_CHECKED)
+    assert turn_checked_through(checked) and not turn_checked_through(_hand(_THROUGH_RIVER))
+    river = equity_spot(
+        checked, "BB", Street.RIVER, "сет", prior=_prior(Street.FLOP, "QQ, 77, AKs"),
+        defend_path=defend_file(tmp_path),
+    )
+    assert river.narrowed == Range(weights={"QQ": 1.0, "77": 1.0})
+    assert river.categories_of == "flop_turn_checked"
+    with pytest.raises(RangeRefused, match="на флопе эти классы вы уже убрали: 22"):
+        equity_spot(
+            checked, "BB", Street.RIVER, "QQ, 22", prior=_prior(Street.FLOP, "QQ, 77"),
+            defend_path=defend_file(tmp_path),
+        )
+    with pytest.raises(RangeRefused) as refused:
+        equity_spot(checked, "BB", Street.RIVER, "QQ", defend_path=defend_file(tmp_path))
+    assert str(refused.value) == _FIRST_THE_FLOP_TURN_CHECKED
+    with pytest.raises(RangeRefused) as refused:
+        equity_spot(
+            _hand(_THROUGH_RIVER), "BB", Street.RIVER, "QQ", prior=_prior(Street.FLOP, "QQ"),
+            defend_path=defend_file(tmp_path),
+        )
+    assert str(refused.value) == _FIRST_THE_TURN
+
+
+def test_a_turn_with_a_raise_or_not_dealt_is_not_checked_through():
+    """Рейз на тёрне — ставка была; тёрн не роздан — проверять нечего. Олл-ин на флопе:
+    на тёрне ходов нет, ставок не было."""
+    raised = [
+        *BTN_OPENS_BB_CALLS, _bet(T, "P6", 300), _raise(T, "Hero", 900), _call(T, "P6", 600),
+        _check(R, "P6"), _check(R, "Hero"),
+    ]
+    assert not turn_checked_through(_hand(raised))
+    played = _hand(BTN_OPENS_BB_CALLS)
+    flop_only = played.model_copy(update={"boards": {F: played.boards[F]}})
+    assert not turn_checked_through(flop_only)
+    shoved = [
+        *BTN_OPENS_BB_CALLS[:-3], _check(F, "P6"), _bet(F, "Hero", 2750), _call(F, "P6", 2750),
+    ]
+    assert turn_checked_through(_hand(shoved))
+
+
+def test_a_turn_narrowing_reset_by_a_new_flop_is_refused_by_name(tmp_path: Path):
+    """F1 → T1 → F2: сужение тёрна сброшено (решение владельца 2026-10-28). Ставка на
+    тёрне — ривер требует сузить тёрн заново, отказ называет причину; на тёрне ставок
+    не было — ривер от нового сужения флопа."""
+    with pytest.raises(RangeRefused) as refused:
+        equity_spot(
+            _hand(_THROUGH_RIVER), "BB", Street.RIVER, "QQ", prior=_prior(Street.FLOP, "QQ"),
+            reset=[Street.TURN], defend_path=defend_file(tmp_path),
+        )
+    assert str(refused.value).startswith("сначала сузьте тёрн: флоп сужен заново")
+    river = equity_spot(
+        _hand(_TURN_CHECKED), "BB", Street.RIVER, "QQ", prior=_prior(Street.FLOP, "QQ, 77"),
+        reset=[Street.TURN], defend_path=defend_file(tmp_path),
+    )
+    assert river.categories_of == "flop_turn_checked"
+
+
+def test_a_flop_narrowing_reset_by_a_new_preflop_is_refused_by_name(tmp_path: Path):
+    """Префлоп сужен заново после флопа — тёрн требует сузить флоп заново, с причиной."""
+    with pytest.raises(RangeRefused) as refused:
+        equity_spot(
+            _hand(_THROUGH_RIVER), "BB", Street.TURN, "QQ", reset=[Street.FLOP],
+            defend_path=defend_file(tmp_path),
+        )
+    assert str(refused.value).startswith("сначала сузьте флоп: префлоп сужен заново")
+
+
+@pytest.mark.parametrize("actions", [_THROUGH_RIVER, _TURN_CHECKED], ids=["turn-bet", "turn-checked"])
+def test_a_river_after_a_new_preflop_names_the_preflop_reset(tmp_path: Path, actions):
+    """F1 → T1 → P2: флоп и тёрн сброшены. Ривер — и со ставкой на тёрне, и без ставок —
+    отказ с причиной по самой ранней сброшенной улице: «префлоп сужен заново»."""
+    with pytest.raises(RangeRefused) as refused:
+        equity_spot(
+            _hand(actions), "BB", Street.RIVER, "QQ", reset=[Street.FLOP, Street.TURN],
+            defend_path=defend_file(tmp_path),
+        )
+    assert str(refused.value).startswith("сначала сузьте флоп: префлоп сужен заново")

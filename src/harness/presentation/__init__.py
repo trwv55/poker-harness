@@ -91,7 +91,6 @@ from harness.presentation.messages import (
     progress_text,
     question_msg,
     question_refusal_msg,
-    question_too_long_msg,
     question_usage_msg,
     quota_exceeded_msg,
     range_image_title,
@@ -105,6 +104,10 @@ from harness.presentation.messages import (
     session_unavailable_msg,
     sessions_msg,
     settings_msg,
+    spot_description_file_msg,
+    spot_followup_msg,
+    spot_question_msg,
+    spot_scenario_msg,
     start_msg,
     unknown_button_msg,
     unknown_text_msg,
@@ -114,6 +117,7 @@ from harness.presentation.messages import (
     vision_gave_up_msg,
     vision_manual_entry_msg,
 )
+from harness.presentation.natural_hand import natural_scenario_msg
 
 __all__ = [
     "AGENT_MISS_PREFIX",
@@ -175,6 +179,7 @@ __all__ = [
     "invite_created_msg",
     "invite_required_msg",
     "leaks_msg",
+    "natural_scenario_msg",
     "new_session_msg",
     "not_a_hand_msg",
     "note_appended_msg",
@@ -196,7 +201,6 @@ __all__ = [
     "progress_text",
     "question_msg",
     "question_refusal_msg",
-    "question_too_long_msg",
     "question_usage_msg",
     "quota_exceeded_msg",
     "range_image_title",
@@ -210,6 +214,10 @@ __all__ = [
     "session_unavailable_msg",
     "sessions_msg",
     "settings_msg",
+    "spot_description_file_msg",
+    "spot_followup_msg",
+    "spot_question_msg",
+    "spot_scenario_msg",
     "start_msg",
     "unknown_button_msg",
     "unknown_text_msg",

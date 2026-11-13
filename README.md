@@ -98,6 +98,36 @@ git config core.hooksPath .githooks
 `daily-classic-146.txt` и `pko-bounty-172.txt` (числа в именах — количество рук,
 которое ожидает сетка).
 
+## Модель агента и хостер OpenRouter
+
+Модель выбирается в `.env` (настоящий ключ не коммитится):
+
+```dotenv
+OPENROUTER_API_KEY=<ваш ключ>
+LLM_AGENT_MODEL=openrouter:qwen/qwen3.8-flash
+LLM_VERDICT_MODEL=openrouter:qwen/qwen3.8-flash
+LLM_OPENROUTER_PROVIDER_SORT=throughput
+```
+
+`LLM_AGENT_MODEL` — агент, `LLM_VERDICT_MODEL` — старый `/ask` и модули изложения.
+Умолчание агента — Qwen3.8 Flash. Ключ OpenRouter читает клиент PydanticAI.
+После изменения `.env` перезапустите бот и воркер: конфиг читается при старте.
+
+Хостер внутри OpenRouter настраивается отдельно от модели:
+
+- `LLM_OPENROUTER_PROVIDER_SORT`: `throughput` (по умолчанию, скорость генерации),
+  `latency` (первый токен) или `price` (цена).
+- `LLM_OPENROUTER_PROVIDER_ORDER`: необязательный список приоритетных хостеров или
+  endpoint'ов через запятую, например `alibaba/us-east-1,alibaba`. Пусто — выбор по
+  сортировке. Резервные хостеры разрешены, модель при этом остаётся той же.
+
+Код: `platform/config.py` читает настройки; `platform/llm.py::_build_model`
+передаёт их в `OpenRouterModel` как `openrouter_provider`. Только хостеры с
+поддержкой всех параметров запроса (`require_parameters=true`); фактически
+ответивший хостер записывается в `llm_calls.served_by`. Для других вендоров эти
+настройки не применяются. Сортировка не гарантирует время всего хода: в нём
+несколько последовательных запросов, и каждый генерирует свои токены.
+
 ## Деплой
 
 Docker Compose на VPS: `postgres`, `bot`, `worker` (спека §12). Все три процесса

@@ -26,8 +26,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
-from typing import Any, Literal, cast, overload
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from typing import Any, cast, overload
 
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,16 +40,18 @@ from harness.analysis.frequency import (
     threshold_from_bet,
 )
 from harness.analysis.opponent_range import (
+    EquitySpot,
+    RangeRefused,
     board_at,
     equity_spot,
     hero_cards,
+    layout_source,
     live_combos,
-    prior_range,
+    previous_streets,
     range_spot,
     start_range,
 )
 from harness.analysis.player_stats import (
-    hero_bet_called,
     measurement_of,
     player_stats_of_seats,
     seat_position,
@@ -57,6 +59,7 @@ from harness.analysis.player_stats import (
 from harness.analysis.range_categories import layout
 from harness.analysis.solver_guide import SolverFileError, hand_bet, load_library, nearest
 from harness.analysis.tools.equity import equity_vs_range
+from harness.analysis.tools.exact_equity import class_equities, group_equity
 from harness.contracts import (
     POSITIONS,
     CalcName,
@@ -70,7 +73,6 @@ from harness.contracts import (
     DefenseResult,
     EquityVsRangeParams,
     EquityVsRangeResult,
-    FoldHint,
     FrequencyResult,
     FrequencyStat,
     HeroFrequencyParams,
@@ -98,10 +100,12 @@ from harness.memory.repos import (
 )
 
 __all__ = [
-    "AGENT_EQUITY_ITERATIONS",
-    "AGENT_EQUITY_SEED",
+    "CLASS_EQUITY_PREFIX",
+    "PREFLOP_EQUITY_ITERATIONS",
+    "PREFLOP_EQUITY_PREFIX",
+    "PREFLOP_EQUITY_SEED",
     "REGISTRY",
-    "equity_cache_prefix",
+    "class_equity_key",
     "run",
     "seats_of",
 ]
@@ -318,17 +322,55 @@ async def _threshold(
     )
 
 
-# Потолок итераций Монте-Карло у эквити агента: ход агента ждут до 30 с, а расчёт
-# идёт в процессе воркера. Значение — по замеру на стенде (план 2026-10-14, Task 5,
-# Step 6). Сид — тот же, что умолчание `equity_vs_range`: один вход — одно число.
-AGENT_EQUITY_ITERATIONS = 50_000
-AGENT_EQUITY_SEED = 42
+# Пространство ключей `calc_cache` эквити героя против класса (спека 2026-10-24, §14):
+# метод и версия в префиксе — число другого метода (Монте-Карло `eqr:`) не отдаётся.
+CLASS_EQUITY_PREFIX = "eqc:v1:exact:"
+
+# До флопа категорий нет, и эквити против суженного — одно число (§14.11). Точный
+# перебор там — 1.7 млн бордов на комбо, поэтому Монте-Карло, как до §14: потолок
+# итераций — по замеру на стенде (план 2026-10-14, Task 5), сид — умолчание
+# `equity_vs_range`; оба в префиксе ключа — смена любого не отдаёт старое число.
+PREFLOP_EQUITY_ITERATIONS = 50_000
+PREFLOP_EQUITY_SEED = 42
+PREFLOP_EQUITY_PREFIX = f"eqr:v1:{PREFLOP_EQUITY_ITERATIONS}:{PREFLOP_EQUITY_SEED}:"
 
 
-def equity_cache_prefix() -> str:
-    """Пространство ключей `calc_cache` эквити агента: смена итераций или сида не
-    отдаёт число, посчитанное на старых (тот же приём, что у `CalcCacheRepo`)."""
-    return f"eqr:v1:{AGENT_EQUITY_ITERATIONS}:{AGENT_EQUITY_SEED}:"
+def class_equity_key(hero: Sequence[str], board: Sequence[str], hand_class: str) -> str:
+    """Ключ строки `calc_cache` эквити класса: карты героя, борд, класс."""
+    return f"{''.join(hero)}|{''.join(board)}|{hand_class}"
+
+
+async def _class_equities(
+    db: AsyncSession, hero: Sequence[str], board: Sequence[str], classes: Collection[str]
+) -> dict[str, float]:
+    """Эквити героя против каждого из `classes` (точный перебор, `class_equities`): все
+    есть в `calc_cache` — без пересчёта
+    (`test_a_cached_class_equity_is_returned_without_counting_again`); иначе перебор
+    в потоке, и в кэш уходят все классы с живыми комбо на этом борде — любое другое
+    сужение той же руки на той же улице собирается из них."""
+    cache = CalcCacheRepo(db)
+    keys = {cls: class_equity_key(hero, board, cls) for cls in classes}
+    found = await cache.get_many(CLASS_EQUITY_PREFIX, list(keys.values()))
+    if all(key in found for key in keys.values()):
+        return {cls: found[key] for cls, key in keys.items()}
+    counted = await asyncio.to_thread(class_equities, list(hero), list(board))
+    await cache.upsert_many(CLASS_EQUITY_PREFIX, {
+        class_equity_key(hero, board, cls): value for cls, value in counted.items()
+    })
+    return {cls: counted[cls] for cls in classes}
+
+
+async def _with_equity(
+    db: AsyncSession, hero: Sequence[str], board: Sequence[str], groups: Sequence[CategoryGroup]
+) -> list[CategoryGroup]:
+    """Раскладка с эквити против каждой категории — средним эквити её классов по живым
+    комбо с долей (`group_equity`)."""
+    by_class = await _class_equities(
+        db, hero, board, [item.hand_class for group in groups for item in group.classes]
+    )
+    return [
+        group.model_copy(update={"equity": group_equity(group, by_class)}) for group in groups
+    ]
 
 
 async def _analysed_hand(db: AsyncSession, player_id: int, analysis_id: int) -> CanonicalHand:
@@ -368,9 +410,12 @@ async def _opponent_range(
     db: AsyncSession, player_id: int, params: OpponentRangeParams
 ) -> OpponentRangeResult:
     """Стартовый диапазон по чарту в руке разбора; отказы ядра — `ValueError` словами.
-    На флопе и тёрне — и раскладка по категориям (спека 2026-10-24, §4): на тёрне —
-    сужения флопа этой руки, если оно есть, иначе стартового
-    (`test_the_turn_layout_is_of_the_flop_narrowing_and_without_it_of_the_start`)."""
+    После флопа — и раскладка по категориям (спека 2026-10-24, §4) с эквити руки героя
+    против каждой (§14): на тёрне и ривере — исходного сужения этой руки (прошлой улицы,
+    после чек-чек тёрна на ривере — и флопа); без него раскладки нет, а в
+    `layout_refusal` — «сначала сузьте …» (§14.11)
+    (`test_the_turn_layout_is_of_the_flop_narrowing_and_without_it_is_refused`,
+    `test_every_category_of_the_range_layout_carries_its_own_equity`)."""
     _check_position(params.opponent_position)
     enriched = await AnalysesRepo(db).enriched_hand(params.analysis_id, player_id)
     if enriched is None:
@@ -378,16 +423,19 @@ async def _opponent_range(
     hand = enriched.hand
     start = start_range(range_spot(hand, params.opponent_position))
     board = board_at(hand, params.street)
-    dead = [*hero_cards(hand), *board]
-    layout_of: Literal["start", "flop"] | None = None
-    groups: list[CategoryGroup] = []
-    if params.street in (Street.FLOP, Street.TURN):
-        layout_of = "start"
-        source = start.range
-        prior = params.prior
-        if params.street is Street.TURN and prior is not None and prior.street is Street.FLOP:
-            layout_of, source = "flop", prior_range(start.range, prior)
-        groups = await asyncio.to_thread(layout, source, board, dead)
+    hero = sorted(hero_cards(hand))
+    dead = [*hero, *board]
+    layout_refusal: str | None = None
+    try:
+        layout_of, found = await asyncio.to_thread(
+            layout_source, start.range, params.street, params.prior, board, dead,
+            previous_streets(hand, params.street), params.reset,
+        )
+    except RangeRefused as exc:
+        layout_of, found, layout_refusal = None, None, str(exc)
+    groups = list(found or [])
+    if groups and len(hero) == 2:
+        groups = await _with_equity(db, hero, board, groups)
     solver: SolverGuide | None = None
     solver_error: str | None = None
     if params.street is Street.FLOP:
@@ -413,37 +461,34 @@ async def _opponent_range(
         absent=list(start.absent),
         layout_of=layout_of,
         layout=groups,
+        layout_refusal=layout_refusal,
         solver=solver,
         solver_error=solver_error,
     )
 
 
-async def _fold_hint(
-    db: AsyncSession, player_id: int, hand: CanonicalHand, label: str, street: Street
-) -> FoldHint | None:
-    """Частота сдачи соперника на ставку героя, которую он уравнял (спека 2026-10-24, §13;
-    линия — `hero_bet_called`). Подлежащее — правилом `opponent_frequency`: сшивка места в
-    этом турнире — этот соперник, иначе поле
-    (`test_the_flop_equity_after_a_called_cbet_carries_the_fold_to_cbet_hint`)."""
-    stat = hero_bet_called(hand, label, street)
-    if stat is None:
-        return None
-    holder = await OpponentsRepo(db).holder(player_id, hand.tournament_id, label)
-    opponent_id, nick = holder if holder is not None else (None, None)
-    subject = _subject_of(opponent_id)
-    measurement = await _measure(
-        db, player_id, subject=subject, stat=stat, opponent_id=opponent_id, position=None,
-        window=Window(),
-    )
-    return FoldHint(stat=stat, subject=subject, opponent=nick, measurement=measurement)
+async def _preflop_equity(db: AsyncSession, spot: EquitySpot) -> float:
+    """Одно эквити против суженного до флопа — Монте-Карло с фиксированным сидом и
+    `calc_cache` (`test_the_preflop_equity_is_one_number_deterministic_and_cached`)."""
+    cache = CalcCacheRepo(db)
+    key = f"{''.join(spot.hero)}|{''.join(spot.board)}|{to_notation(spot.narrowed)}"
+    equity = await cache.get(PREFLOP_EQUITY_PREFIX, key)
+    if equity is None:
+        equity = await asyncio.to_thread(
+            equity_vs_range, spot.hero, spot.narrowed, spot.board,
+            iterations=PREFLOP_EQUITY_ITERATIONS, seed=PREFLOP_EQUITY_SEED,
+        )
+        await cache.upsert_many(PREFLOP_EQUITY_PREFIX, {key: equity})
+    return equity
 
 
 async def _equity_vs_range(
     db: AsyncSession, player_id: int, params: EquityVsRangeParams
 ) -> EquityVsRangeResult:
-    """Эквити против суженного: Монте-Карло под потолком итераций, с фиксированным
-    сидом (`test_equity_is_deterministic_and_cached`) и `calc_cache`: строка кэша
-    отдаётся без пересчёта (`test_a_cached_equity_is_returned_without_counting_again`).
+    """Сужение и эквити героя против каждой категории суженного — точным перебором,
+    без сида, с `calc_cache` по классам (спека 2026-10-24, §14); одного общего эквити
+    после флопа нет (`test_every_category_of_the_narrowed_range_carries_its_own_equity`).
+    До флопа категорий нет — одно эквити, Монте-Карло (`_preflop_equity`, §14.11).
     Счёт — в потоке, чтобы не держать цикл событий воркера."""
     _check_position(params.opponent_position)
     hand = await _analysed_hand(db, player_id, params.analysis_id)
@@ -451,34 +496,24 @@ async def _equity_vs_range(
         equity_spot, hand, params.opponent_position, params.street, params.hands,
         added=params.added, prior=params.prior, named=params.player_classes,
         kept=params.kept_classes, reason=params.added_reason, kept_agent=params.kept_agent,
+        reset=params.reset,
     )
-    cache = CalcCacheRepo(db)
-    prefix = equity_cache_prefix()
-    equity = await cache.get(prefix, spot.cache_key)
-    if equity is None:
-        equity = await asyncio.to_thread(
-            equity_vs_range, spot.hero, spot.narrowed, spot.board,
-            iterations=AGENT_EQUITY_ITERATIONS, seed=AGENT_EQUITY_SEED,
-        )
-        await cache.upsert_many(prefix, {spot.cache_key: equity})
-    hint = None
-    if spot.categories:
-        hint = await _fold_hint(db, player_id, hand, spot.start.spot.label, params.street)
+    preflop = params.street is Street.PREFLOP
+    groups = [] if preflop else await _with_equity(db, spot.hero, spot.board, spot.narrowed_layout)
     return EquityVsRangeResult(
         calc=params.calc,
         opponent_position=params.opponent_position,
         street=params.street,
         range_text=to_notation(spot.narrowed),
         live_combos=spot.live_combos,
-        share_of_start=spot.share_of_start,
-        equity=equity,
         added=list(spot.added),
         agent_added=dict(spot.agent_added or {}),
         categories_of=spot.categories_of,
         categories=list(spot.categories),
         source_combos=sum(c.combos for c in spot.categories) if spot.categories else None,
         kept_combos=sum(c.kept_combos for c in spot.categories) if spot.categories else None,
-        fold_hint=hint,
+        layout=groups,
+        preflop_equity=await _preflop_equity(db, spot) if preflop else None,
     )
 
 
