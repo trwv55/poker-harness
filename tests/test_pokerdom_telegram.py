@@ -94,8 +94,8 @@ async def test_actual_router_to_queue_worker_report_no_gaming_writes(intake, mon
     assert await scalar(deps.db_factory,'select gg_nickname from players') == 'unrelated-gg-name'
     assert await scalar(deps.db_factory,'select pending_input from players') is None
     report='\n'.join(m.text for m in sender.sent)
-    assert 'возврат непокрытой ставки' in report and '→ до 600' in report
-    assert '5000 (25.00BB)' in report and 'не записана' in report
+    assert 'тебе возвращается 400' in report and 'повышаешь до 600' in report
+    assert '5\u2009000 (25,00 ББ)' in report and 'не записана' not in report
     image_path=job.payload['source_file']
     from pathlib import Path
     assert Path(image_path).read_bytes()==IMAGE
@@ -114,7 +114,7 @@ async def test_unsupported_format_refuses_without_replay(intake,monkeypatch,kind
     sender=FakeSender()
     await run_job(job,Deps(db_factory=intake.db_factory,queue=intake.queue,sender=sender,llm=MagicMock(),pokerdom_llm=MagicMock()))
     report='\n'.join(m.text for m in sender.sent)
-    assert 'Не подтверждён поддерживаемый формат' in report
+    assert 'Не удалось распознать полную таблицу' in report
     assert 'Расчёт кодом' not in report and kind not in report
 
 
@@ -126,7 +126,7 @@ async def test_missing_format_marker_never_uses_poker_legality_as_format_detecto
     monkeypatch.setattr('harness.worker.pokerdom.read_pokerdom',AsyncMock(return_value=(reading,None)))
     sender=FakeSender()
     await run_job(job,Deps(db_factory=intake.db_factory,queue=intake.queue,sender=sender,llm=MagicMock(),pokerdom_llm=MagicMock()))
-    assert any('Не подтверждён поддерживаемый формат' in m.text for m in sender.sent)
+    assert any('Не удалось распознать полную таблицу' in m.text for m in sender.sent)
 
 
 @pytest.mark.parametrize('mode',['cancel','expired','wrong-owner','blank','long','quota'])
@@ -193,9 +193,10 @@ async def test_read_failures_are_diagnostic_no_hidden_retry(intake,monkeypatch,m
     await run_job(job,Deps(db_factory=intake.db_factory,queue=intake.queue,sender=sender,llm=MagicMock(),pokerdom_llm=MagicMock()))
     assert stub.await_count==1
     report='\n'.join(m.text for m in sender.sent)
-    if mode=='missing-pot':assert 'не указан; не сверен' in report
+    if mode=='missing-pot':assert 'Не удалось прочитать банк' in report
+    elif mode=='no-events':assert 'последовательность действий' in report
     elif mode=='read-error':assert await scalar(intake.db_factory,'select status from jobs')=='failed'
-    else:assert 'не прошло полную проверку' in report
+    else:assert 'Не удалось' in report
     assert await scalar(intake.db_factory,'select count(*) from hands')==0
 
 
@@ -203,10 +204,10 @@ def test_human_report_conditional_cards_unknown_pot_and_unicode_length():
     reading=v2(showdown_table(explicit=False));reading.notes=['<b>not markup</b>😀'*800]
     result=process_pokerdom(reading,nickname='synthetic-alice')
     messages=pokerdom_messages(result)
-    assert len(messages)>1
+    assert len(messages)==1
     assert all(m.parse_mode is None and len(m.text.encode('utf-16-le'))//2<=3500 for m in messages)
     full=''.join(m.text for m in messages)
-    assert '<b>not markup</b>' in full and 'Условный расчёт' in full and 'вскрытие не подтверждено' in full
+    assert '<b>not markup</b>' not in full and 'По видимым картам' in full and 'вскрытие не подтверждено' in full
 
 
 async def test_nickname_saved_once_reused_across_sessions_and_changeable(intake):
