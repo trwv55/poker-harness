@@ -71,6 +71,22 @@ def _chips(value: int) -> str:
     return f"{value:,}".replace(",", "\u2009")
 
 
+def _amount(value: int, bb: int, *, signed: bool = False) -> str:
+    """Display conversion only; preserve exact chips and round BB half up to .01."""
+    from decimal import ROUND_HALF_UP, Decimal, localcontext
+
+    from harness.presentation.messages import _plural_form
+
+    if bb <= 0:
+        raise ValueError("positive big blind required")
+    sign = "−" if value < 0 else "+" if signed and value > 0 else ""
+    with localcontext() as context:
+        context.prec = max(28, len(str(abs(value))) + len(str(bb)) + 4)
+        converted = (Decimal(abs(value)) / bb).quantize(Decimal(".01"), rounding=ROUND_HALF_UP)
+    unit = _plural_form(value, "фишка", "фишки", "фишек")
+    return f"{sign}{_chips(abs(value))} {unit} ({sign}{str(converted).replace('.', ',')} ББ)"
+
+
 def _cards(values: list[str]) -> str:
     suits = {"h": "♥", "d": "♦", "c": "♣", "s": "♠"}
     return "".join(c[:-1] + suits.get(c[-1:], c[-1:]) for c in values)
@@ -105,11 +121,11 @@ def _friendly_problem(result: PokerdomResult) -> str:
 
 
 def _friendly_story(result: PokerdomResult) -> str:
-    from decimal import ROUND_HALF_UP, Decimal
-
     reading, raw, enriched = result.reading, result.raw, result.enriched
     if result.read_status != "ok" or result.replay_status != "passed" or raw is None or enriched is None:
         return _friendly_problem(result)
+    if not isinstance(raw.bb, int) or raw.bb <= 0:
+        return "Не удалось определить большой блайнд. Пришли полный читаемый скрин с блайндами."
     played = {e.street for e in reading.events}
     if any(reading.pot_after_street.get(street) is None for street in played):
         return "Не удалось прочитать банк сыгранной улицы. Пришли полный скрин с банками после каждой сыгранной улицы."
@@ -135,8 +151,7 @@ def _friendly_story(result: PokerdomResult) -> str:
     def stack(label: str) -> str:
         value = players[label].stack_shown
         assert value is not None
-        bb = str((Decimal(value) / raw.bb).quantize(Decimal(".01"), rounding=ROUND_HALF_UP)).replace(".", ",")
-        return f"{_chips(value)} ({bb} ББ)"
+        return _amount(value, raw.bb)
     hero_cards = _cards(hero_player.cards)
     title = f"Рука с {hero_cards}." if hero_cards else "Рука с неизвестными картами."
     versus = " и ".join(hand(label) for label in opponents)
@@ -163,7 +178,7 @@ def _friendly_story(result: PokerdomResult) -> str:
                 label = next(seat.label for seat, player in zip(raw.seats, reading.players, strict=True)
                              if (player.row_id if isinstance(player, PokerdomPlayer) else player.nickname) == key)
                 assert e.amount is not None
-                moves.append(f"{'тебе' if label == hero else positions[label]} возвращается {_chips(e.amount)}")
+                moves.append(f"{'тебе' if label == hero else positions[label]} возвращается {_amount(e.amount, raw.bb)}")
                 continue
             assert action is not None
             if e.token in {"R", "B", "C"}:
@@ -171,13 +186,13 @@ def _friendly_story(result: PokerdomResult) -> str:
             who = actor(action.label)
             if e.token == "R":
                 assert action.to_amount is not None
-                move = f"{'повышаешь' if action.label == hero else 'повышает'} до {_chips(action.to_amount)}"
+                move = f"{'повышаешь' if action.label == hero else 'повышает'} до {_amount(action.to_amount, raw.bb)}"
             elif e.token == "B":
                 assert e.amount is not None
-                move = f"{'ставишь' if action.label == hero else 'ставит'} {_chips(e.amount)}"
+                move = f"{'ставишь' if action.label == hero else 'ставит'} {_amount(e.amount, raw.bb)}"
             elif e.token == "C":
                 assert e.amount is not None
-                move = f"{'доплачиваешь' if action.label == hero else 'доплачивает'} {_chips(e.amount)}"
+                move = f"{'доплачиваешь' if action.label == hero else 'доплачивает'} {_amount(e.amount, raw.bb)}"
             elif e.token == "Check":
                 move = "чек"
             else:
@@ -187,15 +202,15 @@ def _friendly_story(result: PokerdomResult) -> str:
         heading = _STREET_NAMES[street] + (f" {board}" if board else "")
         pot = reading.pot_after_street[street]
         assert pot is not None
-        paragraphs.append(f"{heading}: " + ", ".join(moves) + f".\nБанк {_chips(pot)}.")
-    final_pot = _chips(enriched.report.final_pot)
+        paragraphs.append(f"{heading}: " + ", ".join(moves) + f".\nБанк {_amount(pot, raw.bb)}.")
+    final_pot = _amount(enriched.report.final_pot, raw.bb)
     if result.outcome_confirmed or result.outcome_basis == "visible_cards":
         end = enriched.report.stacks_end[hero]
         assert hero_player.stack_shown is not None
         net = end - hero_player.stack_shown
-        signed = ("+" if net > 0 else "−" if net < 0 else "") + _chips(abs(net))
+        signed = _amount(net, raw.bb, signed=True)
         prefix = "Результат по расчёту" if result.outcome_confirmed else "По видимым картам, условный результат"
-        paragraphs.append(f"{prefix}: банк {final_pot}, твой чистый результат {signed}, конечный стек {_chips(end)}." +
+        paragraphs.append(f"{prefix}: банк {final_pot}, твой чистый результат {signed}, конечный стек {_amount(end, raw.bb)}." +
                           ("" if result.outcome_confirmed else " Явное вскрытие не подтверждено."))
     else:
         paragraphs.append(f"Результат: банк {final_pot}. Победитель и конечный стек не определены: не хватает известных карт для расчёта.")
@@ -205,11 +220,12 @@ def _friendly_story(result: PokerdomResult) -> str:
 def pokerdom_messages(result: PokerdomResult) -> list[Msg]:
     """Friendly TG projection only; detailed CLI/JSON diagnostics are unchanged."""
     text = _friendly_story(result)
-    # Plain text prevents tag injection; UTF-16 chunks never drop source characters.
+    # Keep each chips+BB pair intact across Telegram messages. Preserve all text.
+    import re
+    tokens = re.findall(r"[+−]?[\d\u2009]+ фиш(?:ка|ки|ек) \([+−]?\d+,\d{2} ББ\)|\s+|\S+", text)
     chunks = [""]
-    for part in text.splitlines(keepends=True):
-        for character in part:
-            if len((chunks[-1] + character).encode("utf-16-le")) // 2 > 3500:
-                chunks.append("")
-            chunks[-1] += character
+    for token in tokens:
+        if len((chunks[-1] + token).encode("utf-16-le")) // 2 > 3500:
+            chunks.append("")
+        chunks[-1] += token
     return [Msg(text=chunk) for chunk in chunks if chunk]

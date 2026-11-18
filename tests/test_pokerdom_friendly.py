@@ -49,9 +49,9 @@ def test_preflop_foldout_uses_raise_total_refund_once_and_hero_only_end_stack():
     result,text=render(v2(table()))
     assert result.replay_status=='passed'
     assert text.startswith('Рука с A♥K♦.\nТы на SB с A♥K♦ против BB с неизвестными картами.')
-    assert 'у тебя 5\u2009000 (25,00 ББ), у BB 5\u2009000 (25,00 ББ)' in text
-    assert 'Префлоп: ты повышаешь до 600, BB пасует, тебе возвращается 400.\nБанк 420.' in text
-    assert 'твой чистый результат +210, конечный стек 5\u2009210' in text
+    assert 'у тебя 5\u2009000 фишек (25,00 ББ), у BB 5\u2009000 фишек (25,00 ББ)' in text
+    assert 'Префлоп: ты повышаешь до 600 фишек (3,00 ББ), BB пасует, тебе возвращается 400 фишек (2,00 ББ).\nБанк 420 фишек (2,10 ББ).' in text
+    assert 'твой чистый результат +210 фишек (+1,05 ББ), конечный стек 5\u2009210 фишек (26,05 ББ)' in text
     assert text.count('возвращается')==1 and '4\u2009790' not in text
     # Full diagnostic transcript remains unchanged and independently available.
     assert '#7' in pokerdom_report(result) and 'room_payout' in pokerdom_report(result)
@@ -62,11 +62,11 @@ def test_six_player_bet_fold_story_has_only_continuing_opponent_and_no_technical
     assert result.replay_status=='passed'
     header=text.split('\n\n')[0]
     assert 'Ты на UTG с A♣Q♣ против BB с неизвестными картами' in header
-    assert 'у BB 7\u2009000 (35,00 ББ)' in header and 'у SB' not in header and 'у BTN' not in header
-    assert '\n\nФлоп 4♥6♠T♦: BB чек, ты ставишь 300, BB доплачивает 300.\nБанк 1\u2009700.' in text
-    assert 'Тёрн Q♥: BB чек, ты ставишь 600, BB пасует, тебе возвращается 600.' in text
+    assert 'у BB 7\u2009000 фишек (35,00 ББ)' in header and 'у SB' not in header and 'у BTN' not in header
+    assert '\n\nФлоп 4♥6♠T♦: BB чек, ты ставишь 300 фишек (1,50 ББ), BB доплачивает 300 фишек (1,50 ББ).\nБанк 1\u2009700 фишек (8,50 ББ).' in text
+    assert 'Тёрн Q♥: BB чек, ты ставишь 600 фишек (3,00 ББ), BB пасует, тебе возвращается 600 фишек (3,00 ББ).' in text
     assert '\n\nРивер: не сыгран.' in text
-    assert 'Результат по расчёту: банк 1\u2009700, твой чистый результат +940, конечный стек 7\u2009940.' in text
+    assert 'Результат по расчёту: банк 1\u2009700 фишек (8,50 ББ), твой чистый результат +940 фишек (+4,70 ББ), конечный стек 7\u2009940 фишек (39,70 ББ).' in text
     for unwanted in ('|','Чтение:','проверка чтения','Проверка пройдена','not_checked','room_','#1','Примечание','Dmarker','не записана','стратег','P1','SB 6'):
         assert unwanted not in text
 
@@ -75,8 +75,8 @@ def test_multiway_header_keeps_hj_that_folds_on_river_and_conditional_outcome():
     result,text=render(six_players(river=True))
     assert result.replay_status=='passed' and not result.outcome_confirmed
     assert 'против SB с Q♥J♦ и HJ с неизвестными картами' in text
-    assert 'у HJ 7\u2009000 (35,00 ББ)' in text
-    assert 'Ривер 9♦: SB чек, ты ставишь 300, HJ пасует, SB доплачивает 300.' in text
+    assert 'у HJ 7\u2009000 фишек (35,00 ББ)' in text
+    assert 'Ривер 9♦: SB чек, ты ставишь 300 фишек (1,50 ББ), HJ пасует, SB доплачивает 300 фишек (1,50 ББ).' in text
     assert 'По видимым картам, условный результат' in text and 'Явное вскрытие не подтверждено.' in text
     assert 'Результат по расчёту:' not in text
 
@@ -138,4 +138,38 @@ def test_notes_and_markup_nicknames_do_not_leak_into_story_and_long_actions_are_
     messages=pokerdom_messages(result);text=''.join(m.text for m in messages)
     assert len(messages)>1 and all(m.parse_mode is None and len(m.text.encode('utf-16-le'))//2<=3500 for m in messages)
     assert text.count('повышаешь до')==101 and text.count('повышает до')==100
-    assert '<b>' not in text and text.endswith('конечный стек 1\u2009080\u2009210.')
+    import re
+    money_pattern = r"[+−]?[0-9][0-9\u2009]* фиш(?:ка|ки|ек) \([^)]*ББ\)"
+    assert re.findall(money_pattern,text)==[pair for message in messages for pair in re.findall(money_pattern,message.text)]
+    assert '<b>' not in text and text.endswith('конечный стек 1\u2009080\u2009210 фишек (5401,05 ББ).')
+
+
+@pytest.mark.parametrize('amount,bb,expected',[
+    (1,8,'1 фишка (0,13 ББ)'),(2,8,'2 фишки (0,25 ББ)'),
+    (11,8,'11 фишек (1,38 ББ)'),(21,8,'21 фишка (2,63 ББ)'),
+    (22,8,'22 фишки (2,75 ББ)'),(0,8,'0 фишек (0,00 ББ)'),
+    (0,100,'0 фишек (0,00 ББ)'),(105,100,'+105 фишек (+1,05 ББ)'),(-105,100,'−105 фишек (−1,05 ББ)'),
+    (1,1000,'+1 фишка (+0,00 ББ)'),(-1,1000,'−1 фишка (−0,00 ББ)'),
+])
+def test_money_display_exact_chips_plural_signs_and_half_up(amount,bb,expected):
+    from harness.presentation.pokerdom_vision import _amount
+    assert _amount(amount,bb,signed=bb>=100)==expected
+
+
+@pytest.mark.parametrize('bb',[0,-1])
+def test_unknown_or_invalid_blind_is_not_replaced_by_one(bb):
+    from harness.presentation.pokerdom_vision import _amount
+    with pytest.raises(ValueError):_amount(100,bb)
+    result=process_pokerdom(v2(table()),nickname='synthetic-alice')
+    assert result.raw is not None
+    result.raw.bb=bb
+    text=''.join(m.text for m in pokerdom_messages(result))
+    assert 'Не удалось определить большой блайнд' in text and 'Рука с' not in text
+
+
+def test_losing_hero_uses_same_negative_sign_for_chips_and_bb():
+    result=process_pokerdom(v2(table()),nickname='synthetic-bob')
+    assert result.replay_status=='passed' and result.outcome_confirmed
+    text=''.join(m.text for m in pokerdom_messages(result))
+    assert 'чистый результат −210 фишек (−1,05 ББ)' in text
+    assert 'конечный стек 4\u2009790 фишек (23,95 ББ)' in text

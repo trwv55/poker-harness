@@ -95,7 +95,7 @@ async def test_actual_router_to_queue_worker_report_no_gaming_writes(intake, mon
     assert await scalar(deps.db_factory,'select pending_input from players') is None
     report='\n'.join(m.text for m in sender.sent)
     assert 'тебе возвращается 400' in report and 'повышаешь до 600' in report
-    assert '5\u2009000 (25,00 ББ)' in report and 'не записана' not in report
+    assert '5\u2009000 фишек (25,00 ББ)' in report and 'не записана' not in report
     image_path=job.payload['source_file']
     from pathlib import Path
     assert Path(image_path).read_bytes()==IMAGE
