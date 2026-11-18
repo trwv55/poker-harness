@@ -922,6 +922,18 @@ async def handle_text(deps: BotDeps, tg_user_id: int, text: str) -> Msg | None:
             return screen
 
         pending = dict(player.pending_input or {})
+        if pending.get("kind") == "pokerdom_image_nickname":
+            from sqlalchemy import select
+
+            from harness.bot.pokerdom import answer_nickname
+            # Serialize answers: two text updates must not queue the held image twice.
+            player = (await db.execute(select(Player).where(Player.id == player.id).with_for_update().execution_options(populate_existing=True))).scalar_one()
+            pending = dict(player.pending_input or {})
+            if pending.get("kind") != "pokerdom_image_nickname":
+                return Msg(text="Ответ уже принят. Дождитесь результата.")
+            reply = await answer_nickname(deps, db, player, pending, answer)
+            await db.commit()
+            return reply
         if pending:
             reply = await _apply_pending_input(db, player, pending, answer)
             await db.commit()

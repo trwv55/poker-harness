@@ -92,6 +92,7 @@ _DEFAULT_PRIORITY_BY_TYPE: dict[str, int] = {
 # получает дефолт колонки — см. модульный докстринг.
 _DEFAULT_MAX_ATTEMPTS_BY_TYPE: dict[str, int] = {
     "agent": 1,
+    "pokerdom_read": 1,
 }
 
 # Единственный SQL, которому доверена сама атомарность захвата: WHERE-подзапрос
@@ -166,7 +167,7 @@ class JobsQueue:
         *,
         type: str,
         player_id: int,
-        session_id: int,
+        session_id: int | None,
         payload: dict,
         priority: int | None = None,
         max_attempts: int | None = None,

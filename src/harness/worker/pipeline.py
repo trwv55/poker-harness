@@ -308,6 +308,8 @@ class Deps:
     # Потолок истории вечера агента в токенах (оценка `agent.history.estimate_tokens`);
     # значение из `Config.agent_history_max_tokens` (`worker/main.py`).
     agent_history_max_tokens: int = 30_000
+    pokerdom_llm: LLM | None = None
+    pokerdom_provider: str = "openai"
 
 
 def _cache_delta(cache_seed: dict[str, float]) -> dict[str, float]:
@@ -410,12 +412,7 @@ async def _send_idempotent(
     session: AsyncSession,
     job_id: int,
     worker_id: str | None,
-    key: Literal[
-        "progress_message_id",
-        "result_message_id",
-        "raw_overflow_message_id",
-        "escalation_message_id",
-    ],
+    key: str,
     chat_id: int,
     msg: Msg,
 ) -> dict[str, Any]:
@@ -692,7 +689,7 @@ async def _run_hh_scan(job: JobModel, deps: Deps, trace: Trace) -> None:
                     tournament_id = payload["tournament_id"]
                 else:
                     tournament_id = await tournaments_repo.create(
-                        session_id=job.session_id, source_file=source_file
+                        session_id=_game_session_id(job), source_file=source_file
                     )
                     payload["tournament_id"] = tournament_id
                     await _sync_payload(session, job.id, worker_id, payload)
@@ -711,7 +708,7 @@ async def _run_hh_scan(job: JobModel, deps: Deps, trace: Trace) -> None:
                     if idx < existing_raw:
                         continue  # чекпоинт: уже сохранена в прошлой попытке
                     await hands_repo.save_raw(
-                        session_id=job.session_id, tournament_id=tournament_id, raw=raw
+                        session_id=_game_session_id(job), tournament_id=tournament_id, raw=raw
                     )
                     await session.commit()
 
@@ -772,7 +769,7 @@ async def _run_hh_scan(job: JobModel, deps: Deps, trace: Trace) -> None:
             await tournaments_repo.save_scan_summary(tournament_id, summary)
             # Новый файл — агент больше не отвечает про старую руку (план агента,
             # отклонение 2).
-            await SessionsRepo(session).set_last_analysis(job.session_id, None)
+            await SessionsRepo(session).set_last_analysis(_game_session_id(job), None)
             await session.commit()
 
         quota_left, quota_total = await _quota_numbers(session, job.player_id)
@@ -1079,7 +1076,7 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
                     )
                     await session.commit()
                     return None
-                hand_id = await hands_repo.save_raw(session_id=job.session_id, raw=outcome.raw)
+                hand_id = await hands_repo.save_raw(session_id=_game_session_id(job), raw=outcome.raw)
                 await session.commit()
                 payload["hand_id"] = hand_id
                 await _fenced_update(session, job.id, worker_id, hand_id=hand_id, payload=payload)
@@ -1172,7 +1169,7 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
                 )
                 await session.commit()
             # Указатель вечера для агента — как в `_run_deep_dive`.
-            await SessionsRepo(session).set_last_analysis(job.session_id, analysis_id)
+            await SessionsRepo(session).set_last_analysis(_game_session_id(job), analysis_id)
             await session.commit()
 
             # Та же развилка, что в `_run_deep_dive`: картинки рисует код внутри
@@ -1219,9 +1216,9 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
 
         async with trace.span("analyze"):
             payload = await _ensure_progress(deps, session, job.id, worker_id, chat_id, "analyze")
-            hand = await hands_repo.find_by_hand_no(job.session_id, hand_no)
+            hand = await hands_repo.find_by_hand_no(_game_session_id(job), hand_no)
             if hand is None:
-                raise HandDataMissing(f"рука {hand_no!r} не найдена в сессии {job.session_id}")
+                raise HandDataMissing(f"рука {hand_no!r} не найдена в сессии {_game_session_id(job)}")
             if hand.enriched is None:
                 raise HandDataMissing(f"рука {hand_no!r} ещё не прошла чекпоинт enriched")
 
@@ -1253,7 +1250,7 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
                 await session.commit()
             # Указатель вечера: агент отвечает про этот разбор, пока игрок не
             # загрузит новый (спека агента №1, §4). На обоих путях — и на чекпоинте.
-            await SessionsRepo(session).set_last_analysis(job.session_id, analysis_id)
+            await SessionsRepo(session).set_last_analysis(_game_session_id(job), analysis_id)
             await session.commit()
 
             # Картинки диапазонов — выход КОДА, и рисуются они внутри `analyze`:
@@ -1314,7 +1311,7 @@ async def _run_question(job: JobModel, deps: Deps, trace: Trace) -> None:
                 session,
                 deps.llm,
                 player_id=job.player_id,
-                session_id=job.session_id,
+                session_id=_game_session_id(job),
                 question=payload["question"],
                 trace_id=trace.trace_id,
             )
@@ -1392,10 +1389,10 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
         payload: dict[str, Any] = dict(job.payload)
         chat_id = await _chat_id(session, job.player_id)
         sessions = SessionsRepo(session)
-        state = await sessions.agent_state(job.session_id)
+        state = await sessions.agent_state(_game_session_id(job))
         spots = DecisionSpotsRepo(session)
         active = (
-            await spots.get(state.active_spot_id, job.player_id, job.session_id)
+            await spots.get(state.active_spot_id, job.player_id, _game_session_id(job))
             if state.active_spot_id is not None
             else None
         )
@@ -1449,7 +1446,7 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
                     except (InvalidNaturalHand, InvalidScenario) as exc:
                         failure = str(exc)
                     row = await spots.save(
-                        player_id=job.player_id, session_id=job.session_id,
+                        player_id=job.player_id, session_id=_game_session_id(job),
                         source_text=source.source_text,
                         raw=source.model_dump(mode="json"),
                         canonical=canonical.model_dump(mode="json")
@@ -1519,7 +1516,7 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
                             questions = [str(exc)]
                     row = await spots.save(
                         player_id=job.player_id,
-                        session_id=job.session_id,
+                        session_id=_game_session_id(job),
                         source_text=source,
                         raw=raw.model_dump(mode="json"),
                         canonical=canonical.model_dump(mode="json")
@@ -1587,7 +1584,7 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
                     session,
                     deps.llm,
                     player_id=job.player_id,
-                    session_id=job.session_id,
+                    session_id=_game_session_id(job),
                     text=payload["text"],
                     trace_id=trace.trace_id,
                     history=turn_history,
@@ -1639,12 +1636,23 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
         seen = turn.saved_messages(None if turn.state == "prose" else msg.text)
         seen = [*_other_contexts(history, marker), *seen]
         await sessions.save_agent_history(
-            job.session_id, dump_history(trim_history(seen, deps.agent_history_max_tokens))
+            _game_session_id(job), dump_history(trim_history(seen, deps.agent_history_max_tokens))
         )
         await session.commit()
 
 
+def _game_session_id(job: JobModel) -> int:
+    """Only temporary Pokerdom jobs may lack a game session (DB CHECK too)."""
+    if job.session_id is None:
+        raise ValueError("game job requires session_id")
+    return job.session_id
+
+
 async def _dispatch(job: JobModel, deps: Deps, trace: Trace, started_at: float) -> int | None:
+    if job.type == "pokerdom_read":
+        from harness.worker.pokerdom import run_pokerdom
+        await run_pokerdom(job, deps, trace)
+        return None
     if job.type == "agent":
         await _run_agent(job, deps, trace)
         return None

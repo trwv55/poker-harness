@@ -48,12 +48,12 @@ from harness.bot.handlers import (
     handle_new_session,
     handle_nickname_command,
     handle_note_command,
-    handle_photo,
     handle_question_command,
     handle_start,
     handle_text,
     handle_ui_callback,
 )
+from harness.bot.pokerdom import MAX_IMAGE_BYTES, enqueue_image, preflight
 from harness.presentation import (
     Msg,
     bot_failure_msg,
@@ -158,6 +158,21 @@ def build_router(deps: BotDeps) -> Router:
             return
         await _deliver(bot, message.chat.id, msg)
 
+    @router.message(Command("cancel"))
+    async def on_cancel(message: Message, bot: Bot) -> None:
+        if message.from_user is None or message.chat.type != "private":
+            return
+        from harness.bot.pokerdom import cancel_image
+        await _deliver(bot, message.chat.id, await cancel_image(deps, message.from_user.id))
+
+    @router.message(Command("pdnick"))
+    async def on_pdnick(message: Message, bot: Bot, command: CommandObject) -> None:
+        if message.from_user is None or message.chat.type != "private":
+            return
+        from harness.bot.pokerdom import change_nickname
+        await _deliver(bot, message.chat.id, await change_nickname(
+            deps, message.from_user.id, command.args or ""))
+
     @router.message(Command("alias"))
     async def on_alias(message: Message, bot: Bot, command: CommandObject) -> None:
         """`/alias` — список оппонентов; `/alias МЕСТО НИК` — привязать участника."""
@@ -201,42 +216,60 @@ def build_router(deps: BotDeps) -> Router:
         msg = await handle_new_session(deps, message.from_user.id)
         await _deliver(bot, message.chat.id, msg)
 
+    async def receive_image(message: Message, bot: Bot, file_id: str,
+                            size: int | None, *, original: bool) -> None:
+        if message.from_user is None:
+            return
+        if message.chat.type != "private":
+            await _deliver(bot, message.chat.id, Msg(text="Пришлите таблицу в личный чат с ботом."))
+            return
+        caption = message.caption or ""
+        refusal = await preflight(deps, message.from_user.id, caption, size)
+        if refusal:
+            await _deliver(bot, message.chat.id, refusal)
+            return
+        file = await bot.get_file(file_id)
+        if file.file_path is None:
+            raise RuntimeError("Telegram не вернул файл изображения")
+        if file.file_size is None or file.file_size > MAX_IMAGE_BYTES:
+            await _deliver(bot, message.chat.id, Msg(text="Не удалось подтвердить размер до 10 МБ. Пришлите изображение меньшим файлом."))
+            return
+        # Bound the actual download too, not only Telegram metadata.
+        import io
+        class BoundedImage(io.BytesIO):
+            def write(self, data) -> int:
+                if self.tell() + len(data) > MAX_IMAGE_BYTES:
+                    raise ValueError("изображение больше 10 МБ")
+                return super().write(data)
+        buffer = BoundedImage()
+        await bot.download_file(file.file_path, destination=buffer)
+        msg = await enqueue_image(deps, message.from_user.id, buffer.getvalue(), caption,
+                                  original=original)
+        if msg:
+            await _deliver(bot, message.chat.id, msg)
+
     @router.message(F.document)
     async def on_document(message: Message, bot: Bot) -> None:
-        """Файл: раздачи `.txt` либо скрин без сжатия — какой именно, решает не здесь.
-
-        `mime_type` уходит обработчику как есть, вместе с именем файла: обе
-        приметы приходят от Телеграма, и выбирать между ними — решение, а
-        решений в этом модуле нет. `None` в ответе значит то же, что у кнопки
-        «разобрать»: задача поставлена, дальше говорит воркер.
-        """
         if message.from_user is None or message.document is None:
             return
-        file_bytes = await _download(bot, message.document.file_id)
-        msg = await handle_document(
-            deps,
-            tg_user_id=message.from_user.id,
-            file_bytes=file_bytes,
-            filename=message.document.file_name or "",
-            mime_type=message.document.mime_type,
-        )
-        if msg is None:
+        from harness.bot.handlers import _is_image_document
+        doc = message.document
+        if _is_image_document(doc.mime_type, doc.file_name or ""):
+            await receive_image(message, bot, doc.file_id, doc.file_size, original=True)
             return
-        await _deliver(bot, message.chat.id, msg)
+        file_bytes = await _download(bot, doc.file_id)
+        msg = await handle_document(deps, tg_user_id=message.from_user.id,
+                                    file_bytes=file_bytes, filename=doc.file_name or "",
+                                    mime_type=doc.mime_type)
+        if msg:
+            await _deliver(bot, message.chat.id, msg)
 
     @router.message(F.photo)
     async def on_photo(message: Message, bot: Bot) -> None:
-        """Фото — отказ, и картинка ради него НЕ скачивается.
-
-        Скрин-вход отложен (решение владельца 2026-09-12), и отключён он именно
-        здесь: `_download` больше не зовётся, поэтому за отказ не платится ни
-        байтом трафика — Телеграм отдаёт фото до 20 МБ. Обработчик при этом
-        остаётся: без него бот на присланный экран промолчал бы, а молчание
-        игрок читает как поломку.
-        """
         if message.from_user is None or not message.photo:
             return
-        await _deliver(bot, message.chat.id, await handle_photo(deps, message.from_user.id))
+        photo = message.photo[-1]
+        await receive_image(message, bot, photo.file_id, photo.file_size, original=False)
 
     @router.callback_query(F.data.startswith(DEEP_DIVE_PREFIX))
     async def on_deep_dive(callback: CallbackQuery, bot: Bot) -> None:

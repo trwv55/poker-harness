@@ -112,6 +112,8 @@ class Player(Base):
     # одна контрольная сумма подменённого героя не ловит). NULL — ника ещё не
     # спросили; тогда разбор скрина упирается в вопрос игроку, а не угадывает.
     gg_nickname: Mapped[str | None] = mapped_column(String(64))
+    # Room-scoped screenshot hero setting; not consent to save played hands.
+    pokerdom_nickname: Mapped[str | None] = mapped_column(String(64))
     # NULL = у игрока нет персонального переопределения, действует дефолт из
     # Config (спека §7: "квоты по умолчанию" — конфиг, не схема БД).
     quota_daily: Mapped[int | None] = mapped_column(Integer)
@@ -576,13 +578,14 @@ class Job(Base):
     __table_args__ = (
         CheckConstraint(
             "type IN ('screenshot_analyze', 'hh_scan', 'deep_dive', 'eval_run', 'question', "
-            "'agent')",
+            "'agent', 'pokerdom_read')",
             name="type_allowed",
         ),
         CheckConstraint(
             "status IN ('queued', 'running', 'awaiting_user', 'done', 'failed')",
             name="status_allowed",
         ),
+        CheckConstraint("session_id IS NOT NULL OR type = 'pokerdom_read'", name="session_required"),
         Index("ix_jobs_status_priority_created_at", "status", "priority", "created_at"),
         Index("ix_jobs_player_id_status", "player_id", "status"),
         # Партиционный уникальный индекс — структурная гарантия «одна активная
@@ -605,8 +608,8 @@ class Job(Base):
     type: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="queued")
     payload: Mapped[Any] = mapped_column(JSONB, nullable=False)
-    session_id: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("sessions.id"), nullable=False
+    session_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("sessions.id"), nullable=True
     )
     player_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("players.id"), nullable=False)
     hand_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("hands.id"))

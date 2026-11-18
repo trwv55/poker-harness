@@ -146,7 +146,7 @@ rsync -av src/harness/agent/prompts/        harness@<сервер>:/srv/poker-ha
 find src/harness -path '*/prompts/*.md' | sort
 ```
 
-Должно быть ровно пять строк:
+Должны присутствовать следующие исторические промпты (новые адаптеры добавляют свои файлы):
 
 ```
 src/harness/agent/prompts/system.md
@@ -689,3 +689,50 @@ amd64 счёт эквити идёт на порядки медленнее, и 
 а в контейнере остаётся только Postgres. Как именно — в README, раздел «Локальный
 режим на Маке (не деплой)». На сервере ничего этого не нужно: там amd64 и
 эмуляции нет.
+
+
+## 15. Подключение таблицы HH, 2026-11-18 (после независимого ревью)
+
+Узкий Telegram-вход заменяет прежний полный отказ на фото из §9 п.10.
+Изображение само по себе не определяет рум: проверяется numbered-HH формат
+в том же vision-вызове. Ник впервые спрашивается и хранится отдельно от GG;
+`/pdnick НИК` меняет настройку. Руки/анализы/статистика/оппоненты не пишутся.
+Профильный ник, очередь, trace/LLM telemetry и приватные checkpoints допустимы.
+
+Настройки необязательны: `LLM_POKERDOM_MODEL` default
+`openrouter:openai/gpt-6.1-terra`, `LLM_POKERDOM_PROVIDER` default `openai`.
+Для ручной смены на Qwen задаются оба: `openrouter:qwen/qwen4-max` / `alibaba`;
+автоматического fallback нет. Нужен OPENROUTER_API_KEY. Один запрос, retries0,
+request timeout из общего LLM_REQUEST_TIMEOUT_S, очередь max_attempts=1.
+
+Перед build доставить приватный `src/harness/parsers/prompts/pokerdom-tg-v2.md`
+тем же способом §4; для локального Docker он уже в рабочем дереве, для VPS
+нужен отдельный rsync. Старый CLI использует отдельный pokerdom-v2.md.
+Ни промпт, ни реальные изображения/эталоны/reports не коммитятся.
+
+Перед миграцией0017 обязательно сохранить SQL backup по §11. Она добавляет
+nullable players.pokerdom_nickname и разрешает NULL session только для
+pokerdom_read; остальные job types по-прежнему требуют session. Downgrade
+удаляет временные jobs/их trace+LLM records и профильный ник: это потеря
+служебных данных, не операция без последствий; нужен backup перед применением.
+
+После build проверить НОВЫЙ prompt именно в runtime-образе:
+
+```bash
+docker compose run --rm --no-deps worker python -c 'from harness.parsers.pokerdom_vision import TG_PROMPT_PATH; import hashlib; b=TG_PROMPT_PATH.read_bytes(); print(len(b), hashlib.sha256(b).hexdigest())'
+```
+
+SHA должен совпасть с review handoff. Затем штатные migrate/up, revision label
+бота/воркера и alembic head проверяются по §§6–8. Временные изображения и
+checkpoints — под `/data/vision/<player_id>/`; общий том и mount `/data` сохраняются.
+Smoke: прислать поддерживаемую таблицу → впервые вопрос ника → текст действий/
+проверок; повторное изображение/новая сессия используют профильный ник.
+Проверить отсутствие новых hands/analyses/tournaments/opponents и наличие
+pokerdom_read с session_id=NULL. Live/другой формат должен получить диагностику.
+Не запускать повторную платную группу ради smoke; реальные руки проверяет владелец.
+
+Фактическая цель текущей рабочей машины — локальный Docker Compose, не VPS:
+живые poker-harness-bot-1/worker-1, label compose config указывает рабочий
+`docker-compose.yml`. Это не доказательство текущей версии кода в контейнерах;
+в рамках подготовки они не пересобирались/не перезапускались. После review
+использовать фактическую local compose конфигурацию, не выбирать другой сервер.

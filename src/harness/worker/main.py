@@ -37,6 +37,7 @@ from asyncio import FIRST_COMPLETED
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import suppress
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 
@@ -496,6 +497,8 @@ async def main() -> None:
             # необязательна (`.env.example`), и незаданная означает «каскада нет».
             vision_fallback=bool(cfg.llm_vision_fallback_model),
             agent_history_max_tokens=cfg.agent_history_max_tokens,
+            pokerdom_llm=LLM(replace(cfg, llm_vision_model=cfg.llm_pokerdom_model), db_factory),
+            pokerdom_provider=cfg.llm_pokerdom_provider,
         )
         stop = _install_stop_handlers()
         tasks = [

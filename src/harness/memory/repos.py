@@ -99,6 +99,14 @@ class PlayersRepo:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
 
+    async def set_pokerdom_nickname(self, player_id: int, nickname: str) -> None:
+        """Explicit room setting, separate from GG and any played-hand persistence."""
+        if not nickname.strip() or len(nickname.strip()) > 64 or any(ord(c) < 32 for c in nickname):
+            raise ValueError("nickname must be 1..64 characters on one line")
+        await self.db.execute(update(Player).where(Player.id == player_id).values(
+            pokerdom_nickname=nickname.strip()))
+        await self.db.flush()
+
     async def set_gg_nickname(self, player_id: int, nickname: str) -> None:
         """Записать ник игрока в руме — вход опознания героя на скриншоте.
 
@@ -1270,7 +1278,7 @@ QUOTA_DAILY_DEFAULT = 50
 # (`test_a_question_does_not_spend_the_daily_quota`) принято раньше агента, и
 # `/ask` живёт до открытия агента у игроков без доступа. Своего предела у
 # вопросов нет — есть только кросс-процессный лимитер модели.
-QUOTA_INTERACTIVE_JOB_TYPES = ("deep_dive", "screenshot_analyze", "agent")
+QUOTA_INTERACTIVE_JOB_TYPES = ("deep_dive", "screenshot_analyze", "agent", "pokerdom_read")
 
 # Скользящее окно, а не календарные сутки (спека §9 дословно: ни поля пояса, ни
 # cron-сброса, ни полуночного «обнуления посреди ночной сессии»).

@@ -38,9 +38,10 @@ from decimal import Decimal
 from typing import Literal, TypeVar
 
 import anyio
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 from pydantic_ai import Agent, BinaryContent, TextOutput, ToolOutput
 from pydantic_ai._genai_prices import fill_response_cost
+from pydantic_ai._json_schema import InlineDefsJsonSchemaTransformer, JsonSchema
 from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextContent
 from pydantic_ai.models import Model, ModelRequestParameters
@@ -53,6 +54,7 @@ from pydantic_ai.models.openrouter import (
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.profiles.anthropic import AnthropicModelProfile
 from pydantic_ai.profiles.openai import OpenAIModelProfile
+from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import Tool
 from sqlalchemy import update
@@ -207,11 +209,27 @@ def _describe_model(model: Model | str) -> tuple[str, str]:
 _REJECTS_FORCED_TOOL_CHOICE = ("claude-sonnet-5-5",)
 
 
+class _EnumKeyInlineSchema(InlineDefsJsonSchemaTransformer):
+    """Inline enum-key references overlooked by PydanticAI 2.38's object walker.
+
+    That walker removes root $defs but does not visit propertyNames, leaving
+    enum-keyed dictionaries with dangling references. Keep their constraints;
+    use the same definition/recursion handling as the inherited transformer.
+    This compatibility shim is limited to the experimental Qwen4 route.
+    """
+
+    def transform(self, schema: JsonSchema) -> JsonSchema:
+        if isinstance(property_names := schema.get("propertyNames"), dict):
+            schema["propertyNames"] = self._handle(property_names)
+        return schema
+
+
 def _build_model(
     model: str,
     *,
     provider_sort: ProviderSort = "throughput",
     provider_order: tuple[str, ...] = (),
+    fixed_provider: str | None = None,
 ) -> Model | str:
     """OpenRouter получает маршрут хостеров
     (`test_openrouter_route_reaches_every_provider_request`); остальные строки — как есть, кроме
@@ -230,18 +248,31 @@ def _build_model(
             route["order"] = list(provider_order)
         flash_extract = name == "qwen/qwen3.8-flash"
         profile = (
+            OpenAIModelProfile(openai_supports_tool_choice_required=False,
+                               openai_supports_strict_tool_definition=False)
+            if fixed_provider else
             OpenAIModelProfile(openai_supports_tool_choice_required=False)
             if flash_extract
             else None
         )
+        if fixed_provider and name == "qwen/qwen4-max" and profile is not None:
+            profile["json_schema_transformer"] = _EnumKeyInlineSchema
+        if fixed_provider:
+            route["only"] = [fixed_provider]
+            route["allow_fallbacks"] = False
         settings = OpenRouterModelSettings(openrouter_provider=route)
         if flash_extract:
             # Extraction needs a compact JSON tool call, not a long reasoning trace.
             settings["max_tokens"] = 2048
             settings["openrouter_reasoning"] = {"enabled": False}
-        return OpenRouterModel(
-            name, profile=profile, settings=settings
-        )
+        if fixed_provider:
+            settings["openrouter_reasoning"] = {"enabled": False}
+            # The SDK otherwise retries HTTP failures below our per-request ledger.
+            base_provider = OpenRouterProvider()
+            provider_instance = OpenRouterProvider(
+                openai_client=base_provider.client.with_options(max_retries=0))
+            return OpenRouterModel(name, provider=provider_instance, profile=profile, settings=settings)
+        return OpenRouterModel(name, profile=profile, settings=settings)
     if sep and provider == "anthropic" and name.startswith(_REJECTS_FORCED_TOOL_CHOICE):
         return AnthropicModel(
             name, profile=AnthropicModelProfile(anthropic_supports_forced_tool_choice=False)
@@ -329,6 +360,8 @@ class LLM:
         instructions: str | None = None,
         text_output: Callable[[str], T] | None = None,
         trace_id: int,
+        experiment_provider: str | None = None,
+        experiment_observer: Callable[[dict], None] | None = None,
     ) -> tuple[T, CallMeta]:
         """`trace_id` — обязательный параметр каждого вызова, а не конструктора:
         один `LLM` живёт на весь процесс воркера и обслуживает МНОГО задач/трейсов
@@ -391,6 +424,7 @@ class LLM:
                 model,
                 provider_sort=self._cfg.llm_openrouter_provider_sort,
                 provider_order=self._cfg.llm_openrouter_provider_order,
+                fixed_provider=experiment_provider,
             )
         user_prompt: list[str | TextContent | BinaryContent] = [
             *preface,
@@ -412,6 +446,8 @@ class LLM:
                 model_name=model_name,
                 deadline=deadline,
             )
+            metered.experiment_observer = experiment_observer
+            metered.single_attempt = experiment_provider is not None
             agent: Agent[None, T] = Agent(
                 metered,
                 output_type=(
@@ -425,7 +461,8 @@ class LLM:
                 instructions=instructions,
             )
             last_schema_error: UnexpectedModelBehavior | None = None
-            for _schema_attempt in range(_MAX_SCHEMA_ATTEMPTS):
+            schema_attempts = 1 if experiment_provider is not None else _MAX_SCHEMA_ATTEMPTS
+            for _schema_attempt in range(schema_attempts):
                 try:
                     return await self._attempt(
                         agent, metered, user_prompt, message_history, model_name
@@ -434,7 +471,7 @@ class LLM:
                     last_schema_error = exc
             raise LLMSchemaError(
                 f"{purpose}: ответ модели не прошёл валидацию {schema.__name__} "
-                f"после {_MAX_SCHEMA_ATTEMPTS} попыток"
+                f"после {schema_attempts} попыток"
             ) from last_schema_error
 
     def _resolve_model(self, purpose: str) -> str:
@@ -634,6 +671,9 @@ class _MeteredModel(WrapperModel):
                 await asyncio.wait({inner})
             raise
 
+    experiment_observer: Callable[[dict], None] | None = None
+    single_attempt: bool = False
+
     async def _metered_request(
         self,
         messages: list[ModelMessage],
@@ -647,7 +687,7 @@ class _MeteredModel(WrapperModel):
             else llm._cfg.llm_request_timeout_s
         )
         last_http_error: ModelHTTPError | None = None
-        for http_attempt in range(_MAX_HTTP_ATTEMPTS):
+        for http_attempt in range(1 if self.single_attempt else _MAX_HTTP_ATTEMPTS):
             async with llm._limiter.slot(deadline=self._meter_deadline):
                 call_id = await llm._log_started(
                     trace_id=self._meter_trace_id,
@@ -677,7 +717,7 @@ class _MeteredModel(WrapperModel):
                 except ModelHTTPError as exc:
                     await llm._log_finished(call_id, status="error")
                     last_http_error = exc
-                    if http_attempt + 1 >= _MAX_HTTP_ATTEMPTS or not _is_retryable_http_error(exc):
+                    if self.single_attempt or http_attempt + 1 >= _MAX_HTTP_ATTEMPTS or not _is_retryable_http_error(exc):
                         raise LLMProviderError(
                             f"{self._meter_purpose}: провайдер вернул {exc.status_code} после "
                             f"{http_attempt + 1} попыт(ок)"
@@ -687,6 +727,11 @@ class _MeteredModel(WrapperModel):
                     raise
                 else:
                     fill_response_cost(response)
+                    if self.experiment_observer is not None:
+                        self.experiment_observer({
+                            "call_id": call_id, "served_by": _served_by(response),
+                            "response": TypeAdapter(ModelResponse).dump_python(response, mode="json"),
+                        })
                     usage = response.usage
                     await llm._log_finished(
                         call_id,

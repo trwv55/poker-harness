@@ -190,6 +190,9 @@ class Config:
     llm_request_timeout_s: int = 60
     # Потолок истории вечера агента в оценочных токенах (`agent.history.estimate_tokens`).
     agent_history_max_tokens: int = 30_000
+    # Separate from legacy GG vision; no automatic fallback.
+    llm_pokerdom_model: str = "openrouter:openai/gpt-6.1-terra"
+    llm_pokerdom_provider: str = "openai"
 
     @classmethod
     def from_env(cls) -> Config:
@@ -206,4 +209,6 @@ class Config:
             llm_openrouter_provider_order=_openrouter_order(),
             llm_request_timeout_s=optional_int("LLM_REQUEST_TIMEOUT_S", 60),
             agent_history_max_tokens=optional_int("AGENT_HISTORY_MAX_TOKENS", 30_000),
+            llm_pokerdom_model=optional_env("LLM_POKERDOM_MODEL", "openrouter:openai/gpt-6.1-terra"),
+            llm_pokerdom_provider=optional_env("LLM_POKERDOM_PROVIDER", "openai"),
         )
