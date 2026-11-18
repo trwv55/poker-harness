@@ -2,15 +2,18 @@
 
 import json
 from decimal import Decimal
+from pathlib import Path
 from typing import cast
 
 import pytest
 
+from harness.agent import natural_hand as natural_agent
 from harness.agent.natural_hand import NaturalOpinion, natural_opinion
 from harness.analysis.natural_hand import conditional_equity
 from harness.contracts.natural_hand import NaturalAction, NaturalHand, NaturalPlayer, NaturalRead
 from harness.engine.natural_hand import InvalidScenario, replay_natural_hand
 from harness.normalizer.natural_hand import normalize_natural_hand
+from harness.parsers import natural_hand as natural_parser
 from harness.parsers.natural_hand import (
     apply_natural_correction,
     may_describe_hand,
@@ -18,6 +21,15 @@ from harness.parsers.natural_hand import (
 )
 from harness.platform.llm import LLM
 from harness.presentation.natural_hand import natural_scenario_msg
+
+
+@pytest.fixture
+def synthetic_natural_prompts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """FakeLLM tests exercise code without depending on private model instructions."""
+    prompt_path = tmp_path / "natural_hand.md"
+    prompt_path.write_text("Synthetic instructions for FakeLLM tests.\n", encoding="utf-8")
+    monkeypatch.setattr(natural_agent, "_PROMPT_PATH", prompt_path)
+    monkeypatch.setattr(natural_parser, "_PROMPT_PATH", prompt_path)
 
 
 def test_bb_call_spot_keeps_co_live_and_counts_only_one_small_blind() -> None:
@@ -69,6 +81,15 @@ def test_defaulted_three_bet_reaches_flop_before_sb_decision() -> None:
     assert snapshot.live_positions == ["SB", "BTN"]
     assert len(set(spot.board + list(spot.hero_cards or ()))) == 5
     assert {card[1] for card in spot.board} == {"s", "h", "d"}
+    opinion = "На сухом борде можно поставить для ценности."
+    text = natural_scenario_msg(spot, snapshot, opinion=opinion).text
+    assert "Банк перед вашим ходом: 14 BB." in text
+    assert "Оценка модели: " + opinion in text
+    assert "Подставил: " in text
+    assert "Неназванные пасы: " in text
+    assert "Вы можете чекнуть без доплаты." not in text
+    assert "Если решите поставить 33% банка" not in text
+    assert "Выбор линии зависит от диапазона соперника." not in text
 
 
 def test_default_postflop_bet_is_33_percent_of_current_pot() -> None:
@@ -88,6 +109,9 @@ def test_default_postflop_bet_is_33_percent_of_current_pot() -> None:
     assert snapshot.pot_before_bb == Decimal("18.62")
     assert snapshot.to_call_bb == Decimal("4.62")
     assert "BTN ставка 33% банка" in spot.assumptions
+    text = natural_scenario_msg(spot, snapshot).text
+    assert "Для колла нужно добавить 4,62 BB." in text
+    assert "для колла нужно не меньше" in text
 
 
 def test_stack_left_after_flop_bet_includes_both_streets() -> None:
@@ -155,6 +179,7 @@ def test_free_wording_routes_to_natural_extraction() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("synthetic_natural_prompts")
 async def test_model_range_is_only_an_assumption_and_equity_is_computed_by_code() -> None:
     hand = normalize_natural_hand(NaturalHand(
         table_size=8, hero_position="BB", hero_cards="9s9c", question="Есть колл?",
@@ -186,6 +211,7 @@ async def test_model_range_is_only_an_assumption_and_equity_is_computed_by_code(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("synthetic_natural_prompts")
 async def test_model_numeric_claim_is_not_shown() -> None:
     hand = normalize_natural_hand(NaturalHand(
         hero_position="SB", hero_cards="AKs", flop="K72",
@@ -205,6 +231,7 @@ async def test_model_numeric_claim_is_not_shown() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("synthetic_natural_prompts")
 async def test_long_qualitative_opinion_keeps_first_three_sentences() -> None:
     hand = normalize_natural_hand(NaturalHand(
         hero_position="SB", hero_cards="AKs", flop="K72",
@@ -227,6 +254,7 @@ async def test_long_qualitative_opinion_keeps_first_three_sentences() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("synthetic_natural_prompts")
 async def test_stringified_model_json_recovers_blinds_and_hero_stack() -> None:
     source = (
         "Блайнды 400/800, анте 100, за столом 8 игроков.\n"
