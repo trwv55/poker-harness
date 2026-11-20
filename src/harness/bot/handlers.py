@@ -65,6 +65,7 @@ from harness.memory.repos import (
 from harness.parsers.decision_spot import looks_like_decision_spot
 from harness.parsers.vision_adapter import apply_vision_answer
 from harness.platform.queue import JobsQueue
+from harness.platform.source_storage import SourceStorage
 from harness.presentation import (
     AGENT_MISS_PREFIX,
     DISAGREE_PREFIX,
@@ -235,6 +236,7 @@ class BotDeps:
     queue: JobsQueue
     data_dir: Path
     owner_tg_user_id: int | None = None
+    source_storage: SourceStorage | None = None
 
 
 def _store_hh_file(data_dir: Path, file_bytes: bytes) -> Path:

@@ -35,6 +35,7 @@ from harness.memory.models import async_session_factory
 from harness.platform.config import Config, EnvVarError, optional_env, optional_int_or_none
 from harness.platform.logs import configure_logging
 from harness.platform.queue import JobsQueue
+from harness.platform.source_storage import source_storage
 
 __all__ = ["data_dir", "main", "owner_tg_user_id"]
 
@@ -83,6 +84,7 @@ async def main() -> None:
         db_factory=db_factory,
         queue=JobsQueue(db_factory),
         data_dir=deps_data_dir,
+        source_storage=source_storage(deps_data_dir, cfg.source_storage_backend),
         owner_tg_user_id=owner,
     )
 

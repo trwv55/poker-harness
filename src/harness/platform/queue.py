@@ -185,6 +185,17 @@ class JobsQueue:
             _DEFAULT_MAX_ATTEMPTS_BY_TYPE.get(type) if max_attempts is None else max_attempts
         )
         async with self._session_factory() as session:
+            if type in {'hh_scan', 'deep_dive', 'pokerdom_read'} and session_id is not None:
+                from harness.memory.models import Session as SessionRow
+                from harness.memory.repos import SessionsRepo
+                target = await session.get(SessionRow, session_id)
+                if target is not None and target.player_id == player_id and target.closed_at is None:
+                    revision = await SessionsRepo(session).select_context(session_id, player_id)
+                    payload = {**payload, 'context_revision': revision}
+                elif type != 'deep_dive':
+                    raise ValueError('context session is closed or not owned')
+                # Historical HH deep-dive remains readable in its origin evening,
+                # but cannot publish into a closed/current unrelated discussion.
             job = Job(
                 type=type,
                 player_id=player_id,

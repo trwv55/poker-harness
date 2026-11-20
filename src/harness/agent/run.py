@@ -39,6 +39,7 @@ from harness.agent.history import (
     threshold_decided,
     threshold_numbers_in,
 )
+from harness.agent.literal_range import user_literal_ranges
 from harness.analysis.opponent_range import classes_named
 from harness.calcs.routing import CalcRun, tools_for
 from harness.contracts import CalcName, CalcResult, ModelOutput
@@ -47,6 +48,7 @@ from harness.explanation.agent_checks import (
     AgentContext,
     check_agent_answer,
     check_agent_assumption,
+    select_call_thresholds,
 )
 from harness.platform.llm import LLM
 
@@ -199,6 +201,7 @@ def _draft_violations(
     messages: Sequence[ModelMessage],
     context: AgentContext | None,
     said: frozenset[float],
+    *, question: str | None = None,
 ) -> tuple[list[str], list[str]]:
     """Нарушения ответа и блока «Оценка модели» — порознь: при повторном провале
     одного блока игрок получает прозу без него. Разрешённые числа у них одни."""
@@ -230,6 +233,7 @@ def _draft_violations(
         board_ranks=context.board_ranks if context else (),
         threshold_decided=threshold_decided(messages),
         profit_without_folds=context.profit_without_folds if context else False,
+        call_thresholds=select_call_thresholds(context.call_thresholds, question) if context else (),
         calc_numbers=calc_numbers,
         frequency_numbers=frequency_numbers(messages),
         chart_numbers=chart_numbers_in(messages),
@@ -334,6 +338,9 @@ async def run_agent_turn(
         max_calcs=MAX_CALCS_PER_TURN, sizes_from=sizes_from, analysis_id=analysis_id,
         narrowings=narrowings_in(history), player_classes=named,
     )
+    literal_texts = [*hand_player_texts(history, analysis_id), text] if analysis_id is not None else [text]
+    run_state.user_literal_ranges = user_literal_ranges(literal_texts)
+    run_state.literal_required = bool(user_literal_ranges([text]))
     tools = [*tools_for(db, player_id, session_id, run_state), *extra_tools]
     # Другая рука, чем у прошлого хода вечера, — отметка перед вопросом (решение
     # владельца 2026-10-15); она в реплике хода и уйдёт с ней в историю.
@@ -348,7 +355,7 @@ async def run_agent_turn(
     )
     messages = meta.messages
     grounded = context is not None or bool(calcs_in_history(messages))
-    answer_found, block_found = _draft_violations(draft, messages, context, said)
+    answer_found, block_found = _draft_violations(draft, messages, context, said, question=text)
     if context_marker is not None and context_marker < 0 and _SPOT_ADVICE_RE.search(draft.answer):
         answer_found.append("По текстовому споту нельзя давать прямой совет колл/фолд.")
     found = answer_found + block_found
@@ -377,7 +384,7 @@ async def run_agent_turn(
         )
         messages = meta.messages
         rewrite_at = _rewrite_index(messages, first_len - 1, request)
-        answer_found, block_found = _draft_violations(draft, messages, context, said)
+        answer_found, block_found = _draft_violations(draft, messages, context, said, question=text)
         if context_marker is not None and context_marker < 0 and _SPOT_ADVICE_RE.search(draft.answer):
             answer_found.append("По текстовому споту нельзя давать прямой совет колл/фолд.")
         second = answer_found + block_found

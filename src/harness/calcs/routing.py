@@ -195,6 +195,9 @@ class CalcRun:
         self.max_calcs = max_calcs
         self.sizes_from = sizes_from
         self.analysis_id = analysis_id
+        self.discussion_session_id: int | None = None
+        self.user_literal_ranges: frozenset[str] = frozenset()
+        self.literal_required: bool = False
         self.narrowings: list[RangeNarrowing] = list(narrowings)
         self.player_classes = player_classes
         self.results: list[CalcResult] = []
@@ -382,6 +385,17 @@ async def _perform(
     Сужение удачного `equity_vs_range` (`RangeNarrowing`) лежит в `narrowed` и
     добавляется в `run_state.narrowings` (`history.narrowings_in`).
     """
+    if getattr(params, 'analysis_id', None) is not None and run_state.discussion_session_id is not None:
+        from sqlalchemy import select
+
+        from harness.memory.models import Session as SessionRow
+        current = await db.scalar(select(SessionRow.id).where(
+            SessionRow.id == run_state.discussion_session_id,
+            SessionRow.player_id == player_id, SessionRow.closed_at.is_(None),
+            SessionRow.last_analysis_id == run_state.analysis_id,
+            SessionRow.active_spot_id.is_(None)))
+        if current is None:
+            return 'Текущая рука изменилась или недоступна. Выберите её снова.'
     params_json = params.model_dump(mode="json")
     if sizes_bb is not None:
         params_json["sizes_bb"] = {"pot_before_bb": sizes_bb[0], "bet_bb": sizes_bb[1]}
@@ -437,7 +451,7 @@ async def _perform(
     narrowed: dict[str, Any] | None = None
     if isinstance(result, OpponentRangeResult):
         chart = [round(100.0 * result.hands_share, 1), float(round(result.live_combos))]
-    elif isinstance(result, EquityVsRangeResult) and isinstance(params, EquityVsRangeParams):
+    elif isinstance(result, EquityVsRangeResult) and result.range_source == "chart_narrowing" and isinstance(params, EquityVsRangeParams):
         narrowing = RangeNarrowing(
             analysis_id=params.analysis_id,
             opponent_position=params.opponent_position,
@@ -475,7 +489,7 @@ def _equity_numbers(result: CalcResult, opponent: str | None) -> tuple[list[floa
         "layout": [g.model_copy(update={"equity": None}) for g in result.layout]
     }
     single: set[float] = set()
-    if isinstance(result, EquityVsRangeResult):
+    if isinstance(result, EquityVsRangeResult) and result.range_source == "chart_narrowing":
         update["preflop_equity"] = None
         if result.preflop_equity is not None:
             single = {round(100.0 * result.preflop_equity, 1)}
@@ -519,6 +533,8 @@ def tools_for(
     выбирает модель, и набор, который умеет считать код, — один и тот же
     список, а не две копии, способные разойтись.
     """
+
+    run_state.discussion_session_id = session_id
 
     async def hero_frequency(
         stat: FrequencyStat, position: str | None = None, window: WindowArg = "all"
@@ -787,6 +803,7 @@ def tools_for(
         hands: str,
         added: str | None = None,
         added_reason: str | None = None,
+        mode: Literal["chart", "literal"] = "chart",
     ) -> str | ToolReturn:
         """Сужение диапазона соперника вами и эквити вашей руки против каждой категории
         суженного — одного общего числа после флопа нет; до флопа — одно эквити.
@@ -805,6 +822,8 @@ def tools_for(
                 AA, A5s-A2s»; «-<класс>» убирает класс из названного.
             added: классы вне чарта: которые игрок сам назвал в своём сообщении
                 («22-77») — по его просьбе, или ваши — тогда с `added_reason`.
+            mode: chart сохраняет веса чарта; literal считает явно заданный игроком диапазон
+                с его весами (по умолчанию 100%), только префлоп, без чарта.
             added_reason: ваша причина добавить классы `added` вне чарта, одной фразой
                 («на низких лимитах BB часто коллирует пары, которые по GTO 3-бетит»);
                 без неё `added` — только классы, названные игроком.
@@ -814,6 +833,23 @@ def tools_for(
         # Позиция — верхним регистром на границе инструмента: «bb» — тот же BB
         # (`test_a_lower_case_position_is_the_same_opponent`).
         opponent_position = opponent_position.upper()
+        if mode == 'chart' and run_state.literal_required:
+            return 'Игрок задал literal диапазон: нужен mode=literal, чартовые веса не подставляются.'
+        if mode == 'literal':
+            from harness.agent.literal_range import canonical_literal
+            if street is not Street.PREFLOP:
+                return 'Literal диапазон поддержан только до флопа; чартовая замена не выполняется.'
+            try:
+                literal = canonical_literal(hands)
+            except ValueError as exc:
+                return f'Не прочитана запись literal диапазона: {exc}'
+            if literal not in run_state.user_literal_ranges:
+                return 'Нужна явно написанная игроком запись диапазона; модель не может придумать literal range.'
+            if added or added_reason:
+                return 'Literal диапазон не смешивается с добавлениями к чарту.'
+            return await _perform(db, player_id, run_state, EquityVsRangeParams(
+                analysis_id=run_state.analysis_id, opponent_position=opponent_position,
+                street=street, hands=literal, mode='literal', literal_source=literal))
         last = run_state.last_for(run_state.analysis_id, opponent_position)
         return await _perform(
             db, player_id, run_state,

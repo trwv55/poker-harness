@@ -79,6 +79,13 @@ LLM_OPENROUTER_PROVIDER_SORT=throughput
   endpoint'ов через запятую, например `alibaba/us-east-1,alibaba`. Пусто — выбор по
   сортировке. Резервные хостеры разрешены, модель при этом остаётся той же.
 
+`LLM_AGENT_OPENROUTER_PROVIDER` — необязательный точный slug endpoint (например,
+`coreweave/fp4`): только `purpose=agent`, `only=[slug]`, fallback выключен, SDK retries0.
+Требует `LLM_AGENT_MODEL=openrouter:...`; пустое значение сохраняет общий маршрут.
+Профиль модели, reasoning и штатные facade/schema/rewrite limits не меняются;
+vision и остальные purposes используют прежние настройки. Перед release задать
+в окружении bot/worker и перезапустить оба процесса; это не меняет модель агента.
+
 Код: `platform/config.py` читает настройки; `platform/llm.py::_build_model`
 передаёт их в `OpenRouterModel` как `openrouter_provider`. Только хостеры с
 поддержкой всех параметров запроса (`require_parameters=true`); фактически

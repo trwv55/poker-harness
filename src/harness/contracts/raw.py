@@ -147,6 +147,8 @@ class VisionMeta(BaseModel):  # только для скринов
     confidence: dict[str, float] = {}
     needs_review: list[str] = []
     image_hash: str | None = None
+    # Durable versioned read/result manifest, separate from observed poker facts.
+    reading_ref: str | None = None
     nicknames: dict[str, str] = {}
     bounties: dict[str, int] = {}
     displayed_pot: int | None = None

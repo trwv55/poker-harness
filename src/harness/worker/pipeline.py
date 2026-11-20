@@ -129,6 +129,7 @@ from harness.parsers.vision_adapter import (
 )
 from harness.platform.llm import LLM, LLMProviderError, LLMSchemaError
 from harness.platform.queue import JobPreconditionFailed, JobsQueue
+from harness.platform.source_storage import SourceStorage
 from harness.platform.trace import Clock, Trace
 from harness.presentation import (
     Msg,
@@ -310,6 +311,7 @@ class Deps:
     agent_history_max_tokens: int = 30_000
     pokerdom_llm: LLM | None = None
     pokerdom_provider: str = "openai"
+    source_storage: SourceStorage | None = None
 
 
 def _cache_delta(cache_seed: dict[str, float]) -> dict[str, float]:
@@ -769,7 +771,8 @@ async def _run_hh_scan(job: JobModel, deps: Deps, trace: Trace) -> None:
             await tournaments_repo.save_scan_summary(tournament_id, summary)
             # Новый файл — агент больше не отвечает про старую руку (план агента,
             # отклонение 2).
-            await SessionsRepo(session).set_last_analysis(_game_session_id(job), None)
+            # HH admission already cleared current context. A late scan must not
+            # erase a newer image/text spot selection.
             await session.commit()
 
         quota_left, quota_total = await _quota_numbers(session, job.player_id)
@@ -1169,7 +1172,7 @@ async def _run_screenshot(job: JobModel, deps: Deps, trace: Trace, started_at: f
                 )
                 await session.commit()
             # Указатель вечера для агента — как в `_run_deep_dive`.
-            await SessionsRepo(session).set_last_analysis(_game_session_id(job), analysis_id)
+            await _publish_analysis(session, job, analysis_id)
             await session.commit()
 
             # Та же развилка, что в `_run_deep_dive`: картинки рисует код внутри
@@ -1250,7 +1253,7 @@ async def _run_deep_dive(job: JobModel, deps: Deps, trace: Trace, started_at: fl
                 await session.commit()
             # Указатель вечера: агент отвечает про этот разбор, пока игрок не
             # загрузит новый (спека агента №1, §4). На обоих путях — и на чекпоинте.
-            await SessionsRepo(session).set_last_analysis(_game_session_id(job), analysis_id)
+            await _publish_analysis(session, job, analysis_id)
             await session.commit()
 
             # Картинки диапазонов — выход КОДА, и рисуются они внутри `analyze`:
@@ -1339,15 +1342,44 @@ async def _keep_typing(sender: Sender, chat_id: int) -> None:
         await asyncio.sleep(_TYPING_EVERY_S)
 
 
-async def _agent_context(session: AsyncSession, analysis_id: int | None) -> AgentContext | None:
-    """Сводка разбора, на который указывает вечер; `None` — разбора нет."""
-    if analysis_id is None:
+async def _publish_analysis(session: AsyncSession, job: JobModel, analysis_id: int) -> bool:
+    sessions = SessionsRepo(session)
+    revision = job.payload.get('context_revision')
+    if revision is None:
+        # Legacy jobs must not choose a new context after an intervening selection.
+        return False
+    await _fenced_update(session, job.id, job.locked_by, locked_by=job.locked_by)
+    return await sessions.publish_analysis(_game_session_id(job), job.player_id, revision, analysis_id)
+
+
+async def _agent_context(session: AsyncSession, analysis_id: int | None,
+                         player_id: int, session_id: int) -> AgentContext | None:
+    """Owned current discussion target; origin hand may belong to an older evening."""
+    from dataclasses import replace
+
+    from sqlalchemy import select
+
+    from harness.memory.models import Session as SessionRow
+    discussion = await session.scalar(select(SessionRow).where(
+        SessionRow.id == session_id, SessionRow.player_id == player_id,
+        SessionRow.closed_at.is_(None), SessionRow.last_analysis_id == analysis_id,
+        SessionRow.active_spot_id.is_(None)))
+    if analysis_id is None or discussion is None:
         return None
+    enriched = await AnalysesRepo(session).enriched_hand(analysis_id, player_id)
     analysis = await AnalysesRepo(session).get(analysis_id)
-    if analysis is None:
+    if enriched is None or analysis is None:
         return None
+    context = agent_context(analysis.result, enriched)
     hand = await HandsRepo(session).get(analysis.hand_id)
-    return None if hand.enriched is None else agent_context(analysis.result, hand.enriched)
+    if hand.provenance.value == 'screenshot':
+        qualifier = ('Источник — прочитанный скрин, гипотеза; проверка действий не подтверждает точность чтения. '
+            'Выплаты/конечные стеки в сводке — расчёт; видимые карты без явного вскрытия дают только условный исход. '
+            'Показанная прибыль не является наблюдаемым румовым payout. ')
+        if hand.session_id != session_id:
+            qualifier += 'Рука сохранена в прежнем вечере; сейчас обсуждается здесь, повторной игры не было. '
+        context = replace(context, text=qualifier + '\n' + context.text)
+    return context
 
 def _marker_of(turn: list[ModelMessage]) -> int | None:
     for message in turn:
@@ -1575,7 +1607,7 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
                 turn_history = _only_context(history, marker)
                 extra_tools = spot_tools(active.id, spot, snapshot, extra_calls)
             else:
-                context = await _agent_context(session, state.last_analysis_id)
+                context = await _agent_context(session, state.last_analysis_id, job.player_id, _game_session_id(job))
                 marker = state.last_analysis_id if context is not None else None
                 turn_history = _non_spot_history(history, marker)
                 extra_tools = []
@@ -1627,6 +1659,13 @@ async def _run_agent(job: JobModel, deps: Deps, trace: Trace) -> None:
                 context_source="текстовый спот" if marker is not None and marker < 0 else "разбор раздачи",
                 assumption=turn.assumption,
             )
+        current_state = await sessions.agent_state(_game_session_id(job))
+        if ((marker is not None and marker > 0 and current_state.last_analysis_id != marker)
+                or (marker is not None and marker < 0 and current_state.active_spot_id != -marker)):
+            msg = Msg(text='Текущая рука изменилась. Задайте вопрос заново про выбранную руку.')
+            await _send_idempotent(deps, session, job.id, worker_id, 'result_message_id', chat_id, msg)
+            await session.commit()
+            return
         await _send_idempotent(deps, session, job.id, worker_id, "result_message_id", chat_id, msg)
         await session.commit()
         # В историю — только то, что игрок видел (решение контроллера по вопросу
@@ -1651,8 +1690,7 @@ def _game_session_id(job: JobModel) -> int:
 async def _dispatch(job: JobModel, deps: Deps, trace: Trace, started_at: float) -> int | None:
     if job.type == "pokerdom_read":
         from harness.worker.pokerdom import run_pokerdom
-        await run_pokerdom(job, deps, trace)
-        return None
+        return await run_pokerdom(job, deps, trace)
     if job.type == "agent":
         await _run_agent(job, deps, trace)
         return None

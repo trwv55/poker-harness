@@ -736,3 +736,29 @@ pokerdom_read с session_id=NULL. Live/другой формат должен п
 `docker-compose.yml`. Это не доказательство текущей версии кода в контейнерах;
 в рамках подготовки они не пересобирались/не перезапускались. После review
 использовать фактическую local compose конфигурацию, не выбирать другой сервер.
+
+
+## 16. Автосохранение vision: выпуск после Luna review
+
+Спека: [vision autosave](superpowers/specs/2026-11-19-vision-hand-context-design.md).
+Luna review завершён, локальный выпуск разрешён 2026-11-20. Миграция0018 добавляет
+sessions.context_revision default0 и индекс hands.image_hash, без новых таблиц,
+TTL и переноса существующих рук. Перед накатом SQL backup по §11, отдельный
+migrate one-shot, build с новым GIT_SHA и проверка обоих runtime SHA по §§6–8.
+
+SOURCE_STORAGE_BACKEND=local (default) использует общий DATA_DIR volume;
+s3 пока явно не поддержан. Ссылки новых jobs/hands переносимые, реальные пути
+только внутри local adapter. Старые managed UUID intake paths читаются guarded
+resolver, произвольные host paths и symlink escape отвергаются. После успеха
+source и versioned reading manifest постоянные; не чистить sources/ по возрасту.
+Нужны **два** backup: PG dump и полный DATA_DIR (sources + owner manifests и
+vision-jobs checkpoints), согласованные при остановленном intake/worker или
+сохранённом snapshot/manifest. pg_dump не включает байты. Restore в изолированной
+среде: вернуть PG+volume, проверить portable source refs через adapter с owner,
+SHA/size/MIME; не запускать второго poller с рабочим токеном. Disposable PG
+snapshot restore и перенос local source root проверяются offline тестами;
+боевой restore drill остаётся отдельным эксплуатационным действием.
+
+Для устойчивого agent endpoint в этом выпуске: `LLM_AGENT_OPENROUTER_PROVIDER=coreweave/fp4`.
+Поле действует только на agent; vision Terra/OpenAI не меняется (см. development.md).
+§15 описывает предыдущий срез без автосохранения; после0018 действует политика §16.

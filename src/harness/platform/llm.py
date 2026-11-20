@@ -230,6 +230,7 @@ def _build_model(
     provider_sort: ProviderSort = "throughput",
     provider_order: tuple[str, ...] = (),
     fixed_provider: str | None = None,
+    agent_provider: str | None = None,
 ) -> Model | str:
     """OpenRouter получает маршрут хостеров
     (`test_openrouter_route_reaches_every_provider_request`); остальные строки — как есть, кроме
@@ -257,8 +258,8 @@ def _build_model(
         )
         if fixed_provider and name == "qwen/qwen4-max" and profile is not None:
             profile["json_schema_transformer"] = _EnumKeyInlineSchema
-        if fixed_provider:
-            route["only"] = [fixed_provider]
+        if selected_provider := fixed_provider or agent_provider:
+            route["only"] = [selected_provider]
             route["allow_fallbacks"] = False
         settings = OpenRouterModelSettings(openrouter_provider=route)
         if flash_extract:
@@ -267,6 +268,7 @@ def _build_model(
             settings["openrouter_reasoning"] = {"enabled": False}
         if fixed_provider:
             settings["openrouter_reasoning"] = {"enabled": False}
+        if fixed_provider or agent_provider:
             # The SDK otherwise retries HTTP failures below our per-request ledger.
             base_provider = OpenRouterProvider()
             provider_instance = OpenRouterProvider(
@@ -425,6 +427,8 @@ class LLM:
                 provider_sort=self._cfg.llm_openrouter_provider_sort,
                 provider_order=self._cfg.llm_openrouter_provider_order,
                 fixed_provider=experiment_provider,
+                **({"agent_provider": self._cfg.llm_agent_openrouter_provider}
+                   if purpose == "agent" and self._cfg.llm_agent_openrouter_provider else {}),
             )
         user_prompt: list[str | TextContent | BinaryContent] = [
             *preface,

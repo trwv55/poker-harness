@@ -1,13 +1,13 @@
-"""Temporary image intake: explicit hero per screenshot, no profile/history writes."""
+"""Owned image intake; validated hands are automatically saved by the worker."""
 from __future__ import annotations
 
 import hashlib
 import time
-import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from harness.memory.repos import PlayersRepo, QuotaRepo
+from harness.memory.repos import PlayersRepo, QuotaRepo, SessionsRepo
+from harness.platform.source_storage import LocalSourceStorage, SourceRef, image_mime
 from harness.presentation import Msg, invite_required_msg, quota_exceeded_msg
 
 if TYPE_CHECKING:
@@ -27,7 +27,7 @@ def image_help() -> Msg:
                      'Пришлите JPEG, PNG или WebP до 10 МБ, лучше файлом без сжатия. '
                      'Live-столы и другие форматы не поддерживаются. '
                      'При первом чтении спрошу ваш ник и запомню для следующих скринов; '
-                     'рука не записывается в игровую историю.'))
+                     'проверенная полная рука автоматически сохраняется в историю.'))
 
 
 async def preflight(deps: BotDeps, user_id: int, caption: str,
@@ -49,6 +49,23 @@ async def preflight(deps: BotDeps, user_id: int, caption: str,
 
 async def enqueue_image(deps: BotDeps, user_id: int, image: bytes, caption: str,
                         *, original: bool) -> Msg | None:
+    created: list[tuple[int, SourceRef]] = []
+    try:
+        return await _enqueue_image(deps, user_id, image, caption, original=original, created=created)
+    except BaseException:
+        # The inner session has rolled back before compensation queries references.
+        # Hard process death skips this block; adapter intent + grace recovery handles it.
+        from harness.platform.source_lifecycle import release_source
+        store = deps.source_storage or LocalSourceStorage(deps.data_dir)
+        for owner_id, ref in created:
+            async with deps.db_factory() as db:
+                await release_source(db, store, owner_id, ref)
+                await db.commit()
+        raise
+
+
+async def _enqueue_image(deps: BotDeps, user_id: int, image: bytes, caption: str,
+                        *, original: bool, created: list) -> Msg | None:
     """Hold validated bytes; reuse this player's explicit room setting, or ask once."""
     refusal = await preflight(deps, user_id, caption, len(image))
     if refusal:
@@ -69,23 +86,35 @@ async def enqueue_image(deps: BotDeps, user_id: int, image: bytes, caption: str,
         quota = await QuotaRepo(db).check(player.id)
         if not quota.allowed:
             return quota_exceeded_msg(quota.hours_to_free)
-        directory = deps.data_dir / 'vision' / str(player.id)
-        directory.mkdir(parents=True, exist_ok=True)
-        path = (directory / f'{uuid.uuid4().hex}.image').resolve()
-        path.write_bytes(image)
+        store = deps.source_storage or LocalSourceStorage(deps.data_dir)
+        from harness.memory.vision import image_lock, owned_image
+        from harness.platform.source_lifecycle import recover_sources
+        await SessionsRepo(db).lock_player(player.id)
+        await recover_sources(db, store, player.id)
+        sha = hashlib.sha256(image).hexdigest()
+        await image_lock(db, player.id, sha)
+        saved = await owned_image(db, player.id, sha)
+        if saved is not None:
+            ref = SourceRef.model_validate_json(saved.raw['source_ref'])
+        else:
+            ref = store.put(player.id, image, image_mime(image), 'image:' + sha)
+            created.append((player.id, ref))
+        session = await SessionsRepo(db).active_or_create(player.id)
+        revision = await SessionsRepo(db).select_context(session.id, player.id)
         if player.pokerdom_nickname:
             from harness.memory.models import Job
-            db.add(Job(type='pokerdom_read', session_id=None, player_id=player.id,
+            db.add(Job(type='pokerdom_read', session_id=session.id, player_id=player.id,
                        max_attempts=1, priority=100, payload={
-                           'source_file': str(path), 'image_sha256': hashlib.sha256(image).hexdigest(),
+                           'source_ref': ref.model_dump(), 'image_sha256': ref.sha256,
+                           'context_revision': revision,
                            'nickname': player.pokerdom_nickname, 'adapter_format': 'numbered_hh_table',
                            'original_document': original, 'save_requested': False,
                        }))
             await db.commit()
             return None
         await PlayersRepo(db).set_pending_input(player.id, {
-            'kind': INPUT_KIND, 'owner_id': player.id, 'source_file': str(path),
-            'image_sha256': hashlib.sha256(image).hexdigest(),
+            'kind': INPUT_KIND, 'owner_id': player.id, 'source_ref': ref.model_dump(),
+            'image_sha256': ref.sha256, 'session_id': session.id, 'context_revision': revision,
             'original_document': original, 'created_at': time.time(),
         })
         await db.commit()
@@ -96,37 +125,56 @@ async def enqueue_image(deps: BotDeps, user_id: int, image: bytes, caption: str,
 
 async def answer_nickname(deps: BotDeps, db: AsyncSession, player: Player,
                           pending: dict, answer: str) -> Msg:
-    path = Path(pending.get('source_file', ''))
-    root = (deps.data_dir / 'vision' / str(player.id)).resolve()
-    owned = pending.get('owner_id') == player.id and path.resolve().parent == root
-    if not owned:
+    store = deps.source_storage or LocalSourceStorage(deps.data_dir)
+    try:
+        if pending.get('owner_id') != player.id:
+            raise ValueError('intake owner mismatch')
+        if 'source_ref' in pending:
+            ref = SourceRef.model_validate(pending['source_ref'])
+        else:
+            ref = LocalSourceStorage(deps.data_dir).legacy(player.id, Path(pending['source_file']), pending['image_sha256'])
+        store.read(player.id, ref, MAX_IMAGE_BYTES)
+    except (ValueError, OSError):
         await PlayersRepo(db).set_pending_input(player.id, None)
         return Msg(text='Изображение недоступно. Пришлите его заново.')
     expired = time.time() - float(pending.get('created_at', 0)) > INTAKE_TTL_S
     if expired or answer.casefold() in {'отмена', '/cancel'}:
         await PlayersRepo(db).set_pending_input(player.id, None)
-        path.unlink(missing_ok=True)
+        from harness.memory.vision import image_lock, source_is_referenced
+        await db.flush()
+        await image_lock(db, player.id, ref.sha256)
+        if not await source_is_referenced(db, ref.encode(), ref.model_dump()):
+            store.delete(player.id, ref, ref.sha256)
         return Msg(text=('Время ожидания истекло.' if expired else 'Чтение отменено.') + ' Пришлите изображение заново, когда будете готовы.')
     if not answer or len(answer) > 64 or any(ord(c) < 32 for c in answer):
         return Msg(text='Нужен ваш точный ник на этом скрине, от 1 до 64 знаков, одной строкой. Или напишите «отмена».')
     quota = await QuotaRepo(db).check(player.id)
     if not quota.allowed:
         return quota_exceeded_msg(quota.hours_to_free)
-    if not path.is_file():
+    session_id = pending.get('session_id')
+    revision = pending.get('context_revision')
+    if session_id is None:
+        session = await SessionsRepo(db).active_or_create(player.id)
+        session_id = session.id
+        revision = await SessionsRepo(db).select_context(session_id, player.id)
+    from harness.memory.models import Session as SessionRow
+    session = await db.get(SessionRow, session_id)
+    if session is None or session.closed_at is not None or session.player_id != player.id:
         await PlayersRepo(db).set_pending_input(player.id, None)
-        return Msg(text='Изображение недоступно. Пришлите его заново.')
+        return Msg(text='Сессия изменилась. Пришлите изображение заново.')
     # Queue insert and intake completion share this transaction: no lost image/duplicate
     # job between commit and enqueue. Same defaults as the queue for this type.
     from harness.memory.models import Job
-    db.add(Job(type='pokerdom_read', session_id=None, player_id=player.id,
+    db.add(Job(type='pokerdom_read', session_id=session_id, player_id=player.id,
                max_attempts=1, priority=100, payload={
-                   'source_file': str(path), 'image_sha256': pending['image_sha256'],
+                   'source_ref': ref.model_dump(), 'image_sha256': ref.sha256,
+                   'context_revision': revision,
                    'nickname': answer, 'adapter_format': 'numbered_hh_table',
                    'original_document': pending['original_document'], 'save_requested': False,
                }))
     await PlayersRepo(db).set_pokerdom_nickname(player.id, answer)
     await PlayersRepo(db).set_pending_input(player.id, None)
-    return Msg(text='Запомнил ник для скринов Покердома (/pdnick — изменить). Принял ник. Читаю таблицу и проверяю действия; рука не записывается в игровую историю.')
+    return Msg(text='Запомнил ник для скринов Покердома (/pdnick — изменить). Принял ник. Читаю таблицу и проверяю действия; проверенная полная рука автоматически сохраняется в историю.')
 
 
 async def change_nickname(deps: BotDeps, user_id: int, nickname: str) -> Msg:
@@ -141,7 +189,7 @@ async def change_nickname(deps: BotDeps, user_id: int, nickname: str) -> Msg:
         except ValueError:
             return Msg(text="Нужен точный ник от 1 до 64 знаков, одной строкой.")
         await db.commit()
-    return Msg(text="Ник для скринов Покердома изменён. Пришлите изображение заново; история рук не сохраняется.")
+    return Msg(text="Ник для скринов Покердома изменён. Пришлите изображение заново; проверенные полные руки сохраняются в историю.")
 
 
 async def cancel_image(deps: BotDeps, user_id: int) -> Msg:

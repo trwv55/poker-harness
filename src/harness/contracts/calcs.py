@@ -33,7 +33,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from harness.contracts.analysis import SpotKind
 from harness.contracts.history import LeakStat
@@ -528,7 +528,8 @@ class OpponentRangeResult(BaseModel):
 
 class EquityVsRangeResult(BaseModel):
     """Сужение диапазона соперника агентом и эквити героя по его категориям — зона
-    `assuming`: сужение — допущение агента, классы — подмножество стартового с долями
+    `assuming`: mode user_literal — явные веса пользователя, только префлоп;
+    chart_narrowing — допущение агента, классы — подмножество стартового с долями
     чарта. После флопа одного общего эквити нет (спека 2026-10-24, §14): `layout` —
     раскладка суженного по категориям на борде с эквити против каждой. До флопа категорий
     нет, и `preflop_equity` — одно эквити против суженного (§14.11)."""
@@ -538,6 +539,7 @@ class EquityVsRangeResult(BaseModel):
     street: Street
     range_text: str
     live_combos: float
+    range_source: Literal["chart_narrowing", "user_literal"] = "chart_narrowing"
     # Классы вне чарта (входят и в `range_text`): все добавленные — и игроком, и агентом;
     # из них агентом по своей причине — `agent_added` (класс → причина, спека 2026-10-24, §7).
     added: list[str] = []
@@ -654,7 +656,9 @@ class EquityVsRangeParams(BaseModel):
     analysis_id: int
     opponent_position: str
     street: Street
-    hands: str
+    hands: str = Field(min_length=1, max_length=2048)
+    mode: Literal["chart", "literal"] = "chart"
+    literal_source: str | None = Field(default=None, max_length=2048)
     added: str | None = None
     added_reason: str | None = None
     prior: RangeNarrowing | None = None
@@ -662,6 +666,19 @@ class EquityVsRangeParams(BaseModel):
     player_classes: list[str] = []
     kept_classes: list[str] = []
     kept_agent: dict[str, str] = {}
+
+    @model_validator(mode='after')
+    def validate_source_mode(self):
+        if self.mode == 'literal':
+            if not self.literal_source or self.analysis_id <= 0:
+                raise ValueError('literal requires an owned analysis and explicit user range')
+            if self.street is not Street.PREFLOP:
+                raise ValueError('Literal диапазон поддержан только до флопа; чартовая замена не выполняется.')
+            if self.added or self.added_reason or self.prior or self.reset or self.kept_classes or self.kept_agent:
+                raise ValueError('literal range cannot mix chart narrowing/history/added parameters')
+        elif self.literal_source is not None:
+            raise ValueError('chart mode cannot carry a literal source')
+        return self
 
 
 CalcParams = Annotated[

@@ -54,7 +54,7 @@ async def start(deps, *, original=True):
     await handle_text(deps, USER, 'synthetic-alice')
     job = await deps.queue.claim('test-pd-worker')
     assert job is not None and job.type == 'pokerdom_read'
-    assert job.session_id is None and job.max_attempts == 1
+    assert job.session_id is not None and job.max_attempts == 1
     return job
 
 
@@ -84,24 +84,26 @@ async def test_actual_router_to_queue_worker_report_no_gaming_writes(intake, mon
         return observed(), None
     monkeypatch.setattr('harness.worker.pokerdom.read_pokerdom', read)
     sender=FakeSender()
-    worker=Deps(db_factory=deps.db_factory,queue=deps.queue,sender=sender,llm=MagicMock(),pokerdom_llm=MagicMock())
+    worker=Deps(db_factory=deps.db_factory,queue=deps.queue,sender=sender,llm=MagicMock(),pokerdom_llm=MagicMock(),data_dir=deps.data_dir)
     await run_job(job, worker)
     assert len(calls)==1
     assert await scalar(deps.db_factory, 'select status from jobs') == 'done'
     assert await scalar(deps.db_factory, 'select count(*) from traces') == 1
-    for table in ('hands','analyses','tournaments','sessions','opponents','opponent_links','decision_points'):
+    for table in ('tournaments','opponents','opponent_links'):
         assert await scalar(deps.db_factory, f'select count(*) from {table}') == 0
     assert await scalar(deps.db_factory,'select gg_nickname from players') == 'unrelated-gg-name'
     assert await scalar(deps.db_factory,'select pending_input from players') is None
     report='\n'.join(m.text for m in sender.sent)
     assert 'тебе возвращается 400' in report and 'повышаешь до 600' in report
     assert '5\u2009000 фишек (25,00 ББ)' in report and 'не записана' not in report
-    image_path=job.payload['source_file']
-    from pathlib import Path
-    assert Path(image_path).read_bytes()==IMAGE
+    from harness.platform.source_storage import LocalSourceStorage, SourceRef
+    assert LocalSourceStorage(deps.data_dir).read(job.player_id, SourceRef.model_validate(job.payload['source_ref']),MAX_IMAGE_BYTES)==IMAGE
+    assert await scalar(deps.db_factory,'select count(*) from hands')==1
+    assert await scalar(deps.db_factory,'select count(*) from analyses')==1
+    assert await scalar(deps.db_factory,'select last_analysis_id from sessions') is not None
     assert job.payload['original_document']==(media=='document')
     # Simulate resumed processing with durable result + reading; no second model call.
-    await run_job(job, worker)
+    # Finished jobs are not rerun unfenced; duplicate upload reuse is tested separately.
     assert len(calls)==1
 
 
@@ -112,7 +114,7 @@ async def test_unsupported_format_refuses_without_replay(intake,monkeypatch,kind
     reading.format_observation.kind=kind
     monkeypatch.setattr('harness.worker.pokerdom.read_pokerdom', AsyncMock(return_value=(reading,None)))
     sender=FakeSender()
-    await run_job(job,Deps(db_factory=intake.db_factory,queue=intake.queue,sender=sender,llm=MagicMock(),pokerdom_llm=MagicMock()))
+    await run_job(job,Deps(db_factory=intake.db_factory,queue=intake.queue,sender=sender,llm=MagicMock(),pokerdom_llm=MagicMock(),data_dir=intake.data_dir))
     report='\n'.join(m.text for m in sender.sent)
     assert 'Не удалось распознать полную таблицу' in report
     assert 'Расчёт кодом' not in report and kind not in report
@@ -125,7 +127,7 @@ async def test_missing_format_marker_never_uses_poker_legality_as_format_detecto
     else: setattr(reading.format_observation,marker,[] if marker=='evidence' else False)
     monkeypatch.setattr('harness.worker.pokerdom.read_pokerdom',AsyncMock(return_value=(reading,None)))
     sender=FakeSender()
-    await run_job(job,Deps(db_factory=intake.db_factory,queue=intake.queue,sender=sender,llm=MagicMock(),pokerdom_llm=MagicMock()))
+    await run_job(job,Deps(db_factory=intake.db_factory,queue=intake.queue,sender=sender,llm=MagicMock(),pokerdom_llm=MagicMock(),data_dir=intake.data_dir))
     assert any('Не удалось распознать полную таблицу' in m.text for m in sender.sent)
 
 
@@ -145,7 +147,7 @@ async def test_nickname_intake_is_owned_expiring_cancellable_and_quota_gated(int
     msg=await handle_text(intake,USER,answer)
     assert msg is not None
     assert await scalar(intake.db_factory,'select count(*) from jobs')==0
-    assert await scalar(intake.db_factory,'select count(*) from sessions')==0
+    assert await scalar(intake.db_factory,'select count(*) from sessions')==1
 
 
 async def test_before_download_access_size_quota_and_pending_input(intake):
@@ -186,11 +188,14 @@ async def test_read_failures_are_diagnostic_no_hidden_retry(intake,monkeypatch,m
     if mode=='no-events':reading.events=[]
     if mode=='missing-card':reading.board[Street.FLOP]=[]
     if mode=='missing-pot':reading.pot_after_street[Street.FLOP]=None
-    if mode=='wrong-nickname':job.payload['nickname']='unknown-exact-name'
+    if mode=='wrong-nickname':
+        async with intake.db_factory() as db:
+            await db.execute(text("update jobs set payload=jsonb_set(payload,'{nickname}',to_jsonb(cast(:nick as text))) where id=:id"),{'nick':'unknown-exact-name','id':job.id})
+            await db.commit()
     stub=AsyncMock(side_effect=RuntimeError('synthetic provider error')) if mode=='read-error' else AsyncMock(return_value=(reading,None))
     monkeypatch.setattr('harness.worker.pokerdom.read_pokerdom',stub)
     sender=FakeSender()
-    await run_job(job,Deps(db_factory=intake.db_factory,queue=intake.queue,sender=sender,llm=MagicMock(),pokerdom_llm=MagicMock()))
+    await run_job(job,Deps(db_factory=intake.db_factory,queue=intake.queue,sender=sender,llm=MagicMock(),pokerdom_llm=MagicMock(),data_dir=intake.data_dir))
     assert stub.await_count==1
     report='\n'.join(m.text for m in sender.sent)
     if mode=='missing-pot':assert 'Не удалось прочитать банк' in report
@@ -218,7 +223,7 @@ async def test_nickname_saved_once_reused_across_sessions_and_changeable(intake)
     await intake.queue.complete(1, worker_id='test-pd-worker')
     assert await enqueue_image(intake,USER,IMAGE,'ignored caption',original=True) is None
     assert await scalar(intake.db_factory,'select count(*) from jobs')==2
-    assert await scalar(intake.db_factory,'select count(*) from sessions')==0
+    assert await scalar(intake.db_factory,'select count(*) from sessions')==1
     await handle_new_session(intake,USER)
     assert await scalar(intake.db_factory,'select pokerdom_nickname from players')=='synthetic-alice'
     assert await enqueue_image(intake,USER,IMAGE,'',original=True) is None
@@ -244,7 +249,7 @@ async def test_concurrent_nickname_answers_queue_held_image_only_once(intake):
     await enqueue_image(intake,USER,IMAGE,'',original=True)
     await asyncio.gather(handle_text(intake,USER,'synthetic-alice'),handle_text(intake,USER,'synthetic-alice'))
     assert await scalar(intake.db_factory,'select count(*) from jobs')==1
-    assert await scalar(intake.db_factory,'select count(*) from sessions')==0
+    assert await scalar(intake.db_factory,'select count(*) from sessions')==1
 
 
 @pytest.mark.parametrize('media',['photo','document'])
@@ -313,14 +318,13 @@ def test_migration_0017_up_down_preserves_old_jobs_and_separates_room_setting():
 
 
 async def test_reading_checkpoint_survives_adaptation_crash_without_second_model_call(intake,monkeypatch):
-    from pathlib import Path
     job=await start(intake)
     stub=AsyncMock(return_value=(observed(),None))
     monkeypatch.setattr('harness.worker.pokerdom.read_pokerdom',stub)
     monkeypatch.setattr('harness.worker.pokerdom.process_pokerdom',MagicMock(side_effect=RuntimeError('after read checkpoint')))
-    deps=Deps(db_factory=intake.db_factory,queue=intake.queue,sender=FakeSender(),llm=MagicMock(),pokerdom_llm=MagicMock())
+    deps=Deps(db_factory=intake.db_factory,queue=intake.queue,sender=FakeSender(),llm=MagicMock(),pokerdom_llm=MagicMock(),data_dir=intake.data_dir)
     await run_job(job,deps)
-    directory=Path(job.payload['source_file']).parent/f'job-{job.id}'
+    directory=intake.data_dir/'vision-jobs'/str(job.id)
     assert (directory/'reading.json').exists() and not (directory/'result.json').exists()
     assert await scalar(intake.db_factory,'select status from jobs')=='failed'
     # Explicit test-only recovery, not an automatic product retry policy.
@@ -341,7 +345,7 @@ async def test_slash_cancel_real_dispatch_cleans_held_intake_without_queue_or_ll
     from aiogram import Bot, Dispatcher
     from aiogram.types import Chat, Message, MessageEntity, Update, User
     await enqueue_image(intake,USER,IMAGE,'',original=True)
-    held=list(intake.data_dir.rglob('*.image'))
+    held=[p for p in (intake.data_dir/'sources').iterdir() if p.suffix=='']
     assert len(held)==1 and held[0].exists()
     model=AsyncMock()
     monkeypatch.setattr('harness.worker.pokerdom.read_pokerdom',model)
@@ -363,5 +367,5 @@ async def test_slash_cancel_real_dispatch_cleans_held_intake_without_queue_or_ll
     assert await scalar(intake.db_factory,'select pending_input from players') is None
     assert not held[0].exists()
     assert await scalar(intake.db_factory,'select count(*) from jobs')==0
-    assert await scalar(intake.db_factory,'select count(*) from sessions')==0
+    assert await scalar(intake.db_factory,'select count(*) from sessions')==1
     model.assert_not_awaited()

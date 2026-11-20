@@ -942,6 +942,10 @@ async def test_the_tool_passes_the_reset_streets_to_the_calculation(db, tmp_path
     monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
     player_id, session_id = await _player_with_session(db, tg_user_id=9216)
     analysis_id = await stored_analysis(db, session_id=session_id, actions=_THROUGH_RIVER)
+    from harness.memory.repos import SessionsRepo
+    revision = await SessionsRepo(db).select_context(session_id, player_id)
+    assert await SessionsRepo(db).publish_analysis(session_id, player_id, revision, analysis_id)
+
 
     def narrowing(street: Street, classes: list[str]) -> RangeNarrowing:
         return RangeNarrowing(
@@ -975,6 +979,10 @@ async def test_a_lower_case_position_is_the_same_opponent(db, tmp_path, monkeypa
     monkeypatch.setattr(lookup, "DEFAULT_DEFEND_PATH", defend_file(tmp_path))
     player_id, session_id = await _player_with_session(db, tg_user_id=9217)
     analysis_id = await stored_analysis(db, session_id=session_id, actions=_THROUGH_RIVER)
+    from harness.memory.repos import SessionsRepo
+    revision = await SessionsRepo(db).select_context(session_id, player_id)
+    assert await SessionsRepo(db).publish_analysis(session_id, player_id, revision, analysis_id)
+
     run_state = CalcRun(max_calcs=8, sizes_from=frozenset(), analysis_id=analysis_id)
     tools = {
         t.name: cast(Any, t.function) for t in tools_for(db, player_id, session_id, run_state)

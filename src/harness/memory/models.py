@@ -166,6 +166,7 @@ class Session(Base):
     # `tests/conftest.py::db_factory`) падает `CircularDependencyError`.
     # `ondelete="SET NULL"`: удалённый разбор обнуляет указатель, а не держит
     # удаление (`test_a_deleted_analysis_clears_the_pointer_to_it`).
+    context_revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     last_analysis_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("analyses.id", use_alter=True, ondelete="SET NULL")
     )
@@ -233,7 +234,7 @@ class Hand(Base):
         BigInteger, ForeignKey("tournaments.id")
     )
     provenance: Mapped[str] = mapped_column(String(16), nullable=False)
-    image_hash: Mapped[str | None] = mapped_column(String)
+    image_hash: Mapped[str | None] = mapped_column(String, index=True)
     raw: Mapped[Any] = mapped_column(JSONB, nullable=False)
     canonical: Mapped[Any | None] = mapped_column(JSONB)
     enriched: Mapped[Any | None] = mapped_column(JSONB)
