@@ -126,7 +126,8 @@ def _friendly_story(result: PokerdomResult) -> str:
         return _friendly_problem(result)
     if not isinstance(raw.bb, int) or raw.bb <= 0:
         return "Не удалось определить большой блайнд. Пришли полный читаемый скрин с блайндами."
-    played = {e.street for e in reading.events}
+    played = {e.street for e in reading.events} | {
+        street for street, cards in reading.board.items() if cards}
     if any(reading.pot_after_street.get(street) is None for street in played):
         return "Не удалось прочитать банк сыгранной улицы. Пришли полный скрин с банками после каждой сыгранной улицы."
     players = {seat.label: player for seat, player in zip(raw.seats, reading.players, strict=True)}
@@ -202,7 +203,7 @@ def _friendly_story(result: PokerdomResult) -> str:
         heading = _STREET_NAMES[street] + (f" {board}" if board else "")
         pot = reading.pot_after_street[street]
         assert pot is not None
-        paragraphs.append(f"{heading}: " + ", ".join(moves) + f".\nБанк {_amount(pot, raw.bb)}.")
+        paragraphs.append(f"{heading}: " + (", ".join(moves) or "без дальнейших ставок") + f".\nБанк {_amount(pot, raw.bb)}.")
     final_pot = _amount(enriched.report.final_pot, raw.bb)
     if result.outcome_confirmed or result.outcome_basis == "visible_cards":
         end = enriched.report.stacks_end[hero]

@@ -81,17 +81,38 @@ def reading_rows(reading: PokerdomObservation, *, strict: bool = False) -> Poker
     })
 
 
+def _allin_runout_candidate(reading: PokerdomReading) -> bool:
+    """Structural admission only; the single shared replay proves betting closure.
+
+    At least two players remain, with chips behind at most one of them. Amounts
+    are source deltas (including forced bets and exactly one validated UB), not
+    the model's All-In text. A missing response/illegal amount still fails replay.
+    """
+    alive = {p.row_id for p in reading.players} - {
+        e.player for e in reading.events if e.token == "Fold"}
+    if len(alive) < 2:
+        return False
+    remaining = {p.row_id: p.stack_shown or 0 for p in reading.players}
+    for event in reading.events:
+        if event.player in remaining and event.token in MONEY:
+            remaining[event.player] -= (event.amount or 0) * (-1 if event.token == "UB" else 1)
+    return all(value >= 0 for value in remaining.values()) and sum(
+        remaining[player] > 0 for player in alive) <= 1
+
+
 def _terminal_log(reading: PokerdomReading) -> None:
     """Conservative completed-log gate for v2; the shared engine still checks legality.
 
-    Supported terminal evidence: explicit fold-out, or a closed river round.
-    Unknown all-in/runout semantics are diagnostic, never generated continuations.
+    Supported evidence: fold-out, closed river, or a fully visible all-in runout.
+    All-in admission is structural; replay must complete without invented actions.
     """
     events = sorted(reading.events, key=lambda e: e.number)
     actions = [e for e in events if e.token in ACTIONS]
     folded = {e.player for e in actions if e.token == "Fold"}
     alive = {p.row_id for p in reading.players} - folded
     if len(alive) == 1 and actions and actions[-1].token == "Fold":
+        return
+    if _allin_runout_candidate(reading):
         return
     if len(alive) < 2 or not actions or actions[-1].street != Street.RIVER:
         raise ValueError("action log has no supported terminal evidence (fold-out or closed river)")
@@ -153,7 +174,7 @@ def _prepare(reading: PokerdomReading, nickname: str | None) -> RawHand:
             raw.dealt[labels[p.row_id]] = cards
         if p.showdown_shown:
             raw.showdowns.append(ShowdownEntry(label=labels[p.row_id], cards=cards))
-    terminal = events[-1].street
+    terminal = Street.RIVER if _allin_runout_candidate(reading) else events[-1].street
     for street in STREETS[1:STREETS.index(terminal)+1]:
         cards = [_card(c) for c in reading.board.get(street, [])]
         if len(cards) != (3 if street == Street.FLOP else 1):
@@ -246,7 +267,9 @@ def process_pokerdom(reading: PokerdomObservation, *, nickname: str | None = Non
                 en = result.enriched
                 result.replay_status = "passed" if en.verdict.status.value == "pass" else "failed"
                 result.errors.extend(en.verdict.reasons)
-                terminal = max(reading.events, key=lambda e: e.number).street
+                played = {e.street for e in reading.events} | {
+                    street for street, cards in reading.board.items() if cards}
+                terminal = max(played, key=STREETS.index)
                 for street, observed in reading.pot_after_street.items():
                     calculated = (en.report.final_pot if street == terminal
                                   else en.report.pot_by_street.get(street))
@@ -254,7 +277,7 @@ def process_pokerdom(reading: PokerdomObservation, *, nickname: str | None = Non
                         "passed" if observed == calculated else "failed")
                     result.checks.append(PokerdomCheck(name=f"pot_after.{street}", status=status,
                                                       observed=observed, calculated=calculated))
-                for street in dict.fromkeys(e.street for e in reading.events):
+                for street in sorted(played, key=STREETS.index):
                     if reading.pot_after_street.get(street) is None:
                         result.checks.append(PokerdomCheck(name=f"pot_after.{street}",
                             status="not_checked", reason="no observed end-of-street pot"))
