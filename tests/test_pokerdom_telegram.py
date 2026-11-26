@@ -1,4 +1,5 @@
 """Synthetic Telegram intake → temporary queue → vision → report, no paid calls."""
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -12,6 +13,7 @@ from harness.bot.router import build_router
 from harness.contracts.pokerdom_vision import PokerdomReadingV2, PokerdomUncertainty
 from harness.contracts.raw import Street
 from harness.memory.repos import PlayersRepo, QuotaRepo
+from harness.parsers import pokerdom_vision
 from harness.parsers.pokerdom_vision import process_pokerdom
 from harness.platform.queue import JobsQueue
 from harness.presentation.pokerdom_vision import pokerdom_messages
@@ -33,7 +35,16 @@ def observed():
 
 
 @pytest.fixture
-async def intake(db_factory, tmp_path):
+async def intake(db_factory, tmp_path, monkeypatch):
+    # Shared worker tests stub OCR but still write a real diagnostic manifest.
+    # Keep its prompt and neighbouring parser source available in a public clone.
+    parser_dir = tmp_path / 'synthetic-parser'
+    prompt_path = parser_dir / 'prompts' / 'pokerdom-tg-v2.md'
+    prompt_path.parent.mkdir(parents=True)
+    prompt_path.write_text('Synthetic instructions for mocked OCR.\n', encoding='utf-8')
+    (parser_dir / 'pokerdom_vision.py').write_bytes(Path(pokerdom_vision.__file__).read_bytes())
+    monkeypatch.setattr(pokerdom_vision, 'TG_PROMPT_PATH', prompt_path)
+    monkeypatch.setattr('harness.worker.pokerdom.TG_PROMPT_PATH', prompt_path)
     deps = BotDeps(db_factory=db_factory, queue=JobsQueue(db_factory), data_dir=tmp_path)
     async with db_factory() as db:
         p = await PlayersRepo(db).get_or_create(USER)
