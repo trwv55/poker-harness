@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -21,9 +22,14 @@ from harness.memory.vision import (
     save_reading,
 )
 from harness.parsers.pokerdom_vision import TG_PROMPT_PATH, process_pokerdom, read_pokerdom
+from harness.platform.llm import LLMNotConfigured, LLMProviderError, LLMSchemaError
 from harness.platform.source_storage import LocalSourceStorage, SourceRef, image_mime
 from harness.presentation import Msg
-from harness.presentation.pokerdom_vision import pokerdom_messages
+from harness.presentation.pokerdom_vision import (
+    VisionFailure,
+    pokerdom_messages,
+    vision_failure_message,
+)
 
 if TYPE_CHECKING:
     from harness.memory.models import Job
@@ -37,7 +43,51 @@ def _atomic_json(path: Path, value: dict) -> None:
     temporary.replace(path)
 
 
+@dataclass
+class _FailureContext:
+    stage: str = "intake"
+
+
+class PokerdomWorkerFailure(Exception):
+    """Sanitized stage/code envelope for the common worker notification path."""
+
+    def __init__(self, failure: VisionFailure, error_type: str) -> None:
+        super().__init__(f"pokerdom:{failure.stage}:{failure.code}:{error_type}")
+        self.failure = failure
+        self.error_type = error_type
+
+
+def _failure_code(exc: Exception, stage: str) -> tuple[str, str]:
+    if isinstance(exc, LLMProviderError):
+        return "provider_unavailable", "LLMProviderError"
+    if isinstance(exc, LLMSchemaError):
+        return "schema_rejected", "LLMSchemaError"
+    if isinstance(exc, LLMNotConfigured):
+        return "provider_not_configured", "LLMNotConfigured"
+    if isinstance(exc, TimeoutError):
+        return "timeout", "TimeoutError"
+    if stage == "persistence":
+        return "persistence_failed", "PersistenceError"
+    if stage == "delivery":
+        return "delivery_failed", "DeliveryError"
+    if isinstance(exc, OSError) and stage in {"intake", "reading"}:
+        return "source_unavailable", "StorageError"
+    return "internal_error", "InternalError"
+
+
 async def run_pokerdom(job: Job, deps: Deps, trace: Trace) -> int | None:
+    context = _FailureContext()
+    try:
+        return await _run_pokerdom(job, deps, trace, context)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        code, error_type = _failure_code(exc, context.stage)
+        failure = VisionFailure(stage=context.stage, code=code, job_id=job.id, error_type=error_type)
+        raise PokerdomWorkerFailure(failure, error_type) from exc
+
+
+async def _run_pokerdom(job: Job, deps: Deps, trace: Trace, context: _FailureContext) -> int | None:
     from harness.worker.pipeline import _chat_id, _send_idempotent
     root = deps.data_dir
     if root is None:
@@ -58,6 +108,7 @@ async def run_pokerdom(job: Job, deps: Deps, trace: Trace) -> int | None:
             directory = legacy_directory
     directory.mkdir(parents=True, exist_ok=True)
     superseded_ref = None
+    context.stage = "intake"
     async with deps.db_factory() as db:
         row = await fenced_job(db, job)
         if row.session_id is None:
@@ -101,6 +152,7 @@ async def run_pokerdom(job: Job, deps: Deps, trace: Trace) -> int | None:
         async with deps.db_factory() as db:
             await release_source(db, store, job.player_id, superseded_ref)
             await db.commit()
+    context.stage = "reading"
     cached_result = None
     if saved is not None:
         manifest_ref = saved.raw.vision.reading_ref if saved.raw.vision else None
@@ -123,8 +175,9 @@ async def run_pokerdom(job: Job, deps: Deps, trace: Trace) -> int | None:
         if reading_path.exists():
             reading = decode_pokerdom_reading(json.loads(reading_path.read_text()))
         else:
+            context.stage = "provider"
             if deps.pokerdom_llm is None:
-                raise RuntimeError('Pokerdom model not configured')
+                raise LLMNotConfigured('Pokerdom model not configured')
             _atomic_json(directory / 'manifest.json', {
                 'schema_version': 2,
                 'schema_sha256': hashlib.sha256(json.dumps(PokerdomTelegramReading.model_json_schema(), sort_keys=True).encode()).hexdigest(),
@@ -145,6 +198,7 @@ async def run_pokerdom(job: Job, deps: Deps, trace: Trace) -> int | None:
             # Durable checkpoint BEFORE adaptation/send. Resume never rereads the model.
             _atomic_json(reading_path, reading.model_dump(mode='json'))
             _atomic_json(directory / 'call-meta.json', {'meta': str(meta)})
+        context.stage = "replay"
         observation = getattr(reading, 'format_observation', None)
         markers = ('player_rows', 'street_columns', 'numbered_actions', 'known_tokens',
                    'board_area', 'end_street_pots')
@@ -164,7 +218,8 @@ async def run_pokerdom(job: Job, deps: Deps, trace: Trace) -> int | None:
                 'Не подтверждён поддерживаемый формат полной таблицы истории. Пришлите таблицу с игроками, номерами действий, улицами и Total Pot.'
             ])
         _atomic_json(result_path, result.model_dump(mode='json'))
-    analysis_error = False
+    context.stage = "persistence"
+    analysis_error: tuple[str, str] | None = None
     hand_id = None
     if result.read_status == 'ok' and result.replay_status == 'passed' and result.raw is not None and result.enriched is not None:
         if cached_result is None:
@@ -184,6 +239,7 @@ async def run_pokerdom(job: Job, deps: Deps, trace: Trace) -> int | None:
             existing = await AnalysesRepo(db).get_by_hand(hand_id)
             await db.commit()
         try:
+            context.stage = "analysis"
             if existing is None:
                 from harness.worker.pipeline import _analyze_hand_with_cache
                 analysis, _delta = await asyncio.get_running_loop().run_in_executor(
@@ -199,21 +255,27 @@ async def run_pokerdom(job: Job, deps: Deps, trace: Trace) -> int | None:
                     job.payload['context_revision'], analysis_id)
                 await db.commit()
         except Exception as exc:  # noqa: BLE001 — retain validated checkpoint; diagnose analysis failure
-            analysis_error = True
+            _code, error_type = _failure_code(exc, "analysis")
+            analysis_error = ("analysis_failed", error_type)
             trace.record('pokerdom_analysis_unavailable', error_type=type(exc).__name__, error=str(exc))
     trace.record('pokerdom_read', read_status=result.read_status,
                  replay_status=result.replay_status, outcome_confirmed=result.outcome_confirmed,
                  artifacts=str(directory), persistent_hand=hand_id is not None, hand_id=hand_id)
     # Each chunk has its own checkpoint; never silently truncate a transcript.
-    for i, msg in enumerate(pokerdom_messages(result)):
+    context.stage = "delivery"
+    for i, msg in enumerate(pokerdom_messages(result, job_id=job.id)):
         async with deps.db_factory() as db:
             # The common fenced sender supports distinct checkpoint keys.
             await _send_idempotent(deps, db, job.id, job.locked_by,
                                    f'pokerdom_result_{i}', chat_id, msg)
             await db.commit()
     if analysis_error:
+        code, error_type = analysis_error
+        message = vision_failure_message(VisionFailure(stage="analysis", code=code, job_id=job.id,
+                                                       error_type=error_type),
+                                         detail=f"расчёт недоступен ({error_type}); рука сохранена, попробуйте позже")
         async with deps.db_factory() as db:
             await _send_idempotent(deps, db, job.id, job.locked_by,
-                'pokerdom_analysis_error', chat_id, Msg(text='Рука сохранена. Расчёт для обсуждения временно недоступен; повторите этот файл позже.'))
+                'pokerdom_analysis_error', chat_id, message)
             await db.commit()
     return hand_id

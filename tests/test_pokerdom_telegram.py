@@ -127,7 +127,9 @@ async def test_unsupported_format_refuses_without_replay(intake,monkeypatch,kind
     sender=FakeSender()
     await run_job(job,Deps(db_factory=intake.db_factory,queue=intake.queue,sender=sender,llm=MagicMock(),pokerdom_llm=MagicMock(),data_dir=intake.data_dir))
     report='\n'.join(m.text for m in sender.sent)
-    assert 'Не удалось распознать полную таблицу' in report
+    expected={'other_hh':'не поддерживается','live_table':'игровой стол',
+              'not_hand':'формат скрина','uncertain':'формат скрина'}[kind]
+    assert expected in report
     assert 'Расчёт кодом' not in report and kind not in report
 
 
@@ -139,7 +141,8 @@ async def test_missing_format_marker_never_uses_poker_legality_as_format_detecto
     monkeypatch.setattr('harness.worker.pokerdom.read_pokerdom',AsyncMock(return_value=(reading,None)))
     sender=FakeSender()
     await run_job(job,Deps(db_factory=intake.db_factory,queue=intake.queue,sender=sender,llm=MagicMock(),pokerdom_llm=MagicMock(),data_dir=intake.data_dir))
-    assert any('Не удалось распознать полную таблицу' in m.text for m in sender.sent)
+    report='\n'.join(m.text for m in sender.sent)
+    assert 'Total Pot' in report if marker=='end_street_pots' else 'скрин' in report
 
 
 @pytest.mark.parametrize('mode',['cancel','expired','wrong-owner','blank','long','quota'])
@@ -216,6 +219,129 @@ async def test_read_failures_are_diagnostic_no_hidden_retry(intake,monkeypatch,m
     assert await scalar(intake.db_factory,'select count(*) from hands')==0
 
 
+async def test_worker_not_hand_shows_specific_missing_total_pot_and_request(intake,monkeypatch):
+    job=await start(intake); reading=observed()
+    assert reading.format_observation is not None
+    reading.format_observation.kind='uncertain'
+    reading.format_observation.end_street_pots=False
+    monkeypatch.setattr('harness.worker.pokerdom.read_pokerdom',AsyncMock(return_value=(reading,None)))
+    sender=FakeSender()
+    await run_job(job,Deps(db_factory=intake.db_factory,queue=intake.queue,sender=sender,llm=MagicMock(),pokerdom_llm=MagicMock(),data_dir=intake.data_dir))
+    report='\n'.join(m.text for m in sender.sent)
+    assert report.endswith('Этап: чтение таблицы. Причина: На скрине не видна строка Total Pot. '
+                           'Пришлите полный скрин с нижней частью таблицы. Тип: PokerdomResult. '
+                           f'Код: missing_total_pot. Код обращения: {job.id}.')
+
+
+async def test_worker_unsupported_kind_has_distinct_reason(intake,monkeypatch):
+    job=await start(intake); reading=observed()
+    assert reading.format_observation is not None
+    reading.format_observation.kind='live_table'
+    reading.format_observation.end_street_pots=True
+    monkeypatch.setattr('harness.worker.pokerdom.read_pokerdom',AsyncMock(return_value=(reading,None)))
+    sender=FakeSender()
+    await run_job(job,Deps(db_factory=intake.db_factory,queue=intake.queue,sender=sender,llm=MagicMock(),pokerdom_llm=MagicMock(),data_dir=intake.data_dir))
+    report='\n'.join(m.text for m in sender.sent)
+    assert 'игровой стол' in report and 'Total Pot' not in report
+
+
+def test_other_hh_text_and_semantic_failure_code_agree():
+    reading=observed()
+    assert reading.format_observation is not None
+    reading.format_observation.kind='other_hh'
+    from harness.contracts.pokerdom_vision import PokerdomResult
+
+    message=pokerdom_messages(PokerdomResult(reading=reading,read_status='not_hand'),job_id=7)[0].text
+    assert 'формат истории пока не поддерживается' in message
+    assert 'Код: format_not_supported.' in message
+    assert 'Код: missing_total_pot.' not in message
+
+
+def test_delivery_oserror_uses_delivery_failure_classification():
+    from harness.worker.pokerdom import _failure_code
+
+    assert _failure_code(OSError('offline'), 'delivery') == ('delivery_failed', 'DeliveryError')
+
+
+@pytest.mark.parametrize(('failure','code'),[
+    ('provider','provider_unavailable'), ('schema','schema_rejected'),
+    ('timeout','timeout'), ('unknown','internal_error'),
+])
+async def test_vision_provider_schema_timeout_and_unknown_failures_are_typed(intake,monkeypatch,failure,code):
+    from harness.platform.llm import LLMProviderError, LLMSchemaError
+
+    job=await start(intake)
+    raw_error={
+        'provider':LLMProviderError('authorization secret DSN postgres://private'),
+        'schema':LLMSchemaError('secret response body'),
+        'timeout':TimeoutError('private prompt body'),
+        'unknown':RuntimeError('/private/path token=secret'),
+    }[failure]
+    monkeypatch.setattr('harness.worker.pokerdom.read_pokerdom',AsyncMock(side_effect=raw_error))
+    sender=FakeSender()
+    await run_job(job,Deps(db_factory=intake.db_factory,queue=intake.queue,sender=sender,llm=MagicMock(),pokerdom_llm=MagicMock(),data_dir=intake.data_dir))
+    message=sender.sent[-1].text
+    assert 'Этап: запрос к модели.' in message
+    assert f'Код: {code}.' in message and f'Код обращения: {job.id}.' in message
+    assert all(value not in message for value in ('authorization','postgres://','secret','private prompt','/private/path'))
+    assert sender.sent[-1].parse_mode is None and len(message)<900
+
+
+async def test_vision_storage_failure_reports_stage_without_path(intake,monkeypatch):
+    job=await start(intake)
+    def fail_read(*_args,**_kwargs):
+        raise FileNotFoundError('/private/customer/image.jpg')
+    monkeypatch.setattr('harness.worker.pokerdom.LocalSourceStorage.read',fail_read)
+    sender=FakeSender()
+    await run_job(job,Deps(db_factory=intake.db_factory,queue=intake.queue,sender=sender,llm=MagicMock(),pokerdom_llm=MagicMock(),data_dir=intake.data_dir))
+    message=sender.sent[-1].text
+    assert 'Этап: приём изображения.' in message and 'Код: source_unavailable.' in message
+    assert f'Код обращения: {job.id}.' in message and '/private/customer' not in message
+
+
+async def test_vision_persistence_failure_reports_stage_and_job(intake,monkeypatch):
+    job=await start(intake)
+    monkeypatch.setattr('harness.worker.pokerdom.read_pokerdom',AsyncMock(return_value=(observed(),None)))
+    async def fail_save(*_args,**_kwargs):
+        raise RuntimeError('postgres://secret/user-data')
+    monkeypatch.setattr('harness.worker.pokerdom.save_reading',fail_save)
+    sender=FakeSender()
+    await run_job(job,Deps(db_factory=intake.db_factory,queue=intake.queue,sender=sender,llm=MagicMock(),pokerdom_llm=MagicMock(),data_dir=intake.data_dir))
+    message=sender.sent[-1].text
+    assert 'Этап: сохранение результата.' in message and 'Код: persistence_failed.' in message
+    assert f'Код обращения: {job.id}.' in message and 'postgres://' not in message
+
+
+async def test_vision_analysis_failure_message_has_stage_and_id(intake,monkeypatch):
+    job=await start(intake)
+    monkeypatch.setattr('harness.worker.pokerdom.read_pokerdom',AsyncMock(return_value=(observed(),None)))
+    def fail_analysis(*_args,**_kwargs):
+        raise RuntimeError('secret analysis data')
+    monkeypatch.setattr('harness.worker.pipeline._analyze_hand_with_cache',fail_analysis,raising=False)
+    sender=FakeSender()
+    await run_job(job,Deps(db_factory=intake.db_factory,queue=intake.queue,sender=sender,llm=MagicMock(),pokerdom_llm=MagicMock(),data_dir=intake.data_dir))
+    message=next(m.text for m in sender.sent if 'расчёт разбора' in m.text)
+    assert 'Этап: расчёт разбора.' in message and 'Код: analysis_failed.' in message
+    assert f'Код обращения: {job.id}.' in message and 'secret analysis' not in message
+
+
+async def test_reaped_vision_job_gets_unknown_stage_and_job_reference(intake):
+    from harness.worker.pipeline import notify_reaped_failures
+
+    job=await start(intake)
+    sender=FakeSender()
+    async with intake.db_factory() as db:
+        await db.execute(text("update jobs set locked_at=now()-interval '20 minutes' where id=:id"),{'id':job.id})
+        await db.commit()
+    reaped=await intake.queue.reap(older_than_minutes=10)
+    assert reaped.failed==(job.id,)
+    deps=Deps(db_factory=intake.db_factory,queue=intake.queue,sender=sender,llm=MagicMock(),pokerdom_llm=MagicMock(),data_dir=intake.data_dir)
+    await notify_reaped_failures(deps,reaped.failed)
+    message=sender.sent[-1].text
+    assert 'Этап: обработка задачи.' in message and 'Код: worker_interrupted.' in message
+    assert f'Код обращения: {job.id}.' in message
+
+
 def test_human_report_conditional_cards_unknown_pot_and_unicode_length():
     reading=v2(showdown_table(explicit=False));reading.notes=['<b>not markup</b>😀'*800]
     result=process_pokerdom(reading,nickname='synthetic-alice')
@@ -224,6 +350,67 @@ def test_human_report_conditional_cards_unknown_pot_and_unicode_length():
     assert all(m.parse_mode is None and len(m.text.encode('utf-16-le'))//2<=3500 for m in messages)
     full=''.join(m.text for m in messages)
     assert '<b>not markup</b>' not in full and 'По видимым картам' in full and 'вскрытие не подтверждено' in full
+
+
+def test_failure_message_is_fixed_safe_and_has_job_reference():
+    from harness.contracts.pokerdom_vision import PokerdomResult
+
+    reading=observed()
+    assert reading.format_observation is not None
+    reading.format_observation.kind='uncertain'
+    reading.format_observation.end_street_pots=True
+    result=PokerdomResult(reading=reading,read_status='error',errors=[
+        'Authorization: Bearer secret-token /Users/private/file.jpg https://signed.example/x'
+    ])
+    messages=pokerdom_messages(result,job_id=158)
+    assert len(messages)==1
+    assert messages[0].text == (
+        'Этап: чтение таблицы. Причина: Не удалось полностью проверить раздачу. '
+        'Пришлите полный читаемый скрин таблицы истории. Тип: PokerdomResult. '
+        'Код: reading_incomplete. Код обращения: 158.'
+    )
+    assert all(secret not in messages[0].text for secret in ('secret-token','/Users/','signed.example','Authorization'))
+    assert messages[0].parse_mode is None
+
+
+def test_pot_diagnostic_does_not_render_unbounded_model_supplied_number():
+    from harness.contracts.pokerdom_vision import PokerdomCheck, PokerdomResult
+
+    reading=observed()
+    result=PokerdomResult(reading=reading,read_status='incomplete',checks=[
+        PokerdomCheck(name='pot_after.preflop',status='failed',observed=10**100,calculated=1)
+    ])
+    message=pokerdom_messages(result,job_id=9)[0].text
+    assert 'Банк не удалось сверить. Проверь банк и пришли полный читаемый скрин.' in message
+    assert 'Код обращения: 9.' in message and len(message)<300
+    assert len(message)<200
+
+
+def test_failure_envelope_rejects_untrusted_stage_code_and_type():
+    from harness.presentation.pokerdom_vision import VisionFailure, vision_failure_message
+
+    message=vision_failure_message(VisionFailure(
+        stage='Bearer secret',code='postgres://private',job_id=3,error_type='Authorization secret'
+    )).text
+    assert message == (
+        'Этап: обработка задачи. Причина: внутренняя ошибка обработки. '
+        'Тип: InternalError. Код: internal_error. Код обращения: 3.'
+    )
+    assert all(secret not in message for secret in ('Bearer','secret','postgres://','Authorization'))
+
+
+@pytest.mark.parametrize(('field','expected'),[
+    ('player_nickname','Не удалось прочитать ник игрока. Проверьте /pdnick и пришлите полный скрин таблицы.'),
+    ('action_log','Не удалось прочитать одно из действий. Пришлите полный скрин, чтобы вся таблица действий была видна.'),
+])
+def test_structured_uncertainty_selects_a_specific_safe_next_step(field,expected):
+    from harness.contracts.pokerdom_vision import PokerdomResult
+
+    reading=observed()
+    reading.uncertainties=[PokerdomUncertainty(field=field,reason='arbitrary untrusted provider text')]
+    result=PokerdomResult(reading=reading,read_status='incomplete')
+    message=pokerdom_messages(result,job_id=7)[0].text
+    assert f'Причина: {expected}' in message and 'Код обращения: 7.' in message
 
 
 async def test_nickname_saved_once_reused_across_sessions_and_changeable(intake):

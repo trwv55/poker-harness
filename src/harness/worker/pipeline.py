@@ -1744,7 +1744,9 @@ async def _finish_fenced(
         return False
 
 
-async def _notify_failure(deps: Deps, job: JobModel, reason: str) -> None:
+async def _notify_failure(
+    deps: Deps, job: JobModel, reason: str, *, message: Msg | None = None
+) -> None:
     """Лучшее из возможного уведомление игроку о провале — не должно само уронить
     обработку провала: если отправка тоже не удалась (нет сети, чат заблокирован,
     фенсинг), задача всё равно обязана остаться `failed` в БД, а не повиснуть.
@@ -1765,7 +1767,7 @@ async def _notify_failure(deps: Deps, job: JobModel, reason: str) -> None:
                 job.locked_by,
                 "result_message_id",
                 chat_id,
-                failed_msg(reason, job.type),
+                message or failed_msg(reason, job.type),
             )
     except Exception:  # noqa: BLE001 — намеренно: сбой уведомления не должен
         # уронить обработку провала задачи (задача уже честно `failed` в БД,
@@ -1799,6 +1801,17 @@ async def notify_reaped_failures(deps: Deps, job_ids: Sequence[int]) -> None:
                 chat_id = await _chat_id(session, job.player_id)
                 # `worker_id=None`: `reap()` снял `locked_by`, и сверка владельца
                 # в `_send_idempotent` пропускает только задачу без владельца.
+                if job.type == "pokerdom_read":
+                    from harness.presentation.pokerdom_vision import (
+                        VisionFailure,
+                        vision_failure_message,
+                    )
+                    message = vision_failure_message(VisionFailure(
+                        stage="unknown", code="worker_interrupted", job_id=job_id,
+                        error_type="WorkerInterrupted",
+                    ))
+                else:
+                    message = failed_msg(_PUBLIC_FAILURE_REASON_DEFAULT, job.type)
                 await _send_idempotent(
                     deps,
                     session,
@@ -1806,7 +1819,7 @@ async def notify_reaped_failures(deps: Deps, job_ids: Sequence[int]) -> None:
                     None,
                     "result_message_id",
                     chat_id,
-                    failed_msg(_PUBLIC_FAILURE_REASON_DEFAULT, job.type),
+                    message,
                 )
         except Exception:  # noqa: BLE001 — уведомление best-effort, как `_notify_failure`
             _log.exception("reaped_job_notify_failed", job_id=job_id)
@@ -1887,7 +1900,28 @@ async def run_job(job: JobModel, deps: Deps) -> None:
                     return
                 _log.error("job_failed", error=repr(exc), exc_info=exc)
                 if await _finish_fenced(deps, job, outcome="fail", error=str(exc)):
-                    await _notify_failure(deps, job, _public_failure_reason(exc))
+                    if job.type == "pokerdom_read":
+                        from harness.presentation.pokerdom_vision import (
+                            VisionFailure,
+                            vision_failure_message,
+                        )
+                        from harness.worker.pokerdom import (
+                            PokerdomWorkerFailure,
+                            _failure_code,
+                        )
+
+                        if isinstance(exc, PokerdomWorkerFailure):
+                            failure = exc.failure
+                        else:
+                            code, error_type = _failure_code(exc, "unknown")
+                            failure = VisionFailure(stage="unknown", code=code, job_id=job.id,
+                                                    error_type=error_type)
+                        await _notify_failure(
+                            deps, job, _public_failure_reason(exc),
+                            message=vision_failure_message(failure),
+                        )
+                    else:
+                        await _notify_failure(deps, job, _public_failure_reason(exc))
             else:
                 await _finish_fenced(deps, job, outcome="complete")
         finally:

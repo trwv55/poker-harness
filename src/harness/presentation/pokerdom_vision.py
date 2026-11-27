@@ -1,8 +1,11 @@
 """Complete local transcript, independent of analysis and model prose."""
+from dataclasses import dataclass
+
 from harness.contracts.pokerdom_vision import (
     PokerdomEvent,
     PokerdomPlayer,
     PokerdomReading,
+    PokerdomReadingV2,
     PokerdomResult,
 )
 from harness.contracts.raw import Street
@@ -95,29 +98,103 @@ def _cards(values: list[str]) -> str:
 _STREET_NAMES = dict(zip(Street, ("Префлоп", "Флоп", "Тёрн", "Ривер"), strict=True))
 
 
+@dataclass(frozen=True)
+class VisionFailure:
+    stage: str
+    code: str
+    job_id: int
+    error_type: str = "PokerdomResult"
+
+
+_FAILURE_STAGES = {
+    "intake": "приём изображения", "provider": "запрос к модели", "reading": "чтение таблицы",
+    "replay": "проверка раздачи", "persistence": "сохранение результата",
+    "analysis": "расчёт разбора", "delivery": "отправка ответа", "unknown": "обработка задачи",
+}
+_FAILURE_CODES = {
+    "provider_unavailable": "служба распознавания недоступна; попробуйте позже",
+    "schema_rejected": "ответ модели не прошёл проверку структуры",
+    "provider_not_configured": "служба распознавания не настроена",
+    "timeout": "операция не уложилась в отведённое время; попробуйте позже",
+    "source_unavailable": "изображение или сохранённые данные недоступны",
+    "persistence_failed": "не удалось сохранить проверенный результат",
+    "analysis_failed": "рука сохранена, но расчёт разбора недоступен; попробуйте позже",
+    "internal_error": "внутренняя ошибка обработки",
+    "worker_interrupted": "обработка прервалась до завершения",
+    "delivery_failed": "не удалось отправить ответ; попробуйте позже",
+    "format_not_supported": "формат изображения не поддерживается",
+    "missing_total_pot": "не видна строка Total Pot",
+    "reading_incomplete": "чтение таблицы неполное",
+    "replay_failed": "последовательность действий не прошла проверку",
+    "bank_mismatch": "банк на скрине не совпал с расчётом действий",
+}
+_FAILURE_TYPES = {
+    "PokerdomResult", "LLMProviderError", "LLMSchemaError", "LLMNotConfigured",
+    "TimeoutError", "StorageError", "PersistenceError", "DeliveryError", "AnalysisError",
+    "InternalError", "WorkerInterrupted",
+}
+
+
+def vision_failure_message(failure: VisionFailure, *, detail: str | None = None) -> Msg:
+    stage = _FAILURE_STAGES.get(failure.stage, _FAILURE_STAGES["unknown"])
+    code = failure.code if failure.code in _FAILURE_CODES else "internal_error"
+    error_type = failure.error_type if failure.error_type in _FAILURE_TYPES else "InternalError"
+    reason = (detail or _FAILURE_CODES[code]).rstrip(". ")
+    text = (f"Этап: {stage}. Причина: {reason}. Тип: {error_type}. "
+            f"Код: {code}. Код обращения: {failure.job_id}.")
+    return Msg(text=text[:900], parse_mode=None)
+
+
 def _friendly_problem(result: PokerdomResult) -> str:
     """Localize the blocking category; raw diagnostics remain in JSON/CLI."""
     if result.read_status == "not_hand":
-        return "Не удалось распознать полную таблицу истории раздачи. Пришли таблицу с игроками, номерами действий и банками по улицам."
+        observation = getattr(result.reading, "format_observation", None)
+        if observation is not None:
+            if observation.kind == "live_table":
+                return "Похоже, это игровой стол, а не история раздачи. Откройте историю и пришлите полный скрин таблицы."
+            if observation.kind == "other_hh":
+                return "Этот формат истории пока не поддерживается. Пришлите скрин таблицы с игроками, улицами, номерами действий и Total Pot."
+            if not observation.end_street_pots and observation.player_rows and observation.street_columns and observation.numbered_actions and observation.known_tokens and observation.board_area:
+                return "На скрине не видна строка Total Pot. Пришлите полный скрин с нижней частью таблицы."
+            if not observation.end_street_pots:
+                return "Не видна часть таблицы истории. Пришлите полный скрин с игроками, действиями и Total Pot."
+            if not observation.player_rows:
+                return "Не видны строки игроков. Пришлите полный скрин таблицы истории."
+            if not observation.numbered_actions or not observation.street_columns:
+                return "Не видны улицы или номера действий. Пришлите полный скрин таблицы истории."
+        return "Не удалось определить формат скрина. Пришлите полный скрин таблицы истории с игроками, улицами и Total Pot."
     if not result.reading.events:
         return "Не удалось прочитать последовательность действий. Пришли полную таблицу с номерами всех действий."
     for check in result.checks:
         if check.status == "failed" and check.name.startswith("pot_after."):
             street = check.name.removeprefix("pot_after.")
             title = next((name for value, name in _STREET_NAMES.items() if value.value == street), "Улица")
-            if not isinstance(check.observed, int) or not isinstance(check.calculated, int):
+            if (not isinstance(check.observed, int) or not isinstance(check.calculated, int)
+                    or max(len(str(abs(check.observed))), len(str(abs(check.calculated)))) > 15):
                 return "Банк не удалось сверить. Проверь банк и пришли полный читаемый скрин."
             return f"{title}: банк на скрине {_chips(check.observed)} не сошёлся с действиями ({_chips(check.calculated)}). Проверь эту улицу и пришли полный читаемый скрин."
     errors = " ".join(result.errors).lower()
-    if "nickname" in errors or "hero" in errors:
-        return "Не удалось однозначно определить игрока по нику. Проверь ник: /pdnick ТВОЙ_НИК, затем пришли скрин заново."
+    if any(term in errors for term in ("nickname", "hero", "player nickname")):
+        return "Не удалось однозначно найти ваш ник на скрине. Проверьте его командой /pdnick актуальный_ник и пришлите скрин заново."
     if "card" in errors or "board" in errors:
         return "Не удалось прочитать карты без пропусков или противоречий. Пришли полный скрин, на котором видны карты и масти."
     if "банк" in errors or "pot" in errors:
         return "Не удалось прочитать банк сыгранной улицы. Пришли полный скрин с банками после каждой сыгранной улицы."
     if "stack" in errors:
         return "Не удалось однозначно прочитать стартовые стеки. Пришли скрин с читаемыми числами под никами."
-    return "Не удалось полностью прочитать и проверить последовательность действий. Пришли полную читаемую таблицу без обрезки, лучше файлом без сжатия."
+    if isinstance(result.reading, PokerdomReadingV2) and result.reading.uncertainties:
+        field = result.reading.uncertainties[0].field.lower()
+        if "pot" in field:
+            return "Не удалось прочитать банк сыгранной улицы. Пришлите полный скрин с банками после каждой сыгранной улицы."
+        if "event" in field or "action" in field:
+            return "Не удалось прочитать одно из действий. Пришлите полный скрин, чтобы вся таблица действий была видна."
+        if "nick" in field or "player" in field:
+            return "Не удалось прочитать ник игрока. Проверьте /pdnick и пришлите полный скрин таблицы."
+        if "board" in field or "card" in field:
+            return "Не удалось прочитать карты на скрине. Пришлите полный скрин, где видны борд и масти."
+    if any(term in errors for term in ("terminal", "response", "closed", "all-in", "allin")):
+        return "Не удалось восстановить завершение последовательности действий. Пришлите полный скрин, включая последнее действие."
+    return "Не удалось полностью проверить раздачу. Пришлите полный читаемый скрин таблицы истории."
 
 
 def _friendly_story(result: PokerdomResult) -> str:
@@ -218,9 +295,26 @@ def _friendly_story(result: PokerdomResult) -> str:
     return "\n\n".join(paragraphs)
 
 
-def pokerdom_messages(result: PokerdomResult) -> list[Msg]:
+def pokerdom_messages(result: PokerdomResult, *, job_id: int | None = None) -> list[Msg]:
     """Friendly TG projection only; detailed CLI/JSON diagnostics are unchanged."""
     text = _friendly_story(result)
+    if (result.read_status != "ok" or result.replay_status != "passed") and job_id is not None:
+        stage = "replay" if result.replay_status == "failed" else "reading"
+        code = "replay_failed" if stage == "replay" else "reading_incomplete"
+        if result.read_status == "not_hand":
+            observation = getattr(result.reading, "format_observation", None)
+            if observation is not None and observation.kind in {"live_table", "other_hh"}:
+                code = "format_not_supported"
+            elif (observation is not None and not observation.end_street_pots
+                    and observation.player_rows and observation.street_columns
+                    and observation.numbered_actions and observation.known_tokens
+                    and observation.board_area):
+                code = "missing_total_pot"
+            else:
+                code = "format_not_supported"
+        elif any(check.status == "failed" and check.name.startswith("pot_after.") for check in result.checks):
+            code = "bank_mismatch"
+        return [vision_failure_message(VisionFailure(stage=stage, code=code, job_id=job_id), detail=text)]
     # Keep each chips+BB pair intact across Telegram messages. Preserve all text.
     import re
     tokens = re.findall(r"[+−]?[\d\u2009]+ фиш(?:ка|ки|ек) \([+−]?\d+,\d{2} ББ\)|\s+|\S+", text)
