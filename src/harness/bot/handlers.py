@@ -65,6 +65,7 @@ from harness.memory.repos import (
 from harness.parsers.decision_spot import looks_like_decision_spot
 from harness.parsers.vision_adapter import apply_vision_answer
 from harness.platform.queue import JobsQueue
+from harness.platform.source_storage import SourceStorage
 from harness.presentation import (
     AGENT_MISS_PREFIX,
     DISAGREE_PREFIX,
@@ -235,6 +236,7 @@ class BotDeps:
     queue: JobsQueue
     data_dir: Path
     owner_tg_user_id: int | None = None
+    source_storage: SourceStorage | None = None
 
 
 def _store_hh_file(data_dir: Path, file_bytes: bytes) -> Path:
@@ -922,6 +924,18 @@ async def handle_text(deps: BotDeps, tg_user_id: int, text: str) -> Msg | None:
             return screen
 
         pending = dict(player.pending_input or {})
+        if pending.get("kind") == "pokerdom_image_nickname":
+            from sqlalchemy import select
+
+            from harness.bot.pokerdom import answer_nickname
+            # Serialize answers: two text updates must not queue the held image twice.
+            player = (await db.execute(select(Player).where(Player.id == player.id).with_for_update().execution_options(populate_existing=True))).scalar_one()
+            pending = dict(player.pending_input or {})
+            if pending.get("kind") != "pokerdom_image_nickname":
+                return Msg(text="Ответ уже принят. Дождитесь результата.")
+            reply = await answer_nickname(deps, db, player, pending, answer)
+            await db.commit()
+            return reply
         if pending:
             reply = await _apply_pending_input(db, player, pending, answer)
             await db.commit()

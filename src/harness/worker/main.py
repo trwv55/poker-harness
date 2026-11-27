@@ -37,6 +37,7 @@ from asyncio import FIRST_COMPLETED
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import suppress
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 
@@ -49,6 +50,7 @@ from harness.platform.config import Config, EnvVarError, optional_int
 from harness.platform.llm import LLM
 from harness.platform.logs import configure_logging
 from harness.platform.queue import JobsQueue
+from harness.platform.source_storage import source_storage
 from harness.presentation import Btn, Msg, Photo
 from harness.worker.pipeline import Deps, notify_reaped_failures, run_job
 
@@ -491,11 +493,14 @@ async def main() -> None:
             # Тот же том, что у бота (`bot.main.data_dir`): туда ложатся картинки
             # диапазонов (`pipeline._render_ranges`), в БД едут пути (спека §6).
             data_dir=data_dir(),
+            source_storage=source_storage(data_dir(), cfg.source_storage_backend),
             # Флаг, а не имя модели: станции нужно одно решение — звать вторую
             # ступень каскада зрения или сразу спрашивать игрока. Переменная
             # необязательна (`.env.example`), и незаданная означает «каскада нет».
             vision_fallback=bool(cfg.llm_vision_fallback_model),
             agent_history_max_tokens=cfg.agent_history_max_tokens,
+            pokerdom_llm=LLM(replace(cfg, llm_vision_model=cfg.llm_pokerdom_model), db_factory),
+            pokerdom_provider=cfg.llm_pokerdom_provider,
         )
         stop = _install_stop_handlers()
         tasks = [

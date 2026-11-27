@@ -895,7 +895,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     natural.add_argument("--variant", default=None, help="один вариант диалога")
     natural.add_argument("--validate-only", action="store_true", help="проверить JSON без API")
     natural.add_argument("--with-opinion", action="store_true", help="вызвать и модель ответа")
+    from harness.platform.pokerdom_eval import add_parser
+    from harness.platform.pokerdom_eval import run as run_pokerdom
+    add_parser(sub)
     args = parser.parse_args(argv)
+    if args.suite == "pokerdom-vision":
+        return asyncio.run(run_pokerdom(args))
     if args.suite == "tournament":
         return asyncio.run(_run_tournament(args))
     if args.suite == "vision":

@@ -32,7 +32,7 @@ from typing import Any, cast, overload
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from harness.analysis.charts import to_notation
+from harness.analysis.charts import parse_range, to_notation
 from harness.analysis.frequency import (
     compare_to_reference,
     compare_to_threshold,
@@ -83,6 +83,7 @@ from harness.contracts import (
     OpponentRangeParams,
     OpponentRangeResult,
     PointFilter,
+    Range,
     SolverAction,
     SolverGuide,
     Street,
@@ -172,7 +173,19 @@ async def _measure(
     if subject is Subject.OPPONENT:
         labels = await OpponentsRepo(db).links(cast(int, opponent_id), player_id)
     hands = await HandsRepo(db).player_canonical(player_id, window)
-    stats = player_stats_of_seats(hands, seats_of(subject, position, labels))
+    chosen_seats = seats_of(subject, position, labels)
+
+    def observable_seats(hand: CanonicalHand) -> list[str]:
+        selected = chosen_seats(hand)
+        if stat is FrequencyStat.SHOWDOWN and hand.provenance.value == 'screenshot' and not hand.showdowns:
+            folded = {a.label for a in hand.actions if a.kind.value == 'fold'}
+            if len({p.label for p in hand.players} - folded) >= 2:
+                # Unknown showdown concerns only the remaining players. A player
+                # who folded is a known negative (and saw_flop still gates denominator).
+                return [label for label in selected if label in folded]
+        return selected
+
+    stats = player_stats_of_seats(hands, observable_seats)
     return measurement_of(stats, stat)
 
 
@@ -470,12 +483,17 @@ async def _opponent_range(
 async def _preflop_equity(db: AsyncSession, spot: EquitySpot) -> float:
     """Одно эквити против суженного до флопа — Монте-Карло с фиксированным сидом и
     `calc_cache` (`test_the_preflop_equity_is_one_number_deterministic_and_cached`)."""
+    return await _cached_range_equity(db, spot.hero, spot.narrowed, spot.board)
+
+
+async def _cached_range_equity(db: AsyncSession, hero: Sequence[str], narrowed: Range,
+                               board: Sequence[str]) -> float:
     cache = CalcCacheRepo(db)
-    key = f"{''.join(spot.hero)}|{''.join(spot.board)}|{to_notation(spot.narrowed)}"
+    key = f"{''.join(hero)}|{''.join(board)}|{to_notation(narrowed)}"
     equity = await cache.get(PREFLOP_EQUITY_PREFIX, key)
     if equity is None:
         equity = await asyncio.to_thread(
-            equity_vs_range, spot.hero, spot.narrowed, spot.board,
+            equity_vs_range, (hero[0], hero[1]), narrowed, list(board),
             iterations=PREFLOP_EQUITY_ITERATIONS, seed=PREFLOP_EQUITY_SEED,
         )
         await cache.upsert_many(PREFLOP_EQUITY_PREFIX, {key: equity})
@@ -492,6 +510,20 @@ async def _equity_vs_range(
     Счёт — в потоке, чтобы не держать цикл событий воркера."""
     _check_position(params.opponent_position)
     hand = await _analysed_hand(db, player_id, params.analysis_id)
+    if params.mode == 'literal':
+        literal = parse_range(params.hands)
+        if to_notation(literal) != to_notation(parse_range(params.literal_source or '')):
+            raise ValueError('literal range differs from explicit user source')
+        opponent = next((p for p in hand.players if p.position == params.opponent_position), None)
+        if opponent is None or opponent.label == hand.hero_label:
+            raise ValueError('opponent position absent or belongs to hero')
+        hero = hero_cards(hand)
+        combos = live_combos(literal, hero)
+        if combos <= 0:
+            raise ValueError('literal range has no live combinations')
+        return EquityVsRangeResult(calc=params.calc, opponent_position=params.opponent_position,
+            street=params.street, range_text=to_notation(literal), live_combos=combos,
+            range_source='user_literal', preflop_equity=await _cached_range_equity(db, hero, literal, []))
     spot = await asyncio.to_thread(
         equity_spot, hand, params.opponent_position, params.street, params.hands,
         added=params.added, prior=params.prior, named=params.player_classes,

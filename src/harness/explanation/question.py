@@ -603,6 +603,12 @@ def _agent_equity_lines(result: EquityVsRangeResult, book: NumberBook) -> list[s
     (`test_the_agent_added_classes_are_said_with_the_reason`). После флопа одного общего
     эквити нет: эквити — по категориям суженного (`_equity_lines`); до флопа — одно число
     (`test_the_preflop_equity_digest_prints_one_number`)."""
+    if result.range_source == 'user_literal':
+        return [f"Соперник: {result.opponent_position}, улица: {_STREET_WORD[result.street]}.",
+            (f"Явный диапазон пользователя (допущение): {_range_text(result.range_text, book)}. "
+             "Веса взяты из записи пользователя; без указанного веса — все комбо класса, не частоты чарта."),
+            f"Живых комбо с указанными весами: {book.prose(f'{result.live_combos:g}')}.",
+            *_preflop_lines(result, book)]
     player = [cls for cls in result.added if cls not in result.agent_added]
     named = _range_text(", ".join(player), book)
     added = [f"Добавлено по вашей просьбе: {named} — по чарту их здесь нет."] if player else []
@@ -702,7 +708,10 @@ def agent_digest(result: CalcResult, *, opponent: str | None = None) -> Digest:
     и выборка словами; `opponent` — ник, по которому модель позвала инструмент.
     """
     book = NumberBook()
-    lines = [f"Расчёт: {_CALC_BRIEF[result.calc]}."]
+    brief = ("эквити против явно заданного диапазона пользователя (допущение)"
+             if isinstance(result, EquityVsRangeResult) and result.range_source == 'user_literal'
+             else _CALC_BRIEF[result.calc])
+    lines = [f"Расчёт: {brief}."]
     if isinstance(result, FrequencyResult):
         lines += _agent_frequency_lines(result, opponent, book)
         lines.append(_window_line(result.window, book))

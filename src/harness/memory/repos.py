@@ -99,6 +99,14 @@ class PlayersRepo:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
 
+    async def set_pokerdom_nickname(self, player_id: int, nickname: str) -> None:
+        """Explicit room setting, separate from GG and any played-hand persistence."""
+        if not nickname.strip() or len(nickname.strip()) > 64 or any(ord(c) < 32 for c in nickname):
+            raise ValueError("nickname must be 1..64 characters on one line")
+        await self.db.execute(update(Player).where(Player.id == player_id).values(
+            pokerdom_nickname=nickname.strip()))
+        await self.db.flush()
+
     async def set_gg_nickname(self, player_id: int, nickname: str) -> None:
         """Записать ник игрока в руме — вход опознания героя на скриншоте.
 
@@ -245,6 +253,11 @@ class SessionsRepo:
 
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
+    async def lock_player(self, player_id: int) -> None:
+        """Context protocol: player advisory BEFORE any session row lock/update."""
+        await self.db.execute(text("SELECT pg_advisory_xact_lock(:ns, :player_id)"),
+                              {"ns": _SESSIONS_LOCK_NS, "player_id": player_id})
+
     async def active(self, player_id: int) -> SessionRow | None:
         return await self.db.scalar(
             select(SessionRow)
@@ -269,10 +282,7 @@ class SessionsRepo:
         Ждут друг друга только транзакции ОДНОГО игрока — на чужие уплаты этот
         лок не влияет.
         """
-        await self.db.execute(
-            text("SELECT pg_advisory_xact_lock(:ns, :player_id)"),
-            {"ns": _SESSIONS_LOCK_NS, "player_id": player_id},
-        )
+        await self.lock_player(player_id)
         stmt = (
             select(SessionRow)
             .where(SessionRow.player_id == player_id, SessionRow.closed_at.is_(None))
@@ -406,10 +416,11 @@ class SessionsRepo:
         История диалога с агентом уходит вместе с вечером (спека агента №1, §8;
         `test_the_evening_history_is_written_read_and_erased_by_new`).
         """
+        await self.lock_player(player_id)
         result = await self.db.execute(
             update(SessionRow)
             .where(SessionRow.player_id == player_id, SessionRow.closed_at.is_(None))
-            .values(closed_at=datetime.now(UTC), agent_history=None)
+            .values(closed_at=datetime.now(UTC), agent_history=None, last_analysis_id=None, active_spot_id=None, context_revision=SessionRow.context_revision + 1)
             .execution_options(synchronize_session=False)
             .returning(SessionRow.id)
         )
@@ -447,7 +458,33 @@ class SessionsRepo:
         )
         return result.first() is not None
 
+    async def select_context(self, session_id: int, player_id: int) -> int:
+        """Atomic admission token: also invalidates an earlier running calculation."""
+        await self.lock_player(player_id)
+        revision = await self.db.scalar(update(SessionRow).where(
+            SessionRow.id == session_id, SessionRow.player_id == player_id,
+            SessionRow.closed_at.is_(None),
+        ).values(context_revision=SessionRow.context_revision + 1,
+                 last_analysis_id=None, active_spot_id=None).returning(SessionRow.context_revision))
+        if revision is None:
+            raise ValueError('context session is closed or not owned')
+        return revision
+
+    async def publish_analysis(self, session_id: int, player_id: int,
+                               revision: int, analysis_id: int) -> bool:
+        await self.lock_player(player_id)
+        if await AnalysesRepo(self.db).enriched_hand(analysis_id, player_id) is None:
+            raise ValueError('analysis is not owned')
+        row = await self.db.scalar(update(SessionRow).where(
+            SessionRow.id == session_id, SessionRow.player_id == player_id,
+            SessionRow.closed_at.is_(None), SessionRow.context_revision == revision,
+        ).values(last_analysis_id=analysis_id, active_spot_id=None).returning(SessionRow.id))
+        return row is not None
+
     async def set_last_analysis(self, session_id: int, analysis_id: int | None) -> None:
+        owner = await self.db.scalar(select(SessionRow.player_id).where(SessionRow.id == session_id))
+        if owner is not None:
+            await self.lock_player(owner)
         await self.db.execute(
             update(SessionRow)
             .where(SessionRow.id == session_id)
@@ -481,6 +518,7 @@ class DecisionSpotsRepo:
         snapshot: dict[str, Any] | None,
         prior_id: int | None = None,
     ) -> DecisionSpot:
+        await SessionsRepo(self.db).lock_player(player_id)
         session = await self.db.scalar(
             select(SessionRow)
             .where(
@@ -505,6 +543,7 @@ class DecisionSpotsRepo:
         row.canonical = canonical
         row.snapshot = snapshot
         row.status = "verified" if canonical is not None and snapshot is not None else "draft"
+        session.context_revision += 1
         session.active_spot_id = row.id
         session.last_analysis_id = None
         await self.db.flush()
@@ -607,6 +646,8 @@ class HandsRepo:
         jsonb: `hand_no` уникален не глобально, а в рамках источника, и поиск
         по `raw`, а не `canonical`, работает даже до чекпоинта нормализации).
         """
+        if not hand_no:
+            return None
         stmt = select(Hand).where(
             Hand.session_id == session_id,
             Hand.raw["hand_no"].astext == hand_no,
@@ -632,6 +673,8 @@ class HandsRepo:
         содержимое раздачи идентично, поэтому выбор безопасен, а свежая сессия
         ближе к тому, на что игрок сейчас смотрит.
         """
+        if not hand_no:
+            return None
         stmt = (
             select(Hand.session_id)
             .join(SessionRow, SessionRow.id == Hand.session_id)
@@ -1270,7 +1313,7 @@ QUOTA_DAILY_DEFAULT = 50
 # (`test_a_question_does_not_spend_the_daily_quota`) принято раньше агента, и
 # `/ask` живёт до открытия агента у игроков без доступа. Своего предела у
 # вопросов нет — есть только кросс-процессный лимитер модели.
-QUOTA_INTERACTIVE_JOB_TYPES = ("deep_dive", "screenshot_analyze", "agent")
+QUOTA_INTERACTIVE_JOB_TYPES = ("deep_dive", "screenshot_analyze", "agent", "pokerdom_read")
 
 # Скользящее окно, а не календарные сутки (спека §9 дословно: ни поля пояса, ни
 # cron-сброса, ни полуночного «обнуления посреди ночной сессии»).

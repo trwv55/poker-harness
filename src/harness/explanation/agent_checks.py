@@ -1057,6 +1057,29 @@ _WITHOUT_FOLDS_RE = re.compile(
 )
 
 
+_CALL_THRESHOLD_EXPLANATION = re.compile(
+    r"(?:порог\s+эквити\s+(?:для\s+)?(?:окупаемости\s+)?колла"
+    r"|для\s+(?:окупаемости|безубыточности)\s+колла\s+(?:нужна|требуется)\s+эквити)"
+    r"\s*(?:(?:равен|составляет|от)\s*|[—–:\-]\s*)?(?P<pct>" + _NUMBER + r")\s*%",
+    re.IGNORECASE,
+)
+
+
+def _without_call_threshold_explanation(sentence: str,
+        evidence: tuple[CallThresholdEvidence, ...]) -> str:
+    """Remove only a complete threshold-description clause, never an EV conclusion."""
+    if len(evidence) != 1:
+        return sentence
+    values = frozenset(item.required_equity_pct for item in evidence)
+    clauses = re.split(r";|,(?!\d)|\s+и\s+|\s+а\s+", sentence, flags=re.IGNORECASE)
+    retained = []
+    for clause in clauses:
+        match = _CALL_THRESHOLD_EXPLANATION.fullmatch(clause.strip(' .!?'))
+        if match is None or not _in(match.group('pct'), values, percent=True):
+            retained.append(clause)
+    return '; '.join(retained)
+
+
 def _profit_without_folds(sentence: str) -> bool:
     """Каждый вывод о прибыльности в предложении — «окупается / в плюсе (и) без
     фолдов» (`test_the_without_folds_flag_frees_only_that_conclusion`)."""
@@ -1325,6 +1348,14 @@ def _purpose_line(
 
 
 @dataclass(frozen=True, slots=True)
+class CallThresholdEvidence:
+    """Required equity percentage from a trusted saved CALL decision point."""
+    dp_index: int
+    street: Street
+    required_equity_pct: float
+
+
+@dataclass(frozen=True, slots=True)
 class AgentContext:
     """Сводка последнего разбора для агента: текст, разрешённые числа, метки
     классификатора, класс руки героя и ранги борда (для вырезания карт).
@@ -1342,6 +1373,35 @@ class AgentContext:
     board_ranks: tuple[str, ...]
     threshold_numbers: frozenset[float] = frozenset()
     profit_without_folds: bool = False
+    call_thresholds: tuple[CallThresholdEvidence, ...] = ()
+
+
+def select_call_thresholds(evidence: tuple[CallThresholdEvidence, ...],
+                           question: str | None) -> tuple[CallThresholdEvidence, ...]:
+    """Authority is the latest user question, not an amount or model draft.
+
+    Only one explicitly named street with exactly one CALL point is supported.
+    Unknown/multiple streets or multiple CALLs on that street require clarification.
+    """
+    if not question:
+        return ()
+    text = question.casefold().replace('ё', 'е')
+    if not re.search(r"\b(?:колл[а-я]*|call)\b", text):
+        return ()
+    # Relative 'before the next street' is not an explicit action street.
+    if re.search(r"\b(?:до|перед)\s+(?:флоп|терн|ривер)[а-я]*\b", text):
+        return ()
+    patterns = {
+        Street.PREFLOP: r"\b(?:префлоп[а-я]*|preflop)\b",
+        Street.FLOP: r"\b(?:флоп[а-я]*|flop)\b",
+        Street.TURN: r"\b(?:терн[а-я]*|turn)\b",
+        Street.RIVER: r"\b(?:ривер[а-я]*|river)\b",
+    }
+    streets = [street for street, pattern in patterns.items() if re.search(pattern, text)]
+    if len(streets) != 1:
+        return ()
+    selected = tuple(item for item in evidence if item.street is streets[0])
+    return selected if len(selected) == 1 else ()
 
 
 def agent_context(result: AnalysisResult, enriched: EnrichedHand) -> AgentContext:
@@ -1374,6 +1434,22 @@ def agent_context(result: AnalysisResult, enriched: EnrichedHand) -> AgentContex
             f"Раздача {book.token(result.hand_no)}.\nРешений с вердиктом в этой раздаче нет."
         )
         verdict_allowed = frozenset()
+    # Exact saved decision-point money, separate from rounded street replay.
+    from harness.analysis.tools.pot_odds import required_equity
+    call_lines = []
+    call_thresholds = []
+    for point in enriched.report.decision_points:
+        if point.to_call <= 0 or point.action.kind.value != 'call':
+            continue
+        threshold = required_equity(point.to_call, point.pot_before)
+        call_thresholds.append(CallThresholdEvidence(point.index, point.street, 100 * threshold))
+        shown = book.pct(100 * threshold, trim=True)
+        line = (f"Точный колл, {_STREET_NAME[point.street]}: "
+            f"банк перед действием героя (ставка соперника уже включена) {point.pot_before} фишек "
+            f"({point.pot_before / hand.bb:.8f} BB); доплата героя {point.to_call} фишек "
+            f"({point.to_call / hand.bb:.8f} BB); банк после колла {point.pot_before + point.to_call} фишек; "
+            f"порог эквити колла {100 * threshold:.8f}% (округлённо {shown}%).")
+        call_lines.append(book.prose(line))
     labels: set[str] = set()
     label_lines: list[str] = []
     equity_lines: list[str] = []
@@ -1407,7 +1483,7 @@ def agent_context(result: AnalysisResult, enriched: EnrichedHand) -> AgentContex
     text = "\n\n".join(
         part
         for part in (
-            replay, verdict_text, "\n".join(label_lines), "\n".join(purpose_lines), equity_text
+            replay, "\n".join(call_lines), verdict_text, "\n".join(label_lines), "\n".join(purpose_lines), equity_text
         )
         if part
     )
@@ -1419,6 +1495,7 @@ def agent_context(result: AnalysisResult, enriched: EnrichedHand) -> AgentContex
         board_ranks=board,
         threshold_numbers=thresholds.allowed,
         profit_without_folds=without_folds,
+        call_thresholds=tuple(call_thresholds),
     )
 
 
@@ -1565,6 +1642,7 @@ def check_agent_answer(
     equity_numbers: frozenset[float] = frozenset(),
     preflop_equity_numbers: frozenset[float] = frozenset(),
     other_numbers: frozenset[float] = frozenset(),
+    call_thresholds: tuple[CallThresholdEvidence, ...] = (),
 ) -> list[str]:
     """Нарушения ответа словами; пустой список — ответ прошёл (спека §6).
 
@@ -1650,8 +1728,20 @@ def check_agent_answer(
             )
         if _BEST_LINE_RE.search(sentence) and _FLOP_TURN_RE.search(sentence):
             violations.append(f"лучшая линия на флопе или тёрне — «{quoted}»")
+        # A call's required threshold cannot serve as measured equity of hero's hand.
+        actual_equity_claim = re.search(
+            r"эквити\s+(?:вашей\s+руки|у\s+вас)|(?:у\s+вашей\s+руки|ваша\s+рука)[^,;.!?]*эквити",
+            sentence, re.IGNORECASE)
+        if call_thresholds and actual_equity_claim and _equity_shares(sentence,
+                frozenset(item.required_equity_pct for item in call_thresholds),
+                equity_numbers | preflop_equity_numbers):
+            violations.append(f"порог колла не является рассчитанным эквити вашей руки — «{quoted}»")
+        profit_text = _without_call_threshold_explanation(_unquoted_for_profit(sentence), call_thresholds)
+        call_conclusion = bool(call_thresholds and re.search(r"колл[а-яё]*", profit_text, re.IGNORECASE)
+            and (_BLOCK_PROFIT_RE.search(profit_text)
+                 or re.search(r"выгоден|(?:да[её]т|имеет)\s+EV", profit_text, re.IGNORECASE)))
         if (
-            _PROFIT_RE.search(_unquoted_for_profit(sentence))
+            (_PROFIT_RE.search(profit_text) or call_conclusion)
             and not _profit_arithmetic(sentence, calc_numbers)
             and not threshold_decided
             and not (profit_without_folds and _profit_without_folds(sentence))

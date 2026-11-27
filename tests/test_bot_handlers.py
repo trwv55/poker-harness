@@ -278,7 +278,7 @@ async def test_document_payload_matches_what_worker_reads(db_factory, deps, tmp_
 
     t = await fetch_one(db_factory, "select * from tournaments")
     j = await fetch_one(db_factory, "select * from jobs")
-    assert j["payload"] == {"source_file": str(path), "tournament_id": t["id"]}
+    assert j["payload"] == {"source_file": str(path), "tournament_id": t["id"], "context_revision": 1}
     assert t["source_file"] == str(path)
     assert t["session_id"] == j["session_id"]
 
@@ -930,7 +930,7 @@ async def test_deep_dive_callback_enqueues_silently(db_factory, deps, invited):
     assert result is None
     jobs = await fetch_all(db_factory, "select * from jobs order by id")
     assert jobs[-1]["type"] == "deep_dive"
-    assert jobs[-1]["payload"] == {"hand_no": "RC1234"}
+    assert jobs[-1]["payload"] == {"hand_no": "RC1234", "context_revision": 2}
     assert jobs[-1]["session_id"] == active["id"]
 
 

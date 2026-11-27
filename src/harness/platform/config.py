@@ -185,11 +185,23 @@ class Config:
     # Остальные провайдеры эти настройки не используют.
     llm_openrouter_provider_sort: ProviderSort = "throughput"
     llm_openrouter_provider_order: tuple[str, ...] = ()
+    # Optional strict host for agent only; other purposes retain global routing.
+    llm_agent_openrouter_provider: str = ""
     # Таймаут ОДНОГО запроса к провайдеру, в секундах. До него запрос ничем не
     # ограничивался (тех-спека §7, «Известный дефект»).
     llm_request_timeout_s: int = 60
     # Потолок истории вечера агента в оценочных токенах (`agent.history.estimate_tokens`).
     agent_history_max_tokens: int = 30_000
+    # Separate from legacy GG vision; no automatic fallback.
+    llm_pokerdom_model: str = "openrouter:openai/gpt-6.1-terra"
+    llm_pokerdom_provider: str = "openai"
+    source_storage_backend: str = "local"
+
+    def __post_init__(self) -> None:
+        host = self.llm_agent_openrouter_provider.strip()
+        object.__setattr__(self, "llm_agent_openrouter_provider", host)
+        if host and not self.llm_agent_model.startswith("openrouter:"):
+            raise InvalidEnvVar("LLM_AGENT_OPENROUTER_PROVIDER требует LLM_AGENT_MODEL=openrouter:...")
 
     @classmethod
     def from_env(cls) -> Config:
@@ -204,6 +216,10 @@ class Config:
             llm_agent_model=optional_env("LLM_AGENT_MODEL", DEFAULT_AGENT_MODEL),
             llm_openrouter_provider_sort=_openrouter_sort(),
             llm_openrouter_provider_order=_openrouter_order(),
+            llm_agent_openrouter_provider=optional_env("LLM_AGENT_OPENROUTER_PROVIDER", ""),
             llm_request_timeout_s=optional_int("LLM_REQUEST_TIMEOUT_S", 60),
             agent_history_max_tokens=optional_int("AGENT_HISTORY_MAX_TOKENS", 30_000),
+            llm_pokerdom_model=optional_env("LLM_POKERDOM_MODEL", "openrouter:openai/gpt-6.1-terra"),
+            llm_pokerdom_provider=optional_env("LLM_POKERDOM_PROVIDER", "openai"),
+            source_storage_backend=optional_env("SOURCE_STORAGE_BACKEND", "local"),
         )
